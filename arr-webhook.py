@@ -317,7 +317,7 @@ def handle_upgrade_import(data, source):
 
     # Identify the new torrent to skip it
     # First try downloadId direct hash lookup (most accurate)
-    download_id = data.get('downloadId', '').lower()
+    download_id = (data.get('downloadId') or '').lower()
     if download_id and download_id in torrents:
         new_torrent_hash = download_id
         log.info(f'{source}: identified new torrent by downloadId: {new_torrent_hash}')
@@ -392,7 +392,7 @@ def handle_grab(data, source):
     Fires when Sonarr/Radarr sends a grab to Deluge.
     Check via API if this is an upgrade, then throttle if over 10GB.
     """
-    download_id = data.get('downloadId', '').lower()
+    download_id = (data.get('downloadId') or '').lower()
     if not download_id:
         log.warning(f"{source}: On Grab but no downloadId, skipping")
         return
