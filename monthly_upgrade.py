@@ -23,6 +23,7 @@ print('Step 1: Purging stalled radarr-upgrade torrents...')
 deluge_login()
 torrents = get_torrents()
 to_remove = []
+removed = 0
 for h,i in torrents.items():
     if i.get('label') == RADARR_UPG_LABEL and i.get('total_done', 0) < 5*1024*1024:
         print(f'  Purging: {i["name"]} ({i["total_done"]/1024/1024:.1f}MB)')
@@ -31,7 +32,6 @@ for h,i in torrents.items():
         print(f'  Skipping in-progress: {i["name"]} ({i["total_done"]/1024/1024:.1f}MB)')
 if to_remove:
     batch_size = 5
-    removed = 0
     for i in range(0, len(to_remove), batch_size):
         batch = to_remove[i:i+batch_size]
         try:

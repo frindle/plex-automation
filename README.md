@@ -40,6 +40,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `main`: syn
 ## Changelog
 
 ### Unreleased
+- Fix `NameError: name 'removed' is not defined` in `monthly_upgrade.py` when no torrents qualified for purging — `removed` was only initialized inside the `if to_remove:` block, crashing the script before it could reach the search/relabel steps.
 - Fix Radarr bulk search (`radarr_bulk_search()` in `arr-webhook.py`, Step 2 of `monthly_upgrade.py`) sending `movieIds: []` to the `MoviesSearch` command — Radarr treats that as a no-op. Now fetches all monitored movie IDs first and passes them explicitly.
 - Add `requirements.txt`, GitHub Actions CI (lint + Docker build), and this README.
 - Initial public release: stripped a shared personal "monitor" stack down to just the Sonarr/Radarr/Deluge automation (`arr-webhook.py`, `monthly_upgrade.py`); the unrelated reddit/BTC/XMR monitors were split out to a separate project.
