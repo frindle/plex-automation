@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timedelta
 
 import paramiko
-from flask import Blueprint, redirect, render_template_string, request
+from flask import Blueprint, redirect, render_template_string, request, send_file
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +51,7 @@ def init_db():
             library TEXT NOT NULL,
             rel_path TEXT NOT NULL,
             status TEXT NOT NULL,
+            bytes_total INTEGER NOT NULL DEFAULT 0,
             bytes_done INTEGER NOT NULL DEFAULT 0,
             error TEXT,
             created_at TEXT NOT NULL,
@@ -171,55 +172,203 @@ def _current_email():
     return request.headers.get('Cf-Access-Authenticated-User-Email', '')
 
 
-INDEX_HTML = '''
-<h2>Media share</h2>
-<p>Signed in as {{ email }}</p>
-<ul>
-{% for lib in libraries %}
-  <li><a href="/share/browse/{{ lib }}">{{ lib }}</a></li>
-{% endfor %}
-</ul>
-<p><a href="/share/usage">My usage</a></p>
+_BASE_CSS = '''
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: #0f0f0f; color: #e8e8e8; min-height: 100vh; }
+  header { background: #1a1a1a; border-bottom: 1px solid #2a2a2a;
+           padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
+  header h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.02em; color: #fff; }
+  header .meta { font-size: 0.8rem; color: #666; }
+  header nav a { color: #888; text-decoration: none; font-size: 0.85rem; margin-left: 16px; }
+  header nav a:hover { color: #fff; }
+  main { max-width: 900px; margin: 0 auto; padding: 32px 24px; }
+  h2 { font-size: 1.3rem; font-weight: 600; margin-bottom: 24px; color: #fff; }
+  a { color: #6ea8fe; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; }
+  .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px;
+          padding: 24px 20px; text-align: center; cursor: pointer;
+          transition: border-color 0.15s, background 0.15s; text-decoration: none; color: inherit; }
+  .card:hover { border-color: #555; background: #222; text-decoration: none; }
+  .card .icon { font-size: 2.4rem; margin-bottom: 12px; }
+  .card .label { font-size: 0.95rem; font-weight: 500; color: #e8e8e8; text-transform: capitalize; }
+  .breadcrumb { font-size: 0.85rem; color: #666; margin-bottom: 20px; }
+  .breadcrumb a { color: #6ea8fe; }
+  .file-list { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; overflow: hidden; }
+  .file-row { display: flex; align-items: center; padding: 11px 16px;
+              border-bottom: 1px solid #222; gap: 10px; }
+  .file-row:last-child { border-bottom: none; }
+  .file-row:hover { background: #222; }
+  .file-icon { font-size: 1.1rem; width: 24px; text-align: center; flex-shrink: 0; }
+  .file-name { flex: 1; font-size: 0.9rem; color: #e8e8e8; overflow: hidden;
+               text-overflow: ellipsis; white-space: nowrap; }
+  .file-name a { color: #e8e8e8; }
+  .file-name a:hover { color: #6ea8fe; text-decoration: none; }
+  .actions { display: flex; gap: 8px; flex-shrink: 0; }
+  .btn { display: inline-block; padding: 5px 12px; border-radius: 6px; font-size: 0.78rem;
+         font-weight: 500; cursor: pointer; border: none; text-decoration: none; white-space: nowrap; }
+  .btn-primary { background: #2563eb; color: #fff; }
+  .btn-primary:hover { background: #1d4ed8; text-decoration: none; }
+  .btn-ghost { background: #2a2a2a; color: #bbb; border: 1px solid #333; }
+  .btn-ghost:hover { background: #333; color: #fff; text-decoration: none; }
+  .stat-table { width: 100%; border-collapse: collapse; }
+  .stat-table th { text-align: left; font-size: 0.8rem; font-weight: 500; color: #666;
+                   text-transform: uppercase; letter-spacing: 0.05em; padding: 0 0 10px; }
+  .stat-table td { padding: 10px 0; border-top: 1px solid #222; font-size: 0.9rem; }
+  .stat-table .size { font-variant-numeric: tabular-nums; color: #aaa; }
+  .status-card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px;
+                 padding: 28px; max-width: 480px; }
+  .status-label { font-size: 0.8rem; color: #666; text-transform: uppercase;
+                  letter-spacing: 0.05em; margin-bottom: 4px; }
+  .status-value { font-size: 1rem; font-weight: 500; margin-bottom: 18px; }
+  .status-done { color: #4ade80; }
+  .status-running { color: #facc15; }
+  .status-failed { color: #f87171; }
+  .progress-bar { height: 6px; background: #2a2a2a; border-radius: 3px; overflow: hidden; margin-bottom: 18px; }
+  .progress-fill { height: 100%; background: #2563eb; border-radius: 3px; transition: width 0.5s; }
+  .error-box { background: #2a1a1a; border: 1px solid #5a2a2a; border-radius: 6px;
+               padding: 12px 14px; font-size: 0.85rem; color: #f87171; word-break: break-all; }
 '''
 
-BROWSE_HTML = '''
-<h2>{{ library }} / {{ rel_path }}</h2>
-{% if parent is not none %}<p><a href="/share/browse/{{ library }}?path={{ parent }}">.. up</a></p>{% endif %}
-<ul>
-{% for e in entries %}
-  <li>
-    {% if e.is_dir %}
-      <a href="/share/browse/{{ library }}?path={{ e.rel }}">{{ e.name }}/</a>
-    {% else %}
-      {{ e.name }}
+_LIB_ICONS = {'movies': '🎬', 'tv': '📺', 'music': '🎵'}
+
+INDEX_HTML = '''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Media Share</title><style>''' + _BASE_CSS + '''</style></head>
+<body>
+<header>
+  <h1>Media Share</h1>
+  <div style="display:flex;align-items:center;gap:16px">
+    <nav><a href="/share/usage">Usage</a></nav>
+    <span class="meta">{{ email }}</span>
+  </div>
+</header>
+<main>
+  <h2>Libraries</h2>
+  <div class="card-grid">
+  {% for lib in libraries %}
+    <a class="card" href="/share/browse/{{ lib }}">
+      <div class="icon">{{ icons.get(lib, "📁") }}</div>
+      <div class="label">{{ lib }}</div>
+    </a>
+  {% endfor %}
+  </div>
+</main>
+</body></html>
+'''
+
+BROWSE_HTML = '''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ library }} — Media Share</title><style>''' + _BASE_CSS + '''</style></head>
+<body>
+<header>
+  <h1>Media Share</h1>
+  <div style="display:flex;align-items:center;gap:16px">
+    <nav><a href="/share">Libraries</a><a href="/share/usage">Usage</a></nav>
+    <span class="meta">{{ email }}</span>
+  </div>
+</header>
+<main>
+  <div class="breadcrumb">
+    <a href="/share">home</a> /
+    <a href="/share/browse/{{ library }}">{{ library }}</a>
+    {% if rel_path %}
+      {% for part in rel_path.split("/") if part %}
+        / {{ part }}
+      {% endfor %}
     {% endif %}
-    <form style="display:inline" method="post" action="/share/upload">
-      <input type="hidden" name="library" value="{{ library }}">
-      <input type="hidden" name="rel_path" value="{{ e.rel }}">
-      <button type="submit">Upload</button>
-    </form>
-  </li>
-{% endfor %}
-</ul>
+  </div>
+  <div class="file-list">
+    {% if parent is not none %}
+    <div class="file-row">
+      <span class="file-icon">⬆</span>
+      <span class="file-name"><a href="/share/browse/{{ library }}?path={{ parent }}">.. up</a></span>
+    </div>
+    {% endif %}
+    {% for e in entries %}
+    <div class="file-row">
+      <span class="file-icon">{% if e.is_dir %}📁{% else %}🎬{% endif %}</span>
+      <span class="file-name">
+        {% if e.is_dir %}
+          <a href="/share/browse/{{ library }}?path={{ e.rel }}">{{ e.name }}</a>
+        {% else %}
+          {{ e.name }}
+        {% endif %}
+      </span>
+      <div class="actions">
+        {% if not e.is_dir %}
+        <a class="btn btn-ghost" href="/share/download/{{ library }}?path={{ e.rel }}">Download</a>
+        {% endif %}
+        <form method="post" action="/share/upload">
+          <input type="hidden" name="library" value="{{ library }}">
+          <input type="hidden" name="rel_path" value="{{ e.rel }}">
+          <button class="btn btn-primary" type="submit">Upload to me</button>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</main>
+</body></html>
 '''
 
-STATUS_HTML = '''
-<h2>Upload {{ row.id }}</h2>
-<p>Status: {{ row.status }}</p>
-<p>Sent: {{ "%.1f"|format(row.bytes_done / 1024 / 1024) }} MB</p>
-{% if row.error %}<p>Error: {{ row.error }}</p>{% endif %}
-{% if row.status in ("pending", "running") %}
-<meta http-equiv="refresh" content="3">
-{% endif %}
+STATUS_HTML = '''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Upload Status — Media Share</title>
+{% if row.status in ("pending", "running") %}<meta http-equiv="refresh" content="3">{% endif %}
+<style>''' + _BASE_CSS + '''</style></head>
+<body>
+<header>
+  <h1>Media Share</h1>
+  <nav><a href="/share">Libraries</a><a href="/share/usage">Usage</a></nav>
+</header>
+<main>
+  <h2>Upload #{{ row.id }}</h2>
+  <div class="status-card">
+    <div class="status-label">File</div>
+    <div class="status-value">{{ row.rel_path.split("/")[-1] }}</div>
+    <div class="status-label">Status</div>
+    <div class="status-value status-{{ row.status }}">{{ row.status }}</div>
+    {% if row.bytes_total and row.bytes_total > 0 %}
+    <div class="progress-bar">
+      <div class="progress-fill" style="width:{{ [(row.bytes_done / row.bytes_total * 100), 100]|min|int }}%"></div>
+    </div>
+    {% endif %}
+    <div class="status-label">Sent</div>
+    <div class="status-value">{{ "%.1f"|format(row.bytes_done / 1024 / 1024) }} MB</div>
+    {% if row.error %}
+    <div class="error-box">{{ row.error }}</div>
+    {% endif %}
+  </div>
+</main>
+</body></html>
 '''
 
-USAGE_HTML = '''
-<h2>Usage for {{ email }}</h2>
-<ul>
-{% for label, total in usage.items() %}
-  <li>{{ label }}: {{ "%.2f"|format(total / 1024 / 1024 / 1024) }} GB</li>
-{% endfor %}
-</ul>
+USAGE_HTML = '''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Usage — Media Share</title><style>''' + _BASE_CSS + '''</style></head>
+<body>
+<header>
+  <h1>Media Share</h1>
+  <div style="display:flex;align-items:center;gap:16px">
+    <nav><a href="/share">Libraries</a></nav>
+    <span class="meta">{{ email }}</span>
+  </div>
+</header>
+<main>
+  <h2>Your Usage</h2>
+  <table class="stat-table">
+    <tr><th>Period</th><th>Data Sent</th></tr>
+    {% for label, total in usage.items() %}
+    <tr>
+      <td>{{ label }}</td>
+      <td class="size">{{ "%.2f"|format(total / 1024 / 1024 / 1024) }} GB</td>
+    </tr>
+    {% endfor %}
+  </table>
+</main>
+</body></html>
 '''
 
 
@@ -228,7 +377,7 @@ def share_index():
     email = _current_email()
     if not email:
         return 'Access denied: no Cloudflare Access identity found', 403
-    return render_template_string(INDEX_HTML, libraries=LIBRARIES.keys(), email=email)
+    return render_template_string(INDEX_HTML, libraries=LIBRARIES.keys(), email=email, icons=_LIB_ICONS)
 
 
 @share_bp.route('/browse/<library>')
@@ -255,8 +404,25 @@ def share_browse(library):
         })
     parent = os.path.dirname(rel_path) if rel_path else None
     return render_template_string(
-        BROWSE_HTML, library=library, entries=entries, rel_path=rel_path, parent=parent
+        BROWSE_HTML, library=library, entries=entries, rel_path=rel_path, parent=parent, email=email
     )
+
+
+@share_bp.route('/download/<library>')
+def share_download(library):
+    email = _current_email()
+    if not email:
+        return 'Access denied', 403
+    if library not in LIBRARIES:
+        return 'Unknown library', 404
+    rel_path = request.args.get('path', '')
+    try:
+        full = safe_join(LIBRARIES[library], rel_path)
+    except ValueError:
+        return 'Invalid path', 400
+    if not os.path.isfile(full):
+        return 'Not a file', 400
+    return send_file(full, as_attachment=True, conditional=True)
 
 
 @share_bp.route('/upload', methods=['POST'])
@@ -278,10 +444,16 @@ def share_upload():
     if not os.path.exists(full):
         return 'Not found', 404
 
+    full = safe_join(LIBRARIES[library], rel_path)
+    if os.path.isdir(full):
+        bytes_total = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(full) for f in fs)
+    else:
+        bytes_total = os.path.getsize(full)
+
     db = sqlite3.connect(DB_PATH)
     cur = db.execute(
-        'INSERT INTO uploads (friend_email, library, rel_path, status, created_at) VALUES (?, ?, ?, ?, ?)',
-        (email, library, rel_path, 'pending', datetime.utcnow().isoformat())
+        'INSERT INTO uploads (friend_email, library, rel_path, status, bytes_total, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        (email, library, rel_path, 'pending', bytes_total, datetime.utcnow().isoformat())
     )
     upload_id = cur.lastrowid
     db.commit()
