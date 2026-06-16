@@ -48,6 +48,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `main`: syn
 ## Changelog
 
 ### Unreleased
+- Queue all upgrade-labeled torrents (`sonarr-upgrade`/`radarr-upgrade`) to the bottom of the Deluge queue immediately on grab, and re-enforce top/bottom ordering every hour in `prioritize_normal_torrents()` — previously a newly-grabbed upgrade kept whatever queue position Deluge assigned it until the next monthly relabel cycle, so some upgrades queued ahead of others inconsistently.
 - Add `media_share.py`: friend-facing media upload portal at `/share`, gated by Cloudflare Access identity, browsing the Movies/TV/Music libraries and pushing files/folders to a per-friend SFTP destination (`FRIENDS_CONFIG`), rate-limited to 5 Mbit/s by default, with SQLite-backed per-friend usage tracking (`/share/usage`).
 - Run the Flask dev server with `threaded=True` so a slow synchronous webhook handler (e.g. `handle_upgrade_import` waiting on Deluge) can't briefly block other incoming Sonarr/Radarr webhooks.
 - Fix potential `AttributeError` in `handle_grab()`/`handle_upgrade_import()` (`arr-webhook.py`) when Sonarr/Radarr sends `downloadId: null` — `.get('downloadId', '')` doesn't substitute the default for an explicit `null` value, only a missing key.

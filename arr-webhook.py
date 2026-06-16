@@ -425,6 +425,12 @@ def handle_grab(data, source):
         deluge_login()
         ensure_label_exists_named(upgrade_label)
         set_torrent_label(download_id, upgrade_label)
+        session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.queue_bottom', 'params': [[download_id]], 'id': 11},
+            timeout=10
+        )
+        log.info(f"{source}: moved {download_id} to bottom of queue")
     except Exception as e:
         log.error(f"{source}: failed to label upgrade torrent: {e}")
 
@@ -589,25 +595,35 @@ def monthly_search_scheduler():
 
 
 def prioritize_normal_torrents():
-    """Every hour, move sonarr/radarr labeled torrents to top of Deluge queue."""
-    log.info('Prioritizing normal sonarr/radarr torrents in Deluge queue...')
+    """Every hour, move sonarr/radarr labeled torrents to top and upgrade-labeled torrents to bottom of Deluge queue."""
+    log.info('Reordering Deluge queue: normal downloads to top, upgrades to bottom...')
     try:
         deluge_login()
         torrents = get_all_torrents()
         if not torrents:
             return
         priority_labels = {'sonarr', 'radarr'}
-        hashes = [h for h, i in torrents.items() if i.get('label', '') in priority_labels]
-        if not hashes:
-            log.info('No normal sonarr/radarr torrents to prioritize')
-            return
-        resp = session.post(
-            f'{DELUGE_URL}/json',
-            json={'method': 'core.queue_top', 'params': [hashes], 'id': 8},
-            timeout=10
-        )
-        resp.raise_for_status()
-        log.info(f'Moved {len(hashes)} sonarr/radarr torrents to top of queue')
+        upgrade_labels = {SONARR_UPG_LABEL, RADARR_UPG_LABEL}
+        top_hashes = [h for h, i in torrents.items() if i.get('label', '') in priority_labels]
+        bottom_hashes = [h for h, i in torrents.items() if i.get('label', '') in upgrade_labels]
+        if top_hashes:
+            resp = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.queue_top', 'params': [top_hashes], 'id': 8},
+                timeout=10
+            )
+            resp.raise_for_status()
+            log.info(f'Moved {len(top_hashes)} sonarr/radarr torrents to top of queue')
+        if bottom_hashes:
+            resp = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.queue_bottom', 'params': [bottom_hashes], 'id': 11},
+                timeout=10
+            )
+            resp.raise_for_status()
+            log.info(f'Moved {len(bottom_hashes)} upgrade torrents to bottom of queue')
+        if not top_hashes and not bottom_hashes:
+            log.info('No torrents to reprioritize')
     except Exception as e:
         log.error(f'Queue prioritization failed: {e}')
 
