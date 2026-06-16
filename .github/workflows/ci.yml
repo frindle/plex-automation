@@ -15,8 +15,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt ruff
-      - run: python -m py_compile arr-webhook.py monthly_upgrade.py
-      - run: ruff check arr-webhook.py monthly_upgrade.py
+      - run: python -m py_compile arr-webhook.py monthly_upgrade.py media_share.py
+      - run: ruff check arr-webhook.py monthly_upgrade.py media_share.py
 
   docker-build:
     runs-on: ubuntu-latest

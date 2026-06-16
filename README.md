@@ -16,18 +16,26 @@ Background schedulers (run inside the same process):
 
 `monthly_upgrade.py` is a standalone script duplicating the monthly cycle (purge → bulk search → wait 90 min → relabel/requeue), kept for manual or cron-triggered runs independent of the long-running webhook process.
 
+`media_share.py` adds a friend-facing media upload portal (Flask blueprint, registered into the same app/port) at `/share`:
+- Friends authenticate via Cloudflare Access (the app trusts the `Cf-Access-Authenticated-User-Email` header, so it must only be reachable through the Cloudflare Tunnel — never expose this port directly to the internet).
+- Browse the read-only-mounted Movies/TV Shows/Music libraries and upload a file or whole folder to that friend's own SFTP server, looked up by their authenticated email in `FRIENDS_CONFIG`.
+- Uploads run in a background thread, throttled to `UPLOAD_RATE_LIMIT_MBIT` (default 5 Mbit/s) so a large upload doesn't saturate the connection.
+- Every upload is logged to a SQLite DB (`/data/share_uploads.db`); `/share/usage` shows each friend their own bandwidth usage over the last 7/30/60/90/182/365 days.
+
 ## Setup
 
 1. Copy `.env.example` to `.env` and fill in:
    - `DELUGE_PASSWORD`
    - `SONARR_API_KEY`
    - `RADARR_API_KEY`
-2. Adjust the hardcoded Deluge/Sonarr/Radarr URLs, labels, `SEED_DAYS`, and `SEEDING_DIR` directly in `docker-compose.yml` if your setup differs.
+   - `FRIENDS_CONFIG` (JSON map of Cloudflare Access email → SFTP destination) if using the media share portal
+2. Adjust the hardcoded Deluge/Sonarr/Radarr URLs, labels, `SEED_DAYS`, `SEEDING_DIR`, and the `/mnt/Media/...` library volume mounts directly in `docker-compose.yml` if your setup differs.
 3. Build and run:
    ```
    docker-compose build && docker-compose up -d
    ```
 4. Point Sonarr/Radarr's webhook connections (Settings → Connect) at `http://<container-ip>:9876/webhook/sonarr` and `/webhook/radarr`, enabling the **On Grab** and **On Import** (upgrade) triggers.
+5. If using the media share portal, point a Cloudflare Tunnel + Access application at `http://<container-ip>:9876/share` and restrict ingress so the container is only reachable through the tunnel.
 
 ## Deployment
 
@@ -35,11 +43,12 @@ Runs on Unraid at `/mnt/user/appdata/plex-automation`, on the `br0` macvlan netw
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `main`: syntax + `ruff` lint check on both Python scripts, then a Docker build to make sure the image actually builds.
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `main`: syntax + `ruff` lint check on all Python scripts, then a Docker build to make sure the image actually builds.
 
 ## Changelog
 
 ### Unreleased
+- Add `media_share.py`: friend-facing media upload portal at `/share`, gated by Cloudflare Access identity, browsing the Movies/TV/Music libraries and pushing files/folders to a per-friend SFTP destination (`FRIENDS_CONFIG`), rate-limited to 5 Mbit/s by default, with SQLite-backed per-friend usage tracking (`/share/usage`).
 - Run the Flask dev server with `threaded=True` so a slow synchronous webhook handler (e.g. `handle_upgrade_import` waiting on Deluge) can't briefly block other incoming Sonarr/Radarr webhooks.
 - Fix potential `AttributeError` in `handle_grab()`/`handle_upgrade_import()` (`arr-webhook.py`) when Sonarr/Radarr sends `downloadId: null` — `.get('downloadId', '')` doesn't substitute the default for an explicit `null` value, only a missing key.
 - Fix `NameError: name 'removed' is not defined` in `monthly_upgrade.py` when no torrents qualified for purging — `removed` was only initialized inside the `if to_remove:` block, crashing the script before it could reach the search/relabel steps.

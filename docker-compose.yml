@@ -16,11 +16,16 @@ services:
       PORT: "9876"
       SEEDING_DIR: "/data/Downloads/Just4Seeding"
       SEED_DAYS: "21"
+      FRIENDS_CONFIG: ${FRIENDS_CONFIG}
+      UPLOAD_RATE_LIMIT_MBIT: "5"
     networks:
       br0:
         ipv4_address: 10.0.0.4
     volumes:
       - ./data:/data
+      - "/mnt/Media/Movies:/media/movies:ro"
+      - "/mnt/Media/TV Shows:/media/tv:ro"
+      - "/mnt/Media/Music:/media/music:ro"
 
 networks:
   br0:

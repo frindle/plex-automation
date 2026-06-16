@@ -6,10 +6,13 @@ import threading
 import requests
 from flask import Flask, request, jsonify
 
+from media_share import share_bp, init_db as init_share_db
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.register_blueprint(share_bp)
 
 DELUGE_URL       = os.environ.get('DELUGE_URL', 'http://10.0.0.2:8112')
 DELUGE_PASSWORD  = os.environ.get('DELUGE_PASSWORD', 'PASSWORDHERE')
@@ -647,6 +650,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 9876))
     log.info(f'Starting arr-webhook listener on port {port}')
     log.info(f'Superseded torrents will be auto-removed after {SEED_DAYS} days of seeding')
+    init_share_db()
     t = threading.Thread(target=cleanup_scheduler, daemon=True)
     t.start()
     t2 = threading.Thread(target=monthly_search_scheduler, daemon=True)
