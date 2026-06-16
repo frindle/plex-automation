@@ -1,6 +1,7 @@
 FROM python:3.11-slim
 WORKDIR /app
-RUN pip install --no-cache-dir requests flask
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY arr-webhook.py .
 COPY monthly_upgrade.py .
 CMD ["python", "-u", "arr-webhook.py"]

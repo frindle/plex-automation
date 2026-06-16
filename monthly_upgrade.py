@@ -47,8 +47,13 @@ print(f'Purged {removed} torrents')
 
 # Step 2: Trigger bulk search
 print('\nStep 2: Triggering Radarr bulk search...')
-r = requests.post(f'{RADARR_URL}/api/v3/command', headers={'X-Api-Key': RADARR_API_KEY}, json={'name': 'MoviesSearch', 'movieIds': []})
-print(f'Bulk search triggered (id: {r.json().get("id")})')
+movies_r = requests.get(f'{RADARR_URL}/api/v3/movie', headers={'X-Api-Key': RADARR_API_KEY})
+movie_ids = [m['id'] for m in movies_r.json() if m.get('monitored')]
+if movie_ids:
+    r = requests.post(f'{RADARR_URL}/api/v3/command', headers={'X-Api-Key': RADARR_API_KEY}, json={'name': 'MoviesSearch', 'movieIds': movie_ids})
+    print(f'Bulk search triggered for {len(movie_ids)} movies (id: {r.json().get("id")})')
+else:
+    print('No monitored movies found, skipping bulk search')
 
 # Step 3: Wait 90 minutes
 print('\nStep 3: Waiting 90 minutes for grabs to complete...')

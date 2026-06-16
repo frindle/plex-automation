@@ -446,14 +446,24 @@ def radarr_bulk_search():
     """Trigger a search for all monitored movies in Radarr to catch missed upgrades."""
     log.info('Running monthly Radarr bulk search for upgrades...')
     try:
+        movies_r = requests.get(
+            f'{RADARR_URL}/api/v3/movie',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            timeout=15
+        )
+        movies_r.raise_for_status()
+        movie_ids = [m['id'] for m in movies_r.json() if m.get('monitored')]
+        if not movie_ids:
+            log.warning('Radarr bulk search: no monitored movies found, skipping')
+            return
         r = requests.post(
             f'{RADARR_URL}/api/v3/command',
             headers={'X-Api-Key': RADARR_API_KEY},
-            json={'name': 'MoviesSearch', 'movieIds': []},
+            json={'name': 'MoviesSearch', 'movieIds': movie_ids},
             timeout=30
         )
         r.raise_for_status()
-        log.info(f'Radarr bulk search triggered: {r.json().get("name")} (id: {r.json().get("id")})')
+        log.info(f'Radarr bulk search triggered for {len(movie_ids)} movies: {r.json().get("name")} (id: {r.json().get("id")})')
     except Exception as e:
         log.error(f'Radarr bulk search failed: {e}')
 
