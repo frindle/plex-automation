@@ -1,4 +1,7 @@
-import os, requests, time
+import os
+import time
+
+import requests
 
 DELUGE_URL = os.environ.get('DELUGE_URL')
 DELUGE_PASSWORD = os.environ.get('DELUGE_PASSWORD')
