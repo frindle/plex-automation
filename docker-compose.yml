@@ -1,0 +1,27 @@
+services:
+  arr-webhook:
+    build: .
+    container_name: arr-webhook
+    restart: unless-stopped
+    entrypoint: ["python", "-u", "arr-webhook.py"]
+    environment:
+      DELUGE_URL: "http://10.0.0.2:8112"
+      DELUGE_PASSWORD: ${DELUGE_PASSWORD}
+      SONARR_URL: "http://10.0.0.8:8989"
+      SONARR_API_KEY: ${SONARR_API_KEY}
+      RADARR_URL: "http://10.0.0.7:7878"
+      RADARR_API_KEY: ${RADARR_API_KEY}
+      SONARR_UPGRADE_LABEL: "sonarr-upgrade"
+      RADARR_UPGRADE_LABEL: "radarr-upgrade"
+      PORT: "9876"
+      SEEDING_DIR: "/data/Downloads/Just4Seeding"
+      SEED_DAYS: "21"
+    networks:
+      br0:
+        ipv4_address: 10.0.0.4
+    volumes:
+      - ./data:/data
+
+networks:
+  br0:
+    external: true
