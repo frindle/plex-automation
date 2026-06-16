@@ -40,6 +40,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `main`: syn
 ## Changelog
 
 ### Unreleased
+- Run the Flask dev server with `threaded=True` so a slow synchronous webhook handler (e.g. `handle_upgrade_import` waiting on Deluge) can't briefly block other incoming Sonarr/Radarr webhooks.
 - Fix potential `AttributeError` in `handle_grab()`/`handle_upgrade_import()` (`arr-webhook.py`) when Sonarr/Radarr sends `downloadId: null` — `.get('downloadId', '')` doesn't substitute the default for an explicit `null` value, only a missing key.
 - Fix `NameError: name 'removed' is not defined` in `monthly_upgrade.py` when no torrents qualified for purging — `removed` was only initialized inside the `if to_remove:` block, crashing the script before it could reach the search/relabel steps.
 - Fix Radarr bulk search (`radarr_bulk_search()` in `arr-webhook.py`, Step 2 of `monthly_upgrade.py`) sending `movieIds: []` to the `MoviesSearch` command — Radarr treats that as a no-op. Now fetches all monitored movie IDs first and passes them explicitly.

@@ -653,4 +653,4 @@ if __name__ == '__main__':
     t2.start()
     t3 = threading.Thread(target=priority_scheduler, daemon=True)
     t3.start()
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, threaded=True)
