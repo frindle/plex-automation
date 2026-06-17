@@ -290,11 +290,19 @@ def _upload_sftp(friend_cfg, files, top_name, upload_id, db):
 
 
 def _upload_ftps(friend_cfg, files, top_name, upload_id, db):
-    ftp = ftplib.FTP_TLS()
-    ftp.connect(friend_cfg['host'], friend_cfg['port'] or 21, timeout=30)
-    ftp.auth()
-    ftp.login(friend_cfg['user'], friend_cfg['password'])
-    ftp.prot_p()
+    host = friend_cfg['host']
+    port = friend_cfg['port'] or 21
+    try:
+        ftp = ftplib.FTP_TLS()
+        ftp.connect(host, port, timeout=30)
+        ftp.auth()
+        ftp.login(friend_cfg['user'], friend_cfg['password'])
+        ftp.prot_p()
+    except Exception:
+        # Fall back to plain FTP if TLS handshake fails
+        ftp = ftplib.FTP()
+        ftp.connect(host, port, timeout=30)
+        ftp.login(friend_cfg['user'], friend_cfg['password'])
     ftp.set_pasv(True)
     base_remote = friend_cfg.get('remote_dir', '/').rstrip('/')
     bytes_done_total = 0
@@ -382,8 +390,20 @@ def _test_connection(protocol, host, port, user, password):
             return False, f'Connection timed out after 10s (could not reach {host}:{default_port})'
         except ftplib.error_perm as e:
             return False, f'Authentication failed: {e}'
-        except Exception as e:
-            return False, str(e)
+        except Exception:
+            # Retry with plain FTP
+            try:
+                ftp = ftplib.FTP()
+                ftp.connect(host, default_port, timeout=10)
+                ftp.login(user, password)
+                ftp.quit()
+                return True, '(connected via plain FTP — TLS not available on this server)'
+            except socket.timeout:
+                return False, f'Connection timed out after 10s (could not reach {host}:{default_port})'
+            except ftplib.error_perm as e2:
+                return False, f'Authentication failed: {e2}'
+            except Exception as e2:
+                return False, str(e2)
     else:
         default_port = port or 22
         try:
@@ -707,7 +727,7 @@ USAGE_HTML = _head('Usage — Media Share') + _NAV + '''
     {% for row in admin_rows %}
     <tr>
       <td>{{ row.email }}</td>
-      {% for v in row.values %}<td class="size">{{ v }}</td>{% endfor %}
+      {% for v in row.cols %}<td class="size">{{ v }}</td>{% endfor %}
     </tr>
     {% endfor %}
   </table>
@@ -1116,7 +1136,7 @@ def share_usage():
                     (femail, cutoff),
                 ).fetchone()[0]
                 values.append(_fmt_bytes(total))
-            admin_rows.append({'email': femail, 'values': values})
+            admin_rows.append({'email': femail, 'cols': values})
         db.close()
         return _render(USAGE_HTML, email, admin_rows=admin_rows, windows=windows)
     else:
