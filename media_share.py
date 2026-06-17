@@ -2,46 +2,64 @@
 Friend-facing media portal + admin panel.
 
 Friends authenticate via Cloudflare Access (Cf-Access-Authenticated-User-Email).
-The admin (ADMIN_EMAIL env var) manages friend accounts at /share/admin without
-any container restart — config is stored in SQLite, not in env vars.
+Admin manages friends at /share/admin; friends update their own upload destination
+at /share/settings. Config stored in SQLite — no container restart needed.
 
-Security: relies on Cloudflare Access being the only ingress to this port.
-Never expose this container directly to the internet.
+Security: relies on Cloudflare Access being the only ingress. Never expose the
+container port directly to the internet.
 """
+import ftplib
 import json
 import logging
 import os
+import socket
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
 
 import paramiko
+import requests as _requests
 from flask import Blueprint, redirect, render_template_string, request, send_file
 
 log = logging.getLogger(__name__)
 
 share_bp = Blueprint('share', __name__, url_prefix='/share')
 
-LIBRARIES = {
-    'movies': '/media/movies',
-    'tv': '/media/tv',
-    'music': '/media/music',
-}
+LIBRARIES = {'movies': '/media/movies', 'tv': '/media/tv', 'music': '/media/music'}
 ALL_LIBRARIES = list(LIBRARIES.keys())
 
 DB_PATH = os.environ.get('SHARE_DB_PATH', '/data/share_uploads.db')
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', '')
-DEFAULT_RATE_MBIT = float(os.environ.get('UPLOAD_RATE_LIMIT_MBIT', '5'))
+RATE_LIMIT_BYTES_PER_SEC = float(os.environ.get('UPLOAD_RATE_LIMIT_MBIT', '5')) * 1_000_000 / 8
+
+RADARR_URL = os.environ.get('RADARR_URL', 'http://10.0.0.7:7878')
+RADARR_API_KEY = os.environ.get('RADARR_API_KEY', '')
+SONARR_URL = os.environ.get('SONARR_URL', 'http://10.0.0.8:8989')
+SONARR_API_KEY = os.environ.get('SONARR_API_KEY', '')
 
 USAGE_WINDOWS = {
-    '7 days': 7,
-    '30 days': 30,
-    '60 days': 60,
-    '90 days': 90,
-    '6 months': 182,
-    '1 year': 365,
+    '7 days': 7, '30 days': 30, '60 days': 60,
+    '90 days': 90, '6 months': 182, '1 year': 365,
 }
+
+# ── Global rate limiter ───────────────────────────────────────────────────────
+
+_rate_bytes_sent = 0
+_rate_start = time.monotonic()
+_rate_lock = threading.Lock()
+
+
+def _global_throttle(delta_bytes):
+    global _rate_bytes_sent, _rate_start
+    if RATE_LIMIT_BYTES_PER_SEC <= 0:
+        return
+    with _rate_lock:
+        _rate_bytes_sent += delta_bytes
+        elapsed = time.monotonic() - _rate_start
+        sleep_for = (_rate_bytes_sent / RATE_LIMIT_BYTES_PER_SEC) - elapsed
+    if sleep_for > 0:
+        time.sleep(sleep_for)
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -52,16 +70,26 @@ def init_db():
         CREATE TABLE IF NOT EXISTS friends (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
+            protocol TEXT NOT NULL DEFAULT 'sftp',
             sftp_host TEXT NOT NULL DEFAULT '',
             sftp_port INTEGER NOT NULL DEFAULT 22,
             sftp_user TEXT NOT NULL DEFAULT '',
             sftp_password TEXT NOT NULL DEFAULT '',
             sftp_remote_dir TEXT NOT NULL DEFAULT '/',
             libraries TEXT NOT NULL DEFAULT '["movies","tv","music"]',
+            allowed_titles TEXT,
             rate_limit_mbit REAL NOT NULL DEFAULT 5.0,
             created_at TEXT NOT NULL
         )
     ''')
+    for col, defn in [
+        ('protocol', "TEXT NOT NULL DEFAULT 'sftp'"),
+        ('allowed_titles', 'TEXT'),
+    ]:
+        try:
+            db.execute(f'ALTER TABLE friends ADD COLUMN {col} {defn}')
+        except sqlite3.OperationalError:
+            pass
     db.execute('''
         CREATE TABLE IF NOT EXISTS uploads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,23 +120,36 @@ def get_friend_config(email):
     row = _get_friend(email)
     if not row:
         return None
+    keys = row.keys()
     return {
+        'protocol': row['protocol'] if 'protocol' in keys else 'sftp',
         'host': row['sftp_host'],
-        'port': row['sftp_port'],
+        'port': int(row['sftp_port']),
         'user': row['sftp_user'],
         'password': row['sftp_password'],
         'remote_dir': row['sftp_remote_dir'],
-        'rate_limit_mbit': row['rate_limit_mbit'],
     }
 
 
 def get_friend_libraries(email):
-    """Return the list of library keys this friend is allowed to access."""
     row = _get_friend(email)
     if not row:
         return []
-    libs = json.loads(row['libraries'])
-    return [k for k in libs if k in LIBRARIES]
+    return [k for k in json.loads(row['libraries']) if k in LIBRARIES]
+
+
+def _get_allowed_titles(email):
+    """Returns dict {library: [folder_names]} or {} meaning no restriction."""
+    row = _get_friend(email)
+    if not row:
+        return {}
+    raw = row['allowed_titles'] if 'allowed_titles' in row.keys() else None
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -124,31 +165,80 @@ def _is_admin(email):
 def safe_join(root, rel_path):
     rel_path = rel_path or ''
     full = os.path.normpath(os.path.join(root, rel_path))
-    root_normalized = os.path.normpath(root)
-    if full != root_normalized and not full.startswith(root_normalized + os.sep):
+    root_n = os.path.normpath(root)
+    if full != root_n and not full.startswith(root_n + os.sep):
         raise ValueError('Path traversal attempt')
     return full
 
 
+def _allowed_libraries(email):
+    if _is_admin(email):
+        return ALL_LIBRARIES
+    return get_friend_libraries(email)
+
+
+def _fmt_bytes(n):
+    n = int(n or 0)
+    if n >= 1 << 30:
+        return f'{n / (1 << 30):.2f} GB'
+    if n >= 1 << 20:
+        return f'{n / (1 << 20):.1f} MB'
+    if n >= 1 << 10:
+        return f'{n / (1 << 10):.0f} KB'
+    return f'{n} B'
+
+
+# ── Arr API helpers ───────────────────────────────────────────────────────────
+
+def _arr_get(base_url, api_key, endpoint):
+    try:
+        r = _requests.get(
+            f'{base_url.rstrip("/")}/api/v3/{endpoint}',
+            headers={'X-Api-Key': api_key},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning('arr API %s: %s', endpoint, e)
+        return []
+
+
+def _poster_url(images):
+    for img in (images or []):
+        if img.get('coverType') == 'poster':
+            return img.get('remoteUrl', '')
+    return ''
+
+
+def _movies_for_user(email):
+    movies = [m for m in _arr_get(RADARR_URL, RADARR_API_KEY, 'movie') if m.get('hasFile')]
+    movies.sort(key=lambda m: m.get('sortTitle', m.get('title', '')).lower())
+    if _is_admin(email):
+        return movies
+    allowed = _get_allowed_titles(email).get('movies')
+    if not allowed:
+        return movies
+    allowed_set = {t.lower() for t in allowed}
+    return [m for m in movies if os.path.basename(m.get('path', '')).lower() in allowed_set]
+
+
+def _series_for_user(email):
+    series = [s for s in _arr_get(SONARR_URL, SONARR_API_KEY, 'series')
+              if s.get('statistics', {}).get('episodeFileCount', 0) > 0]
+    series.sort(key=lambda s: s.get('sortTitle', s.get('title', '')).lower())
+    if _is_admin(email):
+        return series
+    allowed = _get_allowed_titles(email).get('tv')
+    if not allowed:
+        return series
+    allowed_set = {t.lower() for t in allowed}
+    return [s for s in series if os.path.basename(s.get('path', '')).lower() in allowed_set]
+
+
 # ── Upload ────────────────────────────────────────────────────────────────────
 
-class RateLimiter:
-    def __init__(self, rate_bytes_per_sec):
-        self.rate = rate_bytes_per_sec
-        self.start_time = time.monotonic()
-        self.bytes_sent = 0
-
-    def throttle(self, delta_bytes):
-        if self.rate <= 0:
-            return
-        self.bytes_sent += delta_bytes
-        elapsed = time.monotonic() - self.start_time
-        sleep_for = (self.bytes_sent / self.rate) - elapsed
-        if sleep_for > 0:
-            time.sleep(sleep_for)
-
-
-def _mkdirs(sftp, remote_dir):
+def _sftp_mkdirs(sftp, remote_dir):
     path = ''
     for part in remote_dir.strip('/').split('/'):
         if not part:
@@ -158,6 +248,81 @@ def _mkdirs(sftp, remote_dir):
             sftp.mkdir(path)
         except IOError:
             pass
+
+
+def _ftp_mkdirs(ftp, path):
+    parts = [p for p in path.split('/') if p]
+    current = ''
+    for part in parts:
+        current += '/' + part
+        try:
+            ftp.mkd(current)
+        except ftplib.error_perm:
+            pass
+
+
+def _upload_sftp(friend_cfg, files, top_name, upload_id, db):
+    transport = paramiko.Transport((friend_cfg['host'], friend_cfg['port'] or 22))
+    transport.connect(username=friend_cfg['user'], password=friend_cfg['password'])
+    sftp = paramiko.SFTPClient.from_transport(transport)
+    base_remote = friend_cfg.get('remote_dir', '/').rstrip('/')
+    bytes_done_total = 0
+
+    for local_file, rel in files:
+        remote_path = f'{base_remote}/{top_name}/{rel}'.replace('\\', '/')
+        _sftp_mkdirs(sftp, os.path.dirname(remote_path))
+        last_sent = {'val': 0}
+        base = bytes_done_total
+
+        def progress(sent, _total, _last=last_sent, _base=base):
+            delta = sent - _last['val']
+            _last['val'] = sent
+            _global_throttle(delta)
+            db.execute('UPDATE uploads SET bytes_done=? WHERE id=?', (_base + sent, upload_id))
+            db.commit()
+
+        sftp.put(local_file, remote_path, callback=progress)
+        bytes_done_total += os.path.getsize(local_file)
+
+    sftp.close()
+    transport.close()
+    return bytes_done_total
+
+
+def _upload_ftps(friend_cfg, files, top_name, upload_id, db):
+    ftp = ftplib.FTP_TLS()
+    ftp.connect(friend_cfg['host'], friend_cfg['port'] or 21, timeout=30)
+    ftp.auth()
+    ftp.login(friend_cfg['user'], friend_cfg['password'])
+    ftp.prot_p()
+    ftp.set_pasv(True)
+    base_remote = friend_cfg.get('remote_dir', '/').rstrip('/')
+    bytes_done_total = 0
+
+    for local_file, rel in files:
+        remote_path = f'{base_remote}/{top_name}/{rel}'.replace('\\', '/')
+        remote_dir = '/'.join(remote_path.split('/')[:-1])
+        filename = remote_path.split('/')[-1]
+        _ftp_mkdirs(ftp, remote_dir)
+        ftp.cwd(remote_dir)
+        chunk_ref = {'val': 0}
+        base = bytes_done_total
+
+        def cb(data, _ref=chunk_ref, _base=base):
+            _ref['val'] += len(data)
+            _global_throttle(len(data))
+            db.execute('UPDATE uploads SET bytes_done=? WHERE id=?', (_base + _ref['val'], upload_id))
+            db.commit()
+
+        with open(local_file, 'rb') as f:
+            ftp.storbinary(f'STOR {filename}', f, blocksize=8192, callback=cb)
+        bytes_done_total += os.path.getsize(local_file)
+
+    try:
+        ftp.quit()
+    except Exception:
+        pass
+    return bytes_done_total
 
 
 def perform_upload(upload_id, friend_cfg, local_root, rel_path):
@@ -175,146 +340,196 @@ def perform_upload(upload_id, friend_cfg, local_root, rel_path):
         db.execute('UPDATE uploads SET status=? WHERE id=?', ('running', upload_id))
         db.commit()
 
-        rate = friend_cfg.get('rate_limit_mbit', DEFAULT_RATE_MBIT) * 1_000_000 / 8
-        limiter = RateLimiter(rate)
-        transport = paramiko.Transport((friend_cfg['host'], int(friend_cfg.get('port', 22))))
-        transport.connect(username=friend_cfg['user'], password=friend_cfg['password'])
-        sftp = paramiko.SFTPClient.from_transport(transport)
-
-        base_remote = friend_cfg.get('remote_dir', '/').rstrip('/')
         top_name = os.path.basename(full_path.rstrip('/'))
-        bytes_done_total = 0
+        if friend_cfg.get('protocol', 'sftp') == 'ftps':
+            bytes_done = _upload_ftps(friend_cfg, files, top_name, upload_id, db)
+        else:
+            bytes_done = _upload_sftp(friend_cfg, files, top_name, upload_id, db)
 
-        for local_file, rel in files:
-            remote_path = f'{base_remote}/{top_name}/{rel}'.replace('\\', '/')
-            _mkdirs(sftp, os.path.dirname(remote_path))
-            last_sent = {'val': 0}
-
-            def progress(sent, _total, _last=last_sent, _base=bytes_done_total):
-                delta = sent - _last['val']
-                _last['val'] = sent
-                limiter.throttle(delta)
-                db.execute('UPDATE uploads SET bytes_done=? WHERE id=?', (_base + sent, upload_id))
-                db.commit()
-
-            sftp.put(local_file, remote_path, callback=progress)
-            bytes_done_total += os.path.getsize(local_file)
-
-        sftp.close()
-        transport.close()
         db.execute(
             'UPDATE uploads SET status=?, bytes_done=?, finished_at=? WHERE id=?',
-            ('done', bytes_done_total, datetime.utcnow().isoformat(), upload_id)
+            ('done', bytes_done, datetime.utcnow().isoformat(), upload_id),
         )
         db.commit()
-        log.info(f'Upload {upload_id} complete: {bytes_done_total/1024/1024:.1f}MB to {friend_cfg["host"]}')
+        log.info('Upload %d complete: %.1fMB to %s', upload_id, bytes_done / 1024 / 1024, friend_cfg['host'])
     except Exception as e:
         db.execute(
             'UPDATE uploads SET status=?, error=?, finished_at=? WHERE id=?',
-            ('failed', str(e), datetime.utcnow().isoformat(), upload_id)
+            ('failed', str(e), datetime.utcnow().isoformat(), upload_id),
         )
         db.commit()
-        log.error(f'Upload {upload_id} failed: {e}')
+        log.error('Upload %d failed: %s', upload_id, e)
     finally:
         db.close()
 
 
-# ── Templates ─────────────────────────────────────────────────────────────────
+# ── Connection test helper ────────────────────────────────────────────────────
+
+def _test_connection(protocol, host, port, user, password):
+    if not host or not user or not password:
+        return False, 'Host, username, and password are required'
+    if protocol == 'ftps':
+        default_port = port or 21
+        try:
+            ftp = ftplib.FTP_TLS()
+            ftp.connect(host, default_port, timeout=10)
+            ftp.auth()
+            ftp.login(user, password)
+            ftp.prot_p()
+            ftp.quit()
+            return True, ''
+        except socket.timeout:
+            return False, f'Connection timed out after 10s (could not reach {host}:{default_port})'
+        except ftplib.error_perm as e:
+            return False, f'Authentication failed: {e}'
+        except Exception as e:
+            return False, str(e)
+    else:
+        default_port = port or 22
+        try:
+            sock = socket.create_connection((host, default_port), timeout=10)
+            transport = paramiko.Transport(sock)
+            transport.connect(username=user, password=password)
+            transport.close()
+            return True, ''
+        except socket.timeout:
+            return False, f'Connection timed out after 10s (could not reach {host}:{default_port})'
+        except Exception as e:
+            return False, str(e)
+
+
+# ── CSS / shared snippets ─────────────────────────────────────────────────────
 
 _BASE_CSS = '''
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-         background: #0f0f0f; color: #e8e8e8; min-height: 100vh; }
-  header { background: #1a1a1a; border-bottom: 1px solid #2a2a2a;
-           padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
-  header h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.02em; color: #fff; }
-  header .meta { font-size: 0.8rem; color: #666; }
-  header nav a { color: #888; text-decoration: none; font-size: 0.85rem; margin-left: 16px; }
-  header nav a:hover { color: #fff; }
-  main { max-width: 900px; margin: 0 auto; padding: 32px 24px; }
-  h2 { font-size: 1.3rem; font-weight: 600; margin-bottom: 24px; color: #fff; }
-  h3 { font-size: 1rem; font-weight: 600; margin-bottom: 16px; color: #ccc; }
-  a { color: #6ea8fe; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; }
-  .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px;
-          padding: 24px 20px; text-align: center; cursor: pointer;
-          transition: border-color 0.15s, background 0.15s; text-decoration: none; color: inherit; }
-  .card:hover { border-color: #555; background: #222; text-decoration: none; }
-  .card .icon { font-size: 2.4rem; margin-bottom: 12px; }
-  .card .label { font-size: 0.95rem; font-weight: 500; color: #e8e8e8; text-transform: capitalize; }
-  .breadcrumb { font-size: 0.85rem; color: #666; margin-bottom: 20px; }
-  .breadcrumb a { color: #6ea8fe; }
-  .file-list { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; overflow: hidden; }
-  .file-row { display: flex; align-items: center; padding: 11px 16px;
-              border-bottom: 1px solid #222; gap: 10px; }
-  .file-row:last-child { border-bottom: none; }
-  .file-row:hover { background: #222; }
-  .file-icon { font-size: 1.1rem; width: 24px; text-align: center; flex-shrink: 0; }
-  .file-name { flex: 1; font-size: 0.9rem; color: #e8e8e8; overflow: hidden;
-               text-overflow: ellipsis; white-space: nowrap; }
-  .file-name a { color: #e8e8e8; }
-  .file-name a:hover { color: #6ea8fe; text-decoration: none; }
-  .actions { display: flex; gap: 8px; flex-shrink: 0; }
-  .btn { display: inline-block; padding: 5px 12px; border-radius: 6px; font-size: 0.78rem;
-         font-weight: 500; cursor: pointer; border: none; text-decoration: none; white-space: nowrap; }
-  .btn-primary { background: #2563eb; color: #fff; }
-  .btn-primary:hover { background: #1d4ed8; text-decoration: none; color: #fff; }
-  .btn-ghost { background: #2a2a2a; color: #bbb; border: 1px solid #333; }
-  .btn-ghost:hover { background: #333; color: #fff; text-decoration: none; }
-  .btn-danger { background: #7f1d1d; color: #fca5a5; border: 1px solid #991b1b; }
-  .btn-danger:hover { background: #991b1b; text-decoration: none; }
-  .stat-table { width: 100%; border-collapse: collapse; }
-  .stat-table th { text-align: left; font-size: 0.8rem; font-weight: 500; color: #666;
-                   text-transform: uppercase; letter-spacing: 0.05em; padding: 0 0 10px; }
-  .stat-table td { padding: 10px 0; border-top: 1px solid #222; font-size: 0.9rem; }
-  .stat-table .size { font-variant-numeric: tabular-nums; color: #aaa; }
-  .status-card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px;
-                 padding: 28px; max-width: 480px; }
-  .status-label { font-size: 0.8rem; color: #666; text-transform: uppercase;
-                  letter-spacing: 0.05em; margin-bottom: 4px; }
-  .status-value { font-size: 1rem; font-weight: 500; margin-bottom: 18px; }
-  .status-done { color: #4ade80; }
-  .status-running { color: #facc15; }
-  .status-failed { color: #f87171; }
-  .progress-bar { height: 6px; background: #2a2a2a; border-radius: 3px; overflow: hidden; margin-bottom: 18px; }
-  .progress-fill { height: 100%; background: #2563eb; border-radius: 3px; transition: width 0.5s; }
-  .error-box { background: #2a1a1a; border: 1px solid #5a2a2a; border-radius: 6px;
-               padding: 12px 14px; font-size: 0.85rem; color: #f87171; word-break: break-all; }
-  .test-result { display:none; margin-top:10px; padding: 8px 12px; border-radius: 6px;
-                 font-size: 0.85rem; }
-  .test-ok  { background:#052e16; border:1px solid #166534; color:#4ade80; }
-  .test-err { background:#2a1a1a; border:1px solid #5a2a2a; color:#f87171; }
-  .form-card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; padding: 28px;
-               max-width: 560px; }
-  .field { margin-bottom: 18px; }
-  .field label { display: block; font-size: 0.8rem; color: #888; margin-bottom: 6px;
-                 text-transform: uppercase; letter-spacing: 0.04em; }
-  .field input[type=text], .field input[type=password], .field input[type=email],
-  .field input[type=number] {
-    width: 100%; background: #111; border: 1px solid #333; border-radius: 6px;
-    padding: 8px 12px; color: #e8e8e8; font-size: 0.9rem; outline: none; }
-  .field input:focus { border-color: #2563eb; }
-  .checkbox-group { display: flex; gap: 16px; flex-wrap: wrap; }
-  .checkbox-group label { display: flex; align-items: center; gap: 6px; font-size: 0.9rem;
-                          color: #e8e8e8; text-transform: none; letter-spacing: 0; cursor: pointer; }
-  .admin-table { width: 100%; border-collapse: collapse; }
-  .admin-table th { text-align: left; font-size: 0.78rem; color: #666; text-transform: uppercase;
-                    letter-spacing: 0.05em; padding: 0 12px 10px 0; }
-  .admin-table td { padding: 12px 12px 12px 0; border-top: 1px solid #222; font-size: 0.88rem;
-                    vertical-align: middle; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;
-           background: #1e3a5f; color: #93c5fd; margin: 2px 2px 2px 0; }
-  .section-gap { margin-top: 40px; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+       background: #0f0f0f; color: #e8e8e8; min-height: 100vh; }
+header { background: #1a1a1a; border-bottom: 1px solid #2a2a2a;
+         padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
+header h1 a { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.02em; color: #e2a826;
+              text-decoration: none; }
+header h1 a:hover { color: #f0c040; }
+header .meta { font-size: 0.8rem; color: #666; }
+header nav a { color: #888; text-decoration: none; font-size: 0.85rem; margin-left: 16px; }
+header nav a:hover { color: #fff; }
+main { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+h2 { font-size: 1.3rem; font-weight: 600; margin-bottom: 24px; color: #fff; }
+h3 { font-size: 1rem; font-weight: 600; margin-bottom: 16px; color: #ccc; }
+a { color: #6ea8fe; text-decoration: none; }
+a:hover { text-decoration: underline; }
+.card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; }
+.card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px;
+        padding: 24px 20px; text-align: center; cursor: pointer;
+        transition: border-color 0.15s, background 0.15s; text-decoration: none; color: inherit; }
+.card:hover { border-color: #555; background: #222; text-decoration: none; }
+.card .icon { font-size: 2.4rem; margin-bottom: 12px; }
+.card .label { font-size: 0.95rem; font-weight: 500; color: #e8e8e8; text-transform: capitalize; }
+.poster-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 16px; }
+.poster-card { text-decoration: none; color: inherit; display: block; }
+.poster-card:hover .poster-img { opacity: 0.7; transform: scale(1.03); }
+.poster-card:hover .poster-ph { opacity: 0.7; }
+.poster-img { width: 100%; aspect-ratio: 2/3; object-fit: cover; border-radius: 6px;
+              transition: opacity 0.15s, transform 0.15s; display: block; }
+.poster-ph { width: 100%; aspect-ratio: 2/3; background: #2a2a2a; border-radius: 6px;
+             display: flex; align-items: center; justify-content: center; font-size: 2.5rem;
+             transition: opacity 0.15s; }
+.poster-title { font-size: 0.8rem; font-weight: 500; color: #e8e8e8; margin-top: 7px;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.poster-year { font-size: 0.72rem; color: #666; }
+.breadcrumb { font-size: 0.85rem; color: #666; margin-bottom: 20px; }
+.breadcrumb a { color: #6ea8fe; }
+.file-list { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; overflow: hidden; }
+.file-row { display: flex; align-items: center; padding: 11px 16px;
+            border-bottom: 1px solid #222; gap: 10px; }
+.file-row:last-child { border-bottom: none; }
+.file-row:hover { background: #222; }
+.file-icon { font-size: 1.1rem; width: 24px; text-align: center; flex-shrink: 0; }
+.file-name { flex: 1; font-size: 0.9rem; color: #e8e8e8; overflow: hidden;
+             text-overflow: ellipsis; white-space: nowrap; }
+.file-name a { color: #e8e8e8; }
+.file-name a:hover { color: #6ea8fe; text-decoration: none; }
+.actions { display: flex; gap: 8px; flex-shrink: 0; }
+.btn { display: inline-block; padding: 5px 12px; border-radius: 6px; font-size: 0.78rem;
+       font-weight: 500; cursor: pointer; border: none; text-decoration: none; white-space: nowrap; }
+.btn-primary { background: #2563eb; color: #fff; }
+.btn-primary:hover { background: #1d4ed8; text-decoration: none; color: #fff; }
+.btn-ghost { background: #2a2a2a; color: #bbb; border: 1px solid #333; }
+.btn-ghost:hover { background: #333; color: #fff; text-decoration: none; }
+.btn-danger { background: #7f1d1d; color: #fca5a5; border: 1px solid #991b1b; }
+.btn-danger:hover { background: #991b1b; text-decoration: none; }
+.btn-sm { padding: 3px 9px; font-size: 0.74rem; }
+.stat-table { width: 100%; border-collapse: collapse; }
+.stat-table th { text-align: left; font-size: 0.8rem; font-weight: 500; color: #666;
+                 text-transform: uppercase; letter-spacing: 0.05em; padding: 0 0 10px; }
+.stat-table td { padding: 10px 0; border-top: 1px solid #222; font-size: 0.9rem; }
+.stat-table .size { font-variant-numeric: tabular-nums; color: #aaa; }
+.status-card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px;
+               padding: 28px; max-width: 480px; }
+.status-label { font-size: 0.8rem; color: #666; text-transform: uppercase;
+                letter-spacing: 0.05em; margin-bottom: 4px; }
+.status-value { font-size: 1rem; font-weight: 500; margin-bottom: 18px; }
+.status-done { color: #4ade80; }
+.status-running { color: #facc15; }
+.status-failed { color: #f87171; }
+.progress-bar { height: 6px; background: #2a2a2a; border-radius: 3px; overflow: hidden; margin-bottom: 18px; }
+.progress-fill { height: 100%; background: #2563eb; border-radius: 3px; transition: width 0.5s; }
+.error-box { background: #2a1a1a; border: 1px solid #5a2a2a; border-radius: 6px;
+             padding: 12px 14px; font-size: 0.85rem; color: #f87171; word-break: break-all; }
+.alert-ok { background: #052e16; border: 1px solid #166534; border-radius: 6px;
+            padding: 10px 14px; font-size: 0.88rem; color: #4ade80; margin-bottom: 20px; }
+.test-result { display:none; margin-top:10px; padding: 8px 12px; border-radius: 6px; font-size: 0.85rem; }
+.test-ok  { background:#052e16; border:1px solid #166534; color:#4ade80; }
+.test-err { background:#2a1a1a; border:1px solid #5a2a2a; color:#f87171; }
+.form-card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px;
+             padding: 28px; max-width: 560px; }
+.field { margin-bottom: 18px; }
+.field label { display: block; font-size: 0.8rem; color: #888; margin-bottom: 6px;
+               text-transform: uppercase; letter-spacing: 0.04em; }
+.field input[type=text], .field input[type=password], .field input[type=email],
+.field input[type=number], .field select {
+  width: 100%; background: #111; border: 1px solid #333; border-radius: 6px;
+  padding: 8px 12px; color: #e8e8e8; font-size: 0.9rem; outline: none;
+  appearance: none; -webkit-appearance: none; }
+.field input:focus, .field select:focus { border-color: #2563eb; }
+.field .hint { font-size: 0.75rem; color: #555; margin-top: 4px; }
+.checkbox-group { display: flex; gap: 16px; flex-wrap: wrap; }
+.checkbox-group label { display: flex; align-items: center; gap: 6px; font-size: 0.9rem;
+                        color: #e8e8e8; text-transform: none; letter-spacing: 0; cursor: pointer; }
+.admin-table { width: 100%; border-collapse: collapse; }
+.admin-table th { text-align: left; font-size: 0.78rem; color: #666; text-transform: uppercase;
+                  letter-spacing: 0.05em; padding: 0 12px 10px 0; }
+.admin-table td { padding: 12px 12px 12px 0; border-top: 1px solid #222; font-size: 0.88rem;
+                  vertical-align: middle; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;
+         background: #1e3a5f; color: #93c5fd; margin: 2px 2px 2px 0; }
+.section-gap { margin-top: 40px; }
+.search-input { width: 100%; background: #111; border: 1px solid #333; border-radius: 6px;
+                padding: 8px 12px; color: #e8e8e8; font-size: 0.9rem; outline: none;
+                margin-bottom: 12px; }
+.search-input:focus { border-color: #2563eb; }
+.titles-list { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;
+               max-height: 360px; overflow-y: auto; padding: 8px 0; }
+.title-item { display: flex; align-items: center; gap: 10px; padding: 8px 16px; }
+.title-item:hover { background: #222; }
+.title-item label { font-size: 0.88rem; color: #e8e8e8; cursor: pointer; }
+.usage-section { margin-bottom: 40px; }
+.usage-name { font-size: 0.82rem; color: #888; font-weight: 600; text-transform: uppercase;
+              letter-spacing: 0.05em; margin-bottom: 10px; }
 '''
 
-_TEST_JS = '''
+_PROTO_JS = '''
 <script>
+function onProtoChange(sel) {
+  var p = document.querySelector('[name=sftp_port]');
+  if (sel.value === 'ftps' && (p.value == '22' || p.value === '')) p.value = '21';
+  if (sel.value === 'sftp' && (p.value == '21' || p.value === '')) p.value = '22';
+}
 function testConn(friendId) {
   var res = document.getElementById('test-result');
-  res.className = 'test-result';
-  res.style.display = 'none';
+  res.className = 'test-result'; res.style.display = 'none';
   var data = new FormData();
+  var proto = document.querySelector('[name=protocol]');
+  data.append('protocol',      proto ? proto.value : 'sftp');
   data.append('sftp_host',     document.querySelector('[name=sftp_host]').value);
   data.append('sftp_port',     document.querySelector('[name=sftp_port]').value);
   data.append('sftp_user',     document.querySelector('[name=sftp_user]').value);
@@ -329,7 +544,29 @@ function testConn(friendId) {
       res.className = 'test-result ' + (j.ok ? 'test-ok' : 'test-err');
       res.style.display = 'block';
     })
-    .catch(function(e){ res.textContent = '✗ Request failed'; res.className='test-result test-err'; res.style.display='block'; })
+    .catch(function(){ res.textContent='✗ Request failed'; res.className='test-result test-err'; res.style.display='block'; })
+    .finally(function(){ btn.disabled=false; btn.textContent='Test connection'; });
+}
+function testSelf() {
+  var res = document.getElementById('test-result');
+  res.className = 'test-result'; res.style.display = 'none';
+  var data = new FormData();
+  var proto = document.querySelector('[name=protocol]');
+  data.append('protocol',      proto ? proto.value : 'sftp');
+  data.append('sftp_host',     document.querySelector('[name=sftp_host]').value);
+  data.append('sftp_port',     document.querySelector('[name=sftp_port]').value);
+  data.append('sftp_user',     document.querySelector('[name=sftp_user]').value);
+  data.append('sftp_password', document.querySelector('[name=sftp_password]').value);
+  var btn = document.getElementById('test-btn');
+  btn.disabled = true; btn.textContent = 'Testing…';
+  fetch('/share/test-connection', {method:'POST', body:data})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      res.textContent = j.ok ? '✓ Connected successfully' : '✗ ' + j.error;
+      res.className = 'test-result ' + (j.ok ? 'test-ok' : 'test-err');
+      res.style.display = 'block';
+    })
+    .catch(function(){ res.textContent='✗ Request failed'; res.className='test-result test-err'; res.style.display='block'; })
     .finally(function(){ btn.disabled=false; btn.textContent='Test connection'; });
 }
 </script>
@@ -339,11 +576,12 @@ _LIB_ICONS = {'movies': '🎬', 'tv': '📺', 'music': '🎵'}
 
 _NAV = '''
 <header>
-  <h1>Media Share</h1>
+  <h1><a href="/share">Media Share</a></h1>
   <div style="display:flex;align-items:center;gap:16px">
     <nav>
       <a href="/share">Libraries</a>
       <a href="/share/usage">Usage</a>
+      {% if not is_admin %}<a href="/share/settings">Settings</a>{% endif %}
       {% if is_admin %}<a href="/share/admin">Admin</a>{% endif %}
     </nav>
     <span class="meta">{{ email }}</span>
@@ -351,9 +589,13 @@ _NAV = '''
 </header>
 '''
 
-INDEX_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
-    '<meta name="viewport" content="width=device-width,initial-scale=1">' \
-    '<title>Media Share</title><style>' + _BASE_CSS + '</style></head><body>' + _NAV + '''
+# ── Templates ─────────────────────────────────────────────────────────────────
+
+_HEAD = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+         '<title>{title}</title><style>' + _BASE_CSS + '</style></head><body>')
+
+INDEX_HTML = _HEAD.format(title='Media Share') + _NAV + '''
 <main>
   <h2>Libraries</h2>
   <div class="card-grid">
@@ -366,9 +608,29 @@ INDEX_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
   </div>
 </main></body></html>'''
 
-BROWSE_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
-    '<meta name="viewport" content="width=device-width,initial-scale=1">' \
-    '<title>{{ library }} — Media Share</title><style>' + _BASE_CSS + '</style></head><body>' + _NAV + '''
+POSTER_GRID_HTML = _HEAD.format(title='{{ library|capitalize }} — Media Share') + _NAV + '''
+<main>
+  <div class="breadcrumb"><a href="/share">home</a> / {{ library }}</div>
+  {% if not items %}
+  <p style="color:#666">No titles available (library may be empty or API unreachable).</p>
+  {% else %}
+  <div class="poster-grid">
+  {% for item in items %}
+    <a class="poster-card" href="/share/browse/{{ library }}?path={{ item.folder | urlencode }}">
+      {% if item.poster %}
+        <img class="poster-img" src="{{ item.poster }}" loading="lazy" alt="{{ item.title }}">
+      {% else %}
+        <div class="poster-ph">{{ icons.get(library, "📁") }}</div>
+      {% endif %}
+      <div class="poster-title" title="{{ item.title }}">{{ item.title }}</div>
+      <div class="poster-year">{{ item.year }}</div>
+    </a>
+  {% endfor %}
+  </div>
+  {% endif %}
+</main></body></html>'''
+
+BROWSE_HTML = _HEAD.format(title='{{ library }} — Media Share') + _NAV + '''
 <main>
   <div class="breadcrumb">
     <a href="/share">home</a> / <a href="/share/browse/{{ library }}">{{ library }}</a>
@@ -378,25 +640,26 @@ BROWSE_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
     {% if parent is not none %}
     <div class="file-row">
       <span class="file-icon">⬆</span>
-      <span class="file-name"><a href="/share/browse/{{ library }}?path={{ parent }}">.. up</a></span>
+      <span class="file-name"><a href="/share/browse/{{ library }}?path={{ parent | urlencode }}">.. up</a></span>
     </div>
     {% endif %}
     {% for e in entries %}
     <div class="file-row">
       <span class="file-icon">{% if e.is_dir %}📁{% else %}🎬{% endif %}</span>
       <span class="file-name">
-        {% if e.is_dir %}<a href="/share/browse/{{ library }}?path={{ e.rel }}">{{ e.name }}</a>
+        {% if e.is_dir %}
+          <a href="/share/browse/{{ library }}?path={{ e.rel | urlencode }}">{{ e.name }}</a>
         {% else %}{{ e.name }}{% endif %}
       </span>
       <div class="actions">
         {% if not e.is_dir %}
-        <a class="btn btn-ghost" href="/share/download/{{ library }}?path={{ e.rel }}">Download</a>
+        <a class="btn btn-ghost btn-sm" href="/share/download/{{ library }}?path={{ e.rel | urlencode }}">Download</a>
         {% endif %}
-        {% if has_sftp %}
-        <form method="post" action="/share/upload">
+        {% if can_upload %}
+        <form method="post" action="/share/upload" style="display:inline">
           <input type="hidden" name="library" value="{{ library }}">
           <input type="hidden" name="rel_path" value="{{ e.rel }}">
-          <button class="btn btn-primary" type="submit">Upload to me</button>
+          <button class="btn btn-primary btn-sm" type="submit">Upload to me</button>
         </form>
         {% endif %}
       </div>
@@ -405,11 +668,9 @@ BROWSE_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
   </div>
 </main></body></html>'''
 
-STATUS_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
-    '<meta name="viewport" content="width=device-width,initial-scale=1">' \
-    '<title>Upload Status — Media Share</title>' \
-    '{% if row.status in ("pending", "running") %}<meta http-equiv="refresh" content="3">{% endif %}' \
-    '<style>' + _BASE_CSS + '</style></head><body>' + _NAV + '''
+STATUS_HTML = (_HEAD.format(title='Upload Status — Media Share')
+               + '{% if row.status in ("pending", "running") %}<meta http-equiv="refresh" content="3">{% endif %}'
+               + _NAV + '''
 <main>
   <h2>Upload #{{ row.id }}</h2>
   <div class="status-card">
@@ -426,41 +687,93 @@ STATUS_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
     <div class="status-value">{{ "%.1f"|format(row.bytes_done / 1024 / 1024) }} MB</div>
     {% if row.error %}<div class="error-box">{{ row.error }}</div>{% endif %}
   </div>
-</main></body></html>'''
+</main></body></html>''')
 
-USAGE_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
-    '<meta name="viewport" content="width=device-width,initial-scale=1">' \
-    '<title>Usage — Media Share</title><style>' + _BASE_CSS + '</style></head><body>' + _NAV + '''
+USAGE_HTML = _HEAD.format(title='Usage — Media Share') + _NAV + '''
 <main>
-  <h2>Your Usage</h2>
+  <h2>{% if is_admin %}Usage by Friend{% else %}Your Usage{% endif %}</h2>
+  {% if is_admin %}
+  <table class="stat-table">
+    <tr>
+      <th>Friend</th>
+      {% for label in windows %}<th>{{ label }}</th>{% endfor %}
+    </tr>
+    {% for row in admin_rows %}
+    <tr>
+      <td>{{ row.email }}</td>
+      {% for v in row.values %}<td class="size">{{ v }}</td>{% endfor %}
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
   <table class="stat-table">
     <tr><th>Period</th><th>Data Sent</th></tr>
     {% for label, total in usage.items() %}
-    <tr><td>{{ label }}</td><td class="size">{{ "%.2f"|format(total / 1024 / 1024 / 1024) }} GB</td></tr>
+    <tr><td>{{ label }}</td><td class="size">{{ total }}</td></tr>
     {% endfor %}
   </table>
+  {% endif %}
 </main></body></html>'''
 
-ADMIN_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
-    '<meta name="viewport" content="width=device-width,initial-scale=1">' \
-    '<title>Admin — Media Share</title><style>' + _BASE_CSS + '</style></head><body>' + _NAV + '''
+SETTINGS_HTML = _HEAD.format(title='Settings — Media Share') + _NAV + '''
+<main>
+  <h2>Your Upload Settings</h2>
+  <p style="color:#888;margin-bottom:24px;font-size:0.9rem">
+    Set your FTPS or SFTP destination. The "Upload to me" button on any file will push to this server.
+  </p>
+  {% if saved %}<div class="alert-ok">Settings saved.</div>{% endif %}
+  {% if not f %}
+  <p style="color:#f87171;margin-bottom:16px">Your account has not been set up by the admin yet.</p>
+  {% else %}
+  <div class="form-card">
+    <form method="post">
+      <div class="field">
+        <label>Protocol</label>
+        <select name="protocol" onchange="onProtoChange(this)">
+          <option value="ftps" {% if f.protocol == "ftps" %}selected{% endif %}>FTPS (FTP over TLS)</option>
+          <option value="sftp" {% if f.protocol == "sftp" %}selected{% endif %}>SFTP (SSH)</option>
+        </select>
+      </div>
+      <div class="field"><label>Host</label>
+        <input type="text" name="sftp_host" value="{{ f.sftp_host }}"></div>
+      <div class="field"><label>Port</label>
+        <input type="number" name="sftp_port" value="{{ f.sftp_port }}"></div>
+      <div class="field"><label>Username</label>
+        <input type="text" name="sftp_user" value="{{ f.sftp_user }}"></div>
+      <div class="field"><label>Password</label>
+        <input type="password" name="sftp_password" placeholder="Leave blank to keep current"></div>
+      <div class="field"><label>Remote directory</label>
+        <input type="text" name="sftp_remote_dir" value="{{ f.sftp_remote_dir }}"></div>
+      <div class="field">
+        <button class="btn btn-ghost" type="button" id="test-btn" onclick="testSelf()">Test connection</button>
+        <div class="test-result" id="test-result"></div>
+      </div>
+      <button class="btn btn-primary" type="submit">Save settings</button>
+    </form>
+  </div>
+  {% endif %}
+</main>''' + _PROTO_JS + '''</body></html>'''
+
+ADMIN_HTML = _HEAD.format(title='Admin — Media Share') + _NAV + '''
 <main>
   <h2>Friends</h2>
   {% if friends %}
   <table class="admin-table">
-    <tr><th>Email</th><th>SFTP host</th><th>Libraries</th><th>Rate</th><th></th></tr>
+    <tr><th>Email</th><th>Protocol</th><th>Host</th><th>Libraries</th><th>Total sent</th><th></th></tr>
     {% for f in friends %}
     <tr>
       <td>{{ f.email }}</td>
+      <td><span class="badge">{{ f.protocol }}</span></td>
       <td>{{ f.sftp_host or "—" }}</td>
       <td>{% for lib in f.libraries_list %}<span class="badge">{{ lib }}</span>{% endfor %}</td>
-      <td>{{ f.rate_limit_mbit }} Mbit/s</td>
+      <td class="size">{{ f.total_sent }}</td>
       <td>
         <div class="actions">
-          <a class="btn btn-ghost" href="/share/admin/friend/{{ f.id }}/edit">Edit</a>
+          <a class="btn btn-ghost btn-sm" href="/share/admin/friend/{{ f.id }}/edit">Edit</a>
+          <a class="btn btn-ghost btn-sm" href="/share/admin/friend/{{ f.id }}/titles">Titles</a>
           <form method="post" action="/share/admin/friend/{{ f.id }}/delete"
-                onsubmit="return confirm('Remove {{ f.email }}?')">
-            <button class="btn btn-danger" type="submit">Remove</button>
+                onsubmit="return confirm('Remove {{ f.email }}?')" style="display:inline">
+            <button class="btn btn-danger btn-sm" type="submit">Remove</button>
           </form>
         </div>
       </td>
@@ -477,13 +790,20 @@ ADMIN_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
       <form method="post" action="/share/admin/friend/new">
         <div class="field"><label>Cloudflare Access email</label>
           <input type="email" name="email" required placeholder="steve@example.com"></div>
-        <div class="field"><label>SFTP host</label>
+        <div class="field">
+          <label>Protocol</label>
+          <select name="protocol" onchange="onProtoChange(this)">
+            <option value="ftps">FTPS (FTP over TLS)</option>
+            <option value="sftp">SFTP (SSH)</option>
+          </select>
+        </div>
+        <div class="field"><label>Host</label>
           <input type="text" name="sftp_host" placeholder="1.2.3.4"></div>
-        <div class="field"><label>SFTP port</label>
-          <input type="number" name="sftp_port" value="22"></div>
-        <div class="field"><label>SFTP username</label>
+        <div class="field"><label>Port</label>
+          <input type="number" name="sftp_port" value="21"></div>
+        <div class="field"><label>Username</label>
           <input type="text" name="sftp_user"></div>
-        <div class="field"><label>SFTP password</label>
+        <div class="field"><label>Password</label>
           <input type="password" name="sftp_password"></div>
         <div class="field">
           <button class="btn btn-ghost" type="button" id="test-btn" onclick="testConn(null)">Test connection</button>
@@ -498,29 +818,32 @@ ADMIN_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
             <label><input type="checkbox" name="libraries" value="music" checked> Music</label>
           </div>
         </div>
-        <div class="field"><label>Upload rate limit (Mbit/s)</label>
-          <input type="number" name="rate_limit_mbit" value="{{ default_rate }}" step="0.5" min="0"></div>
         <button class="btn btn-primary" type="submit">Add friend</button>
       </form>
     </div>
   </div>
-</main>''' + _TEST_JS + '''</body></html>'''
+</main>''' + _PROTO_JS + '''</body></html>'''
 
-ADMIN_EDIT_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
-    '<meta name="viewport" content="width=device-width,initial-scale=1">' \
-    '<title>Edit {{ f.email }} — Admin</title><style>' + _BASE_CSS + '</style></head><body>' + _NAV + '''
+ADMIN_EDIT_HTML = _HEAD.format(title='Edit — Admin') + _NAV + '''
 <main>
   <div class="breadcrumb"><a href="/share/admin">Admin</a> / Edit friend</div>
   <h2>{{ f.email }}</h2>
   <div class="form-card">
     <form method="post" action="/share/admin/friend/{{ f.id }}/edit">
-      <div class="field"><label>SFTP host</label>
+      <div class="field">
+        <label>Protocol</label>
+        <select name="protocol" onchange="onProtoChange(this)">
+          <option value="ftps" {% if f.protocol == "ftps" %}selected{% endif %}>FTPS (FTP over TLS)</option>
+          <option value="sftp" {% if f.protocol == "sftp" %}selected{% endif %}>SFTP (SSH)</option>
+        </select>
+      </div>
+      <div class="field"><label>Host</label>
         <input type="text" name="sftp_host" value="{{ f.sftp_host }}"></div>
-      <div class="field"><label>SFTP port</label>
+      <div class="field"><label>Port</label>
         <input type="number" name="sftp_port" value="{{ f.sftp_port }}"></div>
-      <div class="field"><label>SFTP username</label>
+      <div class="field"><label>Username</label>
         <input type="text" name="sftp_user" value="{{ f.sftp_user }}"></div>
-      <div class="field"><label>SFTP password</label>
+      <div class="field"><label>Password</label>
         <input type="password" name="sftp_password" placeholder="Leave blank to keep current"></div>
       <div class="field">
         <button class="btn btn-ghost" type="button" id="test-btn" onclick="testConn({{ f.id }})">Test connection</button>
@@ -536,12 +859,61 @@ ADMIN_EDIT_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' 
           {% endfor %}
         </div>
       </div>
-      <div class="field"><label>Upload rate limit (Mbit/s)</label>
-        <input type="number" name="rate_limit_mbit" value="{{ f.rate_limit_mbit }}" step="0.5" min="0"></div>
       <button class="btn btn-primary" type="submit">Save changes</button>
     </form>
   </div>
-</main>''' + _TEST_JS + '''</body></html>'''
+</main>''' + _PROTO_JS + '''</body></html>'''
+
+ADMIN_TITLES_HTML = _HEAD.format(title='Titles — Admin') + _NAV + '''
+<main>
+  <div class="breadcrumb"><a href="/share/admin">Admin</a> / Title access</div>
+  <h2>{{ f.email }} — Title Access</h2>
+  <p style="color:#888;font-size:0.88rem;margin-bottom:24px">
+    Check the titles this friend can see. Leave all unchecked to grant access to <em>everything</em> in that library.
+  </p>
+  {% if saved %}<div class="alert-ok">Saved.</div>{% endif %}
+  <form method="post">
+    {% for lib, lib_items in sections %}
+    <div class="section-gap">
+      <h3>{{ lib|capitalize }} ({{ lib_items|length }} titles)</h3>
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        <button type="button" class="btn btn-ghost btn-sm" onclick="selectAll('{{ lib }}',true)">Select all</button>
+        <button type="button" class="btn btn-ghost btn-sm" onclick="selectAll('{{ lib }}',false)">Clear all</button>
+      </div>
+      <input class="search-input" type="text" placeholder="Filter {{ lib }}…"
+             oninput="filterTitles(this,'{{ lib }}')">
+      <div class="titles-list" id="list-{{ lib }}">
+        {% for folder, title, year in lib_items %}
+        <div class="title-item" data-lib="{{ lib }}" data-title="{{ title|lower }}">
+          <input type="checkbox" name="titles_{{ lib }}" value="{{ folder }}"
+                 id="t-{{ lib }}-{{ loop.index }}"
+                 {% if not allowed.get(lib) or folder in allowed.get(lib, []) %}checked{% endif %}>
+          <label for="t-{{ lib }}-{{ loop.index }}">{{ title }} {% if year %}({{ year }}){% endif %}</label>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+    <div style="margin-top:28px">
+      <button class="btn btn-primary" type="submit">Save title access</button>
+      <a href="/share/admin" class="btn btn-ghost" style="margin-left:8px">Cancel</a>
+    </div>
+  </form>
+</main>
+<script>
+function filterTitles(inp, lib) {
+  var q = inp.value.toLowerCase();
+  document.querySelectorAll('[data-lib="' + lib + '"]').forEach(function(el) {
+    el.style.display = el.dataset.title.indexOf(q) >= 0 ? '' : 'none';
+  });
+}
+function selectAll(lib, checked) {
+  document.querySelectorAll('[name="titles_' + lib + '"]').forEach(function(el) {
+    el.checked = checked;
+  });
+}
+</script>
+</body></html>'''
 
 
 # ── Route helpers ─────────────────────────────────────────────────────────────
@@ -559,10 +931,32 @@ def _require_auth():
     return email, None
 
 
-def _allowed_libraries(email):
-    if _is_admin(email):
-        return ALL_LIBRARIES
-    return get_friend_libraries(email)
+def _require_admin():
+    email, err = _require_auth()
+    if err:
+        return None, err
+    if not _is_admin(email):
+        return None, ('Forbidden', 403)
+    return email, None
+
+
+def _friends_list():
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    rows = db.execute('SELECT * FROM friends ORDER BY created_at').fetchall()
+    friends = []
+    for r in rows:
+        f = dict(r)
+        f['libraries_list'] = json.loads(r['libraries'])
+        f['protocol'] = r['protocol'] if 'protocol' in r.keys() else 'sftp'
+        total = db.execute(
+            "SELECT COALESCE(SUM(bytes_done),0) FROM uploads WHERE friend_email=? AND status='done'",
+            (r['email'],),
+        ).fetchone()[0]
+        f['total_sent'] = _fmt_bytes(total)
+        friends.append(f)
+    db.close()
+    return friends
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -572,8 +966,7 @@ def share_index():
     email, err = _require_auth()
     if err:
         return err
-    libs = _allowed_libraries(email)
-    return _render(INDEX_HTML, email, libraries=libs)
+    return _render(INDEX_HTML, email, libraries=_allowed_libraries(email))
 
 
 @share_bp.route('/browse/<library>')
@@ -583,7 +976,30 @@ def share_browse(library):
         return err
     if library not in _allowed_libraries(email):
         return 'Not found', 404
+
     rel_path = request.args.get('path', '')
+
+    # Poster grid view for movies/tv at library root
+    if not rel_path and library in ('movies', 'tv'):
+        if library == 'movies':
+            raw = _movies_for_user(email)
+            items = [{
+                'title': m['title'],
+                'year': m.get('year', ''),
+                'poster': _poster_url(m.get('images', [])),
+                'folder': os.path.basename(m['path']),
+            } for m in raw if m.get('path')]
+        else:
+            raw = _series_for_user(email)
+            items = [{
+                'title': s['title'],
+                'year': s.get('year', ''),
+                'poster': _poster_url(s.get('images', [])),
+                'folder': os.path.basename(s['path']),
+            } for s in raw if s.get('path')]
+        return _render(POSTER_GRID_HTML, email, library=library, items=items)
+
+    # File browser
     try:
         full = safe_join(LIBRARIES[library], rel_path)
     except ValueError:
@@ -593,12 +1009,13 @@ def share_browse(library):
     entries = []
     for name in sorted(os.listdir(full)):
         p = os.path.join(full, name)
-        entries.append({'name': name, 'is_dir': os.path.isdir(p),
-                        'rel': os.path.join(rel_path, name) if rel_path else name})
+        rel = os.path.join(rel_path, name) if rel_path else name
+        entries.append({'name': name, 'is_dir': os.path.isdir(p), 'rel': rel})
     parent = os.path.dirname(rel_path) if rel_path else None
-    has_sftp = bool(get_friend_config(email)) if not _is_admin(email) else False
+    cfg = get_friend_config(email)
+    can_upload = bool(cfg and cfg.get('host')) if not _is_admin(email) else False
     return _render(BROWSE_HTML, email, library=library, entries=entries,
-                   rel_path=rel_path, parent=parent, has_sftp=has_sftp)
+                   rel_path=rel_path, parent=parent, can_upload=can_upload)
 
 
 @share_bp.route('/download/<library>')
@@ -624,7 +1041,7 @@ def share_upload():
     if err:
         return err
     friend_cfg = get_friend_config(email)
-    if not friend_cfg:
+    if not friend_cfg or not friend_cfg.get('host'):
         return 'No upload destination configured for your account', 403
     library = request.form.get('library')
     rel_path = request.form.get('rel_path', '')
@@ -647,7 +1064,7 @@ def share_upload():
     cur = db.execute(
         'INSERT INTO uploads (friend_email, library, rel_path, status, bytes_total, created_at) '
         'VALUES (?, ?, ?, ?, ?, ?)',
-        (email, library, rel_path, 'pending', bytes_total, datetime.utcnow().isoformat())
+        (email, library, rel_path, 'pending', bytes_total, datetime.utcnow().isoformat()),
     )
     upload_id = cur.lastrowid
     db.commit()
@@ -679,50 +1096,109 @@ def share_usage():
     if err:
         return err
     db = sqlite3.connect(DB_PATH)
-    usage = {}
-    for label, days in USAGE_WINDOWS.items():
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        total = db.execute(
-            "SELECT COALESCE(SUM(bytes_done),0) FROM uploads "
-            "WHERE friend_email=? AND status='done' AND created_at>=?",
-            (email, cutoff)
-        ).fetchone()[0]
-        usage[label] = total
-    db.close()
-    return _render(USAGE_HTML, email, usage=usage)
+    if _is_admin(email):
+        friends = db.execute('SELECT email FROM friends ORDER BY created_at').fetchall()
+        windows = list(USAGE_WINDOWS.keys())
+        admin_rows = []
+        for (femail,) in friends:
+            values = []
+            for days in USAGE_WINDOWS.values():
+                cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+                total = db.execute(
+                    "SELECT COALESCE(SUM(bytes_done),0) FROM uploads "
+                    "WHERE friend_email=? AND status='done' AND created_at>=?",
+                    (femail, cutoff),
+                ).fetchone()[0]
+                values.append(_fmt_bytes(total))
+            admin_rows.append({'email': femail, 'values': values})
+        db.close()
+        return _render(USAGE_HTML, email, admin_rows=admin_rows, windows=windows)
+    else:
+        usage = {}
+        for label, days in USAGE_WINDOWS.items():
+            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            total = db.execute(
+                "SELECT COALESCE(SUM(bytes_done),0) FROM uploads "
+                "WHERE friend_email=? AND status='done' AND created_at>=?",
+                (email, cutoff),
+            ).fetchone()[0]
+            usage[label] = _fmt_bytes(total)
+        db.close()
+        return _render(USAGE_HTML, email, usage=usage)
+
+
+@share_bp.route('/settings', methods=['GET', 'POST'])
+def share_settings():
+    email, err = _require_auth()
+    if err:
+        return err
+    row = _get_friend(email)
+    saved = False
+
+    if request.method == 'POST' and row:
+        new_password = request.form.get('sftp_password', '').strip()
+        db = sqlite3.connect(DB_PATH)
+        if new_password:
+            db.execute(
+                'UPDATE friends SET protocol=?, sftp_host=?, sftp_port=?, sftp_user=?, '
+                'sftp_password=?, sftp_remote_dir=? WHERE email=?',
+                (request.form.get('protocol', 'sftp'),
+                 request.form.get('sftp_host', ''),
+                 int(request.form.get('sftp_port') or 22),
+                 request.form.get('sftp_user', ''),
+                 new_password,
+                 request.form.get('sftp_remote_dir', '/'),
+                 email),
+            )
+        else:
+            db.execute(
+                'UPDATE friends SET protocol=?, sftp_host=?, sftp_port=?, sftp_user=?, '
+                'sftp_remote_dir=? WHERE email=?',
+                (request.form.get('protocol', 'sftp'),
+                 request.form.get('sftp_host', ''),
+                 int(request.form.get('sftp_port') or 22),
+                 request.form.get('sftp_user', ''),
+                 request.form.get('sftp_remote_dir', '/'),
+                 email),
+            )
+        db.commit()
+        db.close()
+        row = _get_friend(email)
+        saved = True
+
+    f = dict(row) if row else None
+    if f and 'protocol' not in f:
+        f['protocol'] = 'sftp'
+    return _render(SETTINGS_HTML, email, f=f, saved=saved)
+
+
+@share_bp.route('/test-connection', methods=['POST'])
+def friend_test_connection():
+    email, err = _require_auth()
+    if err:
+        return {'ok': False, 'error': 'Not authenticated'}, 403
+    protocol = request.form.get('protocol', 'sftp')
+    host = request.form.get('sftp_host', '').strip()
+    port_raw = request.form.get('sftp_port', '')
+    port = int(port_raw) if port_raw.strip().isdigit() else 0
+    user = request.form.get('sftp_user', '').strip()
+    password = request.form.get('sftp_password', '').strip()
+    if not password:
+        row = _get_friend(email)
+        if row:
+            password = row['sftp_password']
+    ok, error = _test_connection(protocol, host, port, user, password)
+    return {'ok': ok, 'error': error}
 
 
 # ── Admin routes ──────────────────────────────────────────────────────────────
-
-def _require_admin():
-    email, err = _require_auth()
-    if err:
-        return None, err
-    if not _is_admin(email):
-        return None, ('Forbidden', 403)
-    return email, None
-
-
-def _friends_list():
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    rows = db.execute('SELECT * FROM friends ORDER BY created_at').fetchall()
-    db.close()
-    friends = []
-    for r in rows:
-        f = dict(r)
-        f['libraries_list'] = json.loads(r['libraries'])
-        friends.append(f)
-    return friends
-
 
 @share_bp.route('/admin')
 def share_admin():
     email, err = _require_admin()
     if err:
         return err
-    return _render(ADMIN_HTML, email, friends=_friends_list(),
-                   all_libraries=ALL_LIBRARIES, default_rate=DEFAULT_RATE_MBIT)
+    return _render(ADMIN_HTML, email, friends=_friends_list(), all_libraries=ALL_LIBRARIES)
 
 
 @share_bp.route('/admin/friend/new', methods=['POST'])
@@ -737,14 +1213,14 @@ def admin_friend_new():
     db = sqlite3.connect(DB_PATH)
     try:
         db.execute(
-            'INSERT INTO friends (email, sftp_host, sftp_port, sftp_user, sftp_password, '
-            'sftp_remote_dir, libraries, rate_limit_mbit, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
-            (f_email, request.form.get('sftp_host', ''),
+            'INSERT INTO friends (email, protocol, sftp_host, sftp_port, sftp_user, sftp_password, '
+            'sftp_remote_dir, libraries, rate_limit_mbit, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+            (f_email, request.form.get('protocol', 'sftp'),
+             request.form.get('sftp_host', ''),
              int(request.form.get('sftp_port') or 22),
              request.form.get('sftp_user', ''), request.form.get('sftp_password', ''),
              request.form.get('sftp_remote_dir', '/'), libraries,
-             float(request.form.get('rate_limit_mbit') or DEFAULT_RATE_MBIT),
-             datetime.utcnow().isoformat())
+             5.0, datetime.utcnow().isoformat()),
         )
         db.commit()
     except sqlite3.IntegrityError:
@@ -769,6 +1245,7 @@ def admin_friend_edit(friend_id):
     if request.method == 'GET':
         f = dict(row)
         f['libraries_list'] = json.loads(row['libraries'])
+        f['protocol'] = row['protocol'] if 'protocol' in row.keys() else 'sftp'
         return _render(ADMIN_EDIT_HTML, email, f=f, all_libraries=ALL_LIBRARIES)
 
     new_password = request.form.get('sftp_password', '').strip()
@@ -776,57 +1253,85 @@ def admin_friend_edit(friend_id):
     db = sqlite3.connect(DB_PATH)
     if new_password:
         db.execute(
-            'UPDATE friends SET sftp_host=?, sftp_port=?, sftp_user=?, sftp_password=?, '
-            'sftp_remote_dir=?, libraries=?, rate_limit_mbit=? WHERE id=?',
-            (request.form.get('sftp_host', ''), int(request.form.get('sftp_port') or 22),
+            'UPDATE friends SET protocol=?, sftp_host=?, sftp_port=?, sftp_user=?, sftp_password=?, '
+            'sftp_remote_dir=?, libraries=? WHERE id=?',
+            (request.form.get('protocol', 'sftp'),
+             request.form.get('sftp_host', ''), int(request.form.get('sftp_port') or 22),
              request.form.get('sftp_user', ''), new_password,
-             request.form.get('sftp_remote_dir', '/'), libraries,
-             float(request.form.get('rate_limit_mbit') or DEFAULT_RATE_MBIT), friend_id)
+             request.form.get('sftp_remote_dir', '/'), libraries, friend_id),
         )
     else:
         db.execute(
-            'UPDATE friends SET sftp_host=?, sftp_port=?, sftp_user=?, '
-            'sftp_remote_dir=?, libraries=?, rate_limit_mbit=? WHERE id=?',
-            (request.form.get('sftp_host', ''), int(request.form.get('sftp_port') or 22),
+            'UPDATE friends SET protocol=?, sftp_host=?, sftp_port=?, sftp_user=?, '
+            'sftp_remote_dir=?, libraries=? WHERE id=?',
+            (request.form.get('protocol', 'sftp'),
+             request.form.get('sftp_host', ''), int(request.form.get('sftp_port') or 22),
              request.form.get('sftp_user', ''),
-             request.form.get('sftp_remote_dir', '/'), libraries,
-             float(request.form.get('rate_limit_mbit') or DEFAULT_RATE_MBIT), friend_id)
+             request.form.get('sftp_remote_dir', '/'), libraries, friend_id),
         )
     db.commit()
     db.close()
     return redirect('/share/admin')
 
 
-@share_bp.route('/admin/test-connection', methods=['POST'])
-def admin_test_connection():
+@share_bp.route('/admin/friend/<int:friend_id>/titles', methods=['GET', 'POST'])
+def admin_friend_titles(friend_id):
     email, err = _require_admin()
     if err:
-        return {'ok': False, 'error': 'Forbidden'}, 403
-    host = request.form.get('sftp_host', '').strip()
-    port = int(request.form.get('sftp_port') or 22)
-    user = request.form.get('sftp_user', '').strip()
-    password = request.form.get('sftp_password', '').strip()
-    # On edit forms the password field may be blank — fall back to stored value
-    if not password:
-        friend_id = request.form.get('friend_id')
-        if friend_id:
-            db = sqlite3.connect(DB_PATH)
-            db.row_factory = sqlite3.Row
-            row = db.execute('SELECT sftp_password FROM friends WHERE id=?', (friend_id,)).fetchone()
-            db.close()
-            if row:
-                password = row['sftp_password']
-    if not host or not user or not password:
-        return {'ok': False, 'error': 'Host, username, and password are required to test'}
-    try:
-        import socket
-        sock = socket.create_connection((host, port), timeout=10)
-        transport = paramiko.Transport(sock)
-        transport.connect(username=user, password=password)
-        transport.close()
-        return {'ok': True}
-    except Exception as e:
-        return {'ok': False, 'error': str(e)}
+        return err
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    row = db.execute('SELECT * FROM friends WHERE id=?', (friend_id,)).fetchone()
+    db.close()
+    if not row:
+        return 'Not found', 404
+
+    f = dict(row)
+    saved = False
+
+    if request.method == 'POST':
+        allowed_titles = {}
+        movie_sel = request.form.getlist('titles_movies')
+        tv_sel = request.form.getlist('titles_tv')
+        if movie_sel:
+            allowed_titles['movies'] = movie_sel
+        if tv_sel:
+            allowed_titles['tv'] = tv_sel
+        db2 = sqlite3.connect(DB_PATH)
+        db2.execute('UPDATE friends SET allowed_titles=? WHERE id=?',
+                    (json.dumps(allowed_titles) if allowed_titles else None, friend_id))
+        db2.commit()
+        db2.close()
+        f['allowed_titles'] = json.dumps(allowed_titles) if allowed_titles else None
+        saved = True
+
+    allowed = {}
+    if f.get('allowed_titles'):
+        try:
+            allowed = json.loads(f['allowed_titles'])
+        except Exception:
+            allowed = {}
+
+    sections = []
+    movies_raw = _arr_get(RADARR_URL, RADARR_API_KEY, 'movie')
+    movies_raw = [m for m in movies_raw if m.get('hasFile') and m.get('path')]
+    movies_raw.sort(key=lambda m: m.get('sortTitle', m.get('title', '')).lower())
+    if movies_raw:
+        sections.append(('movies', [
+            (os.path.basename(m['path']), m['title'], m.get('year', ''))
+            for m in movies_raw
+        ]))
+
+    series_raw = _arr_get(SONARR_URL, SONARR_API_KEY, 'series')
+    series_raw = [s for s in series_raw if s.get('path')]
+    series_raw.sort(key=lambda s: s.get('sortTitle', s.get('title', '')).lower())
+    if series_raw:
+        sections.append(('tv', [
+            (os.path.basename(s['path']), s['title'], s.get('year', ''))
+            for s in series_raw
+        ]))
+
+    return _render(ADMIN_TITLES_HTML, email, f=f, sections=sections, allowed=allowed, saved=saved)
 
 
 @share_bp.route('/admin/friend/<int:friend_id>/delete', methods=['POST'])
@@ -839,3 +1344,27 @@ def admin_friend_delete(friend_id):
     db.commit()
     db.close()
     return redirect('/share/admin')
+
+
+@share_bp.route('/admin/test-connection', methods=['POST'])
+def admin_test_connection():
+    email, err = _require_admin()
+    if err:
+        return {'ok': False, 'error': 'Forbidden'}, 403
+    protocol = request.form.get('protocol', 'sftp')
+    host = request.form.get('sftp_host', '').strip()
+    port_raw = request.form.get('sftp_port', '')
+    port = int(port_raw) if port_raw.strip().isdigit() else 0
+    user = request.form.get('sftp_user', '').strip()
+    password = request.form.get('sftp_password', '').strip()
+    if not password:
+        friend_id = request.form.get('friend_id')
+        if friend_id:
+            db = sqlite3.connect(DB_PATH)
+            db.row_factory = sqlite3.Row
+            r = db.execute('SELECT sftp_password FROM friends WHERE id=?', (friend_id,)).fetchone()
+            db.close()
+            if r:
+                password = r['sftp_password']
+    ok, error = _test_connection(protocol, host, port, user, password)
+    return {'ok': ok, 'error': error}
