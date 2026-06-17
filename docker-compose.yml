@@ -16,7 +16,7 @@ services:
       PORT: "9876"
       SEEDING_DIR: "/data/Downloads/Just4Seeding"
       SEED_DAYS: "21"
-      FRIENDS_CONFIG: ${FRIENDS_CONFIG}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
       UPLOAD_RATE_LIMIT_MBIT: "5"
     networks:
       br0:
