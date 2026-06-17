@@ -281,6 +281,10 @@ _BASE_CSS = '''
   .progress-fill { height: 100%; background: #2563eb; border-radius: 3px; transition: width 0.5s; }
   .error-box { background: #2a1a1a; border: 1px solid #5a2a2a; border-radius: 6px;
                padding: 12px 14px; font-size: 0.85rem; color: #f87171; word-break: break-all; }
+  .test-result { display:none; margin-top:10px; padding: 8px 12px; border-radius: 6px;
+                 font-size: 0.85rem; }
+  .test-ok  { background:#052e16; border:1px solid #166534; color:#4ade80; }
+  .test-err { background:#2a1a1a; border:1px solid #5a2a2a; color:#f87171; }
   .form-card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; padding: 28px;
                max-width: 560px; }
   .field { margin-bottom: 18px; }
@@ -302,6 +306,33 @@ _BASE_CSS = '''
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;
            background: #1e3a5f; color: #93c5fd; margin: 2px 2px 2px 0; }
   .section-gap { margin-top: 40px; }
+'''
+
+_TEST_JS = '''
+<script>
+function testConn(friendId) {
+  var res = document.getElementById('test-result');
+  res.className = 'test-result';
+  res.style.display = 'none';
+  var data = new FormData();
+  data.append('sftp_host',     document.querySelector('[name=sftp_host]').value);
+  data.append('sftp_port',     document.querySelector('[name=sftp_port]').value);
+  data.append('sftp_user',     document.querySelector('[name=sftp_user]').value);
+  data.append('sftp_password', document.querySelector('[name=sftp_password]').value);
+  if (friendId) data.append('friend_id', friendId);
+  var btn = document.getElementById('test-btn');
+  btn.disabled = true; btn.textContent = 'Testing…';
+  fetch('/share/admin/test-connection', {method:'POST', body:data})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      res.textContent = j.ok ? '✓ Connected successfully' : '✗ ' + j.error;
+      res.className = 'test-result ' + (j.ok ? 'test-ok' : 'test-err');
+      res.style.display = 'block';
+    })
+    .catch(function(e){ res.textContent = '✗ Request failed'; res.className='test-result test-err'; res.style.display='block'; })
+    .finally(function(){ btn.disabled=false; btn.textContent='Test connection'; });
+}
+</script>
 '''
 
 _LIB_ICONS = {'movies': '🎬', 'tv': '📺', 'music': '🎵'}
@@ -454,6 +485,10 @@ ADMIN_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
           <input type="text" name="sftp_user"></div>
         <div class="field"><label>SFTP password</label>
           <input type="password" name="sftp_password"></div>
+        <div class="field">
+          <button class="btn btn-ghost" type="button" id="test-btn" onclick="testConn(null)">Test connection</button>
+          <div class="test-result" id="test-result"></div>
+        </div>
         <div class="field"><label>Remote directory</label>
           <input type="text" name="sftp_remote_dir" value="/"></div>
         <div class="field"><label>Libraries they can see</label>
@@ -469,7 +504,7 @@ ADMIN_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
       </form>
     </div>
   </div>
-</main></body></html>'''
+</main>''' + _TEST_JS + '''</body></html>'''
 
 ADMIN_EDIT_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' \
     '<meta name="viewport" content="width=device-width,initial-scale=1">' \
@@ -487,6 +522,10 @@ ADMIN_EDIT_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' 
         <input type="text" name="sftp_user" value="{{ f.sftp_user }}"></div>
       <div class="field"><label>SFTP password</label>
         <input type="password" name="sftp_password" placeholder="Leave blank to keep current"></div>
+      <div class="field">
+        <button class="btn btn-ghost" type="button" id="test-btn" onclick="testConn({{ f.id }})">Test connection</button>
+        <div class="test-result" id="test-result"></div>
+      </div>
       <div class="field"><label>Remote directory</label>
         <input type="text" name="sftp_remote_dir" value="{{ f.sftp_remote_dir }}"></div>
       <div class="field"><label>Libraries they can see</label>
@@ -502,7 +541,7 @@ ADMIN_EDIT_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' 
       <button class="btn btn-primary" type="submit">Save changes</button>
     </form>
   </div>
-</main></body></html>'''
+</main>''' + _TEST_JS + '''</body></html>'''
 
 
 # ── Route helpers ─────────────────────────────────────────────────────────────
@@ -756,6 +795,38 @@ def admin_friend_edit(friend_id):
     db.commit()
     db.close()
     return redirect('/share/admin')
+
+
+@share_bp.route('/admin/test-connection', methods=['POST'])
+def admin_test_connection():
+    email, err = _require_admin()
+    if err:
+        return {'ok': False, 'error': 'Forbidden'}, 403
+    host = request.form.get('sftp_host', '').strip()
+    port = int(request.form.get('sftp_port') or 22)
+    user = request.form.get('sftp_user', '').strip()
+    password = request.form.get('sftp_password', '').strip()
+    # On edit forms the password field may be blank — fall back to stored value
+    if not password:
+        friend_id = request.form.get('friend_id')
+        if friend_id:
+            db = sqlite3.connect(DB_PATH)
+            db.row_factory = sqlite3.Row
+            row = db.execute('SELECT sftp_password FROM friends WHERE id=?', (friend_id,)).fetchone()
+            db.close()
+            if row:
+                password = row['sftp_password']
+    if not host or not user or not password:
+        return {'ok': False, 'error': 'Host, username, and password are required to test'}
+    try:
+        import socket
+        sock = socket.create_connection((host, port), timeout=10)
+        transport = paramiko.Transport(sock)
+        transport.connect(username=user, password=password)
+        transport.close()
+        return {'ok': True}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
 
 
 @share_bp.route('/admin/friend/<int:friend_id>/delete', methods=['POST'])
