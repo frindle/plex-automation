@@ -211,45 +211,89 @@ def _poster_url(images):
     return ''
 
 
-def _allowed_set_for(email, library):
-    """Return the set of allowed folder names for this library, or None meaning no restriction."""
+def _check_title_access(email, library, rel_path):
+    """Return True if the user may access rel_path inside library.
+
+    allowed_titles formats:
+      movies: {"movies": ["folder1", "folder2"]}
+      tv:     {"tv": {"show_folder": null (all seasons) | ["Season 01", ...]}}
+      legacy tv (pre-season support): {"tv": ["show_folder1", ...]}
+    """
     if _is_admin(email):
-        return None
+        return True
     titles = _get_allowed_titles(email)
     if library not in titles:
-        return None  # key absent = no restriction
-    folders = titles[library]
-    return {f.lower() for f in folders}  # empty set = nothing allowed
+        return True  # no restriction for this library
 
+    parts = [p for p in rel_path.replace('\\', '/').split('/') if p]
+    if not parts:
+        return True  # library root — poster grid handles filtering
 
-def _check_title_access(email, library, rel_path):
-    """Return True if the user may access rel_path inside library."""
-    allowed = _allowed_set_for(email, library)
-    if allowed is None:
-        return True
-    top = rel_path.replace('\\', '/').split('/')[0] if rel_path else ''
-    if not top:
-        return True  # root of library; poster grid handles filtering
-    return top.lower() in allowed
+    top = parts[0]
+
+    if library == 'movies':
+        allowed_list = titles['movies']
+        if not isinstance(allowed_list, list):
+            return True
+        return top.lower() in {f.lower() for f in allowed_list}
+
+    if library == 'tv':
+        tv_map = titles['tv']
+        # Legacy: plain list means whole-show access, all seasons allowed
+        if isinstance(tv_map, list):
+            return top.lower() in {f.lower() for f in tv_map}
+        if not isinstance(tv_map, dict):
+            return True
+        # Find this show in the dict (case-insensitive)
+        show_seasons = _MISSING = object()
+        for k, v in tv_map.items():
+            if k.lower() == top.lower():
+                show_seasons = v
+                break
+        if show_seasons is _MISSING:
+            return False  # show not in allowed dict
+        if show_seasons is None:
+            return True  # all seasons allowed for this show
+        if len(parts) < 2:
+            return True  # browsing the show root — show itself is accessible
+        season = parts[1]
+        return season.lower() in {s.lower() for s in show_seasons}
+
+    return True
 
 
 def _movies_for_user(email):
     movies = [m for m in _arr_get(RADARR_URL, RADARR_API_KEY, 'movie') if m.get('hasFile')]
     movies.sort(key=lambda m: m.get('sortTitle', m.get('title', '')).lower())
-    allowed = _allowed_set_for(email, 'movies')
-    if allowed is None:
+    if _is_admin(email):
         return movies
-    return [m for m in movies if os.path.basename(m.get('path', '')).lower() in allowed]
+    titles = _get_allowed_titles(email)
+    if 'movies' not in titles:
+        return movies
+    allowed_list = titles['movies']
+    if not isinstance(allowed_list, list):
+        return movies
+    allowed_set = {f.lower() for f in allowed_list}
+    return [m for m in movies if os.path.basename(m.get('path', '')).lower() in allowed_set]
 
 
 def _series_for_user(email):
     series = [s for s in _arr_get(SONARR_URL, SONARR_API_KEY, 'series')
               if s.get('statistics', {}).get('episodeFileCount', 0) > 0]
     series.sort(key=lambda s: s.get('sortTitle', s.get('title', '')).lower())
-    allowed = _allowed_set_for(email, 'tv')
-    if allowed is None:
+    if _is_admin(email):
         return series
-    return [s for s in series if os.path.basename(s.get('path', '')).lower() in allowed]
+    titles = _get_allowed_titles(email)
+    if 'tv' not in titles:
+        return series
+    tv_map = titles['tv']
+    if isinstance(tv_map, list):
+        allowed_set = {f.lower() for f in tv_map}
+    elif isinstance(tv_map, dict):
+        allowed_set = {k.lower() for k in tv_map}
+    else:
+        return series
+    return [s for s in series if os.path.basename(s.get('path', '')).lower() in allowed_set]
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────
@@ -911,50 +955,128 @@ ADMIN_EDIT_HTML = _head('Edit — Admin') + _NAV + '''
 </main>''' + _PROTO_JS + '''</body></html>'''
 
 ADMIN_TITLES_HTML = _head('Titles — Admin') + _NAV + '''
+<style>
+.tv-show-list { background:#1a1a1a; border:1px solid #2a2a2a; border-radius:8px; overflow:hidden; }
+.tv-show-row { border-bottom:1px solid #222; }
+.tv-show-row:last-child { border-bottom:none; }
+.show-header { display:flex; align-items:center; gap:10px; padding:10px 14px; cursor:pointer; }
+.show-header:hover { background:#222; }
+.show-toggle { background:none; border:none; color:#666; font-size:0.8rem; cursor:pointer;
+               margin-left:auto; padding:2px 6px; }
+.season-grid { display:flex; flex-wrap:wrap; gap:8px; padding:8px 14px 12px 38px;
+               background:#141414; border-top:1px solid #222; }
+.season-label { display:flex; align-items:center; gap:6px; font-size:0.82rem; color:#ccc;
+                cursor:pointer; white-space:nowrap; }
+.season-label input { cursor:pointer; }
+.all-seasons-row { padding:6px 14px 6px 38px; background:#141414;
+                   border-top:1px solid #1e1e1e; }
+.all-seasons-row label { font-size:0.78rem; color:#888; display:flex; align-items:center; gap:6px; cursor:pointer; }
+</style>
 <main>
   <div class="breadcrumb"><a href="/share/admin">Admin</a> / Title access</div>
   <h2>{{ f.email }} — Title Access</h2>
   <p style="color:#888;font-size:0.88rem;margin-bottom:24px">
-    Check the titles this friend can see. <strong style="color:#ccc">Checked = allowed.</strong>
-    To remove all title restrictions for a library, use "Select all" then save — or leave the library unchecked entirely to block it.
+    Checked = allowed. Leave a library unrestricted for full access.
+    For TV shows you can allow all seasons of a show, or expand it and pick specific seasons.
   </p>
   {% if saved %}<div class="alert-ok">Saved.</div>{% endif %}
-  <form method="post">
-    {% for lib, lib_items in sections %}
-    {% set is_restricted = lib in allowed %}
+  <form method="post" id="titles-form">
+    <input type="hidden" name="tv_config" id="tv-config" value="">
+
+    <!-- ── Movies ── -->
     <div class="section-gap">
-      <h3>{{ lib|capitalize }} ({{ lib_items|length }} titles)</h3>
+      <h3>Movies ({{ movie_items|length }} titles)</h3>
       <div style="margin-bottom:12px">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem;color:#e8e8e8">
-          <input type="checkbox" name="restrict_{{ lib }}" id="restrict-{{ lib }}"
-                 {% if is_restricted %}checked{% endif %}
-                 onchange="toggleRestrict('{{ lib }}',this.checked)">
-          Restrict this library to selected titles only
+          <input type="checkbox" name="restrict_movies" id="restrict-movies"
+                 {% if movie_restricted %}checked{% endif %}
+                 onchange="document.getElementById('picker-movies').style.display=this.checked?'':'none'">
+          Restrict to selected movies only
         </label>
       </div>
-      <div id="picker-{{ lib }}" {% if not is_restricted %}style="display:none"{% endif %}>
+      <div id="picker-movies" {% if not movie_restricted %}style="display:none"{% endif %}>
         <div style="display:flex;gap:8px;margin-bottom:8px">
-          <button type="button" class="btn btn-ghost btn-sm" onclick="selectAll('{{ lib }}',true)">Select all</button>
-          <button type="button" class="btn btn-ghost btn-sm" onclick="selectAll('{{ lib }}',false)">Clear all</button>
+          <button type="button" class="btn btn-ghost btn-sm"
+                  onclick="document.querySelectorAll('[name=titles_movies]').forEach(function(e){e.checked=true})">Select all</button>
+          <button type="button" class="btn btn-ghost btn-sm"
+                  onclick="document.querySelectorAll('[name=titles_movies]').forEach(function(e){e.checked=false})">Clear all</button>
         </div>
-        <input class="search-input" type="text" placeholder="Filter {{ lib }}…"
-               oninput="filterTitles(this,'{{ lib }}')">
-        <div class="titles-list" id="list-{{ lib }}">
-          {% for folder, title, year in lib_items %}
-          <div class="title-item" data-lib="{{ lib }}" data-title="{{ title|lower }}">
-            <input type="checkbox" name="titles_{{ lib }}" value="{{ folder }}"
-                   id="t-{{ lib }}-{{ loop.index }}"
-                   {% if not is_restricted or folder in allowed.get(lib, []) %}checked{% endif %}>
-            <label for="t-{{ lib }}-{{ loop.index }}">{{ title }} {% if year %}({{ year }}){% endif %}</label>
+        <input class="search-input" type="text" placeholder="Filter movies…" oninput="filterMovies(this)">
+        <div class="titles-list" id="list-movies">
+          {% for folder, title, year in movie_items %}
+          <div class="title-item" data-title="{{ title|lower }}">
+            <input type="checkbox" name="titles_movies" value="{{ folder }}"
+                   id="m-{{ loop.index }}"
+                   {% if not movie_restricted or folder in allowed_movies %}checked{% endif %}>
+            <label for="m-{{ loop.index }}">{{ title }}{% if year %} ({{ year }}){% endif %}</label>
           </div>
           {% endfor %}
         </div>
       </div>
-      {% if not is_restricted %}
-      <p style="color:#4ade80;font-size:0.84rem">✓ Full access — no title restrictions</p>
-      {% endif %}
+      {% if not movie_restricted %}<p style="color:#4ade80;font-size:0.84rem">✓ Full access</p>{% endif %}
     </div>
-    {% endfor %}
+
+    <!-- ── TV Shows ── -->
+    <div class="section-gap">
+      <h3>TV Shows ({{ tv_items|length }} shows)</h3>
+      <div style="margin-bottom:12px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem;color:#e8e8e8">
+          <input type="checkbox" id="restrict-tv"
+                 {% if tv_restricted %}checked{% endif %}
+                 onchange="document.getElementById('picker-tv').style.display=this.checked?'':'none'">
+          Restrict to selected shows/seasons only
+        </label>
+      </div>
+      <div id="picker-tv" {% if not tv_restricted %}style="display:none"{% endif %}>
+        <div style="display:flex;gap:8px;margin-bottom:8px">
+          <button type="button" class="btn btn-ghost btn-sm" onclick="tvSelectAll(true)">Select all shows</button>
+          <button type="button" class="btn btn-ghost btn-sm" onclick="tvSelectAll(false)">Clear all</button>
+        </div>
+        <input class="search-input" type="text" placeholder="Filter shows…" oninput="filterShows(this)">
+        <div class="tv-show-list">
+          {% for show in tv_items %}
+          {% set sa = allowed_tv.get(show.folder) %}
+          <div class="tv-show-row" data-folder="{{ show.folder }}" data-title="{{ show.title|lower }}">
+            <div class="show-header" onclick="toggleSeasons('{{ loop.index }}')">
+              <input type="checkbox" class="show-enable" data-idx="{{ loop.index }}"
+                     {% if tv_restricted and (sa is not none) %}checked{% elif not tv_restricted %}checked{% endif %}
+                     onclick="event.stopPropagation(); onShowToggle({{ loop.index }})">
+              <span style="flex:1;font-size:0.9rem;color:#e8e8e8">
+                {{ show.title }}{% if show.year %} <span style="color:#555">({{ show.year }})</span>{% endif %}
+              </span>
+              {% if show.seasons %}
+              <button type="button" class="show-toggle" id="tog-{{ loop.index }}">▼ {{ show.seasons|length }} seasons</button>
+              {% endif %}
+            </div>
+            {% if show.seasons %}
+            <div id="seasons-{{ loop.index }}" style="display:none">
+              <div class="all-seasons-row">
+                <label>
+                  <input type="checkbox" class="all-seasons-cb" data-idx="{{ loop.index }}"
+                         onchange="onAllSeasonsToggle({{ loop.index }}, this.checked)"
+                         {% if sa is none %}checked{% endif %}>
+                  All seasons
+                </label>
+              </div>
+              <div class="season-grid" id="season-grid-{{ loop.index }}"
+                   {% if sa is none %}style="display:none"{% endif %}>
+                {% for season in show.seasons %}
+                <label class="season-label">
+                  <input type="checkbox" class="season-cb" data-idx="{{ loop.index }}" value="{{ season }}"
+                         {% if sa is none or season in (sa or []) %}checked{% endif %}>
+                  {{ season }}
+                </label>
+                {% endfor %}
+              </div>
+            </div>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% if not tv_restricted %}<p style="color:#4ade80;font-size:0.84rem">✓ Full access</p>{% endif %}
+    </div>
+
     <div style="margin-top:28px">
       <button class="btn btn-primary" type="submit">Save title access</button>
       <a href="/share/admin" class="btn btn-ghost" style="margin-left:8px">Cancel</a>
@@ -962,22 +1084,71 @@ ADMIN_TITLES_HTML = _head('Titles — Admin') + _NAV + '''
   </form>
 </main>
 <script>
-function filterTitles(inp, lib) {
+function filterMovies(inp) {
   var q = inp.value.toLowerCase();
-  document.querySelectorAll('[data-lib="' + lib + '"]').forEach(function(el) {
+  document.querySelectorAll('#list-movies .title-item').forEach(function(el) {
     el.style.display = el.dataset.title.indexOf(q) >= 0 ? '' : 'none';
   });
 }
-function selectAll(lib, checked) {
-  document.querySelectorAll('[name="titles_' + lib + '"]').forEach(function(el) {
-    el.checked = checked;
+function filterShows(inp) {
+  var q = inp.value.toLowerCase();
+  document.querySelectorAll('.tv-show-row').forEach(function(el) {
+    el.style.display = el.dataset.title.indexOf(q) >= 0 ? '' : 'none';
   });
 }
-function toggleRestrict(lib, enabled) {
-  document.getElementById('picker-' + lib).style.display = enabled ? '' : 'none';
-  var badge = document.getElementById('badge-' + lib);
-  if (badge) badge.style.display = enabled ? 'none' : '';
+function toggleSeasons(idx) {
+  var el = document.getElementById('seasons-' + idx);
+  var tog = document.getElementById('tog-' + idx);
+  if (!el) return;
+  var open = el.style.display !== 'none';
+  el.style.display = open ? 'none' : '';
+  if (tog) tog.textContent = open ? tog.textContent.replace('▲','▼') : tog.textContent.replace('▼','▲');
 }
+function onShowToggle(idx) {
+  var el = document.getElementById('seasons-' + idx);
+  if (el) el.style.display = 'none'; // collapse on toggle
+}
+function onAllSeasonsToggle(idx, allChecked) {
+  var grid = document.getElementById('season-grid-' + idx);
+  if (grid) grid.style.display = allChecked ? 'none' : '';
+  if (!allChecked) {
+    // ensure at least the first season is checked
+    var cbs = document.querySelectorAll('.season-cb[data-idx="' + idx + '"]');
+    var any = false;
+    cbs.forEach(function(cb){ if(cb.checked) any=true; });
+    if (!any && cbs.length) cbs[0].checked = true;
+  }
+}
+function tvSelectAll(checked) {
+  document.querySelectorAll('.show-enable').forEach(function(cb){ cb.checked = checked; });
+  if (checked) {
+    document.querySelectorAll('.all-seasons-cb').forEach(function(cb){ cb.checked = true; });
+    document.querySelectorAll('[id^=season-grid-]').forEach(function(el){ el.style.display='none'; });
+  }
+}
+document.getElementById('titles-form').addEventListener('submit', function() {
+  if (!document.getElementById('restrict-tv').checked) {
+    document.getElementById('tv-config').value = '';
+    return;
+  }
+  var config = {};
+  document.querySelectorAll('.tv-show-row').forEach(function(row) {
+    var folder = row.dataset.folder;
+    var enableCb = row.querySelector('.show-enable');
+    if (!enableCb || !enableCb.checked) return;
+    var allCb = row.querySelector('.all-seasons-cb');
+    if (!allCb || allCb.checked) {
+      config[folder] = null; // all seasons
+    } else {
+      var seasons = [];
+      row.querySelectorAll('.season-cb').forEach(function(cb){
+        if (cb.checked) seasons.push(cb.value);
+      });
+      config[folder] = seasons;
+    }
+  });
+  document.getElementById('tv-config').value = JSON.stringify(config);
+});
 </script>
 </body></html>'''
 
@@ -1362,12 +1533,18 @@ def admin_friend_titles(friend_id):
     saved = False
 
     if request.method == 'POST':
-        # Build the restriction map. Each library key present = restriction active for that
-        # library. Empty list means "block everything". Key absent means "no restriction".
         allowed_titles = {}
-        for lib in ('movies', 'tv'):
-            if f'restrict_{lib}' in request.form:
-                allowed_titles[lib] = request.form.getlist(f'titles_{lib}')
+        if 'restrict_movies' in request.form:
+            allowed_titles['movies'] = request.form.getlist('titles_movies')
+        if 'restrict-tv' in request.form or request.form.get('tv_config'):
+            raw_tv = request.form.get('tv_config', '').strip()
+            if raw_tv:
+                try:
+                    allowed_titles['tv'] = json.loads(raw_tv)
+                except Exception:
+                    allowed_titles['tv'] = {}
+            else:
+                allowed_titles['tv'] = {}
         db2 = sqlite3.connect(DB_PATH)
         db2.execute('UPDATE friends SET allowed_titles=? WHERE id=?',
                     (json.dumps(allowed_titles) if allowed_titles else None, friend_id))
@@ -1383,26 +1560,45 @@ def admin_friend_titles(friend_id):
         except Exception:
             allowed = {}
 
-    sections = []
-    movies_raw = _arr_get(RADARR_URL, RADARR_API_KEY, 'movie')
-    movies_raw = [m for m in movies_raw if m.get('hasFile') and m.get('path')]
-    movies_raw.sort(key=lambda m: m.get('sortTitle', m.get('title', '')).lower())
-    if movies_raw:
-        sections.append(('movies', [
-            (os.path.basename(m['path']), m['title'], m.get('year', ''))
-            for m in movies_raw
-        ]))
+    movie_restricted = 'movies' in allowed
+    allowed_movies = set(allowed.get('movies') or [])
 
+    tv_restricted = 'tv' in allowed
+    tv_map = allowed.get('tv', {})
+    # Normalise legacy list format to dict
+    if isinstance(tv_map, list):
+        tv_map = {f: None for f in tv_map}
+    # Build per-show season data from filesystem + Sonarr
     series_raw = _arr_get(SONARR_URL, SONARR_API_KEY, 'series')
     series_raw = [s for s in series_raw if s.get('path')]
     series_raw.sort(key=lambda s: s.get('sortTitle', s.get('title', '')).lower())
-    if series_raw:
-        sections.append(('tv', [
-            (os.path.basename(s['path']), s['title'], s.get('year', ''))
-            for s in series_raw
-        ]))
+    tv_items = []
+    for s in series_raw:
+        folder = os.path.basename(s['path'])
+        show_path = os.path.join(LIBRARIES['tv'], folder)
+        seasons = []
+        if os.path.isdir(show_path):
+            seasons = sorted(
+                d for d in os.listdir(show_path)
+                if os.path.isdir(os.path.join(show_path, d))
+            )
+        tv_items.append({
+            'folder': folder,
+            'title': s['title'],
+            'year': s.get('year', ''),
+            'seasons': seasons,
+        })
 
-    return _render(ADMIN_TITLES_HTML, email, f=f, sections=sections, allowed=allowed, saved=saved)
+    movies_raw = _arr_get(RADARR_URL, RADARR_API_KEY, 'movie')
+    movies_raw = [m for m in movies_raw if m.get('hasFile') and m.get('path')]
+    movies_raw.sort(key=lambda m: m.get('sortTitle', m.get('title', '')).lower())
+    movie_items = [(os.path.basename(m['path']), m['title'], m.get('year', ''))
+                   for m in movies_raw]
+
+    return _render(ADMIN_TITLES_HTML, email, f=f,
+                   movie_items=movie_items, movie_restricted=movie_restricted, allowed_movies=allowed_movies,
+                   tv_items=tv_items, tv_restricted=tv_restricted, allowed_tv=tv_map,
+                   saved=saved)
 
 
 @share_bp.route('/admin/friend/<int:friend_id>/delete', methods=['POST'])
