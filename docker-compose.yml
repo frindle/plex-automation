@@ -23,9 +23,9 @@ services:
         ipv4_address: 10.0.0.4
     volumes:
       - ./data:/data
-      - "/mnt/Media/Movies:/media/movies:ro"
-      - "/mnt/Media/TV Shows:/media/tv:ro"
-      - "/mnt/Media/Music:/media/music:ro"
+      - "/mnt/user/data/Media/Movies:/media/movies:ro"
+      - "/mnt/user/data/Media/TV Shows:/media/tv:ro"
+      - "/mnt/user/data/Media/Music:/media/music:ro"
 
 networks:
   br0:
