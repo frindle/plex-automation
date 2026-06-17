@@ -211,29 +211,45 @@ def _poster_url(images):
     return ''
 
 
+def _allowed_set_for(email, library):
+    """Return the set of allowed folder names for this library, or None meaning no restriction."""
+    if _is_admin(email):
+        return None
+    titles = _get_allowed_titles(email)
+    if library not in titles:
+        return None  # key absent = no restriction
+    folders = titles[library]
+    return {f.lower() for f in folders}  # empty set = nothing allowed
+
+
+def _check_title_access(email, library, rel_path):
+    """Return True if the user may access rel_path inside library."""
+    allowed = _allowed_set_for(email, library)
+    if allowed is None:
+        return True
+    top = rel_path.replace('\\', '/').split('/')[0] if rel_path else ''
+    if not top:
+        return True  # root of library; poster grid handles filtering
+    return top.lower() in allowed
+
+
 def _movies_for_user(email):
     movies = [m for m in _arr_get(RADARR_URL, RADARR_API_KEY, 'movie') if m.get('hasFile')]
     movies.sort(key=lambda m: m.get('sortTitle', m.get('title', '')).lower())
-    if _is_admin(email):
+    allowed = _allowed_set_for(email, 'movies')
+    if allowed is None:
         return movies
-    allowed = _get_allowed_titles(email).get('movies')
-    if not allowed:
-        return movies
-    allowed_set = {t.lower() for t in allowed}
-    return [m for m in movies if os.path.basename(m.get('path', '')).lower() in allowed_set]
+    return [m for m in movies if os.path.basename(m.get('path', '')).lower() in allowed]
 
 
 def _series_for_user(email):
     series = [s for s in _arr_get(SONARR_URL, SONARR_API_KEY, 'series')
               if s.get('statistics', {}).get('episodeFileCount', 0) > 0]
     series.sort(key=lambda s: s.get('sortTitle', s.get('title', '')).lower())
-    if _is_admin(email):
+    allowed = _allowed_set_for(email, 'tv')
+    if allowed is None:
         return series
-    allowed = _get_allowed_titles(email).get('tv')
-    if not allowed:
-        return series
-    allowed_set = {t.lower() for t in allowed}
-    return [s for s in series if os.path.basename(s.get('path', '')).lower() in allowed_set]
+    return [s for s in series if os.path.basename(s.get('path', '')).lower() in allowed]
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────
@@ -816,6 +832,17 @@ ADMIN_HTML = _head('Admin — Media Share') + _NAV + '''
       <form method="post" action="/share/admin/friend/new">
         <div class="field"><label>Cloudflare Access email</label>
           <input type="email" name="email" required placeholder="steve@example.com"></div>
+        <div class="field"><label>Libraries they can see</label>
+          <div class="checkbox-group">
+            <label><input type="checkbox" name="libraries" value="movies" checked> Movies</label>
+            <label><input type="checkbox" name="libraries" value="tv" checked> TV Shows</label>
+            <label><input type="checkbox" name="libraries" value="music" checked> Music</label>
+          </div>
+          <div class="hint">Use the Titles button to restrict which specific titles they can see.</div>
+        </div>
+        <p style="font-size:0.82rem;color:#555;margin:-8px 0 18px;border-top:1px solid #222;padding-top:16px">
+          Optional — upload destination (enables the "Upload to me" button)
+        </p>
         <div class="field">
           <label>Protocol</label>
           <select name="protocol" onchange="onProtoChange(this)">
@@ -837,13 +864,6 @@ ADMIN_HTML = _head('Admin — Media Share') + _NAV + '''
         </div>
         <div class="field"><label>Remote directory</label>
           <input type="text" name="sftp_remote_dir" value="/"></div>
-        <div class="field"><label>Libraries they can see</label>
-          <div class="checkbox-group">
-            <label><input type="checkbox" name="libraries" value="movies" checked> Movies</label>
-            <label><input type="checkbox" name="libraries" value="tv" checked> TV Shows</label>
-            <label><input type="checkbox" name="libraries" value="music" checked> Music</label>
-          </div>
-        </div>
         <button class="btn btn-primary" type="submit">Add friend</button>
       </form>
     </div>
@@ -895,29 +915,44 @@ ADMIN_TITLES_HTML = _head('Titles — Admin') + _NAV + '''
   <div class="breadcrumb"><a href="/share/admin">Admin</a> / Title access</div>
   <h2>{{ f.email }} — Title Access</h2>
   <p style="color:#888;font-size:0.88rem;margin-bottom:24px">
-    Check the titles this friend can see. Leave all unchecked to grant access to <em>everything</em> in that library.
+    Check the titles this friend can see. <strong style="color:#ccc">Checked = allowed.</strong>
+    To remove all title restrictions for a library, use "Select all" then save — or leave the library unchecked entirely to block it.
   </p>
   {% if saved %}<div class="alert-ok">Saved.</div>{% endif %}
   <form method="post">
     {% for lib, lib_items in sections %}
+    {% set is_restricted = lib in allowed %}
     <div class="section-gap">
       <h3>{{ lib|capitalize }} ({{ lib_items|length }} titles)</h3>
-      <div style="display:flex;gap:8px;margin-bottom:8px">
-        <button type="button" class="btn btn-ghost btn-sm" onclick="selectAll('{{ lib }}',true)">Select all</button>
-        <button type="button" class="btn btn-ghost btn-sm" onclick="selectAll('{{ lib }}',false)">Clear all</button>
+      <div style="margin-bottom:12px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem;color:#e8e8e8">
+          <input type="checkbox" name="restrict_{{ lib }}" id="restrict-{{ lib }}"
+                 {% if is_restricted %}checked{% endif %}
+                 onchange="toggleRestrict('{{ lib }}',this.checked)">
+          Restrict this library to selected titles only
+        </label>
       </div>
-      <input class="search-input" type="text" placeholder="Filter {{ lib }}…"
-             oninput="filterTitles(this,'{{ lib }}')">
-      <div class="titles-list" id="list-{{ lib }}">
-        {% for folder, title, year in lib_items %}
-        <div class="title-item" data-lib="{{ lib }}" data-title="{{ title|lower }}">
-          <input type="checkbox" name="titles_{{ lib }}" value="{{ folder }}"
-                 id="t-{{ lib }}-{{ loop.index }}"
-                 {% if not allowed.get(lib) or folder in allowed.get(lib, []) %}checked{% endif %}>
-          <label for="t-{{ lib }}-{{ loop.index }}">{{ title }} {% if year %}({{ year }}){% endif %}</label>
+      <div id="picker-{{ lib }}" {% if not is_restricted %}style="display:none"{% endif %}>
+        <div style="display:flex;gap:8px;margin-bottom:8px">
+          <button type="button" class="btn btn-ghost btn-sm" onclick="selectAll('{{ lib }}',true)">Select all</button>
+          <button type="button" class="btn btn-ghost btn-sm" onclick="selectAll('{{ lib }}',false)">Clear all</button>
         </div>
-        {% endfor %}
+        <input class="search-input" type="text" placeholder="Filter {{ lib }}…"
+               oninput="filterTitles(this,'{{ lib }}')">
+        <div class="titles-list" id="list-{{ lib }}">
+          {% for folder, title, year in lib_items %}
+          <div class="title-item" data-lib="{{ lib }}" data-title="{{ title|lower }}">
+            <input type="checkbox" name="titles_{{ lib }}" value="{{ folder }}"
+                   id="t-{{ lib }}-{{ loop.index }}"
+                   {% if not is_restricted or folder in allowed.get(lib, []) %}checked{% endif %}>
+            <label for="t-{{ lib }}-{{ loop.index }}">{{ title }} {% if year %}({{ year }}){% endif %}</label>
+          </div>
+          {% endfor %}
+        </div>
       </div>
+      {% if not is_restricted %}
+      <p style="color:#4ade80;font-size:0.84rem">✓ Full access — no title restrictions</p>
+      {% endif %}
     </div>
     {% endfor %}
     <div style="margin-top:28px">
@@ -937,6 +972,11 @@ function selectAll(lib, checked) {
   document.querySelectorAll('[name="titles_' + lib + '"]').forEach(function(el) {
     el.checked = checked;
   });
+}
+function toggleRestrict(lib, enabled) {
+  document.getElementById('picker-' + lib).style.display = enabled ? '' : 'none';
+  var badge = document.getElementById('badge-' + lib);
+  if (badge) badge.style.display = enabled ? 'none' : '';
 }
 </script>
 </body></html>'''
@@ -1025,7 +1065,9 @@ def share_browse(library):
             } for s in raw if s.get('path')]
         return _render(POSTER_GRID_HTML, email, library=library, items=items)
 
-    # File browser
+    # File browser — enforce title-level access before touching the filesystem
+    if not _check_title_access(email, library, rel_path):
+        return 'Not found', 404
     try:
         full = safe_join(LIBRARIES[library], rel_path)
     except ValueError:
@@ -1052,6 +1094,8 @@ def share_download(library):
     if library not in _allowed_libraries(email):
         return 'Not found', 404
     rel_path = request.args.get('path', '')
+    if not _check_title_access(email, library, rel_path):
+        return 'Not found', 404
     try:
         full = safe_join(LIBRARIES[library], rel_path)
     except ValueError:
@@ -1072,6 +1116,8 @@ def share_upload():
     library = request.form.get('library')
     rel_path = request.form.get('rel_path', '')
     if library not in _allowed_libraries(email):
+        return 'Not found', 404
+    if not _check_title_access(email, library, rel_path):
         return 'Not found', 404
     try:
         full = safe_join(LIBRARIES[library], rel_path)
@@ -1316,13 +1362,12 @@ def admin_friend_titles(friend_id):
     saved = False
 
     if request.method == 'POST':
+        # Build the restriction map. Each library key present = restriction active for that
+        # library. Empty list means "block everything". Key absent means "no restriction".
         allowed_titles = {}
-        movie_sel = request.form.getlist('titles_movies')
-        tv_sel = request.form.getlist('titles_tv')
-        if movie_sel:
-            allowed_titles['movies'] = movie_sel
-        if tv_sel:
-            allowed_titles['tv'] = tv_sel
+        for lib in ('movies', 'tv'):
+            if f'restrict_{lib}' in request.form:
+                allowed_titles[lib] = request.form.getlist(f'titles_{lib}')
         db2 = sqlite3.connect(DB_PATH)
         db2.execute('UPDATE friends SET allowed_titles=? WHERE id=?',
                     (json.dumps(allowed_titles) if allowed_titles else None, friend_id))
