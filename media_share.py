@@ -591,11 +591,17 @@ _NAV = '''
 
 # ── Templates ─────────────────────────────────────────────────────────────────
 
-_HEAD = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
-         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-         '<title>{title}</title><style>' + _BASE_CSS + '</style></head><body>')
+_HEAD_A = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+           '<meta name="viewport" content="width=device-width,initial-scale=1">'
+           '<title>')
+_HEAD_B = '</title><style>' + _BASE_CSS + '</style></head><body>'
 
-INDEX_HTML = _HEAD.format(title='Media Share') + _NAV + '''
+
+def _head(title):
+    return _HEAD_A + title + _HEAD_B
+
+
+INDEX_HTML = _head('Media Share') + _NAV + '''
 <main>
   <h2>Libraries</h2>
   <div class="card-grid">
@@ -608,7 +614,7 @@ INDEX_HTML = _HEAD.format(title='Media Share') + _NAV + '''
   </div>
 </main></body></html>'''
 
-POSTER_GRID_HTML = _HEAD.format(title='{{ library|capitalize }} — Media Share') + _NAV + '''
+POSTER_GRID_HTML = _head('{{ library|capitalize }} — Media Share') + _NAV + '''
 <main>
   <div class="breadcrumb"><a href="/share">home</a> / {{ library }}</div>
   {% if not items %}
@@ -630,7 +636,7 @@ POSTER_GRID_HTML = _HEAD.format(title='{{ library|capitalize }} — Media Share'
   {% endif %}
 </main></body></html>'''
 
-BROWSE_HTML = _HEAD.format(title='{{ library }} — Media Share') + _NAV + '''
+BROWSE_HTML = _head('{{ library }} — Media Share') + _NAV + '''
 <main>
   <div class="breadcrumb">
     <a href="/share">home</a> / <a href="/share/browse/{{ library }}">{{ library }}</a>
@@ -668,7 +674,7 @@ BROWSE_HTML = _HEAD.format(title='{{ library }} — Media Share') + _NAV + '''
   </div>
 </main></body></html>'''
 
-STATUS_HTML = (_HEAD.format(title='Upload Status — Media Share')
+STATUS_HTML = (_head('Upload Status — Media Share')
                + '{% if row.status in ("pending", "running") %}<meta http-equiv="refresh" content="3">{% endif %}'
                + _NAV + '''
 <main>
@@ -689,7 +695,7 @@ STATUS_HTML = (_HEAD.format(title='Upload Status — Media Share')
   </div>
 </main></body></html>''')
 
-USAGE_HTML = _HEAD.format(title='Usage — Media Share') + _NAV + '''
+USAGE_HTML = _head('Usage — Media Share') + _NAV + '''
 <main>
   <h2>{% if is_admin %}Usage by Friend{% else %}Your Usage{% endif %}</h2>
   {% if is_admin %}
@@ -715,7 +721,7 @@ USAGE_HTML = _HEAD.format(title='Usage — Media Share') + _NAV + '''
   {% endif %}
 </main></body></html>'''
 
-SETTINGS_HTML = _HEAD.format(title='Settings — Media Share') + _NAV + '''
+SETTINGS_HTML = _head('Settings — Media Share') + _NAV + '''
 <main>
   <h2>Your Upload Settings</h2>
   <p style="color:#888;margin-bottom:24px;font-size:0.9rem">
@@ -754,7 +760,7 @@ SETTINGS_HTML = _HEAD.format(title='Settings — Media Share') + _NAV + '''
   {% endif %}
 </main>''' + _PROTO_JS + '''</body></html>'''
 
-ADMIN_HTML = _HEAD.format(title='Admin — Media Share') + _NAV + '''
+ADMIN_HTML = _head('Admin — Media Share') + _NAV + '''
 <main>
   <h2>Friends</h2>
   {% if friends %}
@@ -824,7 +830,7 @@ ADMIN_HTML = _HEAD.format(title='Admin — Media Share') + _NAV + '''
   </div>
 </main>''' + _PROTO_JS + '''</body></html>'''
 
-ADMIN_EDIT_HTML = _HEAD.format(title='Edit — Admin') + _NAV + '''
+ADMIN_EDIT_HTML = _head('Edit — Admin') + _NAV + '''
 <main>
   <div class="breadcrumb"><a href="/share/admin">Admin</a> / Edit friend</div>
   <h2>{{ f.email }}</h2>
@@ -864,7 +870,7 @@ ADMIN_EDIT_HTML = _HEAD.format(title='Edit — Admin') + _NAV + '''
   </div>
 </main>''' + _PROTO_JS + '''</body></html>'''
 
-ADMIN_TITLES_HTML = _HEAD.format(title='Titles — Admin') + _NAV + '''
+ADMIN_TITLES_HTML = _head('Titles — Admin') + _NAV + '''
 <main>
   <div class="breadcrumb"><a href="/share/admin">Admin</a> / Title access</div>
   <h2>{{ f.email }} — Title Access</h2>
