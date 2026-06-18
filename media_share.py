@@ -77,6 +77,20 @@ _zip_jobs: dict = {}
 _zip_jobs_lock = threading.Lock()
 
 
+def _zip_sweep():
+    """Periodically clean up zip jobs whose tokens have expired or been revoked."""
+    while True:
+        time.sleep(900)  # run every 15 minutes
+        with _zip_jobs_lock:
+            stale = [t for t in list(_zip_jobs) if _token_expired(t)]
+            for t in stale:
+                _expire_zip_job(t)
+                log.debug('zip sweep: cleaned up stale job for token %s…', t[:8])
+
+
+threading.Thread(target=_zip_sweep, daemon=True).start()
+
+
 def _zip_worker(token, full_path, label):
     tmp_path = None
     try:
