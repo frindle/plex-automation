@@ -380,8 +380,10 @@ def _ftp_connect(host, port, user, password, timeout=30):
         return ftp, 'implicit-ftps'
     except Exception as e:
         last_exc = e
-        try: ftp.close()
-        except Exception: pass
+        try:
+            ftp.close()
+        except Exception:
+            pass
     # 2. Explicit FTPS (AUTH TLS)
     try:
         ftp = ftplib.FTP_TLS()
@@ -392,8 +394,10 @@ def _ftp_connect(host, port, user, password, timeout=30):
         return ftp, 'explicit-ftps'
     except Exception as e:
         last_exc = e
-        try: ftp.close()
-        except Exception: pass
+        try:
+            ftp.close()
+        except Exception:
+            pass
     # 3. Plain FTP
     try:
         ftp = ftplib.FTP()
