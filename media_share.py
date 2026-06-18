@@ -71,6 +71,67 @@ _rate_bytes_sent = 0
 _rate_start = time.monotonic()
 _rate_lock = threading.Lock()
 
+# ── Zip jobs (in-memory, keyed by share token) ────────────────────────────────
+
+_zip_jobs: dict = {}
+_zip_jobs_lock = threading.Lock()
+
+
+def _zip_worker(token, full_path, label):
+    tmp_path = None
+    try:
+        all_files = []
+        bytes_total = 0
+        for dirpath, _, filenames in os.walk(full_path):
+            for fn in sorted(filenames):
+                abs_path = os.path.join(dirpath, fn)
+                try:
+                    size = os.path.getsize(abs_path)
+                except OSError:
+                    continue
+                arc_name = os.path.relpath(abs_path, os.path.dirname(full_path))
+                all_files.append((abs_path, arc_name, size))
+                bytes_total += size
+
+        with _zip_jobs_lock:
+            if token not in _zip_jobs:
+                return
+            _zip_jobs[token]['bytes_total'] = bytes_total
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.zip', delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+
+        bytes_done = 0
+        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for abs_path, arc_name, size in all_files:
+                zf.write(abs_path, arc_name)
+                bytes_done += size
+                with _zip_jobs_lock:
+                    if token not in _zip_jobs:
+                        return
+                    _zip_jobs[token]['bytes_done'] = bytes_done
+
+        with _zip_jobs_lock:
+            if token not in _zip_jobs:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                return
+            _zip_jobs[token].update({'status': 'ready', 'tmp_path': tmp_path, 'bytes_done': bytes_total})
+
+    except Exception as e:
+        log.error('zip worker error for token %s: %s', token, e)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        with _zip_jobs_lock:
+            if token in _zip_jobs:
+                _zip_jobs[token].update({'status': 'error', 'error': str(e)})
+
 
 def _global_throttle(delta_bytes):
     global _rate_bytes_sent, _rate_start
@@ -1571,6 +1632,62 @@ LINK_CREATED_HTML = _head('Link Created — Admin') + _NAV + '''
 </main></body></html>'''
 
 
+PREPARING_HTML = '''<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Preparing Download — Media Share</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+       background: #0f0f0f; color: #e8e8e8; min-height: 100vh;
+       display: flex; align-items: center; justify-content: center; padding: 24px; }
+.card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px;
+        padding: 40px 36px; max-width: 480px; width: 100%; }
+h2 { font-size: 1.2rem; font-weight: 600; margin-bottom: 8px; color: #fff; }
+.lbl { color: #888; font-size: 0.9rem; margin-bottom: 28px;
+       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.progress-bar { height: 6px; background: #2a2a2a; border-radius: 3px;
+                overflow: hidden; margin-bottom: 12px; }
+.progress-fill { height: 100%; background: #2563eb; border-radius: 3px; transition: width 0.4s; }
+.st { font-size: 0.85rem; color: #888; }
+.eta { font-size: 0.82rem; color: #555; margin-top: 6px; min-height: 1.1em; }
+.err { color: #f87171; font-size: 0.88rem; margin-top: 14px; display: none; }
+</style></head><body>
+<div class="card">
+  <h2>Preparing download…</h2>
+  <div class="lbl" title="{{ label }}">{{ label }}</div>
+  <div class="progress-bar"><div class="progress-fill" id="pf" style="width:0%"></div></div>
+  <div class="st" id="st">Starting…</div>
+  <div class="eta" id="eta"></div>
+  <div class="err" id="err"></div>
+</div>
+<script>
+(function poll() {
+  fetch('/share/dl/{{ token }}/status.json')
+    .then(function(r) { return r.json(); })
+    .then(function(j) {
+      if (j.status === 'ready') { window.location = '/share/dl/{{ token }}/file'; return; }
+      if (j.status === 'error') {
+        var e = document.getElementById('err');
+        e.textContent = 'Error: ' + (j.error || 'unknown');
+        e.style.display = '';
+        document.getElementById('st').textContent = 'Failed.';
+        return;
+      }
+      var pct = j.bytes_total > 0 ? Math.round(j.bytes_done / j.bytes_total * 100) : 0;
+      document.getElementById('pf').style.width = pct + '%';
+      document.getElementById('st').textContent = pct + '% — ' + j.done_fmt + ' / ' + j.total_fmt;
+      var s = j.eta_seconds;
+      document.getElementById('eta').textContent = s > 0
+        ? 'Est. ' + (s < 60 ? s + 's' : Math.round(s / 60) + 'm') + ' until download starts'
+        : '';
+      setTimeout(poll, 1000);
+    })
+    .catch(function() { setTimeout(poll, 2000); });
+})();
+</script>
+</body></html>'''
+
+
 # ── Admin routes ──────────────────────────────────────────────────────────────
 
 @share_bp.route('/admin')
@@ -1846,59 +1963,119 @@ def admin_link_revoke(link_id):
     return redirect('/share/admin/links')
 
 
-@share_bp.route('/dl/<token>')
-def share_dl(token):
+def _validate_share_token(token):
+    """Returns (row, full_path, error_response) — error_response is a tuple or None."""
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     row = db.execute('SELECT * FROM share_links WHERE token=?', (token,)).fetchone()
+    db.close()
     if not row:
-        db.close()
-        return 'Link not found', 404
-
+        return None, None, ('Link not found', 404)
     now = datetime.utcnow().isoformat()
     if row['expires_at'] < now:
-        db.close()
-        return 'This link has expired', 410
+        return None, None, ('This link has expired', 410)
     if row['max_downloads'] > 0 and row['download_count'] >= row['max_downloads']:
-        db.close()
-        return 'Download limit reached', 410
-
-    db.execute('UPDATE share_links SET download_count=download_count+1 WHERE id=?', (row['id'],))
-    db.commit()
-    db.close()
-
+        return None, None, ('Download limit reached', 410)
     try:
         full = safe_join(LIBRARIES[row['library']], row['rel_path'])
     except (ValueError, KeyError):
-        return 'Invalid path', 500
+        return None, None, ('Invalid path', 500)
+    if not os.path.exists(full):
+        return None, None, ('Not found', 404)
+    return row, full, None
+
+
+@share_bp.route('/dl/<token>')
+def share_dl(token):
+    row, full, err = _validate_share_token(token)
+    if err:
+        return err
 
     if os.path.isfile(full):
+        db = sqlite3.connect(DB_PATH)
+        db.execute('UPDATE share_links SET download_count=download_count+1 WHERE id=?', (row['id'],))
+        db.commit()
+        db.close()
         return send_file(full, as_attachment=True, download_name=os.path.basename(full), conditional=True)
 
     if os.path.isdir(full):
-        label = row['label'] or os.path.basename(full.rstrip('/'))
-        tmp = tempfile.NamedTemporaryFile(suffix='.zip', delete=False)
-        tmp.close()
-        try:
-            with zipfile.ZipFile(tmp.name, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for dirpath, _, filenames in os.walk(full):
-                    for fn in filenames:
-                        abs_path = os.path.join(dirpath, fn)
-                        arc_name = os.path.relpath(abs_path, os.path.dirname(full))
-                        zf.write(abs_path, arc_name)
-        except Exception as e:
-            os.unlink(tmp.name)
-            log.error('zip failed for token %s: %s', token, e)
-            return 'Failed to create zip', 500
-
-        @after_this_request
-        def _cleanup(response, _tmp=tmp.name):
-            try:
-                os.unlink(_tmp)
-            except Exception:
-                pass
-            return response
-
-        return send_file(tmp.name, as_attachment=True, download_name=f'{label}.zip')
+        with _zip_jobs_lock:
+            if token not in _zip_jobs:
+                db = sqlite3.connect(DB_PATH)
+                db.execute('UPDATE share_links SET download_count=download_count+1 WHERE id=?', (row['id'],))
+                db.commit()
+                db.close()
+                _zip_jobs[token] = {
+                    'status': 'zipping',
+                    'label': row['label'] or os.path.basename(full.rstrip('/')),
+                    'bytes_done': 0,
+                    'bytes_total': 0,
+                    'started_at': time.monotonic(),
+                    'tmp_path': None,
+                    'error': None,
+                }
+                threading.Thread(target=_zip_worker, args=(token, full, row['label']), daemon=True).start()
+        return redirect(f'/share/dl/{token}/preparing')
 
     return 'Not found', 404
+
+
+@share_bp.route('/dl/<token>/preparing')
+def share_dl_preparing(token):
+    with _zip_jobs_lock:
+        job = _zip_jobs.get(token)
+    if not job:
+        return redirect(f'/share/dl/{token}')
+    if job['status'] == 'ready':
+        return redirect(f'/share/dl/{token}/file')
+    return render_template_string(PREPARING_HTML, token=token, label=job['label'])
+
+
+@share_bp.route('/dl/<token>/status.json')
+def share_dl_status(token):
+    with _zip_jobs_lock:
+        job = _zip_jobs.get(token)
+    if not job:
+        return {'status': 'not_found'}, 404
+    eta = 0
+    if job['status'] == 'zipping' and job['bytes_total'] > 0 and job['bytes_done'] > 0:
+        elapsed = time.monotonic() - job['started_at']
+        rate = job['bytes_done'] / elapsed
+        if rate > 0:
+            eta = int((job['bytes_total'] - job['bytes_done']) / rate)
+    return {
+        'status': job['status'],
+        'bytes_done': job['bytes_done'],
+        'bytes_total': job['bytes_total'],
+        'done_fmt': _fmt_bytes(job['bytes_done']),
+        'total_fmt': _fmt_bytes(job['bytes_total']),
+        'eta_seconds': eta,
+        'error': job.get('error'),
+    }
+
+
+@share_bp.route('/dl/<token>/file')
+def share_dl_file(token):
+    with _zip_jobs_lock:
+        job = _zip_jobs.get(token)
+    if not job:
+        return redirect(f'/share/dl/{token}')
+    if job['status'] == 'zipping':
+        return redirect(f'/share/dl/{token}/preparing')
+    if job['status'] == 'error':
+        return f'Zip failed: {job.get("error", "unknown error")}', 500
+
+    tmp_path = job['tmp_path']
+    label = job['label']
+
+    @after_this_request
+    def _cleanup(response, _token=token, _tmp=tmp_path):
+        with _zip_jobs_lock:
+            _zip_jobs.pop(_token, None)
+        try:
+            os.unlink(_tmp)
+        except Exception:
+            pass
+        return response
+
+    return send_file(tmp_path, as_attachment=True, download_name=f'{label}.zip', conditional=True)
