@@ -1666,11 +1666,11 @@ h2 { font-size: 1.2rem; font-weight: 600; margin-bottom: 8px; color: #fff; }
     .then(function(r) { return r.json(); })
     .then(function(j) {
       if (j.status === 'ready') { window.location = '/share/dl/{{ token }}/file'; return; }
-      if (j.status === 'error') {
+      if (j.status === 'error' || j.status === 'expired') {
         var e = document.getElementById('err');
-        e.textContent = 'Error: ' + (j.error || 'unknown');
+        e.textContent = j.status === 'expired' ? 'This link has expired.' : 'Error: ' + (j.error || 'unknown');
         e.style.display = '';
-        document.getElementById('st').textContent = 'Failed.';
+        document.getElementById('st').textContent = j.status === 'expired' ? 'Expired.' : 'Failed.';
         return;
       }
       var pct = j.bytes_total > 0 ? Math.round(j.bytes_done / j.bytes_total * 100) : 0;
@@ -1957,9 +1957,13 @@ def admin_link_revoke(link_id):
     if err:
         return err
     db = sqlite3.connect(DB_PATH)
+    row = db.execute('SELECT token FROM share_links WHERE id=?', (link_id,)).fetchone()
     db.execute('DELETE FROM share_links WHERE id=?', (link_id,))
     db.commit()
     db.close()
+    if row:
+        with _zip_jobs_lock:
+            _expire_zip_job(row[0])
     return redirect('/share/admin/links')
 
 
@@ -2020,10 +2024,39 @@ def share_dl(token):
     return 'Not found', 404
 
 
+def _expire_zip_job(token):
+    """Remove job from memory and delete its temp file. Call with lock held."""
+    job = _zip_jobs.pop(token, None)
+    if job and job.get('tmp_path'):
+        try:
+            os.unlink(job['tmp_path'])
+        except Exception:
+            pass
+
+
+def _token_expired(token):
+    """Return True if the share token no longer exists or has expired/hit its limit."""
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    row = db.execute('SELECT * FROM share_links WHERE token=?', (token,)).fetchone()
+    db.close()
+    if not row:
+        return True
+    now = datetime.utcnow().isoformat()
+    if row['expires_at'] < now:
+        return True
+    if row['max_downloads'] > 0 and row['download_count'] >= row['max_downloads']:
+        return True
+    return False
+
+
 @share_bp.route('/dl/<token>/preparing')
 def share_dl_preparing(token):
     with _zip_jobs_lock:
         job = _zip_jobs.get(token)
+        if job and _token_expired(token):
+            _expire_zip_job(token)
+            return 'This link has expired', 410
     if not job:
         return redirect(f'/share/dl/{token}')
     if job['status'] == 'ready':
@@ -2035,6 +2068,9 @@ def share_dl_preparing(token):
 def share_dl_status(token):
     with _zip_jobs_lock:
         job = _zip_jobs.get(token)
+        if job and _token_expired(token):
+            _expire_zip_job(token)
+            return {'status': 'expired'}, 410
     if not job:
         return {'status': 'not_found'}, 404
     eta = 0
@@ -2058,6 +2094,9 @@ def share_dl_status(token):
 def share_dl_file(token):
     with _zip_jobs_lock:
         job = _zip_jobs.get(token)
+        if job and _token_expired(token):
+            _expire_zip_job(token)
+            return 'This link has expired', 410
     if not job:
         return redirect(f'/share/dl/{token}')
     if job['status'] == 'zipping':
