@@ -18,10 +18,13 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+import secrets
+import tempfile
+import zipfile
 import paramiko
 import requests as _requests
 import ssl
-from flask import Blueprint, redirect, render_template_string, request, send_file
+from flask import Blueprint, after_this_request, redirect, render_template_string, request, send_file
 
 log = logging.getLogger(__name__)
 
@@ -121,6 +124,19 @@ def init_db():
             error TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS share_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT UNIQUE NOT NULL,
+            library TEXT NOT NULL,
+            rel_path TEXT NOT NULL,
+            label TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            max_downloads INTEGER NOT NULL DEFAULT 0,
+            download_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
         )
     ''')
     db.commit()
@@ -347,24 +363,26 @@ def _upload_sftp(friend_cfg, files, top_name, upload_id, db):
     base_remote = friend_cfg.get('remote_dir', '/').rstrip('/')
     bytes_done_total = 0
 
-    for local_file, rel in files:
-        remote_path = f'{base_remote}/{top_name}/{rel}'.replace('\\', '/')
-        _sftp_mkdirs(sftp, os.path.dirname(remote_path))
-        last_sent = {'val': 0}
-        base = bytes_done_total
+    try:
+        for local_file, rel in files:
+            remote_path = f'{base_remote}/{top_name}/{rel}'.replace('\\', '/')
+            _sftp_mkdirs(sftp, os.path.dirname(remote_path))
+            last_sent = {'val': 0}
+            base = bytes_done_total
 
-        def progress(sent, _total, _last=last_sent, _base=base):
-            delta = sent - _last['val']
-            _last['val'] = sent
-            _global_throttle(delta)
-            db.execute('UPDATE uploads SET bytes_done=? WHERE id=?', (_base + sent, upload_id))
-            db.commit()
+            def progress(sent, _total, _last=last_sent, _base=base):
+                delta = sent - _last['val']
+                _last['val'] = sent
+                _global_throttle(delta)
+                db.execute('UPDATE uploads SET bytes_done=? WHERE id=?', (_base + sent, upload_id))
+                db.commit()
 
-        sftp.put(local_file, remote_path, callback=progress)
-        bytes_done_total += os.path.getsize(local_file)
+            sftp.put(local_file, remote_path, callback=progress)
+            bytes_done_total += os.path.getsize(local_file)
+    finally:
+        sftp.close()
+        transport.close()
 
-    sftp.close()
-    transport.close()
     return bytes_done_total
 
 
@@ -698,6 +716,7 @@ _NAV = '''
       <a href="/share/usage">Usage</a>
       {% if not is_admin %}<a href="/share/settings">Settings</a>{% endif %}
       {% if is_admin %}<a href="/share/admin">Admin</a>{% endif %}
+      {% if is_admin %}<a href="/share/admin/links">Links</a>{% endif %}
     </nav>
     <span class="meta">{{ email }}</span>
   </div>
@@ -782,6 +801,9 @@ BROWSE_HTML = _head('{{ library }} — Media Share') + _NAV + '''
           <input type="hidden" name="rel_path" value="{{ e.rel }}">
           <button class="btn btn-primary btn-sm" type="submit">Upload to me</button>
         </form>
+        {% endif %}
+        {% if is_admin %}
+        <a class="btn btn-ghost btn-sm" href="/share/admin/create-link?library={{ library }}&path={{ e.rel | urlencode }}">Create Link</a>
         {% endif %}
       </div>
     </div>
@@ -1469,6 +1491,86 @@ def friend_test_connection():
     return {'ok': ok, 'error': error}
 
 
+# ── Shareable link templates ─────────────────────────────────────────────────
+
+LINKS_HTML = _head('Links — Admin') + _NAV + '''
+<main>
+  <h2>Shareable Links</h2>
+  {% if links %}
+  <table class="stat-table" style="width:100%">
+    <tr>
+      <th>Label</th><th>Library</th><th>Expires</th>
+      <th>Downloads</th><th>URL</th><th></th>
+    </tr>
+    {% for lnk in links %}
+    <tr>
+      <td>{{ lnk.label }}</td>
+      <td>{{ lnk.library }}</td>
+      <td style="white-space:nowrap;color:{% if lnk.expired %}#f87171{% else %}#aaa{% endif %}">
+        {{ lnk.expires_at[:16].replace("T"," ") }} UTC{% if lnk.expired %} (expired){% endif %}
+      </td>
+      <td>{{ lnk.download_count }}{% if lnk.max_downloads %} / {{ lnk.max_downloads }}{% endif %}</td>
+      <td style="font-size:0.75rem;word-break:break-all">
+        <a href="/share/dl/{{ lnk.token }}" target="_blank">/share/dl/{{ lnk.token[:12] }}…</a>
+      </td>
+      <td>
+        <form method="post" action="/share/admin/links/{{ lnk.id }}/revoke" style="display:inline">
+          <button class="btn btn-danger btn-sm" type="submit"
+                  onclick="return confirm('Revoke this link?')">Revoke</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p style="color:#888">No active links.</p>
+  {% endif %}
+</main></body></html>'''
+
+CREATE_LINK_HTML = _head('Create Link — Admin') + _NAV + '''
+<main>
+  <div class="form-card" style="max-width:480px">
+    <h2 style="margin-bottom:1.2rem">Create Shareable Link</h2>
+    <p style="color:#888;margin-bottom:1.2rem;font-size:0.9rem">{{ label }}</p>
+    <form method="post">
+      <input type="hidden" name="library" value="{{ library }}">
+      <input type="hidden" name="rel_path" value="{{ rel_path }}">
+      <div class="field">
+        <label>Expires after (hours)</label>
+        <input type="number" name="expires_hours" value="72" min="1" max="8760">
+      </div>
+      <div class="field">
+        <label>Max downloads (0 = unlimited)</label>
+        <input type="number" name="max_downloads" value="0" min="0">
+      </div>
+      <button class="btn btn-primary" type="submit">Generate Link</button>
+      <a class="btn btn-ghost" href="/share/browse/{{ library }}?path={{ rel_path | urlencode }}"
+         style="margin-left:8px">Cancel</a>
+    </form>
+  </div>
+</main></body></html>'''
+
+LINK_CREATED_HTML = _head('Link Created — Admin') + _NAV + '''
+<main>
+  <div class="form-card" style="max-width:520px">
+    <h2 style="margin-bottom:1rem">Link Created</h2>
+    <p style="color:#888;font-size:0.9rem;margin-bottom:1rem">{{ label }}</p>
+    <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:1rem;
+                word-break:break-all;font-family:monospace;font-size:0.85rem;color:#60a5fa">
+      {{ url }}
+    </div>
+    <p style="color:#888;font-size:0.82rem;margin-top:0.75rem">
+      Expires: {{ expires_at[:16].replace("T"," ") }} UTC ·
+      Max downloads: {% if max_downloads %}{{ max_downloads }}{% else %}unlimited{% endif %}
+    </p>
+    <div style="margin-top:1.2rem;display:flex;gap:8px">
+      <a class="btn btn-ghost" href="/share/admin/links">View all links</a>
+      <a class="btn btn-ghost" href="/share/browse/{{ library }}?path={{ rel_path | urlencode }}">Back to folder</a>
+    </div>
+  </div>
+</main></body></html>'''
+
+
 # ── Admin routes ──────────────────────────────────────────────────────────────
 
 @share_bp.route('/admin')
@@ -1670,3 +1772,133 @@ def admin_test_connection():
                 password = r['sftp_password']
     ok, error = _test_connection(protocol, host, port, user, password)
     return {'ok': ok, 'error': error}
+
+
+@share_bp.route('/admin/create-link', methods=['GET', 'POST'])
+def admin_create_link():
+    email, err = _require_admin()
+    if err:
+        return err
+    library = request.args.get('library') or request.form.get('library', '')
+    rel_path = request.args.get('path') or request.form.get('rel_path', '')
+    if library not in LIBRARIES:
+        return 'Invalid library', 400
+    try:
+        full = safe_join(LIBRARIES[library], rel_path)
+    except ValueError:
+        return 'Invalid path', 400
+    if not os.path.exists(full):
+        return 'Not found', 404
+
+    label = os.path.basename(full.rstrip('/')) or library
+
+    if request.method == 'GET':
+        return _render(CREATE_LINK_HTML, email, library=library, rel_path=rel_path, label=label)
+
+    expires_hours = int(request.form.get('expires_hours') or 72)
+    max_downloads = int(request.form.get('max_downloads') or 0)
+    token = secrets.token_urlsafe(32)
+    expires_at = (datetime.utcnow() + timedelta(hours=expires_hours)).isoformat()
+    created_at = datetime.utcnow().isoformat()
+
+    db = sqlite3.connect(DB_PATH)
+    db.execute(
+        'INSERT INTO share_links (token, library, rel_path, label, expires_at, max_downloads, created_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?)',
+        (token, library, rel_path, label, expires_at, max_downloads, created_at),
+    )
+    db.commit()
+    db.close()
+
+    base_url = request.host_url.rstrip('/')
+    url = f'{base_url}/share/dl/{token}'
+    return _render(LINK_CREATED_HTML, email, library=library, rel_path=rel_path,
+                   label=label, url=url, expires_at=expires_at, max_downloads=max_downloads)
+
+
+@share_bp.route('/admin/links')
+def admin_links():
+    email, err = _require_admin()
+    if err:
+        return err
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    rows = db.execute('SELECT * FROM share_links ORDER BY created_at DESC').fetchall()
+    db.close()
+    now = datetime.utcnow().isoformat()
+    links = []
+    for r in rows:
+        lnk = dict(r)
+        lnk['expired'] = r['expires_at'] < now or (r['max_downloads'] > 0 and r['download_count'] >= r['max_downloads'])
+        links.append(lnk)
+    return _render(LINKS_HTML, email, links=links)
+
+
+@share_bp.route('/admin/links/<int:link_id>/revoke', methods=['POST'])
+def admin_link_revoke(link_id):
+    email, err = _require_admin()
+    if err:
+        return err
+    db = sqlite3.connect(DB_PATH)
+    db.execute('DELETE FROM share_links WHERE id=?', (link_id,))
+    db.commit()
+    db.close()
+    return redirect('/share/admin/links')
+
+
+@share_bp.route('/dl/<token>')
+def share_dl(token):
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    row = db.execute('SELECT * FROM share_links WHERE token=?', (token,)).fetchone()
+    if not row:
+        db.close()
+        return 'Link not found', 404
+
+    now = datetime.utcnow().isoformat()
+    if row['expires_at'] < now:
+        db.close()
+        return 'This link has expired', 410
+    if row['max_downloads'] > 0 and row['download_count'] >= row['max_downloads']:
+        db.close()
+        return 'Download limit reached', 410
+
+    db.execute('UPDATE share_links SET download_count=download_count+1 WHERE id=?', (row['id'],))
+    db.commit()
+    db.close()
+
+    try:
+        full = safe_join(LIBRARIES[row['library']], row['rel_path'])
+    except (ValueError, KeyError):
+        return 'Invalid path', 500
+
+    if os.path.isfile(full):
+        return send_file(full, as_attachment=True, download_name=os.path.basename(full), conditional=True)
+
+    if os.path.isdir(full):
+        label = row['label'] or os.path.basename(full.rstrip('/'))
+        tmp = tempfile.NamedTemporaryFile(suffix='.zip', delete=False)
+        tmp.close()
+        try:
+            with zipfile.ZipFile(tmp.name, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for dirpath, _, filenames in os.walk(full):
+                    for fn in filenames:
+                        abs_path = os.path.join(dirpath, fn)
+                        arc_name = os.path.relpath(abs_path, os.path.dirname(full))
+                        zf.write(abs_path, arc_name)
+        except Exception as e:
+            os.unlink(tmp.name)
+            log.error('zip failed for token %s: %s', token, e)
+            return 'Failed to create zip', 500
+
+        @after_this_request
+        def _cleanup(response, _tmp=tmp.name):
+            try:
+                os.unlink(_tmp)
+            except Exception:
+                pass
+            return response
+
+        return send_file(tmp.name, as_attachment=True, download_name=f'{label}.zip')
+
+    return 'Not found', 404
