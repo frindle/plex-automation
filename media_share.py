@@ -352,6 +352,7 @@ def _upload_sftp(friend_cfg, files, top_name, upload_id, db):
 def _upload_ftps(friend_cfg, files, top_name, upload_id, db):
     host = friend_cfg['host']
     port = friend_cfg['port'] or 21
+    ftp = None
     try:
         ftp = ftplib.FTP_TLS()
         ftp.connect(host, port, timeout=30)
@@ -359,7 +360,12 @@ def _upload_ftps(friend_cfg, files, top_name, upload_id, db):
         ftp.login(friend_cfg['user'], friend_cfg['password'])
         ftp.prot_p()
     except Exception:
-        # Fall back to plain FTP if TLS handshake fails
+        # Close the failed FTPS connection before retrying with plain FTP
+        if ftp is not None:
+            try:
+                ftp.close()
+            except Exception:
+                pass
         ftp = ftplib.FTP()
         ftp.connect(host, port, timeout=30)
         ftp.login(friend_cfg['user'], friend_cfg['password'])
