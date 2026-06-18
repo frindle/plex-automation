@@ -20,11 +20,30 @@ from datetime import datetime, timedelta
 
 import paramiko
 import requests as _requests
+import ssl
 from flask import Blueprint, redirect, render_template_string, request, send_file
 
 log = logging.getLogger(__name__)
 
 share_bp = Blueprint('share', __name__, url_prefix='/share')
+
+
+class _ImplicitFTP_TLS(ftplib.FTP_TLS):
+    """Implicit FTPS: wraps the socket with TLS immediately on connect (port 990)."""
+    def connect(self, host='', port=990, timeout=-999, source_address=None):
+        self.host = host
+        self.port = port
+        self.timeout = self.timeout if timeout == -999 else timeout
+        self.source_address = source_address
+        sock = socket.create_connection((host, port), self.timeout, source_address)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        self.sock = ctx.wrap_socket(sock, server_hostname=host)
+        self.af = self.sock.family
+        self.file = self.sock.makefile('r', encoding=self.encoding)
+        self.welcome = self.getresp()
+        return self.welcome
 
 LIBRARIES = {'movies': '/media/movies', 'tv': '/media/tv', 'music': '/media/music'}
 ALL_LIBRARIES = list(LIBRARIES.keys())
@@ -349,26 +368,47 @@ def _upload_sftp(friend_cfg, files, top_name, upload_id, db):
     return bytes_done_total
 
 
+def _ftp_connect(host, port, user, password, timeout=30):
+    """Try implicit FTPS → explicit FTPS → plain FTP. Returns (ftp, mode_label)."""
+    last_exc = None
+    # 1. Implicit FTPS (port 990 style — TLS from connection start)
+    try:
+        ftp = _ImplicitFTP_TLS()
+        ftp.connect(host, port, timeout=timeout)
+        ftp.login(user, password)
+        ftp.prot_p()
+        return ftp, 'implicit-ftps'
+    except Exception as e:
+        last_exc = e
+        try: ftp.close()
+        except Exception: pass
+    # 2. Explicit FTPS (AUTH TLS)
+    try:
+        ftp = ftplib.FTP_TLS()
+        ftp.connect(host, port, timeout=timeout)
+        ftp.auth()
+        ftp.login(user, password)
+        ftp.prot_p()
+        return ftp, 'explicit-ftps'
+    except Exception as e:
+        last_exc = e
+        try: ftp.close()
+        except Exception: pass
+    # 3. Plain FTP
+    try:
+        ftp = ftplib.FTP()
+        ftp.connect(host, port, timeout=timeout)
+        ftp.login(user, password)
+        return ftp, 'plain-ftp'
+    except Exception as e:
+        last_exc = e
+    raise last_exc
+
+
 def _upload_ftps(friend_cfg, files, top_name, upload_id, db):
     host = friend_cfg['host']
     port = friend_cfg['port'] or 21
-    ftp = None
-    try:
-        ftp = ftplib.FTP_TLS()
-        ftp.connect(host, port, timeout=30)
-        ftp.auth()
-        ftp.login(friend_cfg['user'], friend_cfg['password'])
-        ftp.prot_p()
-    except Exception:
-        # Close the failed FTPS connection before retrying with plain FTP
-        if ftp is not None:
-            try:
-                ftp.close()
-            except Exception:
-                pass
-        ftp = ftplib.FTP()
-        ftp.connect(host, port, timeout=30)
-        ftp.login(friend_cfg['user'], friend_cfg['password'])
+    ftp, _ = _ftp_connect(host, port, friend_cfg['user'], friend_cfg['password'])
     ftp.set_pasv(True)
     base_remote = friend_cfg.get('remote_dir', '/').rstrip('/')
     bytes_done_total = 0
@@ -445,31 +485,16 @@ def _test_connection(protocol, host, port, user, password):
     if protocol == 'ftps':
         default_port = port or 21
         try:
-            ftp = ftplib.FTP_TLS()
-            ftp.connect(host, default_port, timeout=10)
-            ftp.auth()
-            ftp.login(user, password)
-            ftp.prot_p()
+            ftp, mode = _ftp_connect(host, default_port, user, password, timeout=10)
             ftp.quit()
-            return True, ''
+            label = {'implicit-ftps': '', 'explicit-ftps': '(explicit FTPS)', 'plain-ftp': '(plain FTP — no TLS)'}
+            return True, label.get(mode, '')
         except socket.timeout:
             return False, f'Connection timed out after 10s (could not reach {host}:{default_port})'
         except ftplib.error_perm as e:
             return False, f'Authentication failed: {e}'
-        except Exception:
-            # Retry with plain FTP
-            try:
-                ftp = ftplib.FTP()
-                ftp.connect(host, default_port, timeout=10)
-                ftp.login(user, password)
-                ftp.quit()
-                return True, '(connected via plain FTP — TLS not available on this server)'
-            except socket.timeout:
-                return False, f'Connection timed out after 10s (could not reach {host}:{default_port})'
-            except ftplib.error_perm as e2:
-                return False, f'Authentication failed: {e2}'
-            except Exception as e2:
-                return False, str(e2)
+        except Exception as e:
+            return False, str(e)
     else:
         default_port = port or 22
         try:
