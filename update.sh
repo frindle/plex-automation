@@ -18,7 +18,7 @@ echo "=== git pull ==="
 git pull
 
 echo "=== last commit ==="
-git log -1 --pretty='%h %s'
+git --no-pager log -1 --pretty='%h %s'
 
 echo "=== building${EXTRA_BUILD_ARGS:+ (no cache)} ==="
 docker-compose build $EXTRA_BUILD_ARGS
