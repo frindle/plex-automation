@@ -1,5 +1,6 @@
 import os
 import re
+import json as _json
 import time
 import logging
 import threading
@@ -246,8 +247,10 @@ def _torrent_name_matches_file(torrent_name, tracked_relative_path):
     tracked = tracked_relative_path.lower()
     # Strip common release extensions from both sides for the comparison
     for ext in ('.mkv', '.mp4', '.avi'):
-        if tracked.endswith(ext): tracked = tracked[:-len(ext)]
-        if name.endswith(ext): name = name[:-len(ext)]
+        if tracked.endswith(ext):
+            tracked = tracked[:-len(ext)]
+        if name.endswith(ext):
+            name = name[:-len(ext)]
     return name == tracked or tracked in name or name in tracked
 
 def dedup_via_radarr():
@@ -374,7 +377,6 @@ def dedup_via_sonarr():
 # files AND Radarr/Sonarr has an imported file that references this download.
 # Track state in a sidecar JSON so we know the "unpacked at" timestamp.
 
-import json as _json
 _UNPACK_STATE_PATH = os.environ.get('UNPACK_STATE_PATH', '/data/unpacked_torrents.json')
 
 def _load_unpack_state():
