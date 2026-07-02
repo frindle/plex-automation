@@ -25,6 +25,9 @@ SONARR_UPG_LABEL  = os.environ.get('SONARR_UPGRADE_LABEL', 'sonarr-upgrade')
 RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
+PUSHOVER_TOKEN   = os.environ.get('PUSHOVER_TOKEN', '')
+PUSHOVER_USER    = os.environ.get('PUSHOVER_USER', '')
+IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  # 15 min
 
 PROPER_REPACK_RE = re.compile(r'\b(PROPER|REPACK|RERIP)\b', re.IGNORECASE)
 EPISODE_RE       = re.compile(r'S\d{2}E\d{2}', re.IGNORECASE)
@@ -269,6 +272,185 @@ def cleanup_radarr_queue_dupes():
         log.info(f'Radarr queue cleanup complete: removed {removed} duplicate entries')
     except Exception as e:
         log.error(f'Radarr queue cleanup failed: {e}')
+
+# ── Pushover ─────────────────────────────────────────────────────────────────
+
+def send_pushover(title, message, url=None):
+    """Fire a Pushover notification. No-op if credentials aren't set."""
+    if not (PUSHOVER_TOKEN and PUSHOVER_USER):
+        log.info(f'[pushover] skip (no creds): {title} — {message[:80]}')
+        return
+    payload = {
+        'token': PUSHOVER_TOKEN,
+        'user':  PUSHOVER_USER,
+        'title': title,
+        'message': message[:1024],
+    }
+    if url:
+        payload['url'] = url
+    try:
+        r = requests.post('https://api.pushover.net/1/messages.json', data=payload, timeout=10)
+        if not r.ok:
+            log.warning(f'[pushover] HTTP {r.status_code}: {r.text[:200]}')
+    except Exception as e:
+        log.warning(f'[pushover] send failed: {e}')
+
+# ── importBlocked queue handler ─────────────────────────────────────────────
+# Root cause of the dupe wall: Radarr/Sonarr grab an upgrade, download completes,
+# but the import fails (ambiguous movieId, "Manual Import required", etc). The
+# stuck queue entry gets cleared eventually with no import. Repeat over months
+# → wall of dupes seeding in Deluge that nobody knows about.
+#
+# This poller: every IMPORTBLOCKED_INTERVAL, walk both /api/v3/queue endpoints
+# for records with trackedDownloadState=importBlocked. If Radarr/Sonarr has
+# already resolved the target (movieId or seriesId+episodeId), try ManualImport
+# with the resolved candidate. Otherwise Pushover-notify. Per-downloadId dedupe
+# so we don't repeat pushes.
+
+_ib_seen = {}  # downloadId → epoch of last notify
+
+def _ib_seen_recently(download_id, ttl_hours=24):
+    now = time.time()
+    for k, ts in list(_ib_seen.items()):
+        if now - ts > ttl_hours * 3600:
+            _ib_seen.pop(k, None)
+    if download_id in _ib_seen:
+        return True
+    _ib_seen[download_id] = now
+    return False
+
+def _try_radarr_manual_import(record):
+    download_id = record.get('downloadId') or ''
+    movie_id = record.get('movieId')
+    if not (download_id and movie_id):
+        return False, 'no downloadId or movieId'
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/manualimport',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            params={'downloadId': download_id, 'filterExistingFiles': 'true'},
+            timeout=20,
+        )
+        r.raise_for_status()
+        candidates = r.json() or []
+    except Exception as e:
+        return False, f'manualimport lookup failed: {e}'
+    good = [c for c in candidates if (c.get('movie') or {}).get('id') == movie_id and c.get('rejections') in (None, [])]
+    if not good:
+        return False, f'no clean candidate ({len(candidates)} total, none matched movieId {movie_id})'
+    files = []
+    for c in good:
+        files.append({
+            'path': c.get('path'),
+            'movieId': movie_id,
+            'quality': c.get('quality'),
+            'languages': c.get('languages'),
+            'releaseGroup': c.get('releaseGroup'),
+            'downloadId': download_id,
+        })
+    try:
+        cmd = requests.post(
+            f'{RADARR_URL}/api/v3/command',
+            headers={'X-Api-Key': RADARR_API_KEY, 'Content-Type': 'application/json'},
+            json={'name': 'ManualImport', 'files': files, 'importMode': 'auto'},
+            timeout=20,
+        )
+        cmd.raise_for_status()
+        return True, f'ManualImport queued for movieId={movie_id}'
+    except Exception as e:
+        return False, f'ManualImport POST failed: {e}'
+
+def _try_sonarr_manual_import(record):
+    download_id = record.get('downloadId') or ''
+    series_id = record.get('seriesId')
+    episode_id = record.get('episodeId')
+    if not (download_id and series_id):
+        return False, 'no downloadId or seriesId'
+    try:
+        r = requests.get(
+            f'{SONARR_URL}/api/v3/manualimport',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'downloadId': download_id, 'filterExistingFiles': 'true'},
+            timeout=20,
+        )
+        r.raise_for_status()
+        candidates = r.json() or []
+    except Exception as e:
+        return False, f'manualimport lookup failed: {e}'
+    good = [c for c in candidates if (c.get('series') or {}).get('id') == series_id and c.get('rejections') in (None, [])]
+    if not good:
+        return False, f'no clean candidate ({len(candidates)} total, none matched seriesId {series_id})'
+    files = []
+    for c in good:
+        files.append({
+            'path': c.get('path'),
+            'seriesId': series_id,
+            'episodeIds': [e.get('id') for e in (c.get('episodes') or [])] or ([episode_id] if episode_id else []),
+            'quality': c.get('quality'),
+            'languages': c.get('languages'),
+            'releaseGroup': c.get('releaseGroup'),
+            'downloadId': download_id,
+        })
+    try:
+        cmd = requests.post(
+            f'{SONARR_URL}/api/v3/command',
+            headers={'X-Api-Key': SONARR_API_KEY, 'Content-Type': 'application/json'},
+            json={'name': 'ManualImport', 'files': files, 'importMode': 'auto'},
+            timeout=20,
+        )
+        cmd.raise_for_status()
+        return True, f'ManualImport queued for seriesId={series_id}'
+    except Exception as e:
+        return False, f'ManualImport POST failed: {e}'
+
+def check_import_blocked():
+    """Poll Radarr + Sonarr queues for importBlocked records. Auto-resolve or notify."""
+    for label, url, key, resolver in [
+        ('Radarr', RADARR_URL, RADARR_API_KEY, _try_radarr_manual_import),
+        ('Sonarr', SONARR_URL, SONARR_API_KEY, _try_sonarr_manual_import),
+    ]:
+        if not key:
+            continue
+        try:
+            r = requests.get(
+                f'{url}/api/v3/queue',
+                headers={'X-Api-Key': key},
+                params={'pageSize': 500, 'includeUnknownMovieItems': True},
+                timeout=15,
+            )
+            r.raise_for_status()
+            records = r.json().get('records', [])
+        except Exception as e:
+            log.warning(f'[importBlocked] {label} queue fetch failed: {e}')
+            continue
+        blocked = [rec for rec in records if rec.get('trackedDownloadState') == 'importBlocked']
+        for rec in blocked:
+            download_id = rec.get('downloadId') or f'noid-{rec.get("id")}'
+            title = rec.get('title', '<no title>')
+            ok, detail = resolver(rec)
+            if ok:
+                log.info(f'[importBlocked] {label}: auto-imported "{title}" — {detail}')
+                continue
+            if _ib_seen_recently(download_id):
+                continue
+            msgs = rec.get('statusMessages') or []
+            reason = '; '.join(m.get('messages', ['?'])[0] for m in msgs if m.get('messages')) or 'unknown'
+            log.warning(f'[importBlocked] {label}: notifying — "{title}" ({detail}) — reason: {reason}')
+            send_pushover(
+                title=f'{label} import stuck',
+                message=f'{title}\nReason: {reason}\nDetail: {detail}',
+                url=f'{url}/activity/queue',
+            )
+
+def import_blocked_scheduler():
+    # Small warm-up delay so we don't hammer *arr the moment the app boots.
+    time.sleep(60)
+    while True:
+        try:
+            check_import_blocked()
+        except Exception as e:
+            log.error(f'[importBlocked] scheduler tick failed: {e}')
+        time.sleep(IMPORTBLOCKED_INTERVAL)
 
 # ── Core upgrade handler ─────────────────────────────────────────────────────
 
@@ -673,4 +855,6 @@ if __name__ == '__main__':
     t2.start()
     t3 = threading.Thread(target=priority_scheduler, daemon=True)
     t3.start()
+    t4 = threading.Thread(target=import_blocked_scheduler, daemon=True)
+    t4.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
