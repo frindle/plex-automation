@@ -224,7 +224,228 @@ def cleanup_scheduler():
     while True:
         cleanup_superseded()
         cleanup_radarr_queue_dupes()
+        dedup_via_radarr()
+        dedup_via_sonarr()
+        cleanup_unpacked_torrents()
         time.sleep(86400)
+
+
+# ── Radarr/Sonarr → Deluge dedup ─────────────────────────────────────────────
+# For each *arr movie/series with a tracked file, sweep Deluge for torrents
+# that match the title but aren't the tracked file. Relabel those extras as
+# 'superseded' so the existing cleanup_superseded pass removes them after
+# SEED_DAYS. This is what cleans up the pile-of-dupes from the pre-fix era.
+
+def _torrent_name_matches_file(torrent_name, tracked_relative_path):
+    """True if the torrent name looks like the tracked file (fuzzy match on
+    name minus extension). Radarr's relativePath is like 'Movie 2022...mkv';
+    the Deluge torrent name may lack the extension or match exactly."""
+    if not tracked_relative_path:
+        return False
+    name = torrent_name.lower()
+    tracked = tracked_relative_path.lower()
+    # Strip common release extensions from both sides for the comparison
+    for ext in ('.mkv', '.mp4', '.avi'):
+        if tracked.endswith(ext): tracked = tracked[:-len(ext)]
+        if name.endswith(ext): name = name[:-len(ext)]
+    return name == tracked or tracked in name or name in tracked
+
+def dedup_via_radarr():
+    log.info('Running Radarr → Deluge dedup pass...')
+    if not RADARR_API_KEY:
+        log.info('  no RADARR_API_KEY, skip')
+        return
+    try:
+        deluge_login()
+        ensure_label_exists()
+        torrents = get_all_torrents()
+        radarr_torrents = {h: i for h, i in torrents.items() if i.get('label') in ('radarr', RADARR_UPG_LABEL)}
+        if not radarr_torrents:
+            log.info('  no radarr-labeled torrents to check')
+            return
+        # Pull only movies with a tracked file
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/movie',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            timeout=30,
+        )
+        r.raise_for_status()
+        relabeled = 0
+        for movie in r.json():
+            if not movie.get('hasFile'):
+                continue
+            tracked = ((movie.get('movieFile') or {}).get('relativePath')) or ''
+            if not tracked:
+                continue
+            title_variants = get_radarr_movie_titles(movie['id'])
+            if not title_variants:
+                title_variants = {movie.get('title', '').lower()}
+            # Match torrents against this movie
+            matched_hashes = []
+            for h, info in radarr_torrents.items():
+                name = info.get('name', '')
+                if torrent_matches_any_title(name, title_variants):
+                    matched_hashes.append(h)
+            if len(matched_hashes) <= 1:
+                continue
+            # Keep the one that matches the tracked file; relabel the rest
+            for h in matched_hashes:
+                info = radarr_torrents[h]
+                name = info.get('name', '')
+                if _torrent_name_matches_file(name, tracked):
+                    continue
+                log.info(f'  relabeling superseded: "{name}" (movie {movie["id"]}: {movie.get("title")}) — tracked file is {tracked}')
+                set_torrent_label(h, SUPERSEDED_LABEL)
+                relabeled += 1
+        log.info(f'Radarr dedup complete: relabeled {relabeled} superseded torrent(s)')
+    except Exception as e:
+        log.error(f'Radarr dedup failed: {e}')
+
+def dedup_via_sonarr():
+    log.info('Running Sonarr → Deluge dedup pass...')
+    if not SONARR_API_KEY:
+        log.info('  no SONARR_API_KEY, skip')
+        return
+    try:
+        deluge_login()
+        ensure_label_exists()
+        torrents = get_all_torrents()
+        sonarr_torrents = {h: i for h, i in torrents.items() if i.get('label') in ('sonarr', SONARR_UPG_LABEL)}
+        if not sonarr_torrents:
+            log.info('  no sonarr-labeled torrents to check')
+            return
+        # Sonarr episodeFile lookup: per series, gather all tracked file
+        # relativePaths, then per torrent that matches the series title,
+        # relabel superseded if its name doesn't correspond to any tracked file.
+        r = requests.get(
+            f'{SONARR_URL}/api/v3/series',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            timeout=30,
+        )
+        r.raise_for_status()
+        relabeled = 0
+        for series in r.json():
+            series_id = series['id']
+            title_variants = get_sonarr_series_titles(series_id)
+            if not title_variants:
+                title_variants = {series.get('title', '').lower()}
+            # Fetch tracked episode files
+            try:
+                ef = requests.get(
+                    f'{SONARR_URL}/api/v3/episodefile',
+                    headers={'X-Api-Key': SONARR_API_KEY},
+                    params={'seriesId': series_id},
+                    timeout=20,
+                )
+                ef.raise_for_status()
+                tracked_paths = [(f.get('relativePath') or '').lower() for f in ef.json()]
+            except Exception:
+                continue
+            if not tracked_paths:
+                continue
+            # Match torrents against this series
+            matched_hashes = []
+            for h, info in sonarr_torrents.items():
+                name = info.get('name', '')
+                if torrent_matches_any_title(name, title_variants):
+                    matched_hashes.append(h)
+            if len(matched_hashes) <= len(tracked_paths):
+                continue  # 1 torrent per tracked file is normal
+            for h in matched_hashes:
+                info = sonarr_torrents[h]
+                name = info.get('name', '').lower()
+                if any(_torrent_name_matches_file(name, p) for p in tracked_paths):
+                    continue
+                log.info(f'  relabeling superseded: "{info.get("name")}" (series {series_id}: {series.get("title")})')
+                set_torrent_label(h, SUPERSEDED_LABEL)
+                relabeled += 1
+        log.info(f'Sonarr dedup complete: relabeled {relabeled} superseded torrent(s)')
+    except Exception as e:
+        log.error(f'Sonarr dedup failed: {e}')
+
+
+# ── Unpackerr — remove torrents that had to be extracted ────────────────────
+# When unpackerr had to unrar a download so *arr could import, the .rar/.r00
+# files stay in the torrent's original folder. Radarr hardlinks the extracted
+# .mkv into Media, so the torrent's disk-space cost is pure archive. After
+# SEED_DAYS have passed since unpack we remove the torrent + its rar files.
+#
+# We identify "unpacked" torrents by: the torrent's save_path contains .rar
+# files AND Radarr/Sonarr has an imported file that references this download.
+# Track state in a sidecar JSON so we know the "unpacked at" timestamp.
+
+import json as _json
+_UNPACK_STATE_PATH = os.environ.get('UNPACK_STATE_PATH', '/data/unpacked_torrents.json')
+
+def _load_unpack_state():
+    try:
+        with open(_UNPACK_STATE_PATH) as f:
+            return _json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+def _save_unpack_state(state):
+    try:
+        with open(_UNPACK_STATE_PATH, 'w') as f:
+            _json.dump(state, f)
+    except Exception as e:
+        log.warning(f'[unpack] failed to persist state: {e}')
+
+def _torrent_has_rar(save_path, torrent_name):
+    """Best-effort: check whether the torrent folder contains a rar set.
+    Different Deluge setups mount paths differently; assume the container
+    has visibility into /data (standard on Unraid)."""
+    try:
+        base = os.path.join(save_path, torrent_name)
+        if os.path.isdir(base):
+            for entry in os.listdir(base):
+                low = entry.lower()
+                if low.endswith('.rar') or re.match(r'.*\.r\d\d$', low):
+                    return True
+        # Some torrents are single-file at save_path with .rar
+        if os.path.isdir(save_path):
+            for entry in os.listdir(save_path):
+                low = entry.lower()
+                if torrent_name.lower() in low and (low.endswith('.rar') or re.match(r'.*\.r\d\d$', low)):
+                    return True
+    except Exception:
+        pass
+    return False
+
+def cleanup_unpacked_torrents():
+    log.info('Running unpacked-torrent removal pass...')
+    try:
+        deluge_login()
+        torrents = get_all_torrents()
+        state = _load_unpack_state()
+        now = time.time()
+        removed = 0
+        # First: mark newly discovered rar-torrents
+        for h, info in torrents.items():
+            if h in state:
+                continue
+            if info.get('label') == SUPERSEDED_LABEL:
+                continue
+            if _torrent_has_rar(info.get('save_path', ''), info.get('name', '')):
+                state[h] = {'first_seen_rar_at': now, 'name': info.get('name', '')}
+                log.info(f'[unpack] marking rar-torrent (aging out in {SEED_DAYS}d): {info.get("name")}')
+        # Then: remove those that have aged out
+        threshold = SEED_DAYS * 86400
+        for h in list(state.keys()):
+            if h not in torrents:
+                # torrent no longer in Deluge, drop from state
+                state.pop(h, None)
+                continue
+            age = now - state[h].get('first_seen_rar_at', now)
+            if age >= threshold:
+                log.info(f'[unpack] removing rar-torrent aged {age/86400:.1f}d: {state[h].get("name")}')
+                remove_torrent(h)
+                state.pop(h, None)
+                removed += 1
+        _save_unpack_state(state)
+        log.info(f'Unpacked-torrent cleanup complete: removed {removed}')
+    except Exception as e:
+        log.error(f'Unpacked-torrent cleanup failed: {e}')
 
 
 def cleanup_radarr_queue_dupes():
