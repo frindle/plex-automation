@@ -1547,6 +1547,58 @@ def deluge_lookup():
             })
     return jsonify({'ok': True, 'count': len(hits), 'hits': hits}), 200
 
+# List unlabeled Deluge torrents matching TV patterns (SxxExx, "Season N",
+# "Complete Series", TV-quality strings). These are typically pre-Sonarr
+# leftovers — grabbed manually before this project. Read-only; returns
+# the list so the user can decide what to do (relabel, move, delete).
+@app.route('/unlabeled-tv-scan', methods=['GET'])
+def unlabeled_tv_scan():
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'label', 'save_path', 'time_added', 'total_size', 'progress', 'state']],
+                'id': 88,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    tv_re = re.compile(
+        r'(s\d{1,2}e\d{1,2}|season[\s._-]*\d+|complete[\s._-]series|\b\d{3,4}p[\s._-]*(hdtv|web|webrip))',
+        re.IGNORECASE,
+    )
+    hits = []
+    total_gb = 0.0
+    for h, info in torrents.items():
+        if (info.get('label') or '').strip():
+            continue
+        name = info.get('name') or ''
+        if not tv_re.search(name):
+            continue
+        size_gb = round((info.get('total_size') or 0) / (1024**3), 2)
+        total_gb += size_gb
+        hits.append({
+            'hash': h,
+            'name': name,
+            'save_path': info.get('save_path'),
+            'size_gb': size_gb,
+            'state': info.get('state'),
+            'progress': info.get('progress'),
+            'time_added': info.get('time_added'),
+        })
+    hits.sort(key=lambda x: x.get('time_added') or 0)
+    return jsonify({
+        'ok': True,
+        'count': len(hits),
+        'total_gb': round(total_gb, 2),
+        'torrents': hits,
+    }), 200
+
 # Cross-reference Deluge completed torrents against Radarr/Sonarr state
 # to surface the "grabbed → downloaded → never imported" failures that
 # the queue endpoint hides once retries expire.
