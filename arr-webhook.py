@@ -248,6 +248,15 @@ def cleanup_scheduler():
 # 'superseded' so the existing cleanup_superseded pass removes them after
 # SEED_DAYS. This is what cleans up the pile-of-dupes from the pre-fix era.
 
+def _extract_year(text):
+    """Pull a 4-digit release year (1900-2099) from a torrent or file name.
+    Returns int or None. Uses word-boundary lookarounds so we don't hit
+    parts of a larger number."""
+    if not text:
+        return None
+    m = re.search(r'(?<!\d)(19\d{2}|20\d{2})(?!\d)', text)
+    return int(m.group(1)) if m else None
+
 def _torrent_name_matches_file(torrent_name, tracked_relative_path):
     """True if the torrent name looks like the tracked file (fuzzy match on
     name minus extension). Radarr's relativePath is like 'Movie 2022...mkv';
@@ -294,12 +303,21 @@ def dedup_via_radarr():
             title_variants = get_radarr_movie_titles(movie['id'])
             if not title_variants:
                 title_variants = {movie.get('title', '').lower()}
-            # Match torrents against this movie
+            movie_year = movie.get('year')
+            # Match torrents against this movie. Both title AND year must
+            # line up — title-only matching bled across sequels/remakes
+            # (Ghostbusters '84 vs Ghostbusters II '89, Scream '96 vs
+            # Scream '22, etc.). A ±1 year fudge covers release vs
+            # production year drift.
             matched_hashes = []
             for h, info in radarr_torrents.items():
                 name = info.get('name', '')
-                if torrent_matches_any_title(name, title_variants):
-                    matched_hashes.append(h)
+                if not torrent_matches_any_title(name, title_variants):
+                    continue
+                t_year = _extract_year(name)
+                if movie_year and t_year and abs(t_year - movie_year) > 1:
+                    continue
+                matched_hashes.append(h)
             if len(matched_hashes) <= 1:
                 continue
             # Safety: only relabel extras if AT LEAST ONE torrent maps to the
