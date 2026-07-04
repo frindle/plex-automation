@@ -1066,8 +1066,8 @@ def monthly_search_scheduler():
             log.info('Waiting 30 minutes before bulk search...')
             time.sleep(1800)  # 30 minutes
             radarr_bulk_search()
-            log.info('Waiting 90 minutes before relabeling upgrades...')
-            time.sleep(5400)  # 90 minutes
+            log.info('Waiting 5 minutes before relabeling upgrades...')
+            time.sleep(300)  # 5 minutes
             relabel_radarr_upgrades()
             log.info('Monthly upgrade cycle complete')
         time.sleep(3600)  # check every hour
@@ -1203,7 +1203,7 @@ def run_monthly_upgrade():
         log.info(f'Waiting {wait_a}s before bulk search...')
         time.sleep(wait_a)
         radarr_bulk_search()
-        wait_b = 30 if skip_waits else 5400
+        wait_b = 30 if skip_waits else 300
         log.info(f'Waiting {wait_b}s before relabeling upgrades...')
         time.sleep(wait_b)
         relabel_radarr_upgrades()
