@@ -5,6 +5,7 @@ import time
 import logging
 import threading
 import requests
+from datetime import datetime
 from flask import Flask, request, jsonify
 
 from media_share import share_bp, init_db as init_share_db
@@ -25,6 +26,10 @@ SUPERSEDED_LABEL  = 'superseded'
 LIBRARY_SEED_LABEL = 'library-seed'
 SONARR_UPG_LABEL  = os.environ.get('SONARR_UPGRADE_LABEL', 'sonarr-upgrade')
 RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
+# Rolling cutoff: Radarr grabs for movies released more than N years ago
+# get throttled into the -upgrade lane even on first fetch. Ages
+# automatically.
+OLD_GAP_YEARS     = int(os.environ.get('OLD_GAP_YEARS', '10'))
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
 # Root of the movies library from the CONTAINER's perspective — used by
@@ -952,21 +957,32 @@ def is_upgrade_sonarr(data):
         return False
 
 def is_upgrade_radarr(data):
-    """Check if this grab is an upgrade by seeing if the movie already has a file."""
+    """
+    Return a reason string if this grab should be throttled:
+      - 'upgrade' — movie already has a file
+      - 'old_gap' — no file, but release year is older than the rolling cutoff
+    Returns None otherwise.
+    """
     try:
         movie_id = data.get('movie', {}).get('id')
         if not movie_id:
-            return False
+            return None
         r = requests.get(
             f"{RADARR_URL}/api/v3/movie/{movie_id}",
             headers={'X-Api-Key': RADARR_API_KEY},
             timeout=10
         )
         r.raise_for_status()
-        return r.json().get('hasFile', False)
+        movie = r.json()
+        if movie.get('hasFile'):
+            return 'upgrade'
+        year = movie.get('year')
+        if year and year < (datetime.now().year - OLD_GAP_YEARS):
+            return 'old_gap'
+        return None
     except Exception as e:
         log.error(f"Radarr upgrade check failed: {e}")
-        return False
+        return None
 
 def handle_grab(data, source):
     """
@@ -1001,6 +1017,71 @@ def handle_grab(data, source):
     time.sleep(3)
     try:
         deluge_login()
+        # Revive-superseded: if this hash is already in Deluge as
+        # `superseded` AND fully downloaded, Radarr/Sonarr is re-grabbing a
+        # file we already have on disk. Instead of throttling it as an
+        # upgrade, flip it back to the active label + kick a rescan so the
+        # arr re-imports for free (no bandwidth). The currently-active
+        # torrent's Download webhook path handles supersede-on-import.
+        existing = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrent_status',
+                'params': [download_id, ['label', 'progress', 'save_path']],
+                'id': 91,
+            },
+            timeout=10,
+        ).json().get('result') or {}
+        existing_label = existing.get('label')
+        existing_progress = existing.get('progress') or 0
+        existing_save_path = existing.get('save_path') or ''
+        # In-flight case: same hash already in Deluge, still downloading, and
+        # already labeled as an -upgrade. Means Radarr/Sonarr re-fired the
+        # Grab webhook for a throttled download that was already in progress
+        # (rare but seen). Sanity-check label + save_path, then bail — nothing
+        # else to do since the download is already running.
+        if existing_label in (SONARR_UPG_LABEL, RADARR_UPG_LABEL) and existing_progress < 99.0:
+            downloads_root = os.environ.get('DOWNLOADS_MOUNT', '/data/Downloads')
+            if existing_label != upgrade_label:
+                log.warning(
+                    f"{source}: in-flight grab {download_id} has wrong upgrade label "
+                    f"'{existing_label}' (expected '{upgrade_label}') — correcting"
+                )
+                ensure_label_exists_named(upgrade_label)
+                set_torrent_label(download_id, upgrade_label)
+            else:
+                log.info(f"{source}: in-flight grab {download_id} already labeled correctly")
+            if existing_save_path and not existing_save_path.startswith(downloads_root):
+                log.error(
+                    f"{source}: in-flight grab {download_id} has save_path "
+                    f"'{existing_save_path}' outside {downloads_root} — investigate"
+                )
+            return
+        if existing_label == SUPERSEDED_LABEL and existing_progress >= 99.0:
+            base_label = 'sonarr' if source == 'Sonarr' else 'radarr'
+            log.warning(
+                f"{source}: grab {download_id} matches already-superseded complete torrent — "
+                f"reviving with label '{base_label}' and firing rescan"
+            )
+            ensure_label_exists_named(base_label)
+            set_torrent_label(download_id, base_label)
+            try:
+                if source == 'Radarr':
+                    scan_cmd, url, key = 'DownloadedMoviesScan', RADARR_URL, RADARR_API_KEY
+                else:
+                    scan_cmd, url, key = 'DownloadedEpisodesScan', SONARR_URL, SONARR_API_KEY
+                save_path = existing.get('save_path') or ''
+                if save_path and key:
+                    requests.post(
+                        f'{url}/api/v3/command',
+                        headers={'X-Api-Key': key},
+                        json={'name': scan_cmd, 'path': save_path, 'downloadClientId': download_id},
+                        timeout=15,
+                    )
+                    log.info(f"{source}: fired {scan_cmd} on {save_path}")
+            except Exception as e:
+                log.error(f"{source}: revive rescan failed: {e}")
+            return
         ensure_label_exists_named(upgrade_label)
         set_torrent_label(download_id, upgrade_label)
         session.post(
