@@ -1141,6 +1141,43 @@ def sonarr_webhook():
 def health():
     return jsonify({'status': 'ok'}), 200
 
+# Debug: look up torrents in Deluge whose name contains ?name=<substr>
+# and report save_path + files. Useful when a Radarr import fails with
+# "no video files found" and you need to see what Deluge thinks it
+# downloaded and where.
+@app.route('/deluge-lookup', methods=['GET', 'POST'])
+def deluge_lookup():
+    q = (request.args.get('name') or '').lower()
+    if not q:
+        return jsonify({'ok': False, 'error': 'name query param required'}), 400
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'save_path', 'files', 'label', 'progress', 'state']],
+                'id': 99,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    hits = []
+    for h, info in (resp.json().get('result') or {}).items():
+        if q in (info.get('name') or '').lower():
+            hits.append({
+                'hash': h,
+                'name': info.get('name'),
+                'label': info.get('label'),
+                'save_path': info.get('save_path'),
+                'state': info.get('state'),
+                'progress': info.get('progress'),
+                'files': [f.get('path') if isinstance(f, dict) else str(f) for f in (info.get('files') or [])],
+            })
+    return jsonify({'ok': True, 'count': len(hits), 'hits': hits}), 200
+
 # Emergency revert for the mass-superseded-relabel bug. Flips every
 # torrent currently labeled `superseded` back to `radarr` or `sonarr`
 # based on which system knows about it. Idempotent; safe to hit twice.
