@@ -1758,6 +1758,9 @@ def _filename_year(basename):
     m = FILENAME_YEAR_RE.search(basename)
     return int(m.group(1)) if m else None
 
+def _year_in_title(text):
+    return set(int(y) for y in FILENAME_YEAR_RE.findall(text or ''))
+
 @app.route('/plex-dupe-scan', methods=['GET'])
 def plex_dupe_scan():
     if not PLEX_TOKEN:
@@ -1804,9 +1807,23 @@ def plex_dupe_scan():
                         f_tokens = _filename_title_tokens(base) - {'the', 'a', 'an', 'of', 'and'}
                         f_year = _filename_year(base)
                         if title_tokens and f_tokens:
+                            # False positive killers:
+                            #   - "Wonder Woman 1984" grabs 1984 as year from title itself
+                            #     → skip year_mismatch if f_year appears in parent title text
+                            #   - "Dune: Part One" file "Dune (2021)" → file tokens ⊆ title tokens
+                            #     means it's the same movie, Plex just has a fuller title
+                            title_years = _year_in_title(title)
+                            file_is_subset = f_tokens.issubset(title_tokens)
                             overlap = len(title_tokens & f_tokens) / max(1, len(title_tokens))
-                            year_mismatch = year and f_year and abs(f_year - year) > 1
-                            if overlap < 0.5 or year_mismatch:
+                            reverse_overlap = len(title_tokens & f_tokens) / max(1, len(f_tokens))
+                            year_mismatch = (
+                                year and f_year
+                                and abs(f_year - year) > 1
+                                and f_year not in title_years
+                            )
+                            # Real mismatch: filename doesn't overlap AND isn't a
+                            # subset of title, OR year genuinely disagrees.
+                            if year_mismatch or (overlap < 0.5 and reverse_overlap < 0.7 and not file_is_subset):
                                 mismatched.append({
                                     'file': base,
                                     'file_year': f_year,
