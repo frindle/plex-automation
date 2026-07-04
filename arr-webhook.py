@@ -1240,7 +1240,7 @@ def purge_non_radarr():
     apply_ = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
     keep_labels = {
         s.strip().lower() for s in
-        request.args.get('keep', 'radarr,radarr-upgrade').split(',')
+        request.args.get('keep', 'radarr,radarr-upgrade,superseded').split(',')
         if s.strip()
     }
     try:
