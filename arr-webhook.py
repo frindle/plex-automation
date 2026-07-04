@@ -22,6 +22,7 @@ SONARR_API_KEY   = os.environ.get('SONARR_API_KEY', '')
 RADARR_URL       = os.environ.get('RADARR_URL', 'http://10.0.0.7:7878')
 RADARR_API_KEY   = os.environ.get('RADARR_API_KEY', '')
 SUPERSEDED_LABEL  = 'superseded'
+LIBRARY_SEED_LABEL = 'library-seed'
 SONARR_UPG_LABEL  = os.environ.get('SONARR_UPGRADE_LABEL', 'sonarr-upgrade')
 RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
@@ -909,7 +910,11 @@ def handle_upgrade_import(data, source):
             except Exception as e:
                 log.warning(f'{source}: post-import relabel failed for {new_torrent_hash}: {e}')
 
-    # Find and supersede old torrents
+    # Find and supersede old torrents. Sweeps everything that matches
+    # the title+search_term regardless of label (radarr, sonarr,
+    # library-seed, blank) — the point of an upgrade is to replace the
+    # old file wherever it came from. Already-superseded is the one
+    # skip because it's already in the flow.
     for torrent_hash, info in torrents.items():
         if torrent_hash == new_torrent_hash:
             continue
