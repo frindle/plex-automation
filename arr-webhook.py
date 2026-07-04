@@ -1981,7 +1981,7 @@ def plex_dupe_fix():
                 'plex_key': plex_key,
                 'title': entry.get('title'),
                 'file': basenames[0],
-                'action': f'Plex → item → ⋯ → Refresh Metadata',
+                'action': 'Plex → item → ⋯ → Refresh Metadata',
             })
             continue
         # Score each Media: (resolution_rank, size_gb). Higher wins.
