@@ -23,7 +23,7 @@ services:
         ipv4_address: 10.0.0.4
     volumes:
       - ./data:/data
-      - "/mnt/user/data/Media/Movies:/media/movies:ro"
+      - "/mnt/user/data/Media/Movies:/media/movies"
       - "/mnt/user/data/Media/TV Shows:/media/tv:ro"
       - "/mnt/user/data/Media/Music:/media/music:ro"
 

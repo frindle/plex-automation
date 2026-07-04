@@ -26,10 +26,10 @@ SONARR_UPG_LABEL  = os.environ.get('SONARR_UPGRADE_LABEL', 'sonarr-upgrade')
 RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
-# Root of the movies library — used by /orphan-scan to find files that
-# Radarr no longer tracks. Override in the compose file if your layout
-# differs from /mnt/user/data/Media/Movies.
-MOVIES_LIBRARY   = os.environ.get('MOVIES_LIBRARY', '/mnt/user/data/Media/Movies')
+# Root of the movies library from the CONTAINER's perspective — used by
+# /orphan-scan. Radarr may report paths from the host's perspective, so
+# matching is done by filename basename rather than absolute path.
+MOVIES_LIBRARY   = os.environ.get('MOVIES_LIBRARY', '/media/movies')
 PUSHOVER_TOKEN   = os.environ.get('PUSHOVER_TOKEN', '')
 PUSHOVER_USER    = os.environ.get('PUSHOVER_USER', '')
 IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  # 15 min
@@ -1211,20 +1211,17 @@ def orphan_scan():
             timeout=30,
         )
         r.raise_for_status()
-        # Collect the exact path of every file Radarr currently tracks.
-        # movieFile.path may be relative to the movie folder OR absolute
-        # depending on Radarr version — handle both.
-        tracked_paths = set()
+        # Collect the basename of every file Radarr currently tracks.
+        # Container's view of the movie library differs from Radarr's
+        # (bind mount at /media/movies vs host /mnt/user/... etc), so
+        # matching on absolute paths won't work. Basename matching is
+        # robust because movie release filenames are effectively unique.
+        tracked_names = set()
         for m in r.json():
             mf = m.get('movieFile') or {}
-            path = mf.get('path')
-            if not path:
-                continue
-            if not os.path.isabs(path):
-                # Radarr stores movie.path (the folder) + movieFile.relativePath
-                folder = m.get('path', '')
-                path = os.path.join(folder, path)
-            tracked_paths.add(os.path.normpath(path))
+            path = mf.get('path') or mf.get('relativePath') or ''
+            if path:
+                tracked_names.add(os.path.basename(path))
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Radarr fetch failed: {e}'}), 500
     orphans = []
@@ -1233,9 +1230,9 @@ def orphan_scan():
         for f in files:
             if not f.lower().endswith(video_exts):
                 continue
-            full = os.path.normpath(os.path.join(root, f))
-            if full in tracked_paths:
+            if f in tracked_names:
                 continue
+            full = os.path.normpath(os.path.join(root, f))
             try:
                 size = os.path.getsize(full)
             except OSError:
@@ -1254,7 +1251,7 @@ def orphan_scan():
     return jsonify({
         'ok': True,
         'dry_run': not delete,
-        'tracked_count': len(tracked_paths),
+        'tracked_count': len(tracked_names),
         'orphan_count': len(orphans),
         'orphan_total_gb': round(total_bytes / (1024**3), 2),
         'deleted': deleted,
