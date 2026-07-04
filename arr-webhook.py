@@ -1116,6 +1116,14 @@ def revert_superseded():
             skipped += 1
     return jsonify({'ok': True, 'reverted': reverted, 'skipped': skipped}), 200
 
+# Manual trigger for the dedup pass — use to verify the fixed matcher
+# behaves before waiting for the 24h scheduled tick.
+@app.route('/run-dedup', methods=['POST'])
+def run_dedup():
+    threading.Thread(target=dedup_via_radarr, daemon=True).start()
+    threading.Thread(target=dedup_via_sonarr, daemon=True).start()
+    return jsonify({'ok': True, 'message': 'dedup passes started; check container logs'}), 200
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 9876))
     log.info(f'Starting arr-webhook listener on port {port}')
