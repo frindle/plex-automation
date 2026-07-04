@@ -1547,6 +1547,133 @@ def deluge_lookup():
             })
     return jsonify({'ok': True, 'count': len(hits), 'hits': hits}), 200
 
+# Cross-reference Deluge completed torrents against Radarr/Sonarr state
+# to surface the "grabbed → downloaded → never imported" failures that
+# the queue endpoint hides once retries expire.
+#
+#   bucket_failed_import: Deluge torrent labeled radarr/radarr-upgrade,
+#     progress ~100, but the matching Radarr movie has hasFile=false.
+#     This is the actionable list — real failed imports.
+#   bucket_no_seed: Radarr hasFile=true but no torrent name/file basename
+#     matches in Deluge. Not a failure, just not seeding anymore.
+#   bucket_orphan_torrent: labeled radarr/radarr-upgrade but no Radarr
+#     movie matches the torrent name at all.
+@app.route('/import-audit', methods=['GET'])
+def import_audit():
+    service = (request.args.get('service') or 'radarr').lower()
+    if service != 'radarr':
+        return jsonify({'ok': False, 'error': 'only radarr supported currently'}), 400
+    if not RADARR_API_KEY:
+        return jsonify({'ok': False, 'error': 'no RADARR_API_KEY'}), 400
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/movie',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            timeout=60,
+        )
+        r.raise_for_status()
+        movies = r.json()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Radarr fetch failed: {e}'}), 500
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'label', 'save_path', 'files', 'progress', 'state']],
+                'id': 77,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Deluge fetch failed: {e}'}), 500
+    radarr_labels = {'radarr', 'radarr-upgrade'}
+    seed_basenames = set()
+    for h, info in torrents.items():
+        n = info.get('name')
+        if n:
+            seed_basenames.add(os.path.basename(n))
+        for f in (info.get('files') or []):
+            p = f.get('path') if isinstance(f, dict) else str(f)
+            if p:
+                seed_basenames.add(os.path.basename(p))
+    bucket_failed = []
+    bucket_no_seed = []
+    bucket_orphan = []
+    matched_movie_ids = set()
+    for h, info in torrents.items():
+        if (info.get('label') or '').lower() not in radarr_labels:
+            continue
+        if (info.get('progress') or 0) < 99.0:
+            continue
+        tname = info.get('name') or ''
+        hit = None
+        for m in movies:
+            titles = {
+                (m.get('title') or '').lower(),
+                (m.get('originalTitle') or '').lower(),
+            }
+            titles.discard('')
+            if torrent_matches_any_title(tname, titles):
+                hit = m
+                break
+        if not hit:
+            bucket_orphan.append({
+                'hash': h,
+                'name': tname,
+                'label': info.get('label'),
+                'save_path': info.get('save_path'),
+            })
+            continue
+        matched_movie_ids.add(hit.get('id'))
+        if not hit.get('hasFile'):
+            bucket_failed.append({
+                'movie_id': hit.get('id'),
+                'title': hit.get('title'),
+                'year': hit.get('year'),
+                'hash': h,
+                'torrent_name': tname,
+                'save_path': info.get('save_path'),
+                'state': info.get('state'),
+            })
+    for m in movies:
+        if not m.get('hasFile'):
+            continue
+        mf = m.get('movieFile') or {}
+        rel = mf.get('relativePath') or (mf.get('path') or '')
+        base = os.path.basename(rel) if rel else ''
+        if not base:
+            continue
+        if base in seed_basenames:
+            continue
+        bucket_no_seed.append({
+            'movie_id': m.get('id'),
+            'title': m.get('title'),
+            'year': m.get('year'),
+            'tracked_file': base,
+            'size_gb': round((mf.get('size') or 0) / (1024**3), 2),
+        })
+    return jsonify({
+        'ok': True,
+        'service': service,
+        'totals': {
+            'radarr_movies': len(movies),
+            'deluge_torrents': len(torrents),
+            'radarr_labeled_torrents': sum(1 for i in torrents.values() if (i.get('label') or '').lower() in radarr_labels),
+        },
+        'bucket_failed_import': bucket_failed,
+        'bucket_orphan_torrent': bucket_orphan,
+        'bucket_no_seed': bucket_no_seed,
+        'counts': {
+            'failed_import': len(bucket_failed),
+            'orphan_torrent': len(bucket_orphan),
+            'no_seed': len(bucket_no_seed),
+        },
+    }), 200
+
 # Emergency revert for the mass-superseded-relabel bug. Flips every
 # torrent currently labeled `superseded` back to `radarr` or `sonarr`
 # based on which system knows about it. Idempotent; safe to hit twice.
