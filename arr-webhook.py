@@ -55,8 +55,11 @@ def _translate_plex_path(p):
     if not p:
         return p
     for plex_prefix, local_prefix in PLEX_PATH_MAP:
-        if p.startswith(plex_prefix):
-            return local_prefix + p[len(plex_prefix):]
+        # Require a directory boundary so a short prefix like `/data/M`
+        # doesn't accidentally match `/data/Movies` AND `/data/Music`.
+        prefix = plex_prefix.rstrip('/')
+        if p == prefix or p.startswith(prefix + '/'):
+            return local_prefix.rstrip('/') + p[len(prefix):]
     return p
 # Comma-separated library titles to skip in plex-dupe-scan (case-insensitive).
 PLEX_SKIP_LIBRARIES = {s.strip().lower() for s in os.environ.get('PLEX_SKIP_LIBRARIES', 'Adult,XXX,NSFW,Music,Music Videos').split(',') if s.strip()}
@@ -173,31 +176,36 @@ def ensure_label_exists():
         log.info(f'Created label: {SUPERSEDED_LABEL}')
 
 _created_labels_cache = set()
+_created_labels_lock = threading.Lock()
 
 def _ensure_deluge_label(label):
     """Deluge silently rejects set-label calls for labels that don't
-    exist yet. Auto-create on first use."""
-    if not label or label in _created_labels_cache:
+    exist yet. Auto-create on first use. Serialized with a lock so
+    concurrent grab webhooks don't race on the cache check."""
+    if not label:
         return
-    try:
-        resp = session.post(
-            f'{DELUGE_URL}/json',
-            json={'method': 'label.get_labels', 'params': [], 'id': 40},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        existing = set(resp.json().get('result') or [])
-        _created_labels_cache.update(existing)
-        if label not in existing:
-            session.post(
+    with _created_labels_lock:
+        if label in _created_labels_cache:
+            return
+        try:
+            resp = session.post(
                 f'{DELUGE_URL}/json',
-                json={'method': 'label.add', 'params': [label], 'id': 41},
+                json={'method': 'label.get_labels', 'params': [], 'id': 40},
                 timeout=10,
-            ).raise_for_status()
-            _created_labels_cache.add(label)
-            log.info(f'Auto-created Deluge label: {label}')
-    except Exception as e:
-        log.warning(f'ensure_label({label}) failed: {e}')
+            )
+            resp.raise_for_status()
+            existing = set(resp.json().get('result') or [])
+            _created_labels_cache.update(existing)
+            if label not in existing:
+                session.post(
+                    f'{DELUGE_URL}/json',
+                    json={'method': 'label.add', 'params': [label], 'id': 41},
+                    timeout=10,
+                ).raise_for_status()
+                _created_labels_cache.add(label)
+                log.info(f'Auto-created Deluge label: {label}')
+        except Exception as e:
+            log.warning(f'ensure_label({label}) failed: {e}')
 
 def set_torrent_label(torrent_hash, label):
     _ensure_deluge_label(label)
@@ -1070,6 +1078,11 @@ def handle_grab(data, source):
                     scan_cmd, url, key = 'DownloadedMoviesScan', RADARR_URL, RADARR_API_KEY
                 else:
                     scan_cmd, url, key = 'DownloadedEpisodesScan', SONARR_URL, SONARR_API_KEY
+                # NOTE: save_path is the Deluge container's view. Radarr/
+                # Sonarr must have the same path mounted the same way for
+                # the scan to find the file. Our stack has matching mounts
+                # (/data/Downloads/... everywhere) so this holds — but if
+                # that ever diverges the scan will silently no-op.
                 save_path = existing.get('save_path') or ''
                 if save_path and key:
                     requests.post(
@@ -2133,8 +2146,11 @@ def relabel_by_plex():
     if not PLEX_TOKEN:
         return jsonify({'ok': False, 'error': 'no PLEX_TOKEN'}), 400
     apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
-    # Build basename → label map from Plex
+    # Build basename → label map from Plex. Track collisions (same
+    # basename appearing in both movie and TV libraries) so we can
+    # punt them to the review bucket instead of guessing.
     plex_basenames = {}  # basename → 'radarr' | 'sonarr'
+    plex_basename_collisions = set()
     try:
         sections = _plex_get('/library/sections').get('MediaContainer', {}).get('Directory') or []
     except Exception as e:
@@ -2155,8 +2171,12 @@ def relabel_by_plex():
                     for m in (item.get('Media') or []):
                         for p in (m.get('Part') or []):
                             fname = os.path.basename(p.get('file') or '')
-                            if fname:
-                                plex_basenames[fname] = target_label
+                            if not fname:
+                                continue
+                            prev = plex_basenames.get(fname)
+                            if prev and prev != target_label:
+                                plex_basename_collisions.add(fname)
+                            plex_basenames[fname] = target_label
             else:
                 shows = _plex_get(f'/library/sections/{skey}/all').get('MediaContainer', {}).get('Metadata') or []
                 for show in shows:
@@ -2202,7 +2222,12 @@ def relabel_by_plex():
         ]
         matched_label = None
         matched_via = None
+        collision = False
         for cand in candidates:
+            if cand in plex_basename_collisions:
+                collision = True
+                matched_via = cand
+                break
             if cand in plex_basenames:
                 matched_label = plex_basenames[cand]
                 matched_via = cand
@@ -2213,7 +2238,10 @@ def relabel_by_plex():
             'save_path': info.get('save_path'),
             'matched_via': matched_via,
         }
-        if matched_label:
+        if collision:
+            entry['reason'] = 'basename collides between movie + TV libraries'
+            plan['review'].append(entry)
+        elif matched_label:
             entry['label'] = matched_label
             if apply:
                 try:
@@ -2352,20 +2380,43 @@ def torrent_move():
 # sight of it and cleanup_superseded takes it out after SEED_DAYS.
 # Dry-run default. ?apply=1 executes.
 def _find_torrent_by_filepath(torrents, filepath):
-    """Return (hash, torrent_info) if any torrent has a file whose
-    path or basename matches the given filepath."""
+    """Find the Deluge torrent seeding a specific file.
+
+    Two-pass match to avoid the "S01E01.mkv in two different shows"
+    ambiguity that basename-only matching had:
+      1. Full-path suffix match against the torrent's save_path + file path
+         (or save_path + name for single-file torrents). Deterministic.
+      2. Basename-only fallback, but only when exactly one candidate exists.
+         Multiple basename matches → return None (unsafe to guess)."""
     if not filepath:
         return None, None
-    target_base = os.path.basename(filepath)
+    target_norm = filepath.rstrip('/')
+    target_base = os.path.basename(target_norm)
+    basename_hits = []
     for h, info in torrents.items():
-        # Direct name match (single-file torrents)
-        if info.get('name') == target_base:
-            return h, info
-        # Multi-file torrents — check the files list
+        save_path = (info.get('save_path') or '').rstrip('/')
+        # Single-file torrents
+        name = info.get('name') or ''
+        if name and save_path:
+            full = f'{save_path}/{name}'
+            if full == target_norm or target_norm.endswith('/' + name) and target_norm == full:
+                return h, info
+        if name == target_base:
+            basename_hits.append((h, info))
+        # Multi-file torrents
         for f in (info.get('files') or []):
             p = f.get('path') if isinstance(f, dict) else str(f)
-            if os.path.basename(p) == target_base:
+            if not p:
+                continue
+            full = f'{save_path}/{p}' if save_path else p
+            if full == target_norm or target_norm.endswith('/' + p):
                 return h, info
+            if os.path.basename(p) == target_base:
+                basename_hits.append((h, info))
+                break
+    unique_hashes = {h for h, _ in basename_hits}
+    if len(unique_hashes) == 1:
+        return basename_hits[0]
     return None, None
 
 @app.route('/plex-dupe-fix', methods=['POST', 'GET'])
@@ -2803,7 +2854,16 @@ def quality_audit():
         rel_l = rel.lower()
         # Fall back to filename markers when mediaInfo is missing
         has_surround = channels >= 5.1 or any(t in rel_l for t in ['5.1', '7.1', 'atmos', 'truehd', 'ddp', 'dts'])
-        has_hdr = bool(dyn_range) or any(t in rel_l for t in ['hdr', 'dv ', 'dovi', 'dolby.vision', 'dolby vision'])
+        # HDR fallback markers: real releases use dot/space delimited tags
+        # like `.DV.`, `.DoVi.`, `.HDR10+.`. Match with delimiters so we
+        # don't falsely fire on words that contain "dv" or "hdr" as
+        # substrings.
+        has_hdr = bool(dyn_range) or any(
+            t in rel_l for t in [
+                '.hdr.', ' hdr ', '.hdr10.', '.hdr10+.', '.dv.', ' dv ',
+                '.dovi.', 'dolby.vision', 'dolby vision', '.uhd.',
+            ]
+        )
         has_x265 = 'x265' in video_codec or 'hevc' in video_codec or any(t in rel_l for t in ['x265', 'hevc', 'h265', 'h.265'])
         missing = set()
         if not has_surround:
@@ -2944,6 +3004,71 @@ def run_dedup():
 def run_cleanup():
     threading.Thread(target=cleanup_superseded, daemon=True).start()
     return jsonify({'ok': True, 'message': f'cleanup started; will remove superseded torrents seeded ≥ {SEED_DAYS} days'}), 200
+
+# Report-only audit of everything labeled `superseded`: how long each has
+# been seeding, whether it's already past SEED_DAYS (i.e. would be swept
+# by the next cleanup run), and whether its save_path is under SEEDING_DIR
+# (where superseded torrents should live so Radarr/Sonarr don't re-see them).
+# Use this before /run-cleanup or a monthly upgrade to eyeball what's about
+# to disappear and catch any misfiled torrents.
+@app.route('/superseded-audit', methods=['GET'])
+def superseded_audit():
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'total_size']],
+                'id': 95,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'deluge fetch failed: {e}'}), 500
+    threshold = SEED_DAYS * 86400
+    seeding_dir_norm = SEEDING_DIR.rstrip('/')
+    ready_to_delete = []
+    misfiled = []
+    still_seeding = []
+    for h, info in torrents.items():
+        if info.get('label') != SUPERSEDED_LABEL:
+            continue
+        seed_sec = info.get('seeding_time') or 0
+        save_path = (info.get('save_path') or '').rstrip('/')
+        in_seeding_dir = save_path == seeding_dir_norm or save_path.startswith(seeding_dir_norm + '/')
+        entry = {
+            'hash': h,
+            'name': info.get('name'),
+            'save_path': save_path,
+            'seed_days': round(seed_sec / 86400, 1),
+            'size_gb': round((info.get('total_size') or 0) / (1024**3), 2),
+            'in_seeding_dir': in_seeding_dir,
+        }
+        if not in_seeding_dir:
+            entry['expected_dir'] = seeding_dir_norm
+            misfiled.append(entry)
+        if seed_sec >= threshold:
+            ready_to_delete.append(entry)
+        else:
+            still_seeding.append(entry)
+    ready_to_delete.sort(key=lambda x: -x['seed_days'])
+    still_seeding.sort(key=lambda x: -x['seed_days'])
+    return jsonify({
+        'ok': True,
+        'seed_days_threshold': SEED_DAYS,
+        'seeding_dir': seeding_dir_norm,
+        'counts': {
+            'ready_to_delete': len(ready_to_delete),
+            'still_seeding': len(still_seeding),
+            'misfiled': len(misfiled),
+        },
+        'ready_to_delete': ready_to_delete,
+        'still_seeding': still_seeding,
+        'misfiled': misfiled,
+    }), 200
 
 # Manual trigger for the monthly upgrade cycle. Full cycle with the
 # normal 30/90-minute waits by default; ?skip_waits=1 replaces them with

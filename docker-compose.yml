@@ -26,6 +26,8 @@ services:
     volumes:
       - ./data:/data
       - "/mnt/user/data/Media/Movies:/media/movies"
+      # rw (not ro) so /plex-dupe-fix can delete misplaced episode files
+      # via the filesystem fallback when the Plex API rejects the delete.
       - "/mnt/user/data/Media/TV Shows:/media/tv"
       - "/mnt/user/data/Media/Music:/media/music:ro"
 
