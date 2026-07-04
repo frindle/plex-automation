@@ -1309,6 +1309,85 @@ def purge_non_radarr():
         'purge_total_gb': round(sum(t['size_gb'] for t in to_purge), 2),
     }), 200
 
+# Radarr-side inspection: shows movie state (hasFile, tracked path,
+# monitored, queue entries, recent import/grab history) for anything
+# matching ?name=<substr>. Complement to /deluge-lookup.
+@app.route('/radarr-lookup', methods=['GET'])
+def radarr_lookup():
+    q = (request.args.get('name') or '').lower()
+    if not q:
+        return jsonify({'ok': False, 'error': 'name query param required'}), 400
+    if not RADARR_API_KEY:
+        return jsonify({'ok': False, 'error': 'no RADARR_API_KEY'}), 400
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/movie',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            timeout=20,
+        )
+        r.raise_for_status()
+        movies = [m for m in r.json() if q in (m.get('title') or '').lower()]
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'movie lookup failed: {e}'}), 500
+    out = []
+    for m in movies:
+        mid = m.get('id')
+        entry = {
+            'id': mid,
+            'title': m.get('title'),
+            'year': m.get('year'),
+            'monitored': m.get('monitored'),
+            'hasFile': m.get('hasFile'),
+            'tracked_file': (m.get('movieFile') or {}).get('relativePath'),
+            'path': m.get('path'),
+        }
+        # Recent history: what has Radarr done with this movie
+        try:
+            h = requests.get(
+                f'{RADARR_URL}/api/v3/history/movie',
+                headers={'X-Api-Key': RADARR_API_KEY},
+                params={'movieId': mid},
+                timeout=15,
+            )
+            h.raise_for_status()
+            events = h.json()
+            events.sort(key=lambda e: e.get('date', ''), reverse=True)
+            entry['history'] = [
+                {
+                    'date': e.get('date'),
+                    'event': e.get('eventType'),
+                    'source_title': e.get('sourceTitle'),
+                    'download_id': e.get('downloadId'),
+                }
+                for e in events[:10]
+            ]
+        except Exception as e:
+            entry['history_error'] = str(e)
+        # Queue entries
+        try:
+            q_resp = requests.get(
+                f'{RADARR_URL}/api/v3/queue',
+                headers={'X-Api-Key': RADARR_API_KEY},
+                params={'pageSize': 500, 'movieId': mid},
+                timeout=15,
+            )
+            q_resp.raise_for_status()
+            entry['queue'] = [
+                {
+                    'title': rec.get('title'),
+                    'status': rec.get('status'),
+                    'trackedDownloadState': rec.get('trackedDownloadState'),
+                    'errorMessage': rec.get('errorMessage'),
+                    'protocol': rec.get('protocol'),
+                }
+                for rec in (q_resp.json().get('records') or [])
+                if rec.get('movieId') == mid
+            ]
+        except Exception as e:
+            entry['queue_error'] = str(e)
+        out.append(entry)
+    return jsonify({'ok': True, 'count': len(out), 'movies': out}), 200
+
 @app.route('/deluge-lookup', methods=['GET', 'POST'])
 def deluge_lookup():
     q = (request.args.get('name') or '').lower()
