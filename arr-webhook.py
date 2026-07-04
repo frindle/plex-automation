@@ -26,6 +26,10 @@ SONARR_UPG_LABEL  = os.environ.get('SONARR_UPGRADE_LABEL', 'sonarr-upgrade')
 RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
+# Root of the movies library — used by /orphan-scan to find files that
+# Radarr no longer tracks. Override in the compose file if your layout
+# differs from /mnt/user/data/Media/Movies.
+MOVIES_LIBRARY   = os.environ.get('MOVIES_LIBRARY', '/mnt/user/data/Media/Movies')
 PUSHOVER_TOKEN   = os.environ.get('PUSHOVER_TOKEN', '')
 PUSHOVER_USER    = os.environ.get('PUSHOVER_USER', '')
 IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  # 15 min
@@ -1185,6 +1189,77 @@ def run_dedup():
 def run_cleanup():
     threading.Thread(target=cleanup_superseded, daemon=True).start()
     return jsonify({'ok': True, 'message': f'cleanup started; will remove superseded torrents seeded ≥ {SEED_DAYS} days'}), 200
+
+# Compare files on disk in MOVIES_LIBRARY against Radarr's tracked
+# movieFile.path values. Anything on disk that Radarr isn't tracking is
+# an orphan (duplicate imports, old files Radarr replaced but didn't
+# delete, manual downloads that never got imported, etc).
+#
+# Default: dry-run — returns the list, no deletions. Pass ?delete=1 to
+# actually remove. Extremely destructive; require explicit opt-in.
+@app.route('/orphan-scan', methods=['POST', 'GET'])
+def orphan_scan():
+    delete = request.args.get('delete', '').lower() in ('1', 'true', 'yes')
+    if not RADARR_API_KEY:
+        return jsonify({'ok': False, 'error': 'no RADARR_API_KEY'}), 400
+    if not os.path.isdir(MOVIES_LIBRARY):
+        return jsonify({'ok': False, 'error': f'MOVIES_LIBRARY not found: {MOVIES_LIBRARY}'}), 400
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/movie',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            timeout=30,
+        )
+        r.raise_for_status()
+        # Collect the exact path of every file Radarr currently tracks.
+        # movieFile.path may be relative to the movie folder OR absolute
+        # depending on Radarr version — handle both.
+        tracked_paths = set()
+        for m in r.json():
+            mf = m.get('movieFile') or {}
+            path = mf.get('path')
+            if not path:
+                continue
+            if not os.path.isabs(path):
+                # Radarr stores movie.path (the folder) + movieFile.relativePath
+                folder = m.get('path', '')
+                path = os.path.join(folder, path)
+            tracked_paths.add(os.path.normpath(path))
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Radarr fetch failed: {e}'}), 500
+    orphans = []
+    video_exts = ('.mkv', '.mp4', '.avi', '.m4v', '.mov')
+    for root, _, files in os.walk(MOVIES_LIBRARY):
+        for f in files:
+            if not f.lower().endswith(video_exts):
+                continue
+            full = os.path.normpath(os.path.join(root, f))
+            if full in tracked_paths:
+                continue
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            orphans.append({'path': full, 'size': size})
+    total_bytes = sum(o['size'] for o in orphans)
+    deleted = 0
+    if delete:
+        for o in orphans:
+            try:
+                os.remove(o['path'])
+                deleted += 1
+                log.info(f'orphan-scan: removed {o["path"]}')
+            except OSError as e:
+                log.warning(f'orphan-scan: failed to remove {o["path"]}: {e}')
+    return jsonify({
+        'ok': True,
+        'dry_run': not delete,
+        'tracked_count': len(tracked_paths),
+        'orphan_count': len(orphans),
+        'orphan_total_gb': round(total_bytes / (1024**3), 2),
+        'deleted': deleted,
+        'orphans': orphans,
+    }), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 9876))
