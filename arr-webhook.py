@@ -1953,6 +1953,115 @@ def plex_dupe_scan():
         'merged_metadata': merged_metadata,
     }), 200
 
+# Cross-reference unlabeled Deluge torrents against Plex's library.
+# Any torrent whose file basename appears in Plex gets the appropriate
+# label (radarr for movies, sonarr for TV). Anything unmatched goes on
+# the review list — that's the "how did this get here" bucket.
+# Dry-run by default; ?apply=1 to actually relabel.
+@app.route('/relabel-by-plex', methods=['GET', 'POST'])
+def relabel_by_plex():
+    if not PLEX_TOKEN:
+        return jsonify({'ok': False, 'error': 'no PLEX_TOKEN'}), 400
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    # Build basename → label map from Plex
+    plex_basenames = {}  # basename → 'radarr' | 'sonarr'
+    try:
+        sections = _plex_get('/library/sections').get('MediaContainer', {}).get('Directory') or []
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'plex sections fetch failed: {e}'}), 500
+    for sec in sections:
+        stype = sec.get('type')
+        skey = sec.get('key')
+        stitle = sec.get('title') or ''
+        if stype not in ('movie', 'show'):
+            continue
+        if stitle.lower() in PLEX_SKIP_LIBRARIES:
+            continue
+        target_label = 'radarr' if stype == 'movie' else 'sonarr'
+        try:
+            if stype == 'movie':
+                items = _plex_get(f'/library/sections/{skey}/all').get('MediaContainer', {}).get('Metadata') or []
+                for item in items:
+                    for m in (item.get('Media') or []):
+                        for p in (m.get('Part') or []):
+                            fname = os.path.basename(p.get('file') or '')
+                            if fname:
+                                plex_basenames[fname] = target_label
+            else:
+                shows = _plex_get(f'/library/sections/{skey}/all').get('MediaContainer', {}).get('Metadata') or []
+                for show in shows:
+                    show_key = show.get('ratingKey')
+                    try:
+                        eps = _plex_get(f'/library/metadata/{show_key}/allLeaves').get('MediaContainer', {}).get('Metadata') or []
+                    except Exception:
+                        continue
+                    for ep in eps:
+                        for m in (ep.get('Media') or []):
+                            for p in (m.get('Part') or []):
+                                fname = os.path.basename(p.get('file') or '')
+                                if fname:
+                                    plex_basenames[fname] = target_label
+        except Exception as e:
+            log.warning(f'relabel-by-plex: section {skey} fetch failed: {e}')
+            continue
+    # Now walk unlabeled Deluge torrents
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'label', 'save_path', 'files']],
+                'id': 92,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'deluge fetch failed: {e}'}), 500
+    plan = {'radarr': [], 'sonarr': [], 'review': []}
+    for h, info in torrents.items():
+        if (info.get('label') or '').strip():
+            continue
+        tname = info.get('name') or ''
+        # Try matching by torrent name (single-file case) and each file's basename
+        candidates = [tname] + [
+            os.path.basename(f.get('path') if isinstance(f, dict) else str(f))
+            for f in (info.get('files') or [])
+        ]
+        matched_label = None
+        matched_via = None
+        for cand in candidates:
+            if cand in plex_basenames:
+                matched_label = plex_basenames[cand]
+                matched_via = cand
+                break
+        entry = {
+            'hash': h,
+            'name': tname,
+            'save_path': info.get('save_path'),
+            'matched_via': matched_via,
+        }
+        if matched_label:
+            entry['label'] = matched_label
+            if apply:
+                try:
+                    set_torrent_label(h, matched_label)
+                    entry['result'] = f'labeled {matched_label}'
+                except Exception as e:
+                    entry['result'] = f'FAILED: {e}'
+            plan[matched_label].append(entry)
+        else:
+            plan['review'].append(entry)
+    return jsonify({
+        'ok': True,
+        'apply': apply,
+        'counts': {k: len(v) for k, v in plan.items()},
+        'plex_basename_index_size': len(plex_basenames),
+        'plan': plan,
+    }), 200
+
 # Manage the /plex-dupe-fix keep-list without rebuilding the container.
 # GET  /plex-dupe-keep                    → list all keeps (env + file)
 # POST /plex-dupe-keep {plex_key,title,reason}  → append
