@@ -166,7 +166,35 @@ def ensure_label_exists():
         )
         log.info(f'Created label: {SUPERSEDED_LABEL}')
 
+_created_labels_cache = set()
+
+def _ensure_deluge_label(label):
+    """Deluge silently rejects set-label calls for labels that don't
+    exist yet. Auto-create on first use."""
+    if not label or label in _created_labels_cache:
+        return
+    try:
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'label.get_labels', 'params': [], 'id': 40},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        existing = set(resp.json().get('result') or [])
+        _created_labels_cache.update(existing)
+        if label not in existing:
+            session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'label.add', 'params': [label], 'id': 41},
+                timeout=10,
+            ).raise_for_status()
+            _created_labels_cache.add(label)
+            log.info(f'Auto-created Deluge label: {label}')
+    except Exception as e:
+        log.warning(f'ensure_label({label}) failed: {e}')
+
 def set_torrent_label(torrent_hash, label):
+    _ensure_deluge_label(label)
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={'method': 'label.set_torrent', 'params': [torrent_hash, label], 'id': 4},
