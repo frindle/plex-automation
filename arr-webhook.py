@@ -32,6 +32,26 @@ SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
 MOVIES_LIBRARY   = os.environ.get('MOVIES_LIBRARY', '/media/movies')
 PLEX_URL         = os.environ.get('PLEX_URL', 'http://10.0.0.6:32400')
 PLEX_TOKEN       = os.environ.get('PLEX_TOKEN', '')
+# Translate Plex-container paths → arr-webhook-container paths for
+# filesystem deletes. Comma-separated `plex_prefix:local_prefix` pairs.
+# Default handles the standard split-mount setup: Plex sees /data/...,
+# arr-webhook has /media/... mounts for the same shares.
+PLEX_PATH_MAP = [
+    tuple(pair.split(':', 1))
+    for pair in os.environ.get(
+        'PLEX_PATH_MAP',
+        '/data/Movies:/media/movies,/data/TV Shows:/media/tv',
+    ).split(',')
+    if ':' in pair
+]
+
+def _translate_plex_path(p):
+    if not p:
+        return p
+    for plex_prefix, local_prefix in PLEX_PATH_MAP:
+        if p.startswith(plex_prefix):
+            return local_prefix + p[len(plex_prefix):]
+    return p
 # Comma-separated library titles to skip in plex-dupe-scan (case-insensitive).
 PLEX_SKIP_LIBRARIES = {s.strip().lower() for s in os.environ.get('PLEX_SKIP_LIBRARIES', 'Adult,XXX,NSFW,Music,Music Videos').split(',') if s.strip()}
 # Plex ratingKeys never touched by /plex-dupe-fix. Env var is the seed
@@ -2190,18 +2210,22 @@ def plex_dupe_fix():
                         move_torrent_storage(h, SEEDING_DIR)
                         action['result'] = f'torrent superseded + moved to {SEEDING_DIR}'
                     else:
-                        # No torrent seeding this file — nuke the Plex Media
-                        # entry directly. Plex library scan will drop the
-                        # associated file per its trash settings.
-                        # Plex API DELETE ignores query-string tokens; header is required.
-                        del_url = f'{PLEX_URL}/library/metadata/{plex_key}/media/{loser.get("media_id")}'
-                        rd = requests.delete(
-                            del_url,
-                            headers={'X-Plex-Token': PLEX_TOKEN, 'Accept': 'application/json'},
-                            timeout=15,
-                        )
-                        rd.raise_for_status()
-                        action['result'] = 'no torrent found — deleted Plex Media entry'
+                        # No torrent seeding it — delete the physical file.
+                        # Plex loses it on next library scan. Path is
+                        # translated from Plex's container view to
+                        # arr-webhook's mounted view.
+                        local = _translate_plex_path(fpath)
+                        action['local_path'] = local
+                        if not os.path.exists(local):
+                            action['result'] = f'file not found at {local} (path map miss?)'
+                        else:
+                            try:
+                                os.remove(local)
+                                action['result'] = f'deleted {local}'
+                            except PermissionError:
+                                action['result'] = f'PERMISSION DENIED at {local} — mount may be ro'
+                            except Exception as e:
+                                action['result'] = f'delete failed: {e}'
                 except Exception as e:
                     action['result'] = f'FAILED: {e}'
             upgrade_actions.append(action)
