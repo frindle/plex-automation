@@ -2622,28 +2622,34 @@ def missing_season_packs():
             except Exception as e:
                 log.warning(f'season-packs: episodeFile fetch failed for {sid}/{snum}: {e}')
                 continue
-            # A legit season pack imports 22 files that all share the same
-            # release group + quality + pack "title stem" (scene name minus
-            # the E## chunk). Prior version keyed on sceneName directly and
-            # counted 22 distinct sources for every season pack because
-            # every episode file has E01/E02/... in its name.
-            def _pack_stem(scene_name):
-                if not scene_name:
-                    return ''
-                # Strip S01E01 / S01E01-E02 / S01.E01 style episode markers
-                stem = re.sub(r'(?i)\.?s\d{1,3}[\.\s_-]?e\d{1,3}(?:[\.\s_-]?e\d{1,3})?\.?', '.', scene_name)
-                # Collapse repeated dots and trim
-                return re.sub(r'\.+', '.', stem).strip('.').lower()
-            distinct_packs = {
-                (
+            # A season pack import lands every episode under a single
+            # pack folder (e.g. `FBI.S08.WEBRip.x265-Vyndros/…`), so
+            # dirname(originalFilePath) is uniform across all files.
+            # Individually-grabbed episodes each have their own parent.
+            # Combine with (releaseGroup, quality) for extra robustness —
+            # different release groups can never be from the same pack
+            # even if names collide.
+            def _pack_key(f):
+                orig = f.get('originalFilePath') or ''
+                parent = os.path.dirname(orig).lower() if orig else ''
+                # Some Vyndros-style packs name every file by episode
+                # title with no shared pack folder — fall back to
+                # (releaseGroup, quality) which still collapses across
+                # a real pack even when the parent is missing.
+                return (
                     (f.get('releaseGroup') or '').lower(),
                     (f.get('quality', {}).get('quality', {}).get('name') or ''),
-                    _pack_stem(f.get('sceneName') or f.get('originalFilePath') or ''),
+                    parent,
                 )
-                for f in files
-            }
-            sample_stems = sorted({p[2] for p in distinct_packs if p[2]})[:3]
-            if len(distinct_packs) > 1:
+            distinct_packs = {_pack_key(f) for f in files}
+            # If every file shares releaseGroup + quality, treat as one
+            # pack regardless of parent-dir variance — covers Vyndros
+            # naming convention.
+            groups = {(f.get('releaseGroup') or '').lower() for f in files}
+            qualities = {(f.get('quality', {}).get('quality', {}).get('name') or '') for f in files}
+            uniform_group_and_quality = len(groups) == 1 and len(qualities) == 1
+            sample_parents = sorted({p[2] for p in distinct_packs if p[2]})[:3]
+            if len(distinct_packs) > 1 and not uniform_group_and_quality:
                 results.append({
                     'series_id': sid,
                     'series_title': s.get('title'),
@@ -2651,7 +2657,8 @@ def missing_season_packs():
                     'episodes': episode_count,
                     'files': file_count,
                     'distinct_releases': len(distinct_packs),
-                    'sample_pack_stems': sample_stems,
+                    'sample_groups': sorted(groups),
+                    'sample_parents': sample_parents,
                 })
     results.sort(key=lambda x: (x['series_title'].lower(), x['season']))
     return jsonify({
