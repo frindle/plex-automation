@@ -814,6 +814,19 @@ def handle_upgrade_import(data, source):
 
     if new_torrent_hash:
         log.info(f'{source}: will skip new torrent {new_torrent_hash}')
+        # Post-import relabel: once an -upgrade grab has landed, flip
+        # its label back to the base one. Any torrent still wearing
+        # -upgrade later means something in the pipeline didn't
+        # complete — quick signal when eyeballing Deluge.
+        current_label = (torrents.get(new_torrent_hash, {}).get('label') or '').lower()
+        base_label = 'radarr' if source == 'Radarr' else 'sonarr'
+        upgrade_label = f'{base_label}-upgrade'
+        if current_label == upgrade_label:
+            try:
+                set_torrent_label(new_torrent_hash, base_label)
+                log.info(f'{source}: relabeled {new_torrent_hash} {upgrade_label} → {base_label}')
+            except Exception as e:
+                log.warning(f'{source}: post-import relabel failed for {new_torrent_hash}: {e}')
 
     # Find and supersede old torrents
     for torrent_hash, info in torrents.items():
@@ -1708,6 +1721,72 @@ def auto_rescue_endpoint():
             'sonarr': _auto_rescue('sonarr', dry_run=dry_run),
         }), 200
     return jsonify(_auto_rescue(service, dry_run=dry_run)), 200
+
+# List Sonarr seasons where NO episode has a season-pack import in
+# history — i.e. seasons that were only ever grabbed as individual
+# episodes. Useful for finding candidates to re-grab as season packs
+# (better quality consistency, easier to seed).
+@app.route('/missing-season-packs', methods=['GET'])
+def missing_season_packs():
+    if not SONARR_API_KEY:
+        return jsonify({'ok': False, 'error': 'no SONARR_API_KEY'}), 400
+    try:
+        r = requests.get(
+            f'{SONARR_URL}/api/v3/series',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            timeout=60,
+        )
+        r.raise_for_status()
+        series_list = r.json()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Sonarr fetch failed: {e}'}), 500
+    results = []
+    for s in series_list:
+        if not s.get('monitored'):
+            continue
+        sid = s.get('id')
+        for season in (s.get('seasons') or []):
+            snum = season.get('seasonNumber')
+            if snum == 0:
+                continue
+            stats = season.get('statistics') or {}
+            episode_count = stats.get('episodeCount') or 0
+            file_count = stats.get('episodeFileCount') or 0
+            if episode_count == 0 or file_count == 0:
+                continue
+            if file_count < episode_count:
+                continue
+            try:
+                efr = requests.get(
+                    f'{SONARR_URL}/api/v3/episodefile',
+                    headers={'X-Api-Key': SONARR_API_KEY},
+                    params={'seriesId': sid},
+                    timeout=20,
+                )
+                efr.raise_for_status()
+                files = [f for f in (efr.json() or []) if f.get('seasonNumber') == snum]
+            except Exception as e:
+                log.warning(f'season-packs: episodeFile fetch failed for {sid}/{snum}: {e}')
+                continue
+            distinct_releases = {(f.get('releaseGroup') or '') + '|' + (f.get('quality', {}).get('quality', {}).get('name') or '') + '|' + (f.get('sceneName') or f.get('originalFilePath') or '') for f in files}
+            distinct_scene = {(f.get('sceneName') or '').split('/')[-1] for f in files if f.get('sceneName')}
+            if len(distinct_releases) > 1 or (distinct_scene and len(distinct_scene) > 1):
+                results.append({
+                    'series_id': sid,
+                    'series_title': s.get('title'),
+                    'season': snum,
+                    'episodes': episode_count,
+                    'files': file_count,
+                    'distinct_releases': len(distinct_releases),
+                    'sample_scene_names': sorted(distinct_scene)[:3],
+                })
+    results.sort(key=lambda x: (x['series_title'].lower(), x['season']))
+    return jsonify({
+        'ok': True,
+        'count': len(results),
+        'search_hint': 'POST /api/v3/command {"name":"SeasonSearch","seriesId":ID,"seasonNumber":N} to Sonarr',
+        'seasons': results,
+    }), 200
 
 # List unlabeled Deluge torrents matching TV patterns (SxxExx, "Season N",
 # "Complete Series", TV-quality strings). These are typically pre-Sonarr
