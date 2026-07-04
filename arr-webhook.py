@@ -1136,6 +1136,13 @@ def run_dedup():
     threading.Thread(target=dedup_via_sonarr, daemon=True).start()
     return jsonify({'ok': True, 'message': 'dedup passes started; check container logs'}), 200
 
+# Manual trigger for cleanup_superseded — remove torrents currently
+# labeled `superseded` that have been seeding at least SEED_DAYS.
+@app.route('/run-cleanup', methods=['POST'])
+def run_cleanup():
+    threading.Thread(target=cleanup_superseded, daemon=True).start()
+    return jsonify({'ok': True, 'message': f'cleanup started; will remove superseded torrents seeded ≥ {SEED_DAYS} days'}), 200
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 9876))
     log.info(f'Starting arr-webhook listener on port {port}')
