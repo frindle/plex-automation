@@ -1243,6 +1243,14 @@ def purge_non_radarr():
         request.args.get('keep', 'radarr,radarr-upgrade,superseded').split(',')
         if s.strip()
     }
+    # A torrent is treated as "broken" when its progress is below this
+    # threshold. Default 100 (anything not fully downloaded). Pass
+    # ?broken_below=1 to only sweep the truly-never-started zeros while
+    # leaving partial downloads alone.
+    try:
+        broken_below = float(request.args.get('broken_below', '100'))
+    except ValueError:
+        broken_below = 100.0
     try:
         deluge_login()
         resp = session.post(
@@ -1263,7 +1271,7 @@ def purge_non_radarr():
     for h, info in (resp.json().get('result') or {}).items():
         label = (info.get('label') or '').lower()
         progress = info.get('progress') or 0
-        broken = progress < 100
+        broken = progress < broken_below
         wrong_label = label not in keep_labels
         if broken or wrong_label:
             to_purge.append({
@@ -1454,6 +1462,56 @@ def no_seed_check():
         'unseeded_count': len(unseeded),
         'unseeded_total_gb': total_gb,
         'unseeded': unseeded,
+    }), 200
+
+# Delete a curated list of paths under the movies library. POST body is
+# newline-separated paths (or JSON {"paths":[...]}). Any path outside
+# MOVIES_LIBRARY is rejected — safety guard against typos. Dry-run by
+# default; ?apply=1 to actually remove.
+@app.route('/delete-paths', methods=['POST'])
+def delete_paths():
+    apply_ = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    body = request.get_data(as_text=True) or ''
+    paths = []
+    body_stripped = body.strip()
+    if body_stripped.startswith('{'):
+        try:
+            data = json.loads(body_stripped)
+            paths = data.get('paths', [])
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'JSON parse: {e}'}), 400
+    else:
+        paths = [ln.strip() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith('#')]
+    if not paths:
+        return jsonify({'ok': False, 'error': 'no paths provided in body'}), 400
+
+    lib_root = os.path.realpath(MOVIES_LIBRARY)
+    results = {'deleted': [], 'skipped': [], 'errors': []}
+    for p in paths:
+        real = os.path.realpath(p)
+        if not real.startswith(lib_root + os.sep) and real != lib_root:
+            results['errors'].append({'path': p, 'reason': f'outside MOVIES_LIBRARY ({lib_root})'})
+            continue
+        if not os.path.isfile(real):
+            results['skipped'].append({'path': p, 'reason': 'not a file / already gone'})
+            continue
+        if not apply_:
+            results['deleted'].append({'path': p, 'action': 'would delete'})
+            continue
+        try:
+            os.remove(real)
+            results['deleted'].append({'path': p, 'action': 'deleted'})
+            log.info(f'delete-paths: removed {p}')
+        except OSError as e:
+            results['errors'].append({'path': p, 'reason': str(e)})
+    return jsonify({
+        'ok': True,
+        'dry_run': not apply_,
+        'received': len(paths),
+        'deleted_count': len(results['deleted']),
+        'skipped_count': len(results['skipped']),
+        'error_count': len(results['errors']),
+        'results': results,
     }), 200
 
 @app.route('/deluge-lookup', methods=['GET', 'POST'])
