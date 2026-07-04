@@ -4,3 +4,4 @@ __pycache__/
 data/
 .memsearch/
 TODO.md
+.DS_Store
