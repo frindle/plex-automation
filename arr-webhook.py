@@ -1216,15 +1216,47 @@ def orphan_scan():
         # (bind mount at /media/movies vs host /mnt/user/... etc), so
         # matching on absolute paths won't work. Basename matching is
         # robust because movie release filenames are effectively unique.
+        # tracked_names: basenames Radarr currently has as movieFile.
+        # radarr_index: (title_words_set, year) so we can decide whether
+        # an unknown-basename file corresponds to a Radarr-managed movie
+        # (safe dupe to delete) vs an untracked movie (do NOT delete).
         tracked_names = set()
+        radarr_index = []
         for m in r.json():
             mf = m.get('movieFile') or {}
             path = mf.get('path') or mf.get('relativePath') or ''
             if path:
                 tracked_names.add(os.path.basename(path))
+            title = (m.get('title') or '').lower()
+            year = m.get('year')
+            if title and year:
+                words = {w for w in re.findall(r'[a-z0-9]+', title) if len(w) >= 3}
+                if words:
+                    radarr_index.append((words, year))
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Radarr fetch failed: {e}'}), 500
-    orphans = []
+
+    def _classify(path, basename):
+        # Sample files — safe to delete.
+        low = path.lower()
+        if 'sample' in low or basename.lower().startswith('sample'):
+            return 'sample'
+        # Dupe of a Radarr-managed movie — the movie has a tracked file
+        # already, this basename is different, so it's an old copy.
+        # Match by title-words + year.
+        name_lower = basename.lower()
+        year_m = re.search(r'(?<!\d)(19\d{2}|20\d{2})(?!\d)', name_lower)
+        if year_m:
+            file_year = int(year_m.group(1))
+            file_words = set(re.findall(r'[a-z0-9]+', name_lower))
+            for words, year in radarr_index:
+                if abs(year - file_year) > 1:
+                    continue
+                if words.issubset(file_words):
+                    return 'dupe'
+        return 'untracked'
+
+    buckets = {'sample': [], 'dupe': [], 'untracked': []}
     video_exts = ('.mkv', '.mp4', '.avi', '.m4v', '.mov')
     for root, _, files in os.walk(MOVIES_LIBRARY):
         for f in files:
@@ -1237,25 +1269,47 @@ def orphan_scan():
                 size = os.path.getsize(full)
             except OSError:
                 size = 0
-            orphans.append({'path': full, 'size': size})
-    total_bytes = sum(o['size'] for o in orphans)
+            buckets[_classify(full, f)].append({'path': full, 'size': size})
+
+    # Which categories to actually delete. `mode` query param picks:
+    #   samples   — only sample files
+    #   dupes     — samples + confirmed dupes (Radarr-tracked movie's old copy)
+    #   all       — everything (danger, includes untracked)
+    mode = request.args.get('mode', 'dupes')
+    to_delete_buckets = []
+    if delete:
+        if mode == 'samples':
+            to_delete_buckets = ['sample']
+        elif mode == 'dupes':
+            to_delete_buckets = ['sample', 'dupe']
+        elif mode == 'all':
+            to_delete_buckets = ['sample', 'dupe', 'untracked']
+        else:
+            return jsonify({'ok': False, 'error': f'unknown mode: {mode}'}), 400
+
     deleted = 0
     if delete:
-        for o in orphans:
-            try:
-                os.remove(o['path'])
-                deleted += 1
-                log.info(f'orphan-scan: removed {o["path"]}')
-            except OSError as e:
-                log.warning(f'orphan-scan: failed to remove {o["path"]}: {e}')
+        for cat in to_delete_buckets:
+            for o in buckets[cat]:
+                try:
+                    os.remove(o['path'])
+                    deleted += 1
+                    log.info(f'orphan-scan[{cat}]: removed {o["path"]}')
+                except OSError as e:
+                    log.warning(f'orphan-scan: failed to remove {o["path"]}: {e}')
+
+    def _gb(items):
+        return round(sum(i['size'] for i in items) / (1024**3), 2)
+
     return jsonify({
         'ok': True,
         'dry_run': not delete,
+        'delete_mode': mode if delete else None,
         'tracked_count': len(tracked_names),
-        'orphan_count': len(orphans),
-        'orphan_total_gb': round(total_bytes / (1024**3), 2),
+        'counts': {k: len(v) for k, v in buckets.items()},
+        'sizes_gb': {k: _gb(v) for k, v in buckets.items()},
         'deleted': deleted,
-        'orphans': orphans,
+        'buckets': buckets,
     }), 200
 
 if __name__ == '__main__':
