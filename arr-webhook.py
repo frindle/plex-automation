@@ -1388,6 +1388,74 @@ def radarr_lookup():
         out.append(entry)
     return jsonify({'ok': True, 'count': len(out), 'movies': out}), 200
 
+# Find Radarr-tracked movie files that DON'T have a matching torrent in
+# Deluge. These are movies you have on disk but aren't currently seeding
+# — either older imports from before the arr setup, or files where the
+# torrent was removed. Useful for deciding what to re-search / re-grab.
+@app.route('/no-seed-check', methods=['GET'])
+def no_seed_check():
+    if not RADARR_API_KEY:
+        return jsonify({'ok': False, 'error': 'no RADARR_API_KEY'}), 400
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/movie',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            timeout=30,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Radarr fetch failed: {e}'}), 500
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'files']],
+                'id': 44,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Deluge fetch failed: {e}'}), 500
+    seed_basenames = set()
+    for h, info in (resp.json().get('result') or {}).items():
+        n = info.get('name')
+        if n:
+            seed_basenames.add(os.path.basename(n))
+        for f in (info.get('files') or []):
+            p = f.get('path') if isinstance(f, dict) else str(f)
+            if p:
+                seed_basenames.add(os.path.basename(p))
+    unseeded = []
+    for m in r.json():
+        if not m.get('hasFile'):
+            continue
+        mf = m.get('movieFile') or {}
+        rel = mf.get('relativePath') or (mf.get('path') or '')
+        base = os.path.basename(rel) if rel else ''
+        if not base:
+            continue
+        if base in seed_basenames:
+            continue
+        unseeded.append({
+            'id': m.get('id'),
+            'title': m.get('title'),
+            'year': m.get('year'),
+            'tracked_file': base,
+            'size_gb': round((mf.get('size') or 0) / (1024**3), 2),
+        })
+    total_gb = round(sum(u['size_gb'] for u in unseeded), 2)
+    return jsonify({
+        'ok': True,
+        'radarr_with_file': sum(1 for m in r.json() if m.get('hasFile')),
+        'seeding_files': len(seed_basenames),
+        'unseeded_count': len(unseeded),
+        'unseeded_total_gb': total_gb,
+        'unseeded': unseeded,
+    }), 200
+
 @app.route('/deluge-lookup', methods=['GET', 'POST'])
 def deluge_lookup():
     q = (request.args.get('name') or '').lower()
