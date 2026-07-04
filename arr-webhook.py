@@ -1547,6 +1547,142 @@ def deluge_lookup():
             })
     return jsonify({'ok': True, 'count': len(hits), 'hits': hits}), 200
 
+# Detect "grabbed but never imported" torrents and fire a scan to
+# recover them. Radarr/Sonarr sometimes silently drop imports (folder
+# name mismatch, transient path glitch, etc). This walks Deluge for
+# completed radarr/sonarr-labeled torrents, cross-references the
+# download_id against the *arr history, and if a `grabbed` event has
+# no matching downloadFolderImported / downloadFolderImported after
+# it, we call DownloadedMoviesScan / DownloadedEpisodesScan against
+# the save_path so Radarr/Sonarr re-attempts the import.
+def _auto_rescue(service, dry_run=False):
+    if service == 'radarr':
+        url, key = RADARR_URL, RADARR_API_KEY
+        labels = {'radarr', 'radarr-upgrade'}
+        history_path = '/api/v3/history'
+        scan_cmd = 'DownloadedMoviesScan'
+        import_event = 'downloadFolderImported'
+    elif service == 'sonarr':
+        url, key = SONARR_URL, SONARR_API_KEY
+        labels = {'sonarr', 'sonarr-upgrade'}
+        history_path = '/api/v3/history'
+        scan_cmd = 'DownloadedEpisodesScan'
+        import_event = 'downloadFolderImported'
+    else:
+        return {'ok': False, 'error': f'unknown service {service}'}
+    if not key:
+        return {'ok': False, 'error': f'no {service.upper()}_API_KEY'}
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'label', 'save_path', 'progress']],
+                'id': 61,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        return {'ok': False, 'error': f'deluge fetch failed: {e}'}
+    stuck = []
+    triggered = []
+    skipped_reasons = {'not_labeled': 0, 'not_complete': 0, 'no_grab': 0, 'already_imported': 0}
+    for h, info in torrents.items():
+        if (info.get('label') or '').lower() not in labels:
+            skipped_reasons['not_labeled'] += 1
+            continue
+        if (info.get('progress') or 0) < 99.0:
+            skipped_reasons['not_complete'] += 1
+            continue
+        try:
+            hr = requests.get(
+                f'{url}{history_path}',
+                headers={'X-Api-Key': key},
+                params={'downloadId': h.upper(), 'pageSize': 50},
+                timeout=20,
+            )
+            hr.raise_for_status()
+            records = hr.json().get('records') or []
+        except Exception as e:
+            log.warning(f'auto-rescue: history lookup for {h[:8]} failed: {e}')
+            continue
+        grabbed_dates = [r.get('date') for r in records if r.get('eventType') == 'grabbed']
+        imported_dates = [r.get('date') for r in records if r.get('eventType') == import_event]
+        if not grabbed_dates:
+            skipped_reasons['no_grab'] += 1
+            continue
+        last_grab = max(grabbed_dates)
+        last_import = max(imported_dates) if imported_dates else ''
+        if last_import >= last_grab:
+            skipped_reasons['already_imported'] += 1
+            continue
+        entry = {
+            'hash': h,
+            'name': info.get('name'),
+            'save_path': info.get('save_path'),
+            'label': info.get('label'),
+            'last_grab': last_grab,
+            'last_import': last_import or None,
+        }
+        stuck.append(entry)
+        if dry_run:
+            continue
+        scan_path = info.get('save_path') or ''
+        if info.get('name'):
+            scan_path = os.path.join(scan_path, info.get('name'))
+        try:
+            cr = requests.post(
+                f'{url}/api/v3/command',
+                headers={'X-Api-Key': key, 'Content-Type': 'application/json'},
+                json={'name': scan_cmd, 'path': scan_path, 'importMode': 'auto'},
+                timeout=20,
+            )
+            cr.raise_for_status()
+            cmd_id = cr.json().get('id')
+            entry['scan_cmd_id'] = cmd_id
+            triggered.append(entry)
+            log.info(f'auto-rescue {service}: fired {scan_cmd} for {info.get("name")} → cmd {cmd_id}')
+        except Exception as e:
+            log.warning(f'auto-rescue: scan trigger failed for {h[:8]}: {e}')
+    return {
+        'ok': True,
+        'service': service,
+        'dry_run': dry_run,
+        'stuck_count': len(stuck),
+        'triggered_count': len(triggered),
+        'skipped': skipped_reasons,
+        'stuck': stuck,
+    }
+
+def auto_rescue_scheduler():
+    # Runs every 15 minutes. Fires DownloadedMoviesScan/EpisodesScan for
+    # any completed labeled torrent that Radarr/Sonarr grabbed but never
+    # imported. Silent on the happy path — logs on rescue.
+    while True:
+        try:
+            for svc in ('radarr', 'sonarr'):
+                res = _auto_rescue(svc, dry_run=False)
+                if res.get('triggered_count'):
+                    log.info(f'auto-rescue {svc}: rescued {res["triggered_count"]} stuck imports')
+        except Exception as e:
+            log.error(f'auto-rescue scheduler failed: {e}')
+        time.sleep(900)
+
+@app.route('/auto-rescue', methods=['POST', 'GET'])
+def auto_rescue_endpoint():
+    service = (request.args.get('service') or 'both').lower()
+    dry_run = request.args.get('dry_run', '').lower() in ('1', 'true', 'yes')
+    if service == 'both':
+        return jsonify({
+            'ok': True,
+            'radarr': _auto_rescue('radarr', dry_run=dry_run),
+            'sonarr': _auto_rescue('sonarr', dry_run=dry_run),
+        }), 200
+    return jsonify(_auto_rescue(service, dry_run=dry_run)), 200
+
 # List unlabeled Deluge torrents matching TV patterns (SxxExx, "Season N",
 # "Complete Series", TV-quality strings). These are typically pre-Sonarr
 # leftovers — grabbed manually before this project. Read-only; returns
@@ -2039,4 +2175,6 @@ if __name__ == '__main__':
     t3.start()
     t4 = threading.Thread(target=import_blocked_scheduler, daemon=True)
     t4.start()
+    t5 = threading.Thread(target=auto_rescue_scheduler, daemon=True)
+    t5.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
