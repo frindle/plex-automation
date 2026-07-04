@@ -34,9 +34,35 @@ PLEX_URL         = os.environ.get('PLEX_URL', 'http://10.0.0.6:32400')
 PLEX_TOKEN       = os.environ.get('PLEX_TOKEN', '')
 # Comma-separated library titles to skip in plex-dupe-scan (case-insensitive).
 PLEX_SKIP_LIBRARIES = {s.strip().lower() for s in os.environ.get('PLEX_SKIP_LIBRARIES', 'Adult,XXX,NSFW,Music,Music Videos').split(',') if s.strip()}
-# Plex ratingKeys never touched by /plex-dupe-fix. Melody keeps multiple
-# Eras Tour versions; add more comma-separated keys as needed.
+# Plex ratingKeys never touched by /plex-dupe-fix. Env var is the seed
+# ("Melody keeps multiple Eras Tour versions"); runtime additions go
+# into /data/plex_dupe_keep.json via the /plex-dupe-keep endpoint so
+# updates don't require a rebuild.
 PLEX_DUPE_KEEP = {s.strip() for s in os.environ.get('PLEX_DUPE_KEEP', '25705').split(',') if s.strip()}
+PLEX_DUPE_KEEP_PATH = os.environ.get('PLEX_DUPE_KEEP_PATH', '/data/plex_dupe_keep.json')
+
+def _load_plex_dupe_keep():
+    """Merge the env-var seed with any runtime entries in the JSON file."""
+    keys = set(PLEX_DUPE_KEEP)
+    try:
+        if os.path.exists(PLEX_DUPE_KEEP_PATH):
+            with open(PLEX_DUPE_KEEP_PATH) as f:
+                data = _json.load(f)
+                for entry in data.get('entries', []):
+                    if entry.get('plex_key'):
+                        keys.add(str(entry['plex_key']))
+    except Exception as e:
+        log.warning(f'plex-dupe-keep load failed: {e}')
+    return keys
+
+def _save_plex_dupe_keep(entries):
+    try:
+        os.makedirs(os.path.dirname(PLEX_DUPE_KEEP_PATH), exist_ok=True)
+        with open(PLEX_DUPE_KEEP_PATH, 'w') as f:
+            _json.dump({'entries': entries}, f, indent=2)
+    except Exception as e:
+        log.error(f'plex-dupe-keep save failed: {e}')
+        raise
 PUSHOVER_TOKEN   = os.environ.get('PUSHOVER_TOKEN', '')
 PUSHOVER_USER    = os.environ.get('PUSHOVER_USER', '')
 IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  # 15 min
@@ -1907,6 +1933,59 @@ def plex_dupe_scan():
         'merged_metadata': merged_metadata,
     }), 200
 
+# Manage the /plex-dupe-fix keep-list without rebuilding the container.
+# GET  /plex-dupe-keep                    → list all keeps (env + file)
+# POST /plex-dupe-keep {plex_key,title,reason}  → append
+# DELETE /plex-dupe-keep?plex_key=X       → remove
+@app.route('/plex-dupe-keep', methods=['GET', 'POST', 'DELETE'])
+def plex_dupe_keep_manage():
+    # Load current file entries
+    entries = []
+    if os.path.exists(PLEX_DUPE_KEEP_PATH):
+        try:
+            with open(PLEX_DUPE_KEEP_PATH) as f:
+                entries = (_json.load(f).get('entries') or [])
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'read failed: {e}'}), 500
+    if request.method == 'GET':
+        return jsonify({
+            'ok': True,
+            'env_seed': sorted(PLEX_DUPE_KEEP),
+            'file_entries': entries,
+            'effective': sorted(_load_plex_dupe_keep()),
+        }), 200
+    if request.method == 'POST':
+        body = request.get_json(force=True, silent=True) or {}
+        plex_key = str(body.get('plex_key') or '').strip()
+        if not plex_key:
+            return jsonify({'ok': False, 'error': 'plex_key required'}), 400
+        # Idempotent: replace if already present
+        entries = [e for e in entries if str(e.get('plex_key')) != plex_key]
+        entries.append({
+            'plex_key': plex_key,
+            'title': body.get('title') or '',
+            'reason': body.get('reason') or '',
+            'added': time.strftime('%Y-%m-%d'),
+        })
+        try:
+            _save_plex_dupe_keep(entries)
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'save failed: {e}'}), 500
+        return jsonify({'ok': True, 'entries': entries}), 200
+    # DELETE
+    plex_key = str(request.args.get('plex_key') or '').strip()
+    if not plex_key:
+        return jsonify({'ok': False, 'error': 'plex_key query param required'}), 400
+    before = len(entries)
+    entries = [e for e in entries if str(e.get('plex_key')) != plex_key]
+    if len(entries) == before:
+        return jsonify({'ok': True, 'removed': False, 'note': 'not in file (may be in env seed)'}), 200
+    try:
+        _save_plex_dupe_keep(entries)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'save failed: {e}'}), 500
+    return jsonify({'ok': True, 'removed': True, 'entries': entries}), 200
+
 # Move a set of torrents' storage locations via Deluge — used for
 # one-off cleanups where scene packs landed in the wrong show folder.
 # Body: {"moves":[{"hash":"…","dest":"/data/Media/TV Shows/Whatever"}]}
@@ -2028,9 +2107,10 @@ def plex_dupe_fix():
         'kept_by_allowlist': [],
         'unknown': [],
     }
+    keep_keys = _load_plex_dupe_keep()
     for entry in scan.get('multi_version') or []:
         plex_key = str(entry.get('plex_key') or '')
-        if plex_key in PLEX_DUPE_KEEP:
+        if plex_key in keep_keys:
             plan['kept_by_allowlist'].append({
                 'plex_key': plex_key, 'title': entry.get('title'),
             })
