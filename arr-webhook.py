@@ -1256,10 +1256,38 @@ def orphan_scan():
                     return 'dupe'
         return 'untracked'
 
-    # Buckets by category. dupe_seeding = classified as dupe but the file
-    # has only one hardlink, so it's likely the sole on-disk copy — if a
-    # Deluge torrent is seeding from this path, deleting kills the seed.
-    # Split it out so ?delete=1 skips it by default.
+    # Cross-check against Deluge: any file basename that appears in an
+    # active torrent's file list is presumed to be seeding. We skip those
+    # to protect the seed. Basename comparison works even when the
+    # movies-library and downloads paths don't line up (bind mounts,
+    # separate filesystems, etc).
+    seeding_basenames = set()
+    try:
+        deluge_login()
+        # Ask Deluge specifically for `files` — the default helper only
+        # returns lightweight fields.
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'files']],
+                'id': 42,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        for h, info in (resp.json().get('result') or {}).items():
+            n = info.get('name')
+            if n:
+                seeding_basenames.add(os.path.basename(n))
+            for f in (info.get('files') or []):
+                p = f.get('path') if isinstance(f, dict) else str(f)
+                if p:
+                    seeding_basenames.add(os.path.basename(p))
+    except Exception as e:
+        log.warning(f'orphan-scan: Deluge cross-check failed ({e}) — treating all dupes as seeding for safety')
+        seeding_basenames = None  # sentinel: unknown, be cautious
+
     buckets = {'sample': [], 'dupe': [], 'dupe_seeding': [], 'untracked': []}
     video_exts = ('.mkv', '.mp4', '.avi', '.m4v', '.mov')
     for root, _, files in os.walk(MOVIES_LIBRARY):
@@ -1277,11 +1305,13 @@ def orphan_scan():
                 size = 0
                 nlink = 1
             cat = _classify(full, f)
-            # If a dupe has nlink=1, there's no hardlink to a downloads
-            # dir — the seed (if any) lives right here. Reroute to the
-            # cautious bucket.
-            if cat == 'dupe' and nlink <= 1:
-                cat = 'dupe_seeding'
+            # Reroute dupe → dupe_seeding when Deluge is still seeding a
+            # torrent with this filename. nlink checks are useless on
+            # Unraid's /mnt/user FUSE (always reports 1 through shfs), so
+            # Deluge is the source of truth for what's actively serving.
+            if cat == 'dupe':
+                if seeding_basenames is None or f in seeding_basenames:
+                    cat = 'dupe_seeding'
             buckets[cat].append({'path': full, 'size': size, 'nlink': nlink})
 
     # Which categories to actually delete. `mode` query param picks:
