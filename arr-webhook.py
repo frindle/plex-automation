@@ -1256,7 +1256,11 @@ def orphan_scan():
                     return 'dupe'
         return 'untracked'
 
-    buckets = {'sample': [], 'dupe': [], 'untracked': []}
+    # Buckets by category. dupe_seeding = classified as dupe but the file
+    # has only one hardlink, so it's likely the sole on-disk copy — if a
+    # Deluge torrent is seeding from this path, deleting kills the seed.
+    # Split it out so ?delete=1 skips it by default.
+    buckets = {'sample': [], 'dupe': [], 'dupe_seeding': [], 'untracked': []}
     video_exts = ('.mkv', '.mp4', '.avi', '.m4v', '.mov')
     for root, _, files in os.walk(MOVIES_LIBRARY):
         for f in files:
@@ -1266,10 +1270,19 @@ def orphan_scan():
                 continue
             full = os.path.normpath(os.path.join(root, f))
             try:
-                size = os.path.getsize(full)
+                st = os.stat(full)
+                size = st.st_size
+                nlink = st.st_nlink
             except OSError:
                 size = 0
-            buckets[_classify(full, f)].append({'path': full, 'size': size})
+                nlink = 1
+            cat = _classify(full, f)
+            # If a dupe has nlink=1, there's no hardlink to a downloads
+            # dir — the seed (if any) lives right here. Reroute to the
+            # cautious bucket.
+            if cat == 'dupe' and nlink <= 1:
+                cat = 'dupe_seeding'
+            buckets[cat].append({'path': full, 'size': size, 'nlink': nlink})
 
     # Which categories to actually delete. `mode` query param picks:
     #   samples   — only sample files
