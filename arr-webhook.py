@@ -30,6 +30,8 @@ SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
 # /orphan-scan. Radarr may report paths from the host's perspective, so
 # matching is done by filename basename rather than absolute path.
 MOVIES_LIBRARY   = os.environ.get('MOVIES_LIBRARY', '/media/movies')
+PLEX_URL         = os.environ.get('PLEX_URL', 'http://10.0.0.6:32400')
+PLEX_TOKEN       = os.environ.get('PLEX_TOKEN', '')
 PUSHOVER_TOKEN   = os.environ.get('PUSHOVER_TOKEN', '')
 PUSHOVER_USER    = os.environ.get('PUSHOVER_USER', '')
 IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  # 15 min
@@ -1721,6 +1723,157 @@ def auto_rescue_endpoint():
             'sonarr': _auto_rescue('sonarr', dry_run=dry_run),
         }), 200
     return jsonify(_auto_rescue(service, dry_run=dry_run)), 200
+
+# ── Plex dupe scanner ────────────────────────────────────────────────────────
+# Two dupe classes:
+#   multi_version — one Plex movie/episode with >1 attached Media entry.
+#     Normal cause: an old + new file both exist under the same item.
+#     Fix: keep the higher-scoring one, drop the other.
+#   merged_metadata — multiple physically different films/episodes that
+#     Plex bundled into one library item (the Pinocchio case). Detected
+#     by comparing each Media's filename against the parent item title.
+#     Fix: NOT automatic; requires user to split in Plex UI.
+#
+# Read-only for now — reports the list. Add ?apply=1 once we trust it.
+def _plex_get(path, params=None):
+    if not PLEX_TOKEN:
+        raise RuntimeError('no PLEX_TOKEN set')
+    p = dict(params or {})
+    p['X-Plex-Token'] = PLEX_TOKEN
+    r = requests.get(f'{PLEX_URL}{path}', params=p, headers={'Accept': 'application/json'}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+TITLE_TOKEN_RE = re.compile(r'[a-z0-9]+')
+FILENAME_YEAR_RE = re.compile(r'(19\d{2}|20\d{2})')
+
+def _filename_title_tokens(basename):
+    stem = basename.rsplit('.', 1)[0]
+    m = FILENAME_YEAR_RE.search(stem)
+    if m:
+        stem = stem[:m.start()]
+    return set(TITLE_TOKEN_RE.findall(stem.lower().replace("'", '')))
+
+def _filename_year(basename):
+    m = FILENAME_YEAR_RE.search(basename)
+    return int(m.group(1)) if m else None
+
+@app.route('/plex-dupe-scan', methods=['GET'])
+def plex_dupe_scan():
+    if not PLEX_TOKEN:
+        return jsonify({'ok': False, 'error': 'no PLEX_TOKEN (add to .env)'}), 400
+    try:
+        sections = _plex_get('/library/sections').get('MediaContainer', {}).get('Directory') or []
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'plex sections fetch failed: {e}'}), 500
+    multi_version = []
+    merged_metadata = []
+    scanned = {'movie': 0, 'show_episodes': 0}
+    for sec in sections:
+        stype = sec.get('type')
+        skey = sec.get('key')
+        if stype not in ('movie', 'show'):
+            continue
+        if stype == 'movie':
+            try:
+                items = _plex_get(f'/library/sections/{skey}/all', {'includeGuids': 1}).get('MediaContainer', {}).get('Metadata') or []
+            except Exception as e:
+                log.warning(f'plex section {skey} fetch failed: {e}')
+                continue
+            for item in items:
+                scanned['movie'] += 1
+                media = item.get('Media') or []
+                title = item.get('title') or ''
+                year = item.get('year')
+                title_tokens = set(TITLE_TOKEN_RE.findall(title.lower().replace("'", '')))
+                title_tokens -= {'the', 'a', 'an', 'of', 'and'}
+                media_summaries = []
+                mismatched = []
+                for m in media:
+                    parts = m.get('Part') or []
+                    for p in parts:
+                        f = p.get('file') or ''
+                        base = os.path.basename(f)
+                        media_summaries.append({
+                            'file': f,
+                            'size_gb': round((p.get('size') or 0) / (1024**3), 2),
+                            'resolution': m.get('videoResolution'),
+                            'bitrate': m.get('bitrate'),
+                            'duration_min': round((m.get('duration') or 0) / 60000, 1),
+                        })
+                        f_tokens = _filename_title_tokens(base) - {'the', 'a', 'an', 'of', 'and'}
+                        f_year = _filename_year(base)
+                        if title_tokens and f_tokens:
+                            overlap = len(title_tokens & f_tokens) / max(1, len(title_tokens))
+                            year_mismatch = year and f_year and abs(f_year - year) > 1
+                            if overlap < 0.5 or year_mismatch:
+                                mismatched.append({
+                                    'file': base,
+                                    'file_year': f_year,
+                                    'title_tokens_overlap': round(overlap, 2),
+                                    'year_mismatch': bool(year_mismatch),
+                                })
+                if len(media) > 1:
+                    multi_version.append({
+                        'library': sec.get('title'),
+                        'plex_key': item.get('ratingKey'),
+                        'title': title,
+                        'year': year,
+                        'media_count': len(media),
+                        'media': media_summaries,
+                    })
+                if mismatched:
+                    merged_metadata.append({
+                        'library': sec.get('title'),
+                        'plex_key': item.get('ratingKey'),
+                        'title': title,
+                        'year': year,
+                        'mismatched_files': mismatched,
+                        'all_media': media_summaries,
+                    })
+        elif stype == 'show':
+            try:
+                shows = _plex_get(f'/library/sections/{skey}/all').get('MediaContainer', {}).get('Metadata') or []
+            except Exception as e:
+                log.warning(f'plex show section {skey} fetch failed: {e}')
+                continue
+            for show in shows:
+                show_key = show.get('ratingKey')
+                try:
+                    episodes = _plex_get(f'/library/metadata/{show_key}/allLeaves').get('MediaContainer', {}).get('Metadata') or []
+                except Exception as e:
+                    log.debug(f'episode fetch for show {show_key} failed: {e}')
+                    continue
+                for ep in episodes:
+                    scanned['show_episodes'] += 1
+                    media = ep.get('Media') or []
+                    if len(media) > 1:
+                        media_summaries = []
+                        for m in media:
+                            for p in (m.get('Part') or []):
+                                media_summaries.append({
+                                    'file': p.get('file'),
+                                    'size_gb': round((p.get('size') or 0) / (1024**3), 2),
+                                    'resolution': m.get('videoResolution'),
+                                    'duration_min': round((m.get('duration') or 0) / 60000, 1),
+                                })
+                        multi_version.append({
+                            'library': sec.get('title'),
+                            'plex_key': ep.get('ratingKey'),
+                            'title': f"{show.get('title')} S{ep.get('parentIndex'):02d}E{ep.get('index'):02d} — {ep.get('title')}",
+                            'media_count': len(media),
+                            'media': media_summaries,
+                        })
+    return jsonify({
+        'ok': True,
+        'scanned': scanned,
+        'counts': {
+            'multi_version': len(multi_version),
+            'merged_metadata': len(merged_metadata),
+        },
+        'multi_version': multi_version,
+        'merged_metadata': merged_metadata,
+    }), 200
 
 # List Sonarr seasons where NO episode has a season-pack import in
 # history — i.e. seasons that were only ever grabbed as individual
