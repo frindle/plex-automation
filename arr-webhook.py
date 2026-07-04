@@ -3005,6 +3005,145 @@ def run_cleanup():
     threading.Thread(target=cleanup_superseded, daemon=True).start()
     return jsonify({'ok': True, 'message': f'cleanup started; will remove superseded torrents seeded ≥ {SEED_DAYS} days'}), 200
 
+# Scan an Incomplete directory for files not backed by any Deluge torrent.
+# Deluge parks in-progress downloads under DOWNLOADS_MOUNT/Incomplete; when
+# a torrent gets removed (or crashes) mid-download the partial files can
+# be left behind as orphans. This surfaces anything on disk whose basename
+# does not correspond to a name/file of a currently-tracked torrent.
+# Dry-run default. ?apply=1 deletes.
+@app.route('/incomplete-orphans', methods=['GET', 'POST'])
+def incomplete_orphans():
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    downloads_root = os.environ.get('DOWNLOADS_MOUNT', '/data/Downloads')
+    incomplete_dir = os.path.join(downloads_root, 'Incomplete')
+    if not os.path.isdir(incomplete_dir):
+        return jsonify({'ok': False, 'error': f'{incomplete_dir} not a directory'}), 400
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'save_path', 'files']],
+                'id': 96,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'deluge fetch failed: {e}'}), 500
+    # Union of every top-level name a torrent might land on disk as: the
+    # torrent's `name`, plus the first path segment of each file entry.
+    tracked_names = set()
+    for info in torrents.values():
+        n = info.get('name')
+        if n:
+            tracked_names.add(n)
+        for f in (info.get('files') or []):
+            p = f.get('path') if isinstance(f, dict) else str(f)
+            if p:
+                tracked_names.add(p.split('/', 1)[0])
+    orphans = []
+    kept = []
+    for entry in sorted(os.listdir(incomplete_dir)):
+        full = os.path.join(incomplete_dir, entry)
+        try:
+            size = _du(full)
+        except Exception:
+            size = 0
+        rec = {
+            'name': entry,
+            'path': full,
+            'size_gb': round(size / (1024**3), 2),
+            'is_dir': os.path.isdir(full),
+        }
+        if entry in tracked_names:
+            kept.append(rec)
+            continue
+        if apply:
+            try:
+                if os.path.isdir(full):
+                    import shutil
+                    shutil.rmtree(full)
+                else:
+                    os.remove(full)
+                rec['result'] = 'deleted'
+            except Exception as e:
+                rec['result'] = f'FAILED: {e}'
+        orphans.append(rec)
+    return jsonify({
+        'ok': True,
+        'apply': apply,
+        'incomplete_dir': incomplete_dir,
+        'counts': {'orphans': len(orphans), 'tracked': len(kept)},
+        'orphans': orphans,
+        'tracked': kept,
+    }), 200
+
+def _du(path):
+    if not os.path.exists(path):
+        return 0
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            fp = os.path.join(root, f)
+            try:
+                total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
+
+# Remove a single torrent by hash, deleting files. Use for the
+# "superseded + still incomplete + not worth finishing" case (Radarr
+# has already moved on to a newer release, so the partial download is
+# dead weight). Body OR query: hash=<hash>. Dry-run default.
+@app.route('/torrent-purge', methods=['POST', 'GET'])
+def torrent_purge():
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    torrent_hash = (request.args.get('hash') or '').lower().strip()
+    if not torrent_hash:
+        body = request.get_json(silent=True) or {}
+        torrent_hash = (body.get('hash') or '').lower().strip()
+    if not torrent_hash:
+        return jsonify({'ok': False, 'error': 'hash required (query or body)'}), 400
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrent_status',
+                'params': [torrent_hash, ['name', 'label', 'save_path', 'progress']],
+                'id': 97,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        info = resp.json().get('result') or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'deluge fetch failed: {e}'}), 500
+    if not info:
+        return jsonify({'ok': False, 'error': f'no torrent with hash {torrent_hash}'}), 404
+    result = {
+        'hash': torrent_hash,
+        'name': info.get('name'),
+        'label': info.get('label'),
+        'save_path': info.get('save_path'),
+        'progress': info.get('progress'),
+    }
+    if not apply:
+        result['note'] = 'dry-run — pass ?apply=1 to remove torrent + files'
+        return jsonify({'ok': True, 'apply': False, 'target': result}), 200
+    try:
+        remove_torrent(torrent_hash)
+        result['result'] = 'removed torrent + files'
+    except Exception as e:
+        result['result'] = f'FAILED: {e}'
+        return jsonify({'ok': False, 'apply': True, 'target': result}), 500
+    return jsonify({'ok': True, 'apply': True, 'target': result}), 200
+
 # Report-only audit of everything labeled `superseded`: how long each has
 # been seeding, whether it's already past SEED_DAYS (i.e. would be swept
 # by the next cleanup run), and whether its save_path is under SEEDING_DIR
