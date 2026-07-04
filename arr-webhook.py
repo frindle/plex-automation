@@ -261,8 +261,35 @@ def _torrent_name_matches_file(torrent_name, tracked_relative_path):
             name = name[:-len(ext)]
     return name == tracked or tracked in name or name in tracked
 
-def dedup_via_radarr():
-    log.info('Running Radarr → Deluge dedup pass...')
+def _radarr_last_imported_download_id(movie_id):
+    """Ask Radarr for the most recent successful import for a movie —
+    that's Radarr's chosen keeper, and its downloadId maps to a Deluge
+    hash. Returns lowercase hash str or None."""
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/history/movie',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            params={'movieId': movie_id, 'eventType': 'downloadFolderImported'},
+            timeout=15,
+        )
+        r.raise_for_status()
+        # Response is a list; take the most recent import event.
+        events = r.json()
+        if not events:
+            return None
+        # Sort by date desc if not already
+        events.sort(key=lambda e: e.get('date', ''), reverse=True)
+        for e in events:
+            did = (e.get('downloadId') or '').lower()
+            if did:
+                return did
+        return None
+    except Exception as e:
+        log.warning(f'Radarr history lookup failed for movie {movie_id}: {e}')
+        return None
+
+def dedup_via_radarr(dry_run=False):
+    log.info(f'Running Radarr → Deluge dedup pass{" (DRY RUN)" if dry_run else ""}...')
     if not RADARR_API_KEY:
         log.info('  no RADARR_API_KEY, skip')
         return
@@ -308,22 +335,33 @@ def dedup_via_radarr():
                 matched_hashes.append(h)
             if len(matched_hashes) <= 1:
                 continue
-            # Safety: only relabel extras if AT LEAST ONE torrent maps to the
-            # currently-tracked file. If none match, we can't identify the
-            # winner — skip the whole movie rather than blow away every
-            # active seed.
+            # Safety: only relabel extras if we can identify AT LEAST ONE
+            # keeper. Fast path: torrent name matches the currently-tracked
+            # file. Fallback path: ask Radarr's history for the downloadId
+            # of the last successful import — that hash IS the keeper by
+            # definition. Only if BOTH fail do we skip the movie.
             keepers = [h for h in matched_hashes if _torrent_name_matches_file(radarr_torrents[h].get('name', ''), tracked)]
+            keeper_source = 'filename-match'
             if not keepers:
-                log.warning(f'  skip movie {movie["id"]} ({movie.get("title")}): {len(matched_hashes)} torrents matched title but NONE matched tracked file "{tracked}" — not relabeling anything')
+                imported_hash = _radarr_last_imported_download_id(movie['id'])
+                if imported_hash and imported_hash in {h.lower() for h in matched_hashes}:
+                    # imported_hash is lowercase; find the matching original-case hash
+                    keepers = [h for h in matched_hashes if h.lower() == imported_hash]
+                    keeper_source = 'radarr-history'
+            if not keepers:
+                log.warning(f'  skip movie {movie["id"]} ({movie.get("title")}): {len(matched_hashes)} torrents matched title but no keeper identified (filename mismatch + no Radarr history) — not relabeling anything')
                 continue
+            log.info(f'  movie {movie["id"]} ({movie.get("title")}): keeper via {keeper_source} = {keepers[0][:12]}')
             for h in matched_hashes:
                 if h in keepers:
                     continue
                 name = radarr_torrents[h].get('name', '')
-                log.info(f'  relabeling superseded: "{name}" (movie {movie["id"]}: {movie.get("title")}) — tracked file is {tracked}')
-                set_torrent_label(h, SUPERSEDED_LABEL)
+                action = 'WOULD relabel' if dry_run else 'relabeling'
+                log.info(f'  {action} superseded: "{name}" (movie {movie["id"]}: {movie.get("title")})')
+                if not dry_run:
+                    set_torrent_label(h, SUPERSEDED_LABEL)
                 relabeled += 1
-        log.info(f'Radarr dedup complete: relabeled {relabeled} superseded torrent(s)')
+        log.info(f'Radarr dedup complete{" (DRY RUN)" if dry_run else ""}: {"would relabel" if dry_run else "relabeled"} {relabeled} superseded torrent(s)')
     except Exception as e:
         log.error(f'Radarr dedup failed: {e}')
 
@@ -1132,9 +1170,14 @@ def revert_superseded():
 # behaves before waiting for the 24h scheduled tick.
 @app.route('/run-dedup', methods=['POST'])
 def run_dedup():
-    threading.Thread(target=dedup_via_radarr, daemon=True).start()
+    dry_run = request.args.get('dry_run', '').lower() in ('1', 'true', 'yes')
+    threading.Thread(target=dedup_via_radarr, args=(dry_run,), daemon=True).start()
     threading.Thread(target=dedup_via_sonarr, daemon=True).start()
-    return jsonify({'ok': True, 'message': 'dedup passes started; check container logs'}), 200
+    return jsonify({
+        'ok': True,
+        'dry_run': dry_run,
+        'message': f'dedup passes started{" (DRY RUN — no changes will be made)" if dry_run else ""}; check container logs',
+    }), 200
 
 # Manual trigger for cleanup_superseded — remove torrents currently
 # labeled `superseded` that have been seeding at least SEED_DAYS.
