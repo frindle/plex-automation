@@ -2491,6 +2491,71 @@ def import_audit():
         },
     }), 200
 
+# Radarr movies whose tracked file lacks surround audio, HDR, and x265.
+# All three markers = "modern release"; missing all three = older encode
+# worth flagging for upgrade. Query args:
+#   ?missing=surround,hdr,x265 (any/all; default: all three)
+@app.route('/quality-audit', methods=['GET'])
+def quality_audit():
+    if not RADARR_API_KEY:
+        return jsonify({'ok': False, 'error': 'no RADARR_API_KEY'}), 400
+    want_missing = {s.strip().lower() for s in (request.args.get('missing') or 'surround,hdr,x265').split(',') if s.strip()}
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/movie',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            timeout=60,
+        )
+        r.raise_for_status()
+        movies = r.json()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Radarr fetch failed: {e}'}), 500
+    hits = []
+    for m in movies:
+        if not m.get('hasFile'):
+            continue
+        mf = m.get('movieFile') or {}
+        mi = mf.get('mediaInfo') or {}
+        channels = mi.get('audioChannels') or 0
+        video_codec = (mi.get('videoCodec') or '').lower()
+        dyn_range = (mi.get('videoDynamicRange') or '').lower()
+        dyn_type = (mi.get('videoDynamicRangeType') or '').lower()
+        rel = mf.get('relativePath') or ''
+        rel_l = rel.lower()
+        # Fall back to filename markers when mediaInfo is missing
+        has_surround = channels >= 5.1 or any(t in rel_l for t in ['5.1', '7.1', 'atmos', 'truehd', 'ddp', 'dts'])
+        has_hdr = bool(dyn_range) or any(t in rel_l for t in ['hdr', 'dv ', 'dovi', 'dolby.vision', 'dolby vision'])
+        has_x265 = 'x265' in video_codec or 'hevc' in video_codec or any(t in rel_l for t in ['x265', 'hevc', 'h265', 'h.265'])
+        missing = set()
+        if not has_surround:
+            missing.add('surround')
+        if not has_hdr:
+            missing.add('hdr')
+        if not has_x265:
+            missing.add('x265')
+        # match rule: movie qualifies if it's missing every marker the caller asked about
+        if not want_missing.issubset(missing):
+            continue
+        hits.append({
+            'id': m.get('id'),
+            'title': m.get('title'),
+            'year': m.get('year'),
+            'file': rel,
+            'size_gb': round((mf.get('size') or 0) / (1024**3), 2),
+            'channels': channels,
+            'video_codec': video_codec,
+            'dyn_range': dyn_range or dyn_type or None,
+            'missing': sorted(missing),
+        })
+    hits.sort(key=lambda x: (x['title'] or '').lower())
+    return jsonify({
+        'ok': True,
+        'want_missing': sorted(want_missing),
+        'count': len(hits),
+        'search_hint': 'POST /api/v3/command {"name":"MoviesSearch","movieIds":[ID]}',
+        'movies': hits,
+    }), 200
+
 # List monitored Radarr movies with hasFile=false — the gap-fill list.
 # Returns enough metadata to prioritize (release dates, availability,
 # added date, quality profile, tags). Sort options exposed via ?sort=.
