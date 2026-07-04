@@ -1616,6 +1616,32 @@ def _auto_rescue(service, dry_run=False):
             continue
         last_grab = max(grabbed_dates)
         last_import = max(imported_dates) if imported_dates else ''
+        # Manual DownloadedMoviesScan strips the downloadId from the
+        # resulting downloadFolderImported event, so history?downloadId
+        # can miss legit imports. Fall back to matching by sourceTitle
+        # substring against the torrent name — cross-references any
+        # import in the movie's full history whose sourceTitle looks
+        # like this torrent.
+        if not last_import:
+            try:
+                tname_key = (info.get('name') or '').lower().replace('.', ' ').replace('_', ' ').strip()
+                if tname_key:
+                    hr2 = requests.get(
+                        f'{url}{history_path}',
+                        headers={'X-Api-Key': key},
+                        params={'sourceTitle': info.get('name'), 'pageSize': 50},
+                        timeout=20,
+                    )
+                    if hr2.ok:
+                        alt_imports = [
+                            r.get('date') for r in (hr2.json().get('records') or [])
+                            if r.get('eventType') == import_event
+                            and tname_key[:40] in (r.get('sourceTitle') or '').lower().replace('.', ' ').replace('_', ' ')
+                        ]
+                        if alt_imports:
+                            last_import = max(alt_imports)
+            except Exception as e:
+                log.debug(f'auto-rescue: sourceTitle fallback failed for {h[:8]}: {e}')
         if last_import >= last_grab:
             skipped_reasons['already_imported'] += 1
             continue
