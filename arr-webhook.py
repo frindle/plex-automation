@@ -2193,8 +2193,13 @@ def plex_dupe_fix():
                         # No torrent seeding this file — nuke the Plex Media
                         # entry directly. Plex library scan will drop the
                         # associated file per its trash settings.
+                        # Plex API DELETE ignores query-string tokens; header is required.
                         del_url = f'{PLEX_URL}/library/metadata/{plex_key}/media/{loser.get("media_id")}'
-                        rd = requests.delete(del_url, params={'X-Plex-Token': PLEX_TOKEN}, timeout=15)
+                        rd = requests.delete(
+                            del_url,
+                            headers={'X-Plex-Token': PLEX_TOKEN, 'Accept': 'application/json'},
+                            timeout=15,
+                        )
                         rd.raise_for_status()
                         action['result'] = 'no torrent found — deleted Plex Media entry'
                 except Exception as e:
