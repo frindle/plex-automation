@@ -170,12 +170,18 @@ def torrent_matches_any_title(torrent_name, title_variants):
     every filename. Word-based matching kills that class of false positive.
 
     Requires ALL words of the variant to be present as separate tokens.
-    Non-alphanumeric chars are treated as word separators (matches the
-    scene-release naming convention of dots/dashes/spaces)."""
+    Also requires the variant to contain at least one word of ≥3 chars —
+    otherwise short/ambiguous variants like "2" (Radarr sometimes lists a
+    lone digit as an alt title for sequels) match every torrent whose
+    name contains that digit as a token."""
     name_words = set(re.findall(r'[a-z0-9]+', torrent_name.lower()))
     for variant in title_variants:
         v_words = re.findall(r'[a-z0-9]+', variant.lower())
-        if v_words and all(w in name_words for w in v_words):
+        if not v_words:
+            continue
+        if max(len(w) for w in v_words) < 3:
+            continue
+        if all(w in name_words for w in v_words):
             return True
     return False
 
