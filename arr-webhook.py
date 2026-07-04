@@ -34,6 +34,9 @@ PLEX_URL         = os.environ.get('PLEX_URL', 'http://10.0.0.6:32400')
 PLEX_TOKEN       = os.environ.get('PLEX_TOKEN', '')
 # Comma-separated library titles to skip in plex-dupe-scan (case-insensitive).
 PLEX_SKIP_LIBRARIES = {s.strip().lower() for s in os.environ.get('PLEX_SKIP_LIBRARIES', 'Adult,XXX,NSFW,Music,Music Videos').split(',') if s.strip()}
+# Plex ratingKeys never touched by /plex-dupe-fix. Melody keeps multiple
+# Eras Tour versions; add more comma-separated keys as needed.
+PLEX_DUPE_KEEP = {s.strip() for s in os.environ.get('PLEX_DUPE_KEEP', '25705').split(',') if s.strip()}
 PUSHOVER_TOKEN   = os.environ.get('PUSHOVER_TOKEN', '')
 PUSHOVER_USER    = os.environ.get('PUSHOVER_USER', '')
 IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  # 15 min
@@ -1805,6 +1808,8 @@ def plex_dupe_scan():
                         f = p.get('file') or ''
                         base = os.path.basename(f)
                         media_summaries.append({
+                            'media_id': m.get('id'),
+                            'part_id': p.get('id'),
                             'file': f,
                             'size_gb': round((p.get('size') or 0) / (1024**3), 2),
                             'resolution': m.get('videoResolution'),
@@ -1876,6 +1881,8 @@ def plex_dupe_scan():
                         for m in media:
                             for p in (m.get('Part') or []):
                                 media_summaries.append({
+                                    'media_id': m.get('id'),
+                                    'part_id': p.get('id'),
                                     'file': p.get('file'),
                                     'size_gb': round((p.get('size') or 0) / (1024**3), 2),
                                     'resolution': m.get('videoResolution'),
@@ -1898,6 +1905,172 @@ def plex_dupe_scan():
         },
         'multi_version': multi_version,
         'merged_metadata': merged_metadata,
+    }), 200
+
+# Act on Plex dupes surfaced by /plex-dupe-scan. Uses the same
+# supersede-and-move flow as post-import: lower-quality file's torrent
+# gets relabeled `superseded` and moved to SEEDING_DIR so Plex loses
+# sight of it and cleanup_superseded takes it out after SEED_DAYS.
+# Dry-run default. ?apply=1 executes.
+def _find_torrent_by_filepath(torrents, filepath):
+    """Return (hash, torrent_info) if any torrent has a file whose
+    path or basename matches the given filepath."""
+    if not filepath:
+        return None, None
+    target_base = os.path.basename(filepath)
+    for h, info in torrents.items():
+        # Direct name match (single-file torrents)
+        if info.get('name') == target_base:
+            return h, info
+        # Multi-file torrents — check the files list
+        for f in (info.get('files') or []):
+            p = f.get('path') if isinstance(f, dict) else str(f)
+            if os.path.basename(p) == target_base:
+                return h, info
+    return None, None
+
+@app.route('/plex-dupe-fix', methods=['POST', 'GET'])
+def plex_dupe_fix():
+    if not PLEX_TOKEN:
+        return jsonify({'ok': False, 'error': 'no PLEX_TOKEN'}), 400
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    # Reuse the scan output rather than duplicating the walk
+    try:
+        scan = plex_dupe_scan().get_json()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'scan failed: {e}'}), 500
+    if not scan or not scan.get('ok'):
+        return jsonify({'ok': False, 'error': 'scan returned no data'}), 500
+    try:
+        deluge_login()
+        ensure_label_exists()
+        dresp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'label', 'save_path', 'files', 'progress']],
+                'id': 91,
+            },
+            timeout=30,
+        )
+        dresp.raise_for_status()
+        torrents = dresp.json().get('result') or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'deluge fetch failed: {e}'}), 500
+    plan = {
+        'quality_upgrade': [],
+        'wrong_show_attach': [],
+        'same_file_ghost': [],
+        'kept_by_allowlist': [],
+        'unknown': [],
+    }
+    for entry in scan.get('multi_version') or []:
+        plex_key = str(entry.get('plex_key') or '')
+        if plex_key in PLEX_DUPE_KEEP:
+            plan['kept_by_allowlist'].append({
+                'plex_key': plex_key, 'title': entry.get('title'),
+            })
+            continue
+        media_list = entry.get('media') or []
+        if len(media_list) < 2:
+            continue
+        # Identical filenames = Plex ghost entry. Manual fix (Refresh Metadata).
+        basenames = [os.path.basename(m.get('file') or '') for m in media_list]
+        if len(set(basenames)) == 1:
+            plan['same_file_ghost'].append({
+                'plex_key': plex_key,
+                'title': entry.get('title'),
+                'file': basenames[0],
+                'action': f'Plex → item → ⋯ → Refresh Metadata',
+            })
+            continue
+        # Score each Media: (resolution_rank, size_gb). Higher wins.
+        res_rank = {'4k': 4, '2160': 4, '1080': 3, '720': 2, '576': 1, '480': 1, None: 0}
+        def score(m):
+            return (res_rank.get(str(m.get('resolution') or '').lower(), 0),
+                    m.get('size_gb') or 0)
+        # Determine title-token overlap for each Media vs parent
+        parent_title_tokens = set(TITLE_TOKEN_RE.findall((entry.get('title') or '').lower().replace("'", '')))
+        parent_title_tokens -= {'the', 'a', 'an', 'of', 'and', 's01e01', 'episode'}
+        def matches_parent(m):
+            base = os.path.basename(m.get('file') or '')
+            f_tokens = _filename_title_tokens(base) - {'the', 'a', 'an', 'of', 'and'}
+            if not parent_title_tokens or not f_tokens:
+                return True
+            overlap = len(parent_title_tokens & f_tokens) / max(1, len(parent_title_tokens))
+            reverse = len(parent_title_tokens & f_tokens) / max(1, len(f_tokens))
+            return overlap >= 0.3 or reverse >= 0.5
+        good = [m for m in media_list if matches_parent(m)]
+        bad = [m for m in media_list if not matches_parent(m)]
+        if bad and good:
+            # Wrong-show attach: the "bad" Media entries don't belong here.
+            # Filesystem move required (into their real show folder), not
+            # into Just4Seeding — so we surface manual instructions.
+            plan['wrong_show_attach'].append({
+                'plex_key': plex_key,
+                'title': entry.get('title'),
+                'keep_files': [os.path.basename(m.get('file') or '') for m in good],
+                'detach_files': [
+                    {
+                        'file': m.get('file'),
+                        'basename': os.path.basename(m.get('file') or ''),
+                        'media_id': m.get('media_id'),
+                        'size_gb': m.get('size_gb'),
+                    } for m in bad
+                ],
+                'action': 'move each detach_file to its correct show folder, then trigger Plex library scan',
+            })
+            continue
+        # Quality upgrade case: all Media match parent, delete lower quality
+        sorted_media = sorted(media_list, key=score, reverse=True)
+        keeper = sorted_media[0]
+        losers = sorted_media[1:]
+        upgrade_actions = []
+        for loser in losers:
+            fpath = loser.get('file') or ''
+            h, tinfo = _find_torrent_by_filepath(torrents, fpath)
+            action = {
+                'file': fpath,
+                'basename': os.path.basename(fpath),
+                'size_gb': loser.get('size_gb'),
+                'resolution': loser.get('resolution'),
+                'media_id': loser.get('media_id'),
+                'torrent_hash': h,
+                'torrent_name': tinfo.get('name') if tinfo else None,
+                'torrent_label': tinfo.get('label') if tinfo else None,
+            }
+            if apply:
+                try:
+                    if h and tinfo:
+                        set_torrent_label(h, SUPERSEDED_LABEL)
+                        move_torrent_storage(h, SEEDING_DIR)
+                        action['result'] = f'torrent superseded + moved to {SEEDING_DIR}'
+                    else:
+                        # No torrent seeding this file — nuke the Plex Media
+                        # entry directly. Plex library scan will drop the
+                        # associated file per its trash settings.
+                        del_url = f'{PLEX_URL}/library/metadata/{plex_key}/media/{loser.get("media_id")}'
+                        rd = requests.delete(del_url, params={'X-Plex-Token': PLEX_TOKEN}, timeout=15)
+                        rd.raise_for_status()
+                        action['result'] = 'no torrent found — deleted Plex Media entry'
+                except Exception as e:
+                    action['result'] = f'FAILED: {e}'
+            upgrade_actions.append(action)
+        plan['quality_upgrade'].append({
+            'plex_key': plex_key,
+            'title': entry.get('title'),
+            'keep': {
+                'file': os.path.basename(keeper.get('file') or ''),
+                'size_gb': keeper.get('size_gb'),
+                'resolution': keeper.get('resolution'),
+            },
+            'supersede': upgrade_actions,
+        })
+    return jsonify({
+        'ok': True,
+        'apply': apply,
+        'counts': {k: len(v) for k, v in plan.items()},
+        'plan': plan,
     }), 200
 
 # List Sonarr seasons where NO episode has a season-pack import in
