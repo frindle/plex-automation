@@ -164,13 +164,18 @@ def get_all_torrents():
 # ── Matching helpers ─────────────────────────────────────────────────────────
 
 def torrent_matches_any_title(torrent_name, title_variants):
-    """Check if a torrent name contains any of the title variants."""
-    name_normalized = re.sub(r'[ :&]+', '.', torrent_name.lower())
-    name_plain = re.sub(r'[ :&.]+', '', torrent_name.lower())
+    """Check if every word of a variant appears as a whole word in the
+    torrent name. Substring matching is dangerous: title "21" matched
+    "2160p", title "X" matched "x265", title "It" matched every "it" in
+    every filename. Word-based matching kills that class of false positive.
+
+    Requires ALL words of the variant to be present as separate tokens.
+    Non-alphanumeric chars are treated as word separators (matches the
+    scene-release naming convention of dots/dashes/spaces)."""
+    name_words = set(re.findall(r'[a-z0-9]+', torrent_name.lower()))
     for variant in title_variants:
-        variant_dotted = re.sub(r'[ :&]+', '.', variant)
-        variant_plain = re.sub(r'[ :&.]+', '', variant)
-        if variant_dotted and (variant_dotted in name_normalized or variant_plain in name_plain):
+        v_words = re.findall(r'[a-z0-9]+', variant.lower())
+        if v_words and all(w in name_words for w in v_words):
             return True
     return False
 
@@ -291,12 +296,18 @@ def dedup_via_radarr():
                     matched_hashes.append(h)
             if len(matched_hashes) <= 1:
                 continue
-            # Keep the one that matches the tracked file; relabel the rest
+            # Safety: only relabel extras if AT LEAST ONE torrent maps to the
+            # currently-tracked file. If none match, we can't identify the
+            # winner — skip the whole movie rather than blow away every
+            # active seed.
+            keepers = [h for h in matched_hashes if _torrent_name_matches_file(radarr_torrents[h].get('name', ''), tracked)]
+            if not keepers:
+                log.warning(f'  skip movie {movie["id"]} ({movie.get("title")}): {len(matched_hashes)} torrents matched title but NONE matched tracked file "{tracked}" — not relabeling anything')
+                continue
             for h in matched_hashes:
-                info = radarr_torrents[h]
-                name = info.get('name', '')
-                if _torrent_name_matches_file(name, tracked):
+                if h in keepers:
                     continue
+                name = radarr_torrents[h].get('name', '')
                 log.info(f'  relabeling superseded: "{name}" (movie {movie["id"]}: {movie.get("title")}) — tracked file is {tracked}')
                 set_torrent_label(h, SUPERSEDED_LABEL)
                 relabeled += 1
@@ -354,12 +365,21 @@ def dedup_via_sonarr():
                     matched_hashes.append(h)
             if len(matched_hashes) <= len(tracked_paths):
                 continue  # 1 torrent per tracked file is normal
+            # Safety: only relabel extras if AT LEAST ONE torrent maps to
+            # a currently-tracked file. Otherwise we can't identify winners
+            # and would blow away every active seed for the series.
+            keepers = set()
             for h in matched_hashes:
-                info = sonarr_torrents[h]
-                name = info.get('name', '').lower()
+                name = sonarr_torrents[h].get('name', '').lower()
                 if any(_torrent_name_matches_file(name, p) for p in tracked_paths):
+                    keepers.add(h)
+            if not keepers:
+                log.warning(f'  skip series {series_id} ({series.get("title")}): {len(matched_hashes)} torrents matched but NONE mapped to tracked files — not relabeling anything')
+                continue
+            for h in matched_hashes:
+                if h in keepers:
                     continue
-                log.info(f'  relabeling superseded: "{info.get("name")}" (series {series_id}: {series.get("title")})')
+                log.info(f'  relabeling superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")})')
                 set_torrent_label(h, SUPERSEDED_LABEL)
                 relabeled += 1
         log.info(f'Sonarr dedup complete: relabeled {relabeled} superseded torrent(s)')
@@ -1066,6 +1086,35 @@ def sonarr_webhook():
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'}), 200
+
+# Emergency revert for the mass-superseded-relabel bug. Flips every
+# torrent currently labeled `superseded` back to `radarr` or `sonarr`
+# based on which system knows about it. Idempotent; safe to hit twice.
+@app.route('/revert-superseded', methods=['POST'])
+def revert_superseded():
+    try:
+        deluge_login()
+        torrents = get_all_torrents()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    reverted = 0
+    skipped = 0
+    for h, info in torrents.items():
+        if info.get('label') != SUPERSEDED_LABEL:
+            continue
+        name = info.get('name', '').lower()
+        # Guess the source by looking at the file extension pattern —
+        # single .mkv/.mp4 is usually a Radarr movie, folders full of
+        # SxxExx are Sonarr. Fall back to radarr since it's the most
+        # common relabel target from the bad dedup pass.
+        new_label = 'sonarr' if EPISODE_RE.search(name) else 'radarr'
+        try:
+            set_torrent_label(h, new_label)
+            reverted += 1
+        except Exception as e:
+            log.warning(f'revert: failed to relabel {h}: {e}')
+            skipped += 1
+    return jsonify({'ok': True, 'reverted': reverted, 'skipped': skipped}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 9876))
