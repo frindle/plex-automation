@@ -1476,7 +1476,7 @@ def delete_paths():
     body_stripped = body.strip()
     if body_stripped.startswith('{'):
         try:
-            data = json.loads(body_stripped)
+            data = _json.loads(body_stripped)
             paths = data.get('paths', [])
         except Exception as e:
             return jsonify({'ok': False, 'error': f'JSON parse: {e}'}), 400
