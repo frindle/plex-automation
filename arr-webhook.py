@@ -32,6 +32,8 @@ SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
 MOVIES_LIBRARY   = os.environ.get('MOVIES_LIBRARY', '/media/movies')
 PLEX_URL         = os.environ.get('PLEX_URL', 'http://10.0.0.6:32400')
 PLEX_TOKEN       = os.environ.get('PLEX_TOKEN', '')
+# Comma-separated library titles to skip in plex-dupe-scan (case-insensitive).
+PLEX_SKIP_LIBRARIES = {s.strip().lower() for s in os.environ.get('PLEX_SKIP_LIBRARIES', 'Adult,XXX,NSFW,Music,Music Videos').split(',') if s.strip()}
 PUSHOVER_TOKEN   = os.environ.get('PUSHOVER_TOKEN', '')
 PUSHOVER_USER    = os.environ.get('PUSHOVER_USER', '')
 IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  # 15 min
@@ -1745,7 +1747,7 @@ def _plex_get(path, params=None):
     return r.json()
 
 TITLE_TOKEN_RE = re.compile(r'[a-z0-9]+')
-FILENAME_YEAR_RE = re.compile(r'(19\d{2}|20\d{2})')
+FILENAME_YEAR_RE = re.compile(r'(?<![a-z0-9])(19\d{2}|20\d{2})(?![a-z0-9])', re.IGNORECASE)
 
 def _filename_title_tokens(basename):
     stem = basename.rsplit('.', 1)[0]
@@ -1772,10 +1774,15 @@ def plex_dupe_scan():
     multi_version = []
     merged_metadata = []
     scanned = {'movie': 0, 'show_episodes': 0}
+    skipped_libraries = []
     for sec in sections:
         stype = sec.get('type')
         skey = sec.get('key')
+        stitle = sec.get('title') or ''
         if stype not in ('movie', 'show'):
+            continue
+        if stitle.lower() in PLEX_SKIP_LIBRARIES:
+            skipped_libraries.append(stitle)
             continue
         if stype == 'movie':
             try:
@@ -1884,6 +1891,7 @@ def plex_dupe_scan():
     return jsonify({
         'ok': True,
         'scanned': scanned,
+        'skipped_libraries': skipped_libraries,
         'counts': {
             'multi_version': len(multi_version),
             'merged_metadata': len(merged_metadata),
