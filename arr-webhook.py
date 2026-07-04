@@ -1953,6 +1953,62 @@ def plex_dupe_scan():
         'merged_metadata': merged_metadata,
     }), 200
 
+# Emergency: strip sonarr/radarr labels from torrents whose save_path
+# is inside /data/Media/ (library seeds, not real arr downloads). Used
+# to undo an over-eager /relabel-by-plex run that made Sonarr/Radarr
+# treat every library seed as a new-download-needing-import.
+# Dry-run default. ?apply=1 to actually relabel.
+@app.route('/unlabel-library-seeds', methods=['POST', 'GET'])
+def unlabel_library_seeds():
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    new_label = request.args.get('new_label', '')  # default: blank
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'label', 'save_path']],
+                'id': 94,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'deluge fetch failed: {e}'}), 500
+    targets = []
+    for h, info in torrents.items():
+        label = (info.get('label') or '').lower()
+        if label not in ('sonarr', 'radarr'):
+            continue
+        save_path = info.get('save_path') or ''
+        # Library seeds live under /data/Media/*, real arr grabs land in
+        # /data/Downloads/Complete/. Anything not in Downloads is a
+        # library seed we shouldn't have labeled.
+        if save_path.startswith('/data/Downloads/'):
+            continue
+        entry = {
+            'hash': h,
+            'name': info.get('name'),
+            'save_path': save_path,
+            'old_label': label,
+            'new_label': new_label or '(blank)',
+        }
+        if apply:
+            try:
+                set_torrent_label(h, new_label)
+                entry['result'] = 'relabeled'
+            except Exception as e:
+                entry['result'] = f'FAILED: {e}'
+        targets.append(entry)
+    return jsonify({
+        'ok': True,
+        'apply': apply,
+        'count': len(targets),
+        'targets': targets,
+    }), 200
+
 # Cross-reference unlabeled Deluge torrents against Plex's library.
 # Any torrent whose file basename appears in Plex gets the appropriate
 # label (radarr for movies, sonarr for TV). Anything unmatched goes on
