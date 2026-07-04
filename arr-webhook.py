@@ -38,7 +38,9 @@ session = requests.Session()
 # ── Arr API helpers ──────────────────────────────────────────────────────────
 
 def get_sonarr_series_titles(series_id):
-    """Return a list of all known title variants for a Sonarr series."""
+    """Return a set of title variants for a Sonarr series. Alt titles
+    ignored — same reason as Radarr: TMDB alt titles have caused
+    catastrophic over-matching in dedup."""
     try:
         r = requests.get(
             f'{SONARR_URL}/api/v3/series/{series_id}',
@@ -47,18 +49,8 @@ def get_sonarr_series_titles(series_id):
         )
         r.raise_for_status()
         data = r.json()
-        titles = set()
-        titles.add(data.get('title', ''))
-        titles.add(data.get('sortTitle', ''))
-        for alt in data.get('alternateTitles', []):
-            titles.add(alt.get('title', ''))
-        # Normalise: lowercase, replace spaces/colons/ampersands with dot
-        normalized = set()
-        for t in titles:
-            if t:
-                normalized.add(t.lower())
-                normalized.add(re.sub(r'[ :&]+', '.', t.lower()))
-                normalized.add(re.sub(r'[ :&]+', '', t.lower()))
+        titles = {data.get('title', ''), data.get('originalTitle', '')}
+        normalized = {t.lower() for t in titles if t}
         log.info(f'Sonarr series {series_id} title variants: {normalized}')
         return normalized
     except Exception as e:
@@ -66,7 +58,12 @@ def get_sonarr_series_titles(series_id):
         return set()
 
 def get_radarr_movie_titles(movie_id):
-    """Return a list of all known title variants for a Radarr movie."""
+    """Return a set of title variants for a Radarr movie. We deliberately
+    IGNORE alternateTitles — Radarr's TMDB-sourced alt-title list has
+    included single digits, common English words, and other tokens that
+    matched millions of unrelated torrents. Primary title and originalTitle
+    are enough for dedup identification; we already require the release
+    year to match separately, which catches remakes."""
     try:
         r = requests.get(
             f'{RADARR_URL}/api/v3/movie/{movie_id}',
@@ -75,17 +72,8 @@ def get_radarr_movie_titles(movie_id):
         )
         r.raise_for_status()
         data = r.json()
-        titles = set()
-        titles.add(data.get('title', ''))
-        titles.add(data.get('sortTitle', ''))
-        for alt in data.get('alternateTitles', []):
-            titles.add(alt.get('title', ''))
-        normalized = set()
-        for t in titles:
-            if t:
-                normalized.add(t.lower())
-                normalized.add(re.sub(r'[ :&]+', '.', t.lower()))
-                normalized.add(re.sub(r'[ :&]+', '', t.lower()))
+        titles = {data.get('title', ''), data.get('originalTitle', '')}
+        normalized = {t.lower() for t in titles if t}
         log.info(f'Radarr movie {movie_id} title variants: {normalized}')
         return normalized
     except Exception as e:
