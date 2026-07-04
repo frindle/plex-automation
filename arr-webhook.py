@@ -1190,6 +1190,31 @@ def run_cleanup():
     threading.Thread(target=cleanup_superseded, daemon=True).start()
     return jsonify({'ok': True, 'message': f'cleanup started; will remove superseded torrents seeded ≥ {SEED_DAYS} days'}), 200
 
+# Manual trigger for the monthly upgrade cycle. Full cycle with the
+# normal 30/90-minute waits by default; ?skip_waits=1 replaces them with
+# a short interval so you can watch the whole pipeline end-to-end.
+@app.route('/run-monthly-upgrade', methods=['POST'])
+def run_monthly_upgrade():
+    skip_waits = request.args.get('skip_waits', '').lower() in ('1', 'true', 'yes')
+    def _cycle():
+        log.info(f'Manual monthly upgrade cycle starting (skip_waits={skip_waits})')
+        purge_stalled_upgrade_torrents()
+        wait_a = 10 if skip_waits else 1800
+        log.info(f'Waiting {wait_a}s before bulk search...')
+        time.sleep(wait_a)
+        radarr_bulk_search()
+        wait_b = 30 if skip_waits else 5400
+        log.info(f'Waiting {wait_b}s before relabeling upgrades...')
+        time.sleep(wait_b)
+        relabel_radarr_upgrades()
+        log.info('Manual monthly upgrade cycle complete')
+    threading.Thread(target=_cycle, daemon=True).start()
+    return jsonify({
+        'ok': True,
+        'skip_waits': skip_waits,
+        'message': 'monthly upgrade cycle started; watch container logs',
+    }), 200
+
 # Compare files on disk in MOVIES_LIBRARY against Radarr's tracked
 # movieFile.path values. Anything on disk that Radarr isn't tracking is
 # an orphan (duplicate imports, old files Radarr replaced but didn't
