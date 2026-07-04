@@ -1995,9 +1995,12 @@ def plex_dupe_fix():
     if not PLEX_TOKEN:
         return jsonify({'ok': False, 'error': 'no PLEX_TOKEN'}), 400
     apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
-    # Reuse the scan output rather than duplicating the walk
+    # Reuse the scan output rather than duplicating the walk.
+    # Flask views return (response, status) tuples — unpack first.
     try:
-        scan = plex_dupe_scan().get_json()
+        scan_result = plex_dupe_scan()
+        scan_resp = scan_result[0] if isinstance(scan_result, tuple) else scan_result
+        scan = scan_resp.get_json()
     except Exception as e:
         return jsonify({'ok': False, 'error': f'scan failed: {e}'}), 500
     if not scan or not scan.get('ok'):
