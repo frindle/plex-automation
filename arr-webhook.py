@@ -1145,6 +1145,90 @@ def health():
 # and report save_path + files. Useful when a Radarr import fails with
 # "no video files found" and you need to see what Deluge thinks it
 # downloaded and where.
+# Radarr expects completed downloads to live at
+# <save_path>/<torrent_name>/... but Deluge saves single-file torrents
+# bare at <save_path>/<name>.mkv. Radarr then tries to scan the file
+# as if it were a directory and fails with "no video files found".
+#
+# This endpoint walks every Radarr/Sonarr-labeled Deluge torrent, and
+# for any single-file bare torrent, creates <save_path>/<name-stem>/
+# and hardlinks the file into it. Deluge keeps seeding the original
+# untouched; Radarr's next import scan now finds the file where it
+# expects. Dry-run by default; pass ?apply=1 to actually fix.
+@app.route('/fix-bare-torrents', methods=['POST'])
+def fix_bare_torrents():
+    apply_ = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    # Downloads dir inside this container — should match wherever Deluge
+    # writes to on the host, seen through this container's bind mount.
+    downloads_root = os.environ.get('DOWNLOADS_MOUNT', '/data/Downloads')
+    if not os.path.isdir(downloads_root):
+        return jsonify({'ok': False, 'error': f'DOWNLOADS_MOUNT not a dir: {downloads_root}'}), 400
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'save_path', 'files', 'label', 'progress']],
+                'id': 77,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    fixed = []
+    skipped = []
+    errors = []
+    for h, info in (resp.json().get('result') or {}).items():
+        label = (info.get('label') or '')
+        if label not in ('radarr', 'radarr-upgrade', 'sonarr', 'sonarr-upgrade'):
+            continue
+        if (info.get('progress') or 0) < 100:
+            continue
+        files = info.get('files') or []
+        if len(files) != 1:
+            continue
+        file_rel = files[0].get('path') if isinstance(files[0], dict) else str(files[0])
+        if not file_rel or '/' in file_rel:  # already inside a subfolder
+            continue
+        deluge_save = info.get('save_path') or ''
+        # Translate Deluge's host path to our container's mount. Simplest
+        # assumption: Deluge's save_path suffix after /Downloads/ matches
+        # ours. So map /data/Downloads/Complete → downloads_root + suffix.
+        # Since our container mounts the same /data/Downloads, the paths
+        # already match — no translation needed.
+        src = os.path.join(deluge_save, file_rel)
+        if not os.path.isfile(src):
+            errors.append({'hash': h, 'reason': f'source not found: {src}'})
+            continue
+        stem = file_rel.rsplit('.', 1)[0]  # drop extension
+        target_dir = os.path.join(deluge_save, stem)
+        target = os.path.join(target_dir, file_rel)
+        if os.path.exists(target):
+            skipped.append({'hash': h, 'reason': 'already wrapped', 'target': target})
+            continue
+        if not apply_:
+            fixed.append({'hash': h, 'name': info.get('name'), 'action': 'would wrap', 'target': target})
+            continue
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            os.link(src, target)
+            fixed.append({'hash': h, 'name': info.get('name'), 'action': 'wrapped', 'target': target})
+            log.info(f'fix-bare-torrents: hardlinked {src} → {target}')
+        except OSError as e:
+            errors.append({'hash': h, 'reason': str(e), 'target': target})
+    return jsonify({
+        'ok': True,
+        'dry_run': not apply_,
+        'fixed_count': len(fixed),
+        'skipped_count': len(skipped),
+        'error_count': len(errors),
+        'fixed': fixed,
+        'skipped': skipped,
+        'errors': errors,
+    }), 200
+
 @app.route('/deluge-lookup', methods=['GET', 'POST'])
 def deluge_lookup():
     q = (request.args.get('name') or '').lower()
