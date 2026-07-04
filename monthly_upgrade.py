@@ -1,7 +1,13 @@
 import os
 import time
+from datetime import datetime
 
 import requests
+
+# Rolling cutoff: gap-fills for movies released more than N years ago
+# ride the throttled -upgrade lane. Keeps aging automatic — no manual
+# year bumps every January.
+OLD_GAP_YEARS = int(os.environ.get('OLD_GAP_YEARS', '10'))
 
 DELUGE_URL = os.environ.get('DELUGE_URL')
 DELUGE_PASSWORD = os.environ.get('DELUGE_PASSWORD')
@@ -85,7 +91,8 @@ for torrent_hash, info in radarr_torrents.items():
     #   2. hasFile=False + year<2020 → filling an old library gap; not
     #      urgent, don't let it hog bandwidth from active releases.
     year = movie.get('year') if movie else None
-    is_old_gap = movie and not movie.get('hasFile') and year and year < 2020
+    old_cutoff = datetime.now().year - OLD_GAP_YEARS
+    is_old_gap = movie and not movie.get('hasFile') and year and year < old_cutoff
     if movie and (movie.get('hasFile') or is_old_gap):
         reason = 'upgrade' if movie.get('hasFile') else f'pre-2020 gap-fill (year={year})'
         print(f'  Relabeling ({reason}): {info.get("name")}')
