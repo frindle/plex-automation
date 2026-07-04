@@ -2622,17 +2622,36 @@ def missing_season_packs():
             except Exception as e:
                 log.warning(f'season-packs: episodeFile fetch failed for {sid}/{snum}: {e}')
                 continue
-            distinct_releases = {(f.get('releaseGroup') or '') + '|' + (f.get('quality', {}).get('quality', {}).get('name') or '') + '|' + (f.get('sceneName') or f.get('originalFilePath') or '') for f in files}
-            distinct_scene = {(f.get('sceneName') or '').split('/')[-1] for f in files if f.get('sceneName')}
-            if len(distinct_releases) > 1 or (distinct_scene and len(distinct_scene) > 1):
+            # A legit season pack imports 22 files that all share the same
+            # release group + quality + pack "title stem" (scene name minus
+            # the E## chunk). Prior version keyed on sceneName directly and
+            # counted 22 distinct sources for every season pack because
+            # every episode file has E01/E02/... in its name.
+            def _pack_stem(scene_name):
+                if not scene_name:
+                    return ''
+                # Strip S01E01 / S01E01-E02 / S01.E01 style episode markers
+                stem = re.sub(r'(?i)\.?s\d{1,3}[\.\s_-]?e\d{1,3}(?:[\.\s_-]?e\d{1,3})?\.?', '.', scene_name)
+                # Collapse repeated dots and trim
+                return re.sub(r'\.+', '.', stem).strip('.').lower()
+            distinct_packs = {
+                (
+                    (f.get('releaseGroup') or '').lower(),
+                    (f.get('quality', {}).get('quality', {}).get('name') or ''),
+                    _pack_stem(f.get('sceneName') or f.get('originalFilePath') or ''),
+                )
+                for f in files
+            }
+            sample_stems = sorted({p[2] for p in distinct_packs if p[2]})[:3]
+            if len(distinct_packs) > 1:
                 results.append({
                     'series_id': sid,
                     'series_title': s.get('title'),
                     'season': snum,
                     'episodes': episode_count,
                     'files': file_count,
-                    'distinct_releases': len(distinct_releases),
-                    'sample_scene_names': sorted(distinct_scene)[:3],
+                    'distinct_releases': len(distinct_packs),
+                    'sample_pack_stems': sample_stems,
                 })
     results.sort(key=lambda x: (x['series_title'].lower(), x['season']))
     return jsonify({
