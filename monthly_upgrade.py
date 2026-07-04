@@ -80,8 +80,15 @@ for torrent_hash, info in radarr_torrents.items():
     if not movie_id:
         continue
     movie = movies.get(movie_id)
-    if movie and movie.get('hasFile'):
-        print(f'  Relabeling: {info.get("name")}')
+    # Two throttle cases:
+    #   1. hasFile=True → real upgrade of an existing file
+    #   2. hasFile=False + year<2020 → filling an old library gap; not
+    #      urgent, don't let it hog bandwidth from active releases.
+    year = movie.get('year') if movie else None
+    is_old_gap = movie and not movie.get('hasFile') and year and year < 2020
+    if movie and (movie.get('hasFile') or is_old_gap):
+        reason = 'upgrade' if movie.get('hasFile') else f'pre-2020 gap-fill (year={year})'
+        print(f'  Relabeling ({reason}): {info.get("name")}')
         # Ensure label exists
         labels_r = s.post(f'{DELUGE_URL}/json', json={'method':'label.get_labels','params':[],'id':4})
         if RADARR_UPG_LABEL not in labels_r.json().get('result', []):
