@@ -1907,6 +1907,67 @@ def plex_dupe_scan():
         'merged_metadata': merged_metadata,
     }), 200
 
+# Move a set of torrents' storage locations via Deluge — used for
+# one-off cleanups where scene packs landed in the wrong show folder.
+# Body: {"moves":[{"hash":"…","dest":"/data/Media/TV Shows/Whatever"}]}
+# Pauses each torrent before moving to avoid the "queued/rechecking
+# refuses move_storage" edge case, then resumes.
+@app.route('/torrent-move', methods=['POST'])
+def torrent_move():
+    body = request.get_json(force=True, silent=True) or {}
+    moves = body.get('moves') or []
+    if not moves:
+        return jsonify({'ok': False, 'error': 'body must be {"moves":[{hash,dest}]}'}), 400
+    try:
+        deluge_login()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'deluge login failed: {e}'}), 500
+    results = []
+    for i, m in enumerate(moves):
+        h = (m.get('hash') or '').lower()
+        dest = m.get('dest')
+        entry = {'hash': h, 'dest': dest}
+        if not h or not dest:
+            entry['result'] = 'missing hash or dest'
+            results.append(entry)
+            continue
+        try:
+            # Pause
+            session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.pause_torrent', 'params': [[h]], 'id': 100 + i * 4},
+                timeout=15,
+            ).raise_for_status()
+            # Move storage
+            mr = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.move_storage', 'params': [[h], dest], 'id': 101 + i * 4},
+                timeout=60,
+            )
+            mr.raise_for_status()
+            move_result = mr.json()
+            if move_result.get('error'):
+                entry['result'] = f'move_storage error: {move_result.get("error")}'
+                # try to resume anyway
+                session.post(
+                    f'{DELUGE_URL}/json',
+                    json={'method': 'core.resume_torrent', 'params': [[h]], 'id': 102 + i * 4},
+                    timeout=15,
+                )
+                results.append(entry)
+                continue
+            # Resume
+            session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.resume_torrent', 'params': [[h]], 'id': 103 + i * 4},
+                timeout=15,
+            ).raise_for_status()
+            entry['result'] = 'moved + resumed'
+        except Exception as e:
+            entry['result'] = f'FAILED: {e}'
+        results.append(entry)
+    return jsonify({'ok': True, 'results': results}), 200
+
 # Act on Plex dupes surfaced by /plex-dupe-scan. Uses the same
 # supersede-and-move flow as post-import: lower-quality file's torrent
 # gets relabeled `superseded` and moved to SEEDING_DIR so Plex loses
