@@ -1229,6 +1229,86 @@ def fix_bare_torrents():
         'errors': errors,
     }), 200
 
+# Nuclear cleanup: remove every Deluge torrent that either (a) has
+# incomplete data (progress < 100 or files missing) or (b) is NOT
+# labeled radarr/radarr-upgrade. Use before a full re-grab pass so
+# Radarr's search starts from a clean slate.
+#
+# Dry-run by default — hit with ?apply=1 to actually delete.
+@app.route('/purge-non-radarr', methods=['POST'])
+def purge_non_radarr():
+    apply_ = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    keep_labels = {
+        s.strip().lower() for s in
+        request.args.get('keep', 'radarr,radarr-upgrade').split(',')
+        if s.strip()
+    }
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'label', 'progress', 'state', 'total_size']],
+                'id': 55,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+    to_purge = []
+    keep_healthy = []
+    for h, info in (resp.json().get('result') or {}).items():
+        label = (info.get('label') or '').lower()
+        progress = info.get('progress') or 0
+        broken = progress < 100
+        wrong_label = label not in keep_labels
+        if broken or wrong_label:
+            to_purge.append({
+                'hash': h,
+                'name': info.get('name'),
+                'label': info.get('label'),
+                'progress': progress,
+                'reason': 'broken' if broken else 'wrong_label',
+                'size_gb': round((info.get('total_size') or 0) / (1024**3), 2),
+            })
+        else:
+            keep_healthy.append(h)
+
+    removed = 0
+    errors = []
+    if apply_:
+        # Remove with data. Batch in chunks so we don't hammer Deluge.
+        BATCH = 25
+        hashes = [t['hash'] for t in to_purge]
+        for i in range(0, len(hashes), BATCH):
+            chunk = hashes[i:i + BATCH]
+            for h in chunk:
+                try:
+                    session.post(
+                        f'{DELUGE_URL}/json',
+                        json={'method': 'core.remove_torrent', 'params': [h, True], 'id': 66},
+                        timeout=15,
+                    ).raise_for_status()
+                    removed += 1
+                except Exception as e:
+                    errors.append({'hash': h, 'error': str(e)})
+        log.info(f'purge-non-radarr: removed {removed}, {len(errors)} errors')
+
+    return jsonify({
+        'ok': True,
+        'dry_run': not apply_,
+        'keep_labels': sorted(keep_labels),
+        'purge_count': len(to_purge),
+        'keep_count': len(keep_healthy),
+        'removed': removed,
+        'error_count': len(errors),
+        'purge_sample': to_purge[:20],  # first 20 for preview; full list too big to dump
+        'purge_total_gb': round(sum(t['size_gb'] for t in to_purge), 2),
+    }), 200
+
 @app.route('/deluge-lookup', methods=['GET', 'POST'])
 def deluge_lookup():
     q = (request.args.get('name') or '').lower()
