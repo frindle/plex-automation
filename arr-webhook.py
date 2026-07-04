@@ -1674,6 +1674,67 @@ def import_audit():
         },
     }), 200
 
+# List monitored Radarr movies with hasFile=false — the gap-fill list.
+# Returns enough metadata to prioritize (release dates, availability,
+# added date, quality profile, tags). Sort options exposed via ?sort=.
+# Trigger searches one at a time via:
+#   curl -X POST http://radarr/api/v3/command -d '{"name":"MoviesSearch","movieIds":[ID]}'
+@app.route('/missing-movies', methods=['GET'])
+def missing_movies():
+    if not RADARR_API_KEY:
+        return jsonify({'ok': False, 'error': 'no RADARR_API_KEY'}), 400
+    sort_by = (request.args.get('sort') or 'added').lower()
+    include_unmonitored = request.args.get('unmonitored', '').lower() in ('1', 'true', 'yes')
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/movie',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            timeout=60,
+        )
+        r.raise_for_status()
+        movies = r.json()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Radarr fetch failed: {e}'}), 500
+    missing = []
+    for m in movies:
+        if m.get('hasFile'):
+            continue
+        if not include_unmonitored and not m.get('monitored'):
+            continue
+        missing.append({
+            'id': m.get('id'),
+            'title': m.get('title'),
+            'year': m.get('year'),
+            'monitored': m.get('monitored'),
+            'added': m.get('added'),
+            'minimum_availability': m.get('minimumAvailability'),
+            'status': m.get('status'),
+            'in_cinemas': m.get('inCinemas'),
+            'digital_release': m.get('digitalRelease'),
+            'physical_release': m.get('physicalRelease'),
+            'quality_profile_id': m.get('qualityProfileId'),
+            'tags': m.get('tags') or [],
+            'tmdb_id': m.get('tmdbId'),
+        })
+    sort_keys = {
+        'added': lambda x: x.get('added') or '',
+        'year': lambda x: x.get('year') or 0,
+        'title': lambda x: (x.get('title') or '').lower(),
+        'digital': lambda x: x.get('digital_release') or '',
+        'physical': lambda x: x.get('physical_release') or '',
+        'cinemas': lambda x: x.get('in_cinemas') or '',
+    }
+    key_fn = sort_keys.get(sort_by, sort_keys['added'])
+    reverse = sort_by in ('added', 'year', 'digital', 'physical', 'cinemas')
+    missing.sort(key=key_fn, reverse=reverse)
+    return jsonify({
+        'ok': True,
+        'count': len(missing),
+        'sort': sort_by,
+        'search_hint': 'POST /api/v3/command {"name":"MoviesSearch","movieIds":[ID]} to Radarr',
+        'movies': missing,
+    }), 200
+
 # Emergency revert for the mass-superseded-relabel bug. Flips every
 # torrent currently labeled `superseded` back to `radarr` or `sonarr`
 # based on which system knows about it. Idempotent; safe to hit twice.
