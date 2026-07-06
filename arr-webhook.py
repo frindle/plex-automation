@@ -13,6 +13,24 @@ from media_share import share_bp, init_db as init_share_db
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
+# ── Activity log (review digest) ─────────────────────────────────────────────
+# Persistent record of every consequential action the automation takes, so
+# the user can review what happened at /digest whenever they're ready
+# (instead of a push notification they have to deal with immediately).
+ACTIVITY_LOG = os.environ.get('ACTIVITY_LOG', '/data/activity-log.jsonl')
+DIGEST_STATE = os.environ.get('DIGEST_STATE', '/data/digest-state.json')
+
+def record_activity(category, summary):
+    try:
+        with open(ACTIVITY_LOG, 'a') as f:
+            f.write(_json.dumps({
+                'ts': datetime.now().isoformat(timespec='seconds'),
+                'category': category,
+                'summary': summary,
+            }) + '\n')
+    except OSError as e:
+        log.debug(f'activity log write failed: {e}')
+
 app = Flask(__name__)
 app.register_blueprint(share_bp)
 
@@ -316,6 +334,8 @@ def cleanup_superseded():
                 remove_torrent(torrent_hash)
                 removed += 1
         log.info(f'Cleanup complete: removed {removed} superseded torrents')
+        if removed:
+            record_activity('cleanup', f'Removed {removed} superseded torrent(s) past the {SEED_DAYS}-day seed window')
     except Exception as e:
         log.error(f'Cleanup failed: {e}')
 
@@ -461,6 +481,8 @@ def dedup_via_radarr(dry_run=False):
                     set_torrent_label(h, SUPERSEDED_LABEL)
                 relabeled += 1
         log.info(f'Radarr dedup complete{" (DRY RUN)" if dry_run else ""}: {"would relabel" if dry_run else "relabeled"} {relabeled} superseded torrent(s)')
+        if relabeled and not dry_run:
+            record_activity('dedup', f'Radarr dedup: relabeled {relabeled} duplicate torrent(s) as superseded')
     except Exception as e:
         log.error(f'Radarr dedup failed: {e}')
 
@@ -532,6 +554,8 @@ def dedup_via_sonarr():
                 set_torrent_label(h, SUPERSEDED_LABEL)
                 relabeled += 1
         log.info(f'Sonarr dedup complete: relabeled {relabeled} superseded torrent(s)')
+        if relabeled:
+            record_activity('dedup', f'Sonarr dedup: relabeled {relabeled} duplicate torrent(s) as superseded')
     except Exception as e:
         log.error(f'Sonarr dedup failed: {e}')
 
@@ -615,6 +639,8 @@ def cleanup_unpacked_torrents():
                 removed += 1
         _save_unpack_state(state)
         log.info(f'Unpacked-torrent cleanup complete: removed {removed}')
+        if removed:
+            record_activity('cleanup', f'Removed {removed} unpacked RAR torrent(s) past the 21-day window')
     except Exception as e:
         log.error(f'Unpacked-torrent cleanup failed: {e}')
 
@@ -662,6 +688,8 @@ def cleanup_radarr_queue_dupes():
                 del_r.raise_for_status()
                 removed += 1
         log.info(f'Radarr queue cleanup complete: removed {removed} duplicate entries')
+        if removed:
+            record_activity('dedup', f'Radarr queue: removed {removed} duplicate queue entr(y/ies)')
     except Exception as e:
         log.error(f'Radarr queue cleanup failed: {e}')
 
@@ -828,12 +856,14 @@ def check_import_blocked():
             ok, detail = resolver(rec)
             if ok:
                 log.info(f'[importBlocked] {label}: auto-imported "{title}" — {detail}')
+                record_activity('import-rescue', f'{label}: auto-imported stuck download "{title}"')
                 continue
             if _ib_seen_recently(download_id):
                 continue
             msgs = rec.get('statusMessages') or []
             reason = '; '.join(m.get('messages', ['?'])[0] for m in msgs if m.get('messages')) or 'unknown'
             log.warning(f'[importBlocked] {label}: notifying — "{title}" ({detail}) — reason: {reason}')
+            record_activity('import-stuck', f'{label}: import stuck, needs manual look — "{title}" ({reason})')
             send_pushover(
                 title=f'{label} import stuck',
                 message=f'{title}\nReason: {reason}\nDetail: {detail}',
@@ -943,11 +973,44 @@ def handle_upgrade_import(data, source):
         if torrent_matches_any_title(name, title_variants) and search_term.lower() in name.lower():
             if proper_repack:
                 log.info(f'{source}: immediately deleting {torrent_hash} - {name} (proper/repack)')
+                record_activity('supersede', f'{source}: deleted "{name}" (replaced by PROPER/REPACK)')
                 remove_torrent(torrent_hash)
             else:
                 log.info(f'{source}: superseding {torrent_hash} - {name}')
+                record_activity('supersede', f'{source}: superseded "{name}" after upgrade import')
                 set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
                 move_torrent_storage(torrent_hash, SEEDING_DIR)
+
+
+def handle_import_relabel(data, source):
+    """Download event that is NOT an upgrade: the finished torrent can still
+    be wearing an -upgrade label — Radarr's old-gap lane and the monthly
+    sweep both throttle no-file gap-fills as radarr-upgrade, and those
+    imports arrive with isUpgrade=false so handle_upgrade_import never sees
+    them. Flip the label back to the base one here, mirroring the
+    post-import relabel in handle_upgrade_import."""
+    download_id = (data.get('downloadId') or '').lower()
+    if not download_id:
+        return
+    base_label = 'radarr' if source == 'Radarr' else 'sonarr'
+    upgrade_label = f'{base_label}-upgrade'
+    try:
+        deluge_login()
+        status = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrent_status',
+                'params': [download_id, ['label', 'name']],
+                'id': 93,
+            },
+            timeout=10,
+        ).json().get('result') or {}
+        if (status.get('label') or '').lower() == upgrade_label:
+            set_torrent_label(download_id, base_label)
+            log.info(f'{source}: relabeled {download_id} {upgrade_label} → {base_label} (non-upgrade import, gap-fill lane)')
+            record_activity('relabel', f'{source}: "{status.get("name", download_id)}" {upgrade_label} → {base_label} after gap-fill import')
+    except Exception as e:
+        log.warning(f'{source}: non-upgrade post-import relabel failed for {download_id}: {e}')
 
 
 def is_upgrade_sonarr(data):
@@ -1321,8 +1384,13 @@ def radarr_webhook():
     log.info(f'Radarr event: {event} | isUpgrade: {data.get("isUpgrade")} | downloadId: {data.get("downloadId")}')
     if event == 'Grab':
         threading.Thread(target=handle_grab, args=(data, 'Radarr'), daemon=True).start()
-    elif event == 'Download' and data.get('isUpgrade'):
-        handle_upgrade_import(data, 'Radarr')
+    elif event == 'Download':
+        if data.get('isUpgrade'):
+            handle_upgrade_import(data, 'Radarr')
+        else:
+            # Gap-fill imports arrive with isUpgrade=false but may wear an
+            # -upgrade label from the grab throttle — flip it back.
+            threading.Thread(target=handle_import_relabel, args=(data, 'Radarr'), daemon=True).start()
     return jsonify({'status': 'ok'}), 200
 
 @app.route('/webhook/sonarr', methods=['POST'])
@@ -1332,13 +1400,106 @@ def sonarr_webhook():
     log.info(f'Sonarr event: {event} | isUpgrade: {data.get("isUpgrade")} | downloadId: {data.get("downloadId")}')
     if event == 'Grab':
         threading.Thread(target=handle_grab, args=(data, 'Sonarr'), daemon=True).start()
-    elif event == 'Download' and data.get('isUpgrade'):
-        handle_upgrade_import(data, 'Sonarr')
+    elif event == 'Download':
+        if data.get('isUpgrade'):
+            handle_upgrade_import(data, 'Sonarr')
+        else:
+            # Gap-fill imports arrive with isUpgrade=false but may wear an
+            # -upgrade label from the grab throttle — flip it back.
+            threading.Thread(target=handle_import_relabel, args=(data, 'Sonarr'), daemon=True).start()
     return jsonify({'status': 'ok'}), 200
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'}), 200
+
+
+# ── Review digest ─────────────────────────────────────────────────────────────
+# Running tracker of everything the automation has done, reviewable whenever
+# the user is ready (deliberately NOT a push notification). GET /digest shows
+# activity since the last review; POST /digest/reviewed marks it read.
+
+def _digest_state():
+    try:
+        with open(DIGEST_STATE) as f:
+            return _json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+def _digest_entries(since_iso=None):
+    entries = []
+    try:
+        with open(ACTIVITY_LOG) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = _json.loads(line)
+                except ValueError:
+                    continue
+                if since_iso and e.get('ts', '') <= since_iso:
+                    continue
+                entries.append(e)
+    except OSError:
+        pass
+    return entries
+
+@app.route('/digest', methods=['GET'])
+def digest():
+    state = _digest_state()
+    since = state.get('last_reviewed_at')
+    show_all = request.args.get('all', '').lower() in ('1', 'true', 'yes')
+    entries = _digest_entries(None if show_all else since)
+    entries.reverse()  # newest first
+    if request.args.get('format') == 'json':
+        return jsonify({'ok': True, 'since': since, 'count': len(entries), 'entries': entries})
+
+    counts = {}
+    for e in entries:
+        counts[e.get('category', '?')] = counts.get(e.get('category', '?'), 0) + 1
+    summary = ' · '.join(f'{v} {k}' for k, v in sorted(counts.items())) or 'nothing new'
+    rows = ''.join(
+        f"<tr><td class='ts'>{e.get('ts','')}</td>"
+        f"<td class='cat cat-{e.get('category','')}'>{e.get('category','')}</td>"
+        f"<td>{e.get('summary','').replace('<','&lt;')}</td></tr>"
+        for e in entries
+    )
+    return f'''<!doctype html><html><head><title>plex-automation digest</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#0e1216; color:#cdd6e0; font: 14px/1.5 -apple-system, sans-serif; margin: 2rem auto; max-width: 900px; padding: 0 1rem; }}
+h1 {{ font-size: 1.3rem; }} .sub {{ color:#7a8794; margin-bottom: 1rem; }}
+table {{ width:100%; border-collapse: collapse; }}
+td {{ padding: 4px 8px; border-bottom: 1px solid #1c2530; vertical-align: top; }}
+.ts {{ color:#7a8794; white-space: nowrap; }}
+.cat {{ white-space: nowrap; font-weight: 600; }}
+.cat-import-stuck {{ color:#ff6b6b; }} .cat-import-rescue {{ color:#ffd166; }}
+.cat-supersede {{ color:#66d9ef; }} .cat-cleanup {{ color:#a9dc76; }}
+.cat-dedup {{ color:#c39ac9; }} .cat-relabel {{ color:#78dce8; }}
+button {{ background:#2563eb; color:#fff; border:0; border-radius:6px; padding:8px 14px; font-size:14px; cursor:pointer; }}
+a {{ color:#78dce8; }}
+</style></head><body>
+<h1>plex-automation — activity since last review</h1>
+<div class="sub">{len(entries)} item(s): {summary}
+{f" · reviewed up to {since}" if since and not show_all else ""}
+· <a href="/digest?all=1">show everything</a></div>
+<form method="post" action="/digest/reviewed"><button type="submit">Mark all reviewed</button></form>
+<table>{rows or "<tr><td>Nothing to review 🎉</td></tr>"}</table>
+</body></html>'''
+
+@app.route('/digest/reviewed', methods=['POST'])
+def digest_reviewed():
+    state = _digest_state()
+    state['last_reviewed_at'] = datetime.now().isoformat(timespec='seconds')
+    try:
+        with open(DIGEST_STATE, 'w') as f:
+            _json.dump(state, f)
+    except OSError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    if request.headers.get('Accept', '').startswith('application/json'):
+        return jsonify({'ok': True, 'last_reviewed_at': state['last_reviewed_at']})
+    return '<meta http-equiv="refresh" content="0;url=/digest">', 200
 
 # Debug: look up torrents in Deluge whose name contains ?name=<substr>
 # and report save_path + files. Useful when a Radarr import fails with
@@ -1870,6 +2031,7 @@ def _auto_rescue(service, dry_run=False):
             entry['scan_cmd_id'] = cmd_id
             triggered.append(entry)
             log.info(f'auto-rescue {service}: fired {scan_cmd} for {info.get("name")} → cmd {cmd_id}')
+            record_activity('import-rescue', f'auto-rescue {service}: triggered import scan for "{info.get("name")}"')
         except Exception as e:
             log.warning(f'auto-rescue: scan trigger failed for {h[:8]}: {e}')
     return {
