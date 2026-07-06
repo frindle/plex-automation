@@ -804,10 +804,16 @@ def check_import_blocked():
         if not key:
             continue
         try:
+            # Radarr and Sonarr name the "include unknown" queue param differently;
+            # each ignores the other's, so send both.
             r = requests.get(
                 f'{url}/api/v3/queue',
                 headers={'X-Api-Key': key},
-                params={'pageSize': 500, 'includeUnknownMovieItems': True},
+                params={
+                    'pageSize': 500,
+                    'includeUnknownMovieItems': True,
+                    'includeUnknownSeriesItems': True,
+                },
                 timeout=15,
             )
             r.raise_for_status()
