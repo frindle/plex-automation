@@ -930,6 +930,7 @@ def handle_upgrade_import(data, source):
 
     # Identify the new torrent to skip it
     # First try downloadId direct hash lookup (most accurate)
+    new_torrent_hash = None
     download_id = (data.get('downloadId') or '').lower()
     if download_id and download_id in torrents:
         new_torrent_hash = download_id
@@ -943,21 +944,25 @@ def handle_upgrade_import(data, source):
         if not new_torrent_hash:
             log.warning(f'{source}: could not identify new torrent by filename, will skip none')
 
-    if new_torrent_hash:
-        log.info(f'{source}: will skip new torrent {new_torrent_hash}')
-        # Post-import relabel: once an -upgrade grab has landed, flip
-        # its label back to the base one. Any torrent still wearing
-        # -upgrade later means something in the pipeline didn't
-        # complete — quick signal when eyeballing Deluge.
-        current_label = (torrents.get(new_torrent_hash, {}).get('label') or '').lower()
-        base_label = 'radarr' if source == 'Radarr' else 'sonarr'
-        upgrade_label = f'{base_label}-upgrade'
-        if current_label == upgrade_label:
-            try:
-                set_torrent_label(new_torrent_hash, base_label)
-                log.info(f'{source}: relabeled {new_torrent_hash} {upgrade_label} → {base_label}')
-            except Exception as e:
-                log.warning(f'{source}: post-import relabel failed for {new_torrent_hash}: {e}')
+    if not new_torrent_hash:
+        log.warning(f'{source}: aborting supersede — cannot identify new torrent, '
+                    f'risk superseding the wrong one')
+        return
+
+    log.info(f'{source}: will skip new torrent {new_torrent_hash}')
+    # Post-import relabel: once an -upgrade grab has landed, flip
+    # its label back to the base one. Any torrent still wearing
+    # -upgrade later means something in the pipeline didn't
+    # complete — quick signal when eyeballing Deluge.
+    current_label = (torrents.get(new_torrent_hash, {}).get('label') or '').lower()
+    base_label = 'radarr' if source == 'Radarr' else 'sonarr'
+    upgrade_label = f'{base_label}-upgrade'
+    if current_label == upgrade_label:
+        try:
+            set_torrent_label(new_torrent_hash, base_label)
+            log.info(f'{source}: relabeled {new_torrent_hash} {upgrade_label} → {base_label}')
+        except Exception as e:
+            log.warning(f'{source}: post-import relabel failed for {new_torrent_hash}: {e}')
 
     # Find and supersede old torrents. Sweeps everything that matches
     # the title+search_term regardless of label (radarr, sonarr,
@@ -1907,6 +1912,9 @@ def deluge_lookup():
             })
     return jsonify({'ok': True, 'count': len(hits), 'hits': hits}), 200
 
+AUTO_RESCUE_MAX_ATTEMPTS = 6  # ~90 min at 15-min intervals
+_rescue_attempts = {}  # hash → attempt count
+
 # Detect "grabbed but never imported" torrents and fire a scan to
 # recover them. Radarr/Sonarr sometimes silently drop imports (folder
 # name mismatch, transient path glitch, etc). This walks Deluge for
@@ -1949,7 +1957,8 @@ def _auto_rescue(service, dry_run=False):
         return {'ok': False, 'error': f'deluge fetch failed: {e}'}
     stuck = []
     triggered = []
-    skipped_reasons = {'not_labeled': 0, 'not_complete': 0, 'no_grab': 0, 'already_imported': 0}
+    skipped_reasons = {'not_labeled': 0, 'not_complete': 0, 'no_grab': 0, 'already_imported': 0, 'max_attempts': 0}
+    active_hashes = set()
     for h, info in torrents.items():
         if (info.get('label') or '').lower() not in labels:
             skipped_reasons['not_labeled'] += 1
@@ -2004,6 +2013,16 @@ def _auto_rescue(service, dry_run=False):
                 log.debug(f'auto-rescue: sourceTitle fallback failed for {h[:8]}: {e}')
         if last_import >= last_grab:
             skipped_reasons['already_imported'] += 1
+            _rescue_attempts.pop(h, None)
+            continue
+        active_hashes.add(h)
+        attempts = _rescue_attempts.get(h, 0)
+        if attempts >= AUTO_RESCUE_MAX_ATTEMPTS:
+            skipped_reasons['max_attempts'] += 1
+            if attempts == AUTO_RESCUE_MAX_ATTEMPTS:
+                log.warning(f'auto-rescue {service}: giving up on "{info.get("name")}" after {attempts} attempts — needs manual import')
+                record_activity('import-rescue', f'auto-rescue {service}: gave up on "{info.get("name")}" after {attempts} attempts')
+                _rescue_attempts[h] = attempts + 1
             continue
         entry = {
             'hash': h,
@@ -2030,10 +2049,16 @@ def _auto_rescue(service, dry_run=False):
             cmd_id = cr.json().get('id')
             entry['scan_cmd_id'] = cmd_id
             triggered.append(entry)
-            log.info(f'auto-rescue {service}: fired {scan_cmd} for {info.get("name")} → cmd {cmd_id}')
+            _rescue_attempts[h] = attempts + 1
+            log.info(f'auto-rescue {service}: fired {scan_cmd} for {info.get("name")} → cmd {cmd_id} (attempt {attempts + 1}/{AUTO_RESCUE_MAX_ATTEMPTS})')
             record_activity('import-rescue', f'auto-rescue {service}: triggered import scan for "{info.get("name")}"')
         except Exception as e:
             log.warning(f'auto-rescue: scan trigger failed for {h[:8]}: {e}')
+    # ponytail: only prune hashes we saw in this service's label set
+    for stale_h in [k for k in _rescue_attempts if k in torrents
+                    and (torrents[k].get('label') or '').lower() in labels
+                    and k not in active_hashes]:
+        del _rescue_attempts[stale_h]
     return {
         'ok': True,
         'service': service,
@@ -2062,6 +2087,9 @@ def auto_rescue_scheduler():
 def auto_rescue_endpoint():
     service = (request.args.get('service') or 'both').lower()
     dry_run = request.args.get('dry_run', '').lower() in ('1', 'true', 'yes')
+    if request.args.get('reset', '').lower() in ('1', 'true', 'yes'):
+        _rescue_attempts.clear()
+        log.info('auto-rescue: retry counters reset')
     if service == 'both':
         return jsonify({
             'ok': True,
