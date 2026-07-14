@@ -20,6 +20,7 @@ services:
       UPLOAD_RATE_LIMIT_MBIT: "5"
       PLEX_URL: "http://10.0.0.6:32400"
       PLEX_TOKEN: ${PLEX_TOKEN}
+    mac_address: "02:8e:b2:5d:a1:37"
     networks:
       br0:
         ipv4_address: 10.0.0.4
