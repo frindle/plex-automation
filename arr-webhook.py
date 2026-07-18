@@ -882,6 +882,47 @@ def import_blocked_scheduler():
 
 # ── Core upgrade handler ─────────────────────────────────────────────────────
 
+def relabel_download_to_base(download_id, source):
+    """Flip a finished download's Deluge label from the '-upgrade' variant back
+    to the base one, keyed on the torrent hash (downloadId) directly.
+
+    This deliberately does NOT depend on the title/filename matching the
+    supersede step needs — the tag transition is what the user watches, and it
+    must fire whenever the completed torrent is present, even if its name has
+    punctuation, it's a season pack, or the supersede matcher can't pin the
+    "new" torrent. Uses the env-configurable label so a customised
+    SONARR_UPGRADE_LABEL / RADARR_UPGRADE_LABEL stays consistent with the grab
+    throttle that applied it.
+
+    Returns (result, name):
+      'flipped'   — was upgrade-labeled, now base
+      'already'   — some other/base label already, nothing to do
+      'not_found' — Deluge has no torrent under this hash
+    """
+    base_label = 'radarr' if source == 'Radarr' else 'sonarr'
+    upgrade_label = (SONARR_UPG_LABEL if source == 'Sonarr' else RADARR_UPG_LABEL).lower()
+    status = session.post(
+        f'{DELUGE_URL}/json',
+        json={
+            'method': 'core.get_torrent_status',
+            'params': [download_id, ['label', 'name']],
+            'id': 93,
+        },
+        timeout=10,
+    ).json().get('result') or {}
+    if not status:
+        return 'not_found', None
+    name = status.get('name', download_id)
+    current = (status.get('label') or '').lower()
+    if current != upgrade_label:
+        log.info(f'{source}: {download_id} ({name}) label is "{current or "(none)"}", '
+                 f'not "{upgrade_label}" — no flip needed')
+        return 'already', name
+    set_torrent_label(download_id, base_label)
+    log.info(f'{source}: relabeled {download_id} ({name}) {upgrade_label} → {base_label}')
+    return 'flipped', name
+
+
 def handle_upgrade_import(data, source):
     if source == 'Sonarr':
         episode_file = data.get('episodeFile', {})
@@ -920,9 +961,21 @@ def handle_upgrade_import(data, source):
     log.info(f'{source}: {"PROPER/REPACK" if proper_repack else "quality upgrade"} imported. New file: "{new_filename}"')
     log.info(f'{source}: looking for superseded torrents matching "{series_title}" {search_term}')
 
+    download_id = (data.get('downloadId') or '').lower()
     try:
         deluge_login()
         ensure_label_exists()
+        # Flip the '-upgrade' tag back to the base label FIRST, keyed on
+        # downloadId — independent of the title/filename matching the supersede
+        # step below needs. This flip used to live *after* the "can't identify
+        # new torrent" abort, so any match miss (special characters, season
+        # packs, or a downloadId/infohash mismatch) aborted before it and left
+        # the finished torrent silently stuck wearing '-upgrade'.
+        flip_result = 'not_found'
+        if download_id:
+            flip_result, flip_name = relabel_download_to_base(download_id, source)
+            if flip_result == 'flipped':
+                record_activity('relabel', f'{source}: "{flip_name}" upgrade → base after import')
         torrents = get_all_torrents()
     except Exception as e:
         log.error(f'Deluge connection failed: {e}')
@@ -931,7 +984,6 @@ def handle_upgrade_import(data, source):
     # Identify the new torrent to skip it
     # First try downloadId direct hash lookup (most accurate)
     new_torrent_hash = None
-    download_id = (data.get('downloadId') or '').lower()
     if download_id and download_id in torrents:
         new_torrent_hash = download_id
         log.info(f'{source}: identified new torrent by downloadId: {new_torrent_hash}')
@@ -947,20 +999,32 @@ def handle_upgrade_import(data, source):
     if not new_torrent_hash:
         log.warning(f'{source}: aborting supersede — cannot identify new torrent, '
                     f'risk superseding the wrong one')
+        # If we also couldn't flip the tag (no torrent under this downloadId),
+        # the finished upgrade is stuck wearing '-upgrade' with no automatic
+        # recovery — make it loud instead of silent.
+        if flip_result == 'not_found':
+            upgrade_label = SONARR_UPG_LABEL if source == 'Sonarr' else RADARR_UPG_LABEL
+            log.error(f'{source}: STUCK upgrade tag — "{series_title}" {search_term}: no torrent '
+                      f'under downloadId "{download_id or "(none)"}", tag not flipped and old copy '
+                      f'not superseded')
+            record_activity('relabel-stuck',
+                            f'{source}: "{series_title}" {search_term} may be stuck as {upgrade_label}')
+            send_pushover(
+                title=f'{source}: upgrade tag may be stuck',
+                message=(f'{series_title} {search_term}\n'
+                         f'Import completed but no Deluge torrent matched downloadId '
+                         f'"{download_id or "(none)"}", so the "{upgrade_label}" tag could not be '
+                         f'flipped back. Check Deluge for a torrent still tagged {upgrade_label}.'),
+            )
         return
 
     log.info(f'{source}: will skip new torrent {new_torrent_hash}')
-    # Post-import relabel: once an -upgrade grab has landed, flip
-    # its label back to the base one. Any torrent still wearing
-    # -upgrade later means something in the pipeline didn't
-    # complete — quick signal when eyeballing Deluge.
-    current_label = (torrents.get(new_torrent_hash, {}).get('label') or '').lower()
-    base_label = 'radarr' if source == 'Radarr' else 'sonarr'
-    upgrade_label = f'{base_label}-upgrade'
-    if current_label == upgrade_label:
+    # Fallback flip: if the new torrent was pinned by filename/season (empty or
+    # mismatched downloadId) the early downloadId flip was a no-op — flip the
+    # matched hash now. Idempotent with the early attempt.
+    if flip_result != 'flipped':
         try:
-            set_torrent_label(new_torrent_hash, base_label)
-            log.info(f'{source}: relabeled {new_torrent_hash} {upgrade_label} → {base_label}')
+            relabel_download_to_base(new_torrent_hash, source)
         except Exception as e:
             log.warning(f'{source}: post-import relabel failed for {new_torrent_hash}: {e}')
 
@@ -997,23 +1061,11 @@ def handle_import_relabel(data, source):
     download_id = (data.get('downloadId') or '').lower()
     if not download_id:
         return
-    base_label = 'radarr' if source == 'Radarr' else 'sonarr'
-    upgrade_label = f'{base_label}-upgrade'
     try:
         deluge_login()
-        status = session.post(
-            f'{DELUGE_URL}/json',
-            json={
-                'method': 'core.get_torrent_status',
-                'params': [download_id, ['label', 'name']],
-                'id': 93,
-            },
-            timeout=10,
-        ).json().get('result') or {}
-        if (status.get('label') or '').lower() == upgrade_label:
-            set_torrent_label(download_id, base_label)
-            log.info(f'{source}: relabeled {download_id} {upgrade_label} → {base_label} (non-upgrade import, gap-fill lane)')
-            record_activity('relabel', f'{source}: "{status.get("name", download_id)}" {upgrade_label} → {base_label} after gap-fill import')
+        result, name = relabel_download_to_base(download_id, source)
+        if result == 'flipped':
+            record_activity('relabel', f'{source}: "{name}" upgrade → base after gap-fill import')
     except Exception as e:
         log.warning(f'{source}: non-upgrade post-import relabel failed for {download_id}: {e}')
 
