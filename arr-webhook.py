@@ -3095,6 +3095,134 @@ def import_audit():
         },
     }), 200
 
+# Bulk sweep for torrents stuck wearing the '-upgrade' label despite their
+# import having actually completed already. The 2026-07-18 fix
+# (relabel_download_to_base, called from handle_upgrade_import) only flips
+# the tag going forward, at the moment a webhook fires -- it never backfilled
+# torrents that were already stuck before that fix landed, and identification
+# failures (messy names, season packs) can still let new ones slip through.
+# This finds them independently, by cross-referencing completed (progress
+# >= 99%) upgrade-labeled torrents against Radarr/Sonarr's own import state,
+# the same proven pattern /import-audit already uses for Radarr.
+#
+# Radarr: torrent title-matched to a movie; movie.hasFile == true means the
+# import landed and the tag is stale.
+# Sonarr: torrent title-matched to a series; season number parsed from the
+# torrent name (S01, S01E02, etc.) -- if it can't be parsed, the torrent is
+# skipped rather than guessed at. episodeFileCount >= episodeCount for that
+# season means the import (single episode or full pack) landed.
+#
+# Defaults to dry-run (?apply=1 to actually flip labels), matching the
+# convention every other bulk-action endpoint here already uses.
+SEASON_RE = re.compile(r'[Ss](\d{1,2})(?:[Ee]\d{1,3})?')
+
+@app.route('/fix-stuck-upgrade-tags', methods=['GET', 'POST'])
+def fix_stuck_upgrade_tags():
+    service = (request.args.get('service') or 'both').lower()
+    apply = request.args.get('apply') == '1'
+    results = {'radarr': [], 'sonarr': []}
+    errors = []
+
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'label', 'progress']],
+                'id': 94,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Deluge fetch failed: {e}'}), 500
+
+    if service in ('radarr', 'both') and RADARR_API_KEY:
+        try:
+            r = requests.get(f'{RADARR_URL}/api/v3/movie', headers={'X-Api-Key': RADARR_API_KEY}, timeout=60)
+            r.raise_for_status()
+            movies = r.json()
+        except Exception as e:
+            errors.append(f'Radarr fetch failed: {e}')
+            movies = []
+        for h, info in torrents.items():
+            if (info.get('label') or '').lower() != RADARR_UPG_LABEL.lower():
+                continue
+            if (info.get('progress') or 0) < 99.0:
+                continue
+            tname = info.get('name') or ''
+            hit = None
+            for m in movies:
+                titles = {(m.get('title') or '').lower(), (m.get('originalTitle') or '').lower()}
+                titles.discard('')
+                if torrent_matches_any_title(tname, titles):
+                    hit = m
+                    break
+            if not hit or not hit.get('hasFile'):
+                continue
+            entry = {'hash': h, 'name': tname, 'movie_title': hit.get('title'), 'year': hit.get('year')}
+            if apply:
+                result, _ = relabel_download_to_base(h, 'Radarr')
+                entry['result'] = result
+                if result == 'flipped':
+                    record_activity('fix-stuck-upgrade-tags', f'Radarr: flipped stale upgrade tag on "{tname}"')
+            results['radarr'].append(entry)
+
+    if service in ('sonarr', 'both') and SONARR_API_KEY:
+        try:
+            r = requests.get(f'{SONARR_URL}/api/v3/series', headers={'X-Api-Key': SONARR_API_KEY}, timeout=60)
+            r.raise_for_status()
+            series_list = r.json()
+        except Exception as e:
+            errors.append(f'Sonarr fetch failed: {e}')
+            series_list = []
+        for h, info in torrents.items():
+            if (info.get('label') or '').lower() != SONARR_UPG_LABEL.lower():
+                continue
+            if (info.get('progress') or 0) < 99.0:
+                continue
+            tname = info.get('name') or ''
+            season_match = SEASON_RE.search(tname)
+            if not season_match:
+                continue  # can't safely determine which season -- skip rather than guess
+            season_num = int(season_match.group(1))
+            hit = None
+            for s in series_list:
+                titles = {(s.get('title') or '').lower()}
+                titles |= {(t.get('title') or '').lower() for t in (s.get('alternateTitles') or [])}
+                titles.discard('')
+                if torrent_matches_any_title(tname, titles):
+                    hit = s
+                    break
+            if not hit:
+                continue
+            season = next((sn for sn in (hit.get('seasons') or []) if sn.get('seasonNumber') == season_num), None)
+            if not season:
+                continue
+            stats = season.get('statistics') or {}
+            episode_count = stats.get('episodeCount') or 0
+            file_count = stats.get('episodeFileCount') or 0
+            if episode_count == 0 or file_count < episode_count:
+                continue  # season not fully imported yet -- correctly still throttled
+            entry = {'hash': h, 'name': tname, 'series_title': hit.get('title'), 'season': season_num}
+            if apply:
+                result, _ = relabel_download_to_base(h, 'Sonarr')
+                entry['result'] = result
+                if result == 'flipped':
+                    record_activity('fix-stuck-upgrade-tags', f'Sonarr: flipped stale upgrade tag on "{tname}"')
+            results['sonarr'].append(entry)
+
+    return jsonify({
+        'ok': True,
+        'apply': apply,
+        'errors': errors,
+        'counts': {k: len(v) for k, v in results.items()},
+        'radarr': results['radarr'],
+        'sonarr': results['sonarr'],
+    }), 200
+
 # Radarr movies whose tracked file lacks surround audio, HDR, and x265.
 # All three markers = "modern release"; missing all three = older encode
 # worth flagging for upgrade. Query args:
