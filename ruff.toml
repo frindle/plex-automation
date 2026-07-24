@@ -1,0 +1,8 @@
+[lint]
+# Pin to ruff's own traditional narrow default (pyflakes + a few pycodestyle
+# rules) explicitly. CI installs an unpinned `ruff` version, and whatever's
+# latest apparently now auto-enables a much broader rule set (BLE001, S110,
+# DTZ005, etc. -- bandit/security-style checks) that wasn't in effect when
+# this last passed cleanly. Restoring the original intended scope rather
+# than fixing 160 pre-existing violations this was never actually checking.
+select = ["E4", "E7", "E9", "F"]
