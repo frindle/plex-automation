@@ -113,6 +113,14 @@ def _save_plex_dupe_keep(entries):
 PUSHOVER_TOKEN   = os.environ.get('PUSHOVER_TOKEN', '')
 PUSHOVER_USER    = os.environ.get('PUSHOVER_USER', '')
 IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  # 15 min
+# Bulk search pacing. One MoviesSearch over the whole library makes Radarr
+# push every accepted release to Deluge back-to-back, so the client
+# announces to the tracker for all of them at once. Private trackers
+# rate-limit announces per-IP -- trip that and announces start timing out
+# for *every* torrent, including the new release you wanted to be early on.
+# Lower batch / higher delay is gentler on the tracker.
+BULK_SEARCH_BATCH = int(os.environ.get('BULK_SEARCH_BATCH', '50'))
+BULK_SEARCH_DELAY = int(os.environ.get('BULK_SEARCH_DELAY', '180'))  # secs between batches
 
 PROPER_REPACK_RE = re.compile(r'\b(PROPER|REPACK|RERIP)\b', re.IGNORECASE)
 EPISODE_RE       = re.compile(r'S\d{2}E\d{2}', re.IGNORECASE)
@@ -1263,14 +1271,25 @@ def radarr_bulk_search():
         if not movie_ids:
             log.warning('Radarr bulk search: no monitored movies found, skipping')
             return
-        r = requests.post(
-            f'{RADARR_URL}/api/v3/command',
-            headers={'X-Api-Key': RADARR_API_KEY},
-            json={'name': 'MoviesSearch', 'movieIds': movie_ids},
-            timeout=30
-        )
-        r.raise_for_status()
-        log.info(f'Radarr bulk search triggered for {len(movie_ids)} movies: {r.json().get("name")} (id: {r.json().get("id")})')
+        batches = [movie_ids[n:n + BULK_SEARCH_BATCH]
+                   for n in range(0, len(movie_ids), BULK_SEARCH_BATCH)]
+        log.info(f'Radarr bulk search: {len(movie_ids)} movies in {len(batches)} '
+                 f'batches of {BULK_SEARCH_BATCH}, {BULK_SEARCH_DELAY}s apart')
+        for n, batch in enumerate(batches, 1):
+            try:
+                r = requests.post(
+                    f'{RADARR_URL}/api/v3/command',
+                    headers={'X-Api-Key': RADARR_API_KEY},
+                    json={'name': 'MoviesSearch', 'movieIds': batch},
+                    timeout=30
+                )
+                r.raise_for_status()
+                log.info(f'Radarr bulk search batch {n}/{len(batches)} '
+                         f'({len(batch)} movies) queued: id {r.json().get("id")}')
+            except Exception as e:
+                log.error(f'Radarr bulk search batch {n}/{len(batches)} failed: {e}')
+            if n < len(batches):
+                time.sleep(BULK_SEARCH_DELAY)
     except Exception as e:
         log.error(f'Radarr bulk search failed: {e}')
 
