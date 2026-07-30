@@ -372,20 +372,20 @@ def _extract_year(text):
     m = re.search(r'(?<!\d)(19\d{2}|20\d{2})(?!\d)', text)
     return int(m.group(1)) if m else None
 
+def _strip_release_ext(s):
+    for ext in ('.mkv', '.mp4', '.avi'):
+        if s.endswith(ext):
+            return s[:-len(ext)]
+    return s
+
 def _torrent_name_matches_file(torrent_name, tracked_relative_path):
     """True if the torrent name looks like the tracked file (fuzzy match on
     name minus extension). Radarr's relativePath is like 'Movie 2022...mkv';
     the Deluge torrent name may lack the extension or match exactly."""
     if not tracked_relative_path:
         return False
-    name = torrent_name.lower()
-    tracked = tracked_relative_path.lower()
-    # Strip common release extensions from both sides for the comparison
-    for ext in ('.mkv', '.mp4', '.avi'):
-        if tracked.endswith(ext):
-            tracked = tracked[:-len(ext)]
-        if name.endswith(ext):
-            name = name[:-len(ext)]
+    name = _strip_release_ext(torrent_name.lower())
+    tracked = _strip_release_ext(tracked_relative_path.lower())
     return name == tracked or tracked in name or name in tracked
 
 def _radarr_last_imported_download_id(movie_id):
@@ -536,31 +536,49 @@ def dedup_via_sonarr():
                 continue
             if not tracked_paths:
                 continue
-            # Match torrents against this series
-            matched_hashes = []
-            for h, info in sonarr_torrents.items():
-                name = info.get('name', '')
-                if torrent_matches_any_title(name, title_variants):
-                    matched_hashes.append(h)
-            if len(matched_hashes) <= len(tracked_paths):
-                continue  # 1 torrent per tracked file is normal
-            # Safety: only relabel extras if AT LEAST ONE torrent maps to
-            # a currently-tracked file. Otherwise we can't identify winners
-            # and would blow away every active seed for the series.
-            keepers = set()
+            # Match torrents against this series, then group by which
+            # tracked file each one maps to. Duplicates are per-file, not
+            # per-series: the old `len(matched_hashes) <= len(tracked_paths)`
+            # series-wide comparison silently missed clustered duplicates —
+            # e.g. 3 copies of one episode within an 8-episode season read
+            # as "normal" (3 <= 8) even though it's a triple-duplicate of a
+            # single file (confirmed live 2026-07-30: House of the Dragon
+            # S03E06 had 3 torrents, season had ~8 tracked files, so the old
+            # check silently skipped it with no warning logged at all).
+            matched_hashes = [
+                h for h, info in sonarr_torrents.items()
+                if torrent_matches_any_title(info.get('name', ''), title_variants)
+            ]
+            if not matched_hashes:
+                continue
+            by_file = {}
             for h in matched_hashes:
                 name = sonarr_torrents[h].get('name', '').lower()
-                if any(_torrent_name_matches_file(name, p) for p in tracked_paths):
-                    keepers.add(h)
-            if not keepers:
-                log.warning(f'  skip series {series_id} ({series.get("title")}): {len(matched_hashes)} torrents matched but NONE mapped to tracked files — not relabeling anything')
-                continue
-            for h in matched_hashes:
-                if h in keepers:
+                mapped = [p for p in tracked_paths if _torrent_name_matches_file(name, p)]
+                if not mapped:
                     continue
-                log.info(f'  relabeling superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")})')
-                set_torrent_label(h, SUPERSEDED_LABEL)
-                relabeled += 1
+                # A torrent could fuzzy-match more than one tracked path in
+                # pathological cases (substring matching) — the longest
+                # match is the most specific one.
+                by_file.setdefault(max(mapped, key=len), []).append(h)
+            for tracked_path, hashes in by_file.items():
+                if len(hashes) <= 1:
+                    continue  # exactly one torrent for this file, nothing to dedup
+                # Safety: only relabel if EXACTLY ONE torrent's name is an
+                # exact match (not just substring) to the tracked file —
+                # otherwise we can't confidently identify the keeper and
+                # would risk superseding the wrong copy.
+                exact = [h for h in hashes if _strip_release_ext(sonarr_torrents[h].get('name', '').lower()) == _strip_release_ext(tracked_path)]
+                if len(exact) != 1:
+                    log.warning(f'  skip file "{tracked_path}" (series {series_id}: {series.get("title")}): {len(hashes)} torrents matched, no single exact-name keeper identified — not relabeling anything')
+                    continue
+                keeper = exact[0]
+                for h in hashes:
+                    if h == keeper:
+                        continue
+                    log.info(f'  relabeling superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")}, file {tracked_path})')
+                    set_torrent_label(h, SUPERSEDED_LABEL)
+                    relabeled += 1
         log.info(f'Sonarr dedup complete: relabeled {relabeled} superseded torrent(s)')
         if relabeled:
             record_activity('dedup', f'Sonarr dedup: relabeled {relabeled} duplicate torrent(s) as superseded')
