@@ -388,6 +388,29 @@ def _torrent_name_matches_file(torrent_name, tracked_relative_path):
     tracked = _strip_release_ext(tracked_relative_path.lower())
     return name == tracked or tracked in name or name in tracked
 
+def _sonarr_series_imported_download_ids(series_id):
+    """Set of lowercase downloadIds Sonarr has actually imported for this
+    series, across all episodes — unambiguous keepers regardless of
+    filename. Needed because Sonarr renames imported files to its own
+    naming scheme, which often doesn't fuzzy-match the raw release name
+    at all (confirmed live 2026-07-30: House of the Dragon S03E06 —
+    filename matching against episodefile.relativePath never matched any
+    of 3 duplicate torrents, so they never even formed a comparison group).
+    eventType=3 is DownloadFolderImported (NzbDrone.Core.History.
+    EpisodeHistoryEventType), confirmed against Sonarr's own source."""
+    try:
+        r = requests.get(
+            f'{SONARR_URL}/api/v3/history/series',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'seriesId': series_id, 'eventType': 3},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return {(e.get('downloadId') or '').lower() for e in r.json() if e.get('downloadId')}
+    except Exception as e:
+        log.warning(f'Sonarr history lookup failed for series {series_id}: {e}')
+        return set()
+
 def _radarr_last_imported_download_id(movie_id):
     """Ask Radarr for the most recent successful import for a movie —
     that's Radarr's chosen keeper, and its downloadId maps to a Deluge
@@ -537,46 +560,61 @@ def dedup_via_sonarr():
             if not tracked_paths:
                 continue
             # Match torrents against this series, then group by which
-            # tracked file each one maps to. Duplicates are per-file, not
-            # per-series: the old `len(matched_hashes) <= len(tracked_paths)`
-            # series-wide comparison silently missed clustered duplicates —
-            # e.g. 3 copies of one episode within an 8-episode season read
-            # as "normal" (3 <= 8) even though it's a triple-duplicate of a
-            # single file (confirmed live 2026-07-30: House of the Dragon
-            # S03E06 had 3 torrents, season had ~8 tracked files, so the old
-            # check silently skipped it with no warning logged at all).
+            # EPISODE each one is for (parsed straight from the release
+            # name via EPISODE_RE) — not by fuzzy-matching against Sonarr's
+            # tracked episodefile.relativePath. Sonarr renames imported
+            # files to its own naming scheme, which frequently doesn't
+            # fuzzy-match the raw release name at all, so grouping by
+            # tracked-path match silently drops real duplicates before
+            # they're ever compared (confirmed live 2026-07-30: House of
+            # the Dragon S03E06 — none of 3 duplicate torrents matched
+            # episodefile.relativePath, so the old series-wide check AND an
+            # earlier per-tracked-path-grouped attempt both silently no-opped).
             matched_hashes = [
                 h for h, info in sonarr_torrents.items()
                 if torrent_matches_any_title(info.get('name', ''), title_variants)
             ]
             if not matched_hashes:
                 continue
-            by_file = {}
+            by_episode = {}
             for h in matched_hashes:
-                name = sonarr_torrents[h].get('name', '').lower()
-                mapped = [p for p in tracked_paths if _torrent_name_matches_file(name, p)]
-                if not mapped:
+                name = sonarr_torrents[h].get('name', '')
+                m = EPISODE_RE.search(name)
+                if not m:
+                    continue  # can't tell which episode this is, leave it alone
+                by_episode.setdefault(m.group(0).upper(), []).append(h)
+            multi = {ep: hashes for ep, hashes in by_episode.items() if len(hashes) > 1}
+            if not multi:
+                continue
+            # Keeper identification, in order of confidence:
+            #  1. Sonarr's own import history (downloadId) — unambiguous,
+            #     Sonarr told us exactly which download it actually used.
+            #  2. Exact filename match against a tracked episodefile path —
+            #     fallback for series where history lookup fails/is thin.
+            # If neither identifies exactly one keeper, skip and warn —
+            # same safety-first philosophy as before, just per-episode now.
+            imported_ids = _sonarr_series_imported_download_ids(series_id)
+            for ep, hashes in multi.items():
+                keeper = None
+                keeper_source = None
+                history_keepers = [h for h in hashes if h.lower() in imported_ids]
+                if len(history_keepers) == 1:
+                    keeper, keeper_source = history_keepers[0], 'sonarr-history'
+                else:
+                    exact = [h for h in hashes if any(
+                        _strip_release_ext(sonarr_torrents[h].get('name', '').lower()) == _strip_release_ext(p)
+                        for p in tracked_paths
+                    )]
+                    if len(exact) == 1:
+                        keeper, keeper_source = exact[0], 'filename-exact'
+                if keeper is None:
+                    log.warning(f'  skip {ep} (series {series_id}: {series.get("title")}): {len(hashes)} torrents matched, no single keeper identified via history or filename — not relabeling anything')
                     continue
-                # A torrent could fuzzy-match more than one tracked path in
-                # pathological cases (substring matching) — the longest
-                # match is the most specific one.
-                by_file.setdefault(max(mapped, key=len), []).append(h)
-            for tracked_path, hashes in by_file.items():
-                if len(hashes) <= 1:
-                    continue  # exactly one torrent for this file, nothing to dedup
-                # Safety: only relabel if EXACTLY ONE torrent's name is an
-                # exact match (not just substring) to the tracked file —
-                # otherwise we can't confidently identify the keeper and
-                # would risk superseding the wrong copy.
-                exact = [h for h in hashes if _strip_release_ext(sonarr_torrents[h].get('name', '').lower()) == _strip_release_ext(tracked_path)]
-                if len(exact) != 1:
-                    log.warning(f'  skip file "{tracked_path}" (series {series_id}: {series.get("title")}): {len(hashes)} torrents matched, no single exact-name keeper identified — not relabeling anything')
-                    continue
-                keeper = exact[0]
+                log.info(f'  {ep} (series {series_id}: {series.get("title")}): keeper via {keeper_source} = {keeper[:12]}')
                 for h in hashes:
                     if h == keeper:
                         continue
-                    log.info(f'  relabeling superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")}, file {tracked_path})')
+                    log.info(f'  relabeling superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")}, {ep})')
                     set_torrent_label(h, SUPERSEDED_LABEL)
                     relabeled += 1
         log.info(f'Sonarr dedup complete: relabeled {relabeled} superseded torrent(s)')
