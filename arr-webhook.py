@@ -266,7 +266,7 @@ def get_all_torrents():
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrents_status',
-            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress']],
+            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress', 'state']],
             'id': 6
         },
         timeout=10
@@ -3660,11 +3660,12 @@ def torrent_purge():
         return jsonify({'ok': False, 'apply': True, 'target': result}), 500
     return jsonify({'ok': True, 'apply': True, 'target': result}), 200
 
-# Bulk-remove superseded torrents that never started downloading (progress
-# 0%, still queued behind other work) — pure dead weight, no bandwidth
-# invested either way. Unlike cleanup_superseded (which waits SEED_DAYS
-# before sweeping), these have nothing to seed and nothing to lose by
-# going now. Dry-run default, apply=1 to actually remove.
+# Bulk-remove superseded torrents sitting in Deluge's own 'Queued' state —
+# waiting behind the active-torrent limit, not transferring, nothing to
+# lose by going now (Deluge's queue can hold a torrent here at any
+# progress %, not just 0, so this checks state rather than progress).
+# Unlike cleanup_superseded (which waits SEED_DAYS before sweeping), these
+# aren't seeding anything either. Dry-run default, apply=1 to remove.
 @app.route('/purge-unstarted-superseded', methods=['POST', 'GET'])
 def purge_unstarted_superseded():
     apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
@@ -3674,9 +3675,9 @@ def purge_unstarted_superseded():
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
     targets = [
-        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress')}
+        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state')}
         for h, info in torrents.items()
-        if info.get('label') == SUPERSEDED_LABEL and (info.get('progress') or 0) == 0
+        if info.get('label') == SUPERSEDED_LABEL and info.get('state') == 'Queued'
     ]
     if not apply:
         return jsonify({'ok': True, 'apply': False, 'count': len(targets), 'targets': targets,
