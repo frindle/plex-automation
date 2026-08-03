@@ -266,7 +266,7 @@ def get_all_torrents():
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrents_status',
-            'params': [{}, ['name', 'label', 'save_path', 'seeding_time']],
+            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress']],
             'id': 6
         },
         timeout=10
@@ -482,6 +482,16 @@ def dedup_via_radarr(dry_run=False):
                 t_year = _extract_year(name)
                 if movie_year and t_year and abs(t_year - movie_year) > 1:
                     continue
+                # Still-downloading torrents can't be "superseded" — there's
+                # nothing to compare against yet, and Radarr's import history
+                # only ever points at the OLD file for a movie that already
+                # hasFile. Without this, an in-flight upgrade grab gets
+                # mislabeled superseded (and starved) before it can ever
+                # finish and become the real keeper. Confirmed live 2026-08-03:
+                # Avengers Infinity War + Man of Steel upgrade downloads both
+                # got tagged superseded mid-transfer by this pass.
+                if (info.get('progress') or 0) < 99.0:
+                    continue
                 matched_hashes.append(h)
             if len(matched_hashes) <= 1:
                 continue
@@ -570,9 +580,14 @@ def dedup_via_sonarr():
             # the Dragon S03E06 — none of 3 duplicate torrents matched
             # episodefile.relativePath, so the old series-wide check AND an
             # earlier per-tracked-path-grouped attempt both silently no-opped).
+            # Excludes in-flight torrents (progress < 99%) — same reasoning
+            # as the Radarr pass above: an upgrade still downloading can't be
+            # a duplicate of the file already on disk, and history/filename
+            # matching can never identify it as the keeper before it imports.
             matched_hashes = [
                 h for h, info in sonarr_torrents.items()
                 if torrent_matches_any_title(info.get('name', ''), title_variants)
+                and (info.get('progress') or 0) >= 99.0
             ]
             if not matched_hashes:
                 continue
@@ -3461,6 +3476,30 @@ def revert_superseded():
             log.warning(f'revert: failed to relabel {h}: {e}')
             skipped += 1
     return jsonify({'ok': True, 'reverted': reverted, 'skipped': skipped}), 200
+
+# Surgical fix for a single mislabeled torrent — e.g. an in-flight upgrade
+# grab the (now-fixed) dedup pass wrongly tagged superseded before it
+# finished downloading. Unlike /revert-superseded (which flips EVERY
+# superseded torrent back and can't tell good relabels from bad ones), this
+# targets one hash. Body OR query: hash=<hash>, label=<label> (default
+# 'radarr-upgrade').
+@app.route('/torrent-relabel', methods=['POST'])
+def torrent_relabel():
+    torrent_hash = (request.args.get('hash') or '').lower().strip()
+    label = request.args.get('label', '').strip()
+    if not torrent_hash or not label:
+        body = request.get_json(silent=True) or {}
+        torrent_hash = torrent_hash or (body.get('hash') or '').lower().strip()
+        label = label or (body.get('label') or RADARR_UPG_LABEL).strip()
+    if not torrent_hash:
+        return jsonify({'ok': False, 'error': 'hash required (query or body)'}), 400
+    try:
+        deluge_login()
+        ensure_label_exists_named(label)
+        set_torrent_label(torrent_hash, label)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True, 'hash': torrent_hash, 'label': label}), 200
 
 # Manual trigger for the dedup pass — use to verify the fixed matcher
 # behaves before waiting for the 24h scheduled tick.
