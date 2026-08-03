@@ -3660,6 +3660,36 @@ def torrent_purge():
         return jsonify({'ok': False, 'apply': True, 'target': result}), 500
     return jsonify({'ok': True, 'apply': True, 'target': result}), 200
 
+# Bulk-remove superseded torrents that never started downloading (progress
+# 0%, still queued behind other work) — pure dead weight, no bandwidth
+# invested either way. Unlike cleanup_superseded (which waits SEED_DAYS
+# before sweeping), these have nothing to seed and nothing to lose by
+# going now. Dry-run default, apply=1 to actually remove.
+@app.route('/purge-unstarted-superseded', methods=['POST', 'GET'])
+def purge_unstarted_superseded():
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    try:
+        deluge_login()
+        torrents = get_all_torrents()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    targets = [
+        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress')}
+        for h, info in torrents.items()
+        if info.get('label') == SUPERSEDED_LABEL and (info.get('progress') or 0) == 0
+    ]
+    if not apply:
+        return jsonify({'ok': True, 'apply': False, 'count': len(targets), 'targets': targets,
+                         'note': 'dry-run — pass ?apply=1 to remove these torrents + files'}), 200
+    removed, failed = 0, []
+    for t in targets:
+        try:
+            remove_torrent(t['hash'])
+            removed += 1
+        except Exception as e:
+            failed.append({'hash': t['hash'], 'error': str(e)})
+    return jsonify({'ok': True, 'apply': True, 'removed': removed, 'failed': failed}), 200
+
 # Report-only audit of everything labeled `superseded`: how long each has
 # been seeding, whether it's already past SEED_DAYS (i.e. would be swept
 # by the next cleanup run), and whether its save_path is under SEEDING_DIR
