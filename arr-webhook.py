@@ -3705,7 +3705,7 @@ def superseded_audit():
             f'{DELUGE_URL}/json',
             json={
                 'method': 'core.get_torrents_status',
-                'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'total_size']],
+                'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'total_size', 'progress', 'state']],
                 'id': 95,
             },
             timeout=30,
@@ -3732,6 +3732,8 @@ def superseded_audit():
             'seed_days': round(seed_sec / 86400, 1),
             'size_gb': round((info.get('total_size') or 0) / (1024**3), 2),
             'in_seeding_dir': in_seeding_dir,
+            'progress': info.get('progress'),
+            'state': info.get('state'),
         }
         if not in_seeding_dir:
             entry['expected_dir'] = seeding_dir_norm
