@@ -69,16 +69,20 @@ PLEX_PATH_MAP = [
     if ':' in pair
 ]
 
-def _translate_plex_path(p):
+def _map_prefix(p, pairs):
+    """Rewrite path `p` using the first matching (from, to) prefix pair.
+    Requires a directory boundary so a short prefix like `/data/M` doesn't
+    accidentally match `/data/Movies` AND `/data/Music`."""
     if not p:
         return p
-    for plex_prefix, local_prefix in PLEX_PATH_MAP:
-        # Require a directory boundary so a short prefix like `/data/M`
-        # doesn't accidentally match `/data/Movies` AND `/data/Music`.
-        prefix = plex_prefix.rstrip('/')
+    for from_prefix, to_prefix in pairs:
+        prefix = from_prefix.rstrip('/')
         if p == prefix or p.startswith(prefix + '/'):
-            return local_prefix.rstrip('/') + p[len(prefix):]
+            return to_prefix.rstrip('/') + p[len(prefix):]
     return p
+
+def _translate_plex_path(p):
+    return _map_prefix(p, PLEX_PATH_MAP)
 # Comma-separated library titles to skip in plex-dupe-scan (case-insensitive).
 PLEX_SKIP_LIBRARIES = {s.strip().lower() for s in os.environ.get('PLEX_SKIP_LIBRARIES', 'Adult,XXX,NSFW,Music,Music Videos').split(',') if s.strip()}
 # Plex ratingKeys never touched by /plex-dupe-fix. Env var is the seed
@@ -121,6 +125,10 @@ IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  #
 # Lower batch / higher delay is gentler on the tracker.
 BULK_SEARCH_BATCH = int(os.environ.get('BULK_SEARCH_BATCH', '50'))
 BULK_SEARCH_DELAY = int(os.environ.get('BULK_SEARCH_DELAY', '180'))  # secs between batches
+# Sonarr batches are much smaller: one SeriesSearch fans out to every
+# monitored episode in that series, so 50 series is an order of magnitude
+# more announces than 50 movies. Tune down further if the tracker complains.
+SONARR_BULK_SEARCH_BATCH = int(os.environ.get('SONARR_BULK_SEARCH_BATCH', '10'))
 
 PROPER_REPACK_RE = re.compile(r'\b(PROPER|REPACK|RERIP)\b', re.IGNORECASE)
 EPISODE_RE       = re.compile(r'S\d{2}E\d{2}', re.IGNORECASE)
@@ -346,6 +354,28 @@ def cleanup_superseded():
             record_activity('cleanup', f'Removed {removed} superseded torrent(s) past the {SEED_DAYS}-day seed window')
     except Exception as e:
         log.error(f'Cleanup failed: {e}')
+
+def queued_superseded_targets(torrents):
+    """Superseded torrents sitting in Deluge's own 'Queued' state — waiting
+    behind the active-torrent limit, not transferring, not seeding, nothing
+    to lose by removing them now. (Deluge can hold a torrent here at any
+    progress %, so this checks state, not progress.) Shared by the
+    /purge-unstarted-superseded route and the post-import sweep."""
+    return [
+        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state')}
+        for h, info in torrents.items()
+        if info.get('label') == SUPERSEDED_LABEL and info.get('state') == 'Queued'
+    ]
+
+def purge_queued_superseded(targets):
+    removed, failed = 0, []
+    for t in targets:
+        try:
+            remove_torrent(t['hash'])
+            removed += 1
+        except Exception as e:
+            failed.append({'hash': t['hash'], 'error': str(e)})
+    return removed, failed
 
 def cleanup_scheduler():
     while True:
@@ -1129,6 +1159,24 @@ def handle_upgrade_import(data, source):
                 set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
                 move_torrent_storage(torrent_hash, SEEDING_DIR)
 
+    # Event-driven version of /purge-unstarted-superseded: an upgrade import
+    # is exactly when stale duplicates pile up, so sweep the superseded
+    # torrents that are merely Queued (not seeding, not transferring) right
+    # now instead of waiting for the daily cleanup_scheduler tick. Re-fetch
+    # status: the ones we just touched above are 'Moving', not 'Queued', so
+    # they're correctly out of scope until they settle.
+    try:
+        stale = queued_superseded_targets(get_all_torrents())
+        if stale:
+            removed, failed = purge_queued_superseded(stale)
+            log.info(f'{source}: post-import purge removed {removed} queued superseded torrent(s)')
+            if removed:
+                record_activity('cleanup', f'{source}: removed {removed} queued superseded torrent(s) after upgrade import')
+            if failed:
+                log.warning(f'{source}: post-import purge failures: {failed}')
+    except Exception as e:
+        log.warning(f'{source}: post-import queued-superseded purge failed: {e}')
+
 
 def handle_import_relabel(data, source):
     """Download event that is NOT an upgrade: the finished torrent can still
@@ -1420,9 +1468,124 @@ def relabel_radarr_upgrades():
     except Exception as e:
         log.error(f'Radarr upgrade relabeling failed: {e}')
 
-def purge_stalled_upgrade_torrents():
-    """Remove radarr-upgrade torrents that haven't downloaded more than 5MB."""
-    log.info('Purging stalled radarr-upgrade torrents...')
+def sonarr_bulk_search():
+    """Sonarr counterpart of radarr_bulk_search: search every monitored
+    series so missing episodes and cutoff-unmet upgrades both get picked up.
+
+    Radarr's MoviesSearch takes a *list* of movieIds in one command; Sonarr's
+    SeriesSearch takes a single seriesId (confirmed against Sonarr's
+    SeriesSearchCommand: `public int SeriesId`), so a "batch" here is N
+    separate commands fired back-to-back before the pacing sleep. One series
+    search fans out to every monitored episode in that series, so it's far
+    heavier per unit than one movie -- hence a much smaller default batch
+    than BULK_SEARCH_BATCH. Same tracker-announce rate-limit reasoning as
+    the Radarr comment above.
+    """
+    log.info('Running monthly Sonarr bulk search for missing/upgrades...')
+    try:
+        series_r = requests.get(
+            f'{SONARR_URL}/api/v3/series',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            timeout=30
+        )
+        series_r.raise_for_status()
+        series_ids = [s['id'] for s in series_r.json() if s.get('monitored')]
+        if not series_ids:
+            log.warning('Sonarr bulk search: no monitored series found, skipping')
+            return
+        batches = [series_ids[n:n + SONARR_BULK_SEARCH_BATCH]
+                   for n in range(0, len(series_ids), SONARR_BULK_SEARCH_BATCH)]
+        log.info(f'Sonarr bulk search: {len(series_ids)} series in {len(batches)} '
+                 f'batches of {SONARR_BULK_SEARCH_BATCH}, {BULK_SEARCH_DELAY}s apart')
+        for n, batch in enumerate(batches, 1):
+            for series_id in batch:
+                try:
+                    r = requests.post(
+                        f'{SONARR_URL}/api/v3/command',
+                        headers={'X-Api-Key': SONARR_API_KEY},
+                        json={'name': 'SeriesSearch', 'seriesId': series_id},
+                        timeout=30
+                    )
+                    r.raise_for_status()
+                except Exception as e:
+                    log.error(f'Sonarr SeriesSearch for series {series_id} failed: {e}')
+            log.info(f'Sonarr bulk search batch {n}/{len(batches)} ({len(batch)} series) queued')
+            if n < len(batches):
+                time.sleep(BULK_SEARCH_DELAY)
+    except Exception as e:
+        log.error(f'Sonarr bulk search failed: {e}')
+
+def relabel_sonarr_upgrades():
+    """Sonarr counterpart of relabel_radarr_upgrades: any 'sonarr'-labeled
+    torrent in Deluge whose queue record points at an episode that already
+    has a file is an upgrade -- throttle it into the sonarr-upgrade lane and
+    push it to the bottom of the queue so it can't starve new releases.
+
+    Radarr can answer 'does this already have a file' from one bulk /movie
+    fetch; Sonarr's per-episode hasFile needs a per-episode lookup, so this
+    queries only the episodes actually sitting in the queue (small set) via
+    the same /api/v3/episode/{id} call is_upgrade_sonarr already uses.
+    """
+    log.info('Relabeling Sonarr upgrade torrents...')
+    try:
+        deluge_login()
+        torrents = get_all_torrents()
+        if not torrents:
+            return
+        sonarr_torrents = {h: i for h, i in torrents.items() if i.get('label') == 'sonarr'}
+        if not sonarr_torrents:
+            log.info('No sonarr-labeled torrents to check')
+            return
+        q = requests.get(
+            f'{SONARR_URL}/api/v3/queue',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'pageSize': 500},
+            timeout=15
+        )
+        q.raise_for_status()
+        download_to_episode = {}
+        for rec in q.json().get('records', []):
+            dl = rec.get('downloadId')
+            ep = rec.get('episodeId')
+            if dl and ep:
+                download_to_episode.setdefault(dl.lower(), ep)
+        relabeled_hashes = []
+        for torrent_hash, info in sonarr_torrents.items():
+            episode_id = download_to_episode.get(torrent_hash.lower())
+            if not episode_id:
+                continue
+            try:
+                er = requests.get(
+                    f'{SONARR_URL}/api/v3/episode/{episode_id}',
+                    headers={'X-Api-Key': SONARR_API_KEY},
+                    timeout=10
+                )
+                er.raise_for_status()
+                has_file = er.json().get('hasFile', False)
+            except Exception as e:
+                log.warning(f'Sonarr episode {episode_id} lookup failed: {e}')
+                continue
+            if has_file:
+                log.info(f'Relabeling upgrade: {info.get("name")}')
+                ensure_label_exists_named(SONARR_UPG_LABEL)
+                set_torrent_label(torrent_hash, SONARR_UPG_LABEL)
+                relabeled_hashes.append(torrent_hash)
+        if relabeled_hashes:
+            session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.queue_bottom', 'params': [relabeled_hashes], 'id': 10},
+                timeout=10
+            )
+            log.info(f'Moved {len(relabeled_hashes)} sonarr upgrade torrents to bottom of queue')
+        log.info(f'Relabeled {len(relabeled_hashes)} torrents as {SONARR_UPG_LABEL}')
+    except Exception as e:
+        log.error(f'Sonarr upgrade relabeling failed: {e}')
+
+def purge_stalled_upgrade_torrents(label=RADARR_UPG_LABEL):
+    """Remove <label> torrents that haven't downloaded more than 5MB.
+    Defaults to the Radarr upgrade lane; the Sonarr monthly cycle passes
+    SONARR_UPG_LABEL."""
+    log.info(f'Purging stalled {label} torrents...')
     try:
         deluge_login()
         resp = session.post(
@@ -1436,7 +1599,7 @@ def purge_stalled_upgrade_torrents():
             return
         to_remove = []
         for h, i in torrents.items():
-            if i.get('label') == RADARR_UPG_LABEL:
+            if i.get('label') == label:
                 total_done = i.get('total_done', 0)
                 if total_done < 5 * 1024 * 1024:  # less than 5MB downloaded
                     log.info(f'Purging stalled upgrade: {i.get("name")} ({total_done/1024/1024:.1f}MB downloaded)')
@@ -1457,12 +1620,14 @@ def purge_stalled_upgrade_torrents():
 
 def monthly_search_scheduler():
     """
-    On the 1st of each month:
-    1. Purge stalled radarr-upgrade torrents
+    On the 1st of each month, Radarr first and then the identical Sonarr
+    cycle (Sonarr was silently missing a lot of episodes because nothing
+    ever bulk-searched it):
+    1. Purge stalled <service>-upgrade torrents
     2. Wait 30 minutes
-    3. Trigger Radarr bulk search
-    4. Wait 90 minutes
-    5. Relabel new upgrade torrents
+    3. Trigger bulk search
+    4. Wait 5 minutes
+    5. Relabel new upgrade torrents to the throttled lane, queue them last
     """
     import datetime
     last_run_month = None
@@ -1470,16 +1635,30 @@ def monthly_search_scheduler():
         now = datetime.datetime.now()
         if now.day == 1 and now.month != last_run_month:
             last_run_month = now.month
-            log.info('Monthly upgrade cycle starting: purging stalled upgrades...')
-            purge_stalled_upgrade_torrents()
-            log.info('Waiting 30 minutes before bulk search...')
-            time.sleep(1800)  # 30 minutes
-            radarr_bulk_search()
-            log.info('Waiting 5 minutes before relabeling upgrades...')
-            time.sleep(300)  # 5 minutes
-            relabel_radarr_upgrades()
+            log.info('Monthly upgrade cycle starting')
+            monthly_upgrade_cycle('radarr')
+            # Sonarr runs after Radarr rather than in parallel so the two
+            # bulk searches don't stack announces on the same tracker.
+            monthly_upgrade_cycle('sonarr')
             log.info('Monthly upgrade cycle complete')
         time.sleep(3600)  # check every hour
+
+
+def monthly_upgrade_cycle(service, wait_before_search=1800, wait_before_relabel=300):
+    """One service's monthly purge → bulk search → relabel pass."""
+    if service == 'sonarr':
+        label, bulk_search, relabel = SONARR_UPG_LABEL, sonarr_bulk_search, relabel_sonarr_upgrades
+    else:
+        label, bulk_search, relabel = RADARR_UPG_LABEL, radarr_bulk_search, relabel_radarr_upgrades
+    log.info(f'{service}: monthly cycle — purging stalled {label} torrents...')
+    purge_stalled_upgrade_torrents(label)
+    log.info(f'{service}: waiting {wait_before_search}s before bulk search...')
+    time.sleep(wait_before_search)
+    bulk_search()
+    log.info(f'{service}: waiting {wait_before_relabel}s before relabeling upgrades...')
+    time.sleep(wait_before_relabel)
+    relabel()
+    log.info(f'{service}: monthly cycle complete')
 
 
 def prioritize_normal_torrents():
@@ -3674,21 +3853,11 @@ def purge_unstarted_superseded():
         torrents = get_all_torrents()
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
-    targets = [
-        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state')}
-        for h, info in torrents.items()
-        if info.get('label') == SUPERSEDED_LABEL and info.get('state') == 'Queued'
-    ]
+    targets = queued_superseded_targets(torrents)
     if not apply:
         return jsonify({'ok': True, 'apply': False, 'count': len(targets), 'targets': targets,
                          'note': 'dry-run — pass ?apply=1 to remove these torrents + files'}), 200
-    removed, failed = 0, []
-    for t in targets:
-        try:
-            remove_torrent(t['hash'])
-            removed += 1
-        except Exception as e:
-            failed.append({'hash': t['hash'], 'error': str(e)})
+    removed, failed = purge_queued_superseded(targets)
     return jsonify({'ok': True, 'apply': True, 'removed': removed, 'failed': failed}), 200
 
 # Report-only audit of everything labeled `superseded`: how long each has
@@ -3759,26 +3928,26 @@ def superseded_audit():
     }), 200
 
 # Manual trigger for the monthly upgrade cycle. Full cycle with the
-# normal 30/90-minute waits by default; ?skip_waits=1 replaces them with
+# normal 30/5-minute waits by default; ?skip_waits=1 replaces them with
 # a short interval so you can watch the whole pipeline end-to-end.
+# ?service=radarr|sonarr|both (default both, radarr first).
 @app.route('/run-monthly-upgrade', methods=['POST'])
 def run_monthly_upgrade():
     skip_waits = request.args.get('skip_waits', '').lower() in ('1', 'true', 'yes')
+    service = (request.args.get('service') or 'both').lower()
+    if service not in ('radarr', 'sonarr', 'both'):
+        return jsonify({'ok': False, 'error': 'service must be radarr, sonarr or both'}), 400
+    services = ['radarr', 'sonarr'] if service == 'both' else [service]
+    waits = (10, 30) if skip_waits else (1800, 300)
     def _cycle():
-        log.info(f'Manual monthly upgrade cycle starting (skip_waits={skip_waits})')
-        purge_stalled_upgrade_torrents()
-        wait_a = 10 if skip_waits else 1800
-        log.info(f'Waiting {wait_a}s before bulk search...')
-        time.sleep(wait_a)
-        radarr_bulk_search()
-        wait_b = 30 if skip_waits else 300
-        log.info(f'Waiting {wait_b}s before relabeling upgrades...')
-        time.sleep(wait_b)
-        relabel_radarr_upgrades()
+        log.info(f'Manual monthly upgrade cycle starting ({service}, skip_waits={skip_waits})')
+        for svc in services:
+            monthly_upgrade_cycle(svc, *waits)
         log.info('Manual monthly upgrade cycle complete')
     threading.Thread(target=_cycle, daemon=True).start()
     return jsonify({
         'ok': True,
+        'service': service,
         'skip_waits': skip_waits,
         'message': 'monthly upgrade cycle started; watch container logs',
     }), 200
@@ -3948,6 +4117,353 @@ def orphan_scan():
         'buckets': buckets,
     }), 200
 
+# ── Deluge error scan + relink ───────────────────────────────────────────────
+# A power outage leaves torrents in Deluge's 'Error' state: libtorrent hit a
+# file error on resume (data half-written, or the file it expects is gone).
+# Two distinct causes need two distinct fixes, and telling them apart matters
+# because the fix for one is destructive if applied to the other:
+#
+#   a) data is still at save_path, libtorrent just gave up on it
+#      → force_recheck. Re-hashes in place, moves nothing. Safe, idempotent.
+#   b) data genuinely isn't at save_path but exists elsewhere under the
+#      downloads tree → the save_path has to be re-pointed. Deluge's only
+#      primitive for that is core.move_storage, which calls libtorrent with
+#      move_flags=2 (dont_replace): files present at the destination win and
+#      are kept, source files that do exist are MOVED (and the source copy
+#      deleted). That's real I/O against real data, so it is opt-in.
+#      core.set_torrent_options({'download_location': ...}) is NOT an
+#      alternative — verified against Deluge's torrent.py, its setter only
+#      stores the option and never touches existing data, so the torrent
+#      would stay broken while looking reconfigured.
+#
+# Whether the data is at save_path is answered by Deluge itself via
+# core.get_path_size (returns -1 for a nonexistent path) rather than by
+# os.path.exists here, because this container does not necessarily have
+# Deluge's download tree mounted.
+#
+# The *search* for a moved file needs local mounts, and the two containers do
+# NOT agree on paths. Confirmed live against this Deluge instance: torrent
+# save_paths are a mix of /data/Downloads/{Incomplete,Complete/*,Just4Seeding}
+# and, for a large number of library-seeding torrents, /data/Media/TV Shows/…
+# and /data/Media/Adult. Deluge's /data/Media/TV Shows is this container's
+# /media/tv, so every path crossing the boundary has to be translated —
+# DELUGE_PATH_MAP does that in both directions. Anything Deluge can see but
+# this container has no mount for (e.g. /data/Media/Adult) simply isn't
+# searchable and gets reported as missing rather than silently mishandled.
+#
+# Because library-seeding torrents seed the library files themselves, a
+# relink is capable of MOVING LIBRARY MEDIA — which is the main reason
+# relinking is opt-in and rechecking is not.
+
+DELUGE_REPAIR_INTERVAL = int(os.environ.get('DELUGE_REPAIR_INTERVAL', '21600'))  # 6h
+# Off by default: rechecks are automatic, relocations are reported and wait
+# for a human. Set DELUGE_RELINK=1 to let the scheduler move storage too.
+DELUGE_RELINK = os.environ.get('DELUGE_RELINK', '').lower() in ('1', 'true', 'yes')
+DOWNLOADS_MOUNT = os.environ.get('DOWNLOADS_MOUNT', '/data/Downloads')
+# deluge_path:local_path pairs, comma-separated.
+DELUGE_PATH_MAP = [
+    tuple(pair.split(':', 1))
+    for pair in os.environ.get(
+        'DELUGE_PATH_MAP',
+        f'/data/Downloads:{DOWNLOADS_MOUNT},'
+        '/data/Media/Movies:/media/movies,'
+        '/data/Media/TV Shows:/media/tv,'
+        '/data/Media/Music:/media/music',
+    ).split(',')
+    if ':' in pair
+]
+
+def _deluge_to_local(p):
+    return _map_prefix(p, DELUGE_PATH_MAP)
+
+def _local_to_deluge(p):
+    return _map_prefix(p, [(local, deluge) for deluge, local in DELUGE_PATH_MAP])
+
+def deluge_force_recheck(torrent_hash):
+    """core.force_recheck — re-verifies pieces against whatever is on disk.
+    Deluge's own force_recheck resumes the torrent afterwards, so no
+    separate resume call is needed."""
+    resp = session.post(
+        f'{DELUGE_URL}/json',
+        json={'method': 'core.force_recheck', 'params': [[torrent_hash]], 'id': 61},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    log.info(f'Forced recheck of {torrent_hash}')
+
+def _deluge_path_exists(path):
+    """True/False from Deluge's own filesystem view; None if we couldn't ask.
+    core.get_path_size returns -1 when the path is inaccessible — which per
+    Deluge's own docstring means non-existent OR insufficient privileges, so a
+    permissions problem reads as 'data missing' here and sends the torrent
+    down the search branch. Harmless while relinking is opt-in; worth
+    remembering if a torrent is reported missing whose data is plainly there."""
+    try:
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.get_path_size', 'params': [path], 'id': 62},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        size = resp.json().get('result')
+        return None if size is None else size >= 0
+    except Exception as e:
+        log.warning(f'get_path_size({path}) failed: {e}')
+        return None
+
+def _search_roots():
+    """Local (this container's) roots to search, derived from the mounts we
+    actually have. Deluge paths we can't see are skipped."""
+    return [local for _, local in DELUGE_PATH_MAP if os.path.isdir(local)]
+
+def _find_torrent_data(torrent_name, roots=None):
+    """Locate a torrent's data by name. Returns a LOCAL path, or None.
+
+    Exact stem match first (Deluge names the file/folder after the torrent,
+    so this is the real case). The fuzzy fallback is gated on a long name
+    because _torrent_name_matches_file is substring-both-ways and a short
+    name would happily match a whole season folder.
+    ponytail: linear os.walk of the mounted roots, fine at homelab scale and
+    only runs for torrents already in Error; index it if that stops holding."""
+    stem = _strip_release_ext(torrent_name.lower())
+    fuzzy_hit = None
+    for root in (roots if roots is not None else _search_roots()):
+        for dirpath, dirnames, filenames in os.walk(root):
+            for entry in list(dirnames) + list(filenames):
+                if _strip_release_ext(entry.lower()) == stem:
+                    return os.path.join(dirpath, entry)
+                if (fuzzy_hit is None and len(stem) >= 20
+                        and _torrent_name_matches_file(torrent_name, entry)):
+                    fuzzy_hit = os.path.join(dirpath, entry)
+    return fuzzy_hit
+
+# A torrent whose data is genuinely gone stays broken until a human deals
+# with it, and the scheduler re-sees it every 6 hours. Report each
+# (hash, outcome) to the digest once per process so the review queue doesn't
+# fill up with the same handful of entries four times a day.
+_reported_deluge_errors = set()
+
+def _report_once(key, category, summary, dry_run=False):
+    if dry_run or key in _reported_deluge_errors:
+        return  # a dry-run inspection shouldn't post to the review queue
+    _reported_deluge_errors.add(key)
+    record_activity(category, summary)
+
+def deluge_error_repair(dry_run=False, relink=None):
+    """Scan Deluge for errored torrents and self-heal what's safe to heal."""
+    if relink is None:
+        relink = DELUGE_RELINK
+    result = {'ok': True, 'dry_run': dry_run, 'relink': relink,
+              'rechecked': [], 'relink_candidates': [], 'missing': [], 'errors': []}
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'state', 'message', 'save_path', 'label', 'progress']],
+                'id': 60,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        log.error(f'Deluge error scan failed: {e}')
+        return {'ok': False, 'error': str(e)}
+
+    for h, info in torrents.items():
+        # Deluge sets state='Error' for torrent/file errors and puts the
+        # detail in 'message'. Tracker problems surface in tracker_status
+        # instead, so they don't land here.
+        if info.get('state') != 'Error':
+            continue
+        name = info.get('name') or ''
+        save_path = info.get('save_path') or ''
+        entry = {'hash': h, 'name': name, 'save_path': save_path,
+                 'message': info.get('message'), 'label': info.get('label')}
+        present = _deluge_path_exists(os.path.join(save_path, name)) if save_path and name else None
+        if present:
+            entry['action'] = 'recheck' if not dry_run else 'would recheck'
+            if not dry_run:
+                try:
+                    deluge_force_recheck(h)
+                except Exception as e:
+                    entry['action'] = f'recheck FAILED: {e}'
+                    result['errors'].append(entry)
+                    continue
+            result['rechecked'].append(entry)
+            continue
+        if present is None:
+            entry['action'] = 'skipped — could not determine whether data exists'
+            result['errors'].append(entry)
+            continue
+        roots = _search_roots()
+        found_local = _find_torrent_data(name, roots)
+        if not found_local:
+            entry['action'] = f'data not found in any searchable root {roots}'
+            result['missing'].append(entry)
+            _report_once(
+                (h, 'missing'), 'deluge-error',
+                f'Errored torrent "{name}" — data missing from {save_path} and not found in '
+                f'{", ".join(roots) or "(no roots mounted)"} ({info.get("message") or "no message"})',
+                dry_run=dry_run,
+            )
+            continue
+        # Everything below crosses the container/Deluge namespace boundary:
+        # found_local is this container's path, Deluge needs its own.
+        found_deluge = _local_to_deluge(found_local)
+        dest = os.path.dirname(found_deluge)
+        entry['found_at'] = found_local
+        entry['found_at_deluge'] = found_deluge
+        entry['relink_dest'] = dest
+        # Never hand Deluge a path it can't see. This re-verifies the
+        # translation against Deluge's own filesystem instead of trusting
+        # DELUGE_PATH_MAP blindly — a wrong map here would move_storage a
+        # torrent to a bogus location.
+        if _deluge_path_exists(found_deluge) is not True:
+            entry['action'] = (f'found at {found_local} but Deluge cannot see {found_deluge} — '
+                               f'check DELUGE_PATH_MAP; not relinking')
+            result['errors'].append(entry)
+            continue
+        if relink and not dry_run:
+            try:
+                # Re-point only. The recheck is left to the next pass: the
+                # move is asynchronous (Deluge goes to state 'Moving'), and
+                # by the next tick get_path_size will see the data at the new
+                # save_path and take the safe recheck branch above.
+                move_torrent_storage(h, dest)
+                entry['action'] = f'relinked to {dest}; recheck on next pass'
+                record_activity('deluge-error', f'Relinked errored torrent "{name}" to {dest}')
+            except Exception as e:
+                entry['action'] = f'relink FAILED: {e}'
+                result['errors'].append(entry)
+                continue
+        else:
+            entry['action'] = f'relink candidate (set DELUGE_RELINK=1 or POST ?relink=1) → {dest}'
+            _report_once((h, 'relink-candidate'), 'deluge-error',
+                         f'Errored torrent "{name}" — data found at {found_local}, relink not applied',
+                         dry_run=dry_run)
+        result['relink_candidates'].append(entry)
+
+    counts = {k: len(v) for k, v in result.items() if isinstance(v, list)}
+    result['counts'] = counts
+    if any(counts.values()):
+        log.info(f'Deluge error repair: {counts}')
+    return result
+
+# Manual trigger for the error scan (mirrors /run-dedup). Runs inline so you
+# get the report back; dry_run=1 to look without rechecking, relink=1 to also
+# move storage for torrents whose data was found elsewhere.
+@app.route('/run-deluge-repair', methods=['POST', 'GET'])
+def run_deluge_repair():
+    dry_run = request.args.get('dry_run', '').lower() in ('1', 'true', 'yes')
+    # Absent → inherit DELUGE_RELINK; present → explicit, so ?relink=0 can
+    # force a no-relink run even once the env default is turned on.
+    raw_relink = request.args.get('relink')
+    relink = None if raw_relink is None else raw_relink.lower() in ('1', 'true', 'yes')
+    return jsonify(deluge_error_repair(dry_run=dry_run, relink=relink)), 200
+
+
+# ── Duplicate media folder scan ──────────────────────────────────────────────
+# When a new torrent lands for content that already has a library folder, the
+# import can end up beside the existing folder instead of replacing it,
+# leaving `Movie Name (2020)` next to `Movie Name (2020) (1)`. Detection only:
+# which copy is the keeper depends on what the arrs think they're tracking, and
+# deleting the wrong one loses the library file, so this reports and stops.
+
+MEDIA_ROOTS = [p.strip() for p in os.environ.get('MEDIA_ROOTS', '/media/movies,/media/tv').split(',') if p.strip()]
+# Trailing collision suffixes only. `\(\d{1,3}\)` deliberately stops at 3
+# digits so a 4-digit year — `Movie Name (2020)` — is never stripped and two
+# different years of the same title don't collapse into one false dupe.
+_DUP_SUFFIX_RE = re.compile(r'(?:\s*\(\d{1,3}\)|\s*-\s*copy|_\d{1,2})$', re.IGNORECASE)
+
+def _dup_folder_key(name):
+    return re.sub(r'[^a-z0-9]+', '', _DUP_SUFFIX_RE.sub('', name.strip()).lower())
+
+def find_duplicate_media_folders():
+    """Sibling folders under the media roots whose names differ only by a
+    collision suffix. Sizes are computed only for actual hits — the scan
+    itself is scandir-only, which is what makes it cheap enough to ride the
+    6-hourly scheduler."""
+    parents = []
+    for root in MEDIA_ROOTS:
+        if not os.path.isdir(root):
+            log.debug(f'dupe-folder scan: {root} not mounted, skipping')
+            continue
+        parents.append(root)
+        # One level down too, so `Series/Season 01 (1)` is caught as well.
+        try:
+            parents.extend(e.path for e in os.scandir(root) if e.is_dir())
+        except OSError as e:
+            log.warning(f'dupe-folder scan: {root}: {e}')
+    findings = []
+    for parent in parents:
+        groups = {}
+        try:
+            for e in os.scandir(parent):
+                if e.is_dir():
+                    groups.setdefault(_dup_folder_key(e.name), []).append(e.path)
+        except OSError:
+            continue
+        for key, paths in groups.items():
+            if len(paths) > 1 and key:
+                findings.append({
+                    'key': key,
+                    'parent': parent,
+                    'folders': [
+                        {'path': p, 'size_gb': round(_du(p) / (1024 ** 3), 2)}
+                        for p in sorted(paths)
+                    ],
+                })
+    return findings
+
+# Report each finding to the digest once per process, so a dupe that the user
+# has decided to leave alone doesn't re-post every 6 hours forever.
+_reported_dupe_folders = set()
+
+def duplicate_folder_scan():
+    try:
+        findings = find_duplicate_media_folders()
+    except Exception as e:
+        log.error(f'Duplicate folder scan failed: {e}')
+        return
+    new = [f for f in findings if f['key'] not in _reported_dupe_folders]
+    for f in new:
+        _reported_dupe_folders.add(f['key'])
+        detail = ', '.join(f'{os.path.basename(x["path"])} ({x["size_gb"]}GB)' for x in f['folders'])
+        record_activity('dupe-folder', f'Duplicate folders in {f["parent"]}: {detail}')
+    log.info(f'Duplicate folder scan: {len(findings)} group(s), {len(new)} new')
+
+@app.route('/duplicate-folders', methods=['GET'])
+def duplicate_folders():
+    findings = find_duplicate_media_folders()
+    return jsonify({
+        'ok': True,
+        'roots': MEDIA_ROOTS,
+        'count': len(findings),
+        'findings': findings,
+        'note': 'detection only — nothing is deleted automatically',
+    }), 200
+
+
+def maintenance_scheduler():
+    """Every 6 hours: heal errored torrents, then look for duplicate library
+    folders. Shares one thread because the dupe scan is scandir-only (sizes
+    are computed for hits only), so it costs nothing to run on the same tick
+    as the error scan rather than owning a fifth scheduler."""
+    while True:
+        try:
+            deluge_error_repair()
+        except Exception as e:
+            log.error(f'Deluge error repair failed: {e}')
+        try:
+            duplicate_folder_scan()
+        except Exception as e:
+            log.error(f'Duplicate folder scan failed: {e}')
+        time.sleep(DELUGE_REPAIR_INTERVAL)
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 9876))
     log.info(f'Starting arr-webhook listener on port {port}')
@@ -3963,4 +4479,6 @@ if __name__ == '__main__':
     t4.start()
     t5 = threading.Thread(target=auto_rescue_scheduler, daemon=True)
     t5.start()
+    t6 = threading.Thread(target=maintenance_scheduler, daemon=True)
+    t6.start()
     app.run(host='0.0.0.0', port=port, threaded=True)

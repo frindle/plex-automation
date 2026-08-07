@@ -15,6 +15,11 @@ services:
       RADARR_UPGRADE_LABEL: "radarr-upgrade"
       PORT: "9876"
       SEEDING_DIR: "/data/Downloads/Just4Seeding"
+      # Errored-torrent repair: rechecks are automatic, relocations are only
+      # reported. Flip to "1" to let it move_storage too -- note that
+      # library-seeding torrents seed the media files themselves, so a relink
+      # can move real library data.
+      DELUGE_RELINK: "0"
       SEED_DAYS: "21"
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       UPLOAD_RATE_LIMIT_MBIT: "5"
@@ -26,6 +31,11 @@ services:
         ipv4_address: 10.0.0.4
     volumes:
       - ./data:/data
+      # Deluge's download tree, mounted at the SAME path Deluge itself uses so
+      # DELUGE_PATH_MAP's entry for it is a no-op identity mapping.
+      # Needed by /run-deluge-repair's missing-data search and by
+      # /incomplete-orphans (which fails "not a directory" without it).
+      - "/mnt/user/data/Downloads:/data/Downloads"
       - "/mnt/user/data/Media/Movies:/media/movies"
       # rw (not ro) so /plex-dupe-fix can delete misplaced episode files
       # via the filesystem fallback when the Plex API rejects the delete.
