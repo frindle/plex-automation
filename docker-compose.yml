@@ -21,6 +21,17 @@ services:
       # can move real library data.
       DELUGE_RELINK: "0"
       SEED_DAYS: "21"
+      # Stale-seed unseed pass (weekly): torrent seeded >= this long AND
+      # negligible upload since last week's check AND swarm already has
+      # STALL_MIN_SWARM_SEEDS+ other seeders -> unseed it (files stay,
+      # only stops tracking/seeding in Deluge). 180 = 6 months, per the
+      # user's stated target for this feature.
+      STALL_SEED_MIN_DAYS: "180"
+      STALL_MIN_SWARM_SEEDS: "5"
+      # Deliberately left off: preview via GET /run-stalled-seeds (dry-run
+      # by default) until reviewed and explicitly turned on. Set to "true"
+      # only after checking a dry-run's candidate list.
+      STALL_AUTOMATION_ENABLED: "false"
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       UPLOAD_RATE_LIMIT_MBIT: "5"
       PLEX_URL: "http://10.0.0.6:32400"
