@@ -58,6 +58,10 @@ STALL_SEED_MIN_DAYS = int(os.environ.get('STALL_SEED_MIN_DAYS', '21'))
 STALL_UPLOAD_THRESHOLD_BYTES = int(os.environ.get('STALL_UPLOAD_THRESHOLD_BYTES', str(10 * 1024 * 1024)))
 STALL_CHECK_INTERVAL = int(os.environ.get('STALL_CHECK_INTERVAL', str(7 * 86400)))
 SEED_STATE_PATH = os.environ.get('SEED_STATE_PATH', '/data/seed_tracking.json')
+# Off by default until proven safe. The manual preview endpoint
+# (/run-stalled-seeds, dry-run by default) still works regardless of this
+# flag — this only gates the automatic weekly background removal.
+STALL_AUTOMATION_ENABLED = os.environ.get('STALL_AUTOMATION_ENABLED', 'false').lower() in ('1', 'true', 'yes')
 # Root of the movies library from the CONTAINER's perspective — used by
 # /orphan-scan. Radarr may report paths from the host's perspective, so
 # matching is done by filename basename rather than absolute path.
@@ -835,6 +839,10 @@ def cleanup_stalled_seeds(dry_run=False):
     return candidates
 
 def stalled_seed_scheduler():
+    if not STALL_AUTOMATION_ENABLED:
+        log.info('Stalled-seed automation disabled (STALL_AUTOMATION_ENABLED=false) — '
+                 'use GET /run-stalled-seeds to preview, or set the env var to enable weekly auto-removal')
+        return
     while True:
         time.sleep(STALL_CHECK_INTERVAL)
         cleanup_stalled_seeds()
