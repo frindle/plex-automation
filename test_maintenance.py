@@ -1,8 +1,10 @@
 """Self-checks for the 6-hourly maintenance pass: the Deluge error-repair
 branch decision (recheck vs relink vs missing -- picking wrong here means
 moving real torrent data), the duplicate-folder name key (must not collapse
-two different release years into one false dupe), and the shared
-queued-superseded filter. No framework. Run: python test_maintenance.py"""
+two different release years into one false dupe), the stalled-seed
+swarm-safety gate (missing/unknown swarm seed data must never be treated as
+safe to remove), and the shared queued-superseded filter.
+No framework. Run: python test_maintenance.py"""
 
 import os
 import tempfile
@@ -137,6 +139,46 @@ def run():
     res = aw.deluge_error_repair(relink=True)
     assert calls == [], calls
     assert not any(res['counts'].values()), res
+
+    # ── stalled-seed swarm-safety gate ───────────────────────────────────
+    # h1: stale + negligible upload + plenty of swarm seeds -> removed
+    # h2: stale + negligible upload but swarm seeds unknown (-1) -> kept
+    # h3: stale + negligible upload but swarm seeds at/below the gate -> kept
+    # h4: stale + negligible upload + swarm seeds missing entirely -> kept
+    seed_torrents = {
+        'h1': {'name': 'Safe To Remove', 'state': 'Seeding', 'seeding_time': 999 * 86400,
+               'total_uploaded': 1000, 'total_seeds': 6},
+        'h2': {'name': 'Unknown Swarm', 'state': 'Seeding', 'seeding_time': 999 * 86400,
+               'total_uploaded': 1000, 'total_seeds': -1},
+        'h3': {'name': 'Too Few Seeds', 'state': 'Seeding', 'seeding_time': 999 * 86400,
+               'total_uploaded': 1000, 'total_seeds': 5},
+        'h4': {'name': 'No Seed Field', 'state': 'Seeding', 'seeding_time': 999 * 86400,
+               'total_uploaded': 1000},
+    }
+    with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+        state_path = f.name
+    try:
+        aw.SEED_STATE_PATH = state_path
+        aw.STALL_SEED_MIN_DAYS = 21
+        aw.STALL_UPLOAD_THRESHOLD_BYTES = 10 * 1024 * 1024
+        aw.STALL_MIN_SWARM_SEEDS = 5
+        removed_hashes = []
+        aw.remove_torrent = lambda h: removed_hashes.append(h)
+
+        # first pass: only establishes the baseline, nothing removed
+        _stub_deluge(aw, seed_torrents, set())
+        candidates = aw.cleanup_stalled_seeds(dry_run=False)
+        assert candidates == [], candidates
+        assert removed_hashes == [], removed_hashes
+
+        # second pass (upload unchanged since baseline): gate decides
+        _stub_deluge(aw, seed_torrents, set())
+        candidates = aw.cleanup_stalled_seeds(dry_run=False)
+        assert removed_hashes == ['h1'], removed_hashes
+        assert [c['hash'] for c in candidates] == ['h1'], candidates
+        assert candidates[0]['swarm_seeds'] == 6, candidates
+    finally:
+        os.unlink(state_path)
 
     # ── shared queued-superseded filter ──────────────────────────────────
     targets = aw.queued_superseded_targets({

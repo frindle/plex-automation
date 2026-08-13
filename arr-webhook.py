@@ -52,11 +52,19 @@ SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
 # Weekly stalled-seed review (any torrent, any label): a torrent must have
 # seeded at least this many days AND uploaded less than the byte threshold
-# since the previous week's check to be considered "not meaningfully
-# seeding" and removed.
+# since the previous week's check AND have more than STALL_MIN_SWARM_SEEDS
+# other seeds already in the swarm (so removing our copy doesn't hurt
+# availability) to be considered "not meaningfully seeding" and removed.
+# For the "old library-seed torrents sitting around for months" use case,
+# set STALL_SEED_MIN_DAYS=180 (6 months) at deploy time.
 STALL_SEED_MIN_DAYS = int(os.environ.get('STALL_SEED_MIN_DAYS', '21'))
 STALL_UPLOAD_THRESHOLD_BYTES = int(os.environ.get('STALL_UPLOAD_THRESHOLD_BYTES', str(10 * 1024 * 1024)))
 STALL_CHECK_INTERVAL = int(os.environ.get('STALL_CHECK_INTERVAL', str(7 * 86400)))
+# Swarm-safety gate: only remove a stalled torrent if the tracker reports
+# MORE than this many other seeds already in the swarm. Deluge/libtorrent
+# reports total_seeds == -1 when the tracker hasn't scraped yet (unknown,
+# not zero) -- treated as "don't know, don't touch", never as safe to remove.
+STALL_MIN_SWARM_SEEDS = int(os.environ.get('STALL_MIN_SWARM_SEEDS', '5'))
 SEED_STATE_PATH = os.environ.get('SEED_STATE_PATH', '/data/seed_tracking.json')
 # Off by default until proven safe. The manual preview endpoint
 # (/run-stalled-seeds, dry-run by default) still works regardless of this
@@ -286,7 +294,7 @@ def get_all_torrents():
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrents_status',
-            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress', 'state', 'total_uploaded']],
+            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress', 'state', 'total_uploaded', 'total_seeds']],
             'id': 6
         },
         timeout=10
@@ -798,9 +806,13 @@ def _save_seed_state(state):
 def cleanup_stalled_seeds(dry_run=False):
     """Weekly review of every torrent currently seeding (any label): if a
     torrent has seeded at least STALL_SEED_MIN_DAYS and uploaded less than
-    STALL_UPLOAD_THRESHOLD_BYTES since the last weekly check, it's dead
-    weight — remove it. First time a torrent is seen it only gets a
-    baseline recorded (no prior week to compare against, so no removal).
+    STALL_UPLOAD_THRESHOLD_BYTES since the last weekly check, AND the swarm
+    already has more than STALL_MIN_SWARM_SEEDS other seeds (tracker's
+    total_seeds), it's dead weight — remove it. First time a torrent is seen
+    it only gets a baseline recorded (no prior week to compare against, so
+    no removal). If total_seeds is unavailable (tracker hasn't scraped yet,
+    reported as -1/missing), the swarm size is unknown and the torrent is
+    NOT removed — missing data means "don't know", never "safe to remove".
 
     dry_run=True reports what WOULD be removed without removing anything
     and without touching the persisted state file (so a preview run
@@ -825,21 +837,31 @@ def cleanup_stalled_seeds(dry_run=False):
             if info.get('seeding_time', 0) < STALL_SEED_MIN_DAYS * 86400:
                 continue
             gained = uploaded - prev.get('total_uploaded', 0)
-            if gained < STALL_UPLOAD_THRESHOLD_BYTES:
-                action = 'WOULD remove' if dry_run else 'removing'
-                log.info(f'[seed-tracking] {action} stalled seed: {info.get("name")} '
-                         f'(+{gained/1e6:.1f}MB uploaded since last week\'s check)')
-                candidates.append({
-                    'hash': h,
-                    'name': info.get('name'),
-                    'label': info.get('label'),
-                    'seeding_days': round(info.get('seeding_time', 0) / 86400, 1),
-                    'uploaded_since_last_check_mb': round(gained / 1e6, 1),
-                })
-                if not dry_run:
-                    remove_torrent(h)
-                    state.pop(h, None)
-                removed += 1
+            if gained >= STALL_UPLOAD_THRESHOLD_BYTES:
+                continue
+            swarm_seeds = info.get('total_seeds')
+            # libtorrent reports -1 (or the key may be absent) when the
+            # tracker hasn't scraped yet -- unknown, not zero. Fail safe.
+            if swarm_seeds is None or swarm_seeds < 0 or swarm_seeds <= STALL_MIN_SWARM_SEEDS:
+                log.info(f'[seed-tracking] skipping stalled candidate (swarm seeds unknown/low, '
+                         f'safety gate): {info.get("name")} (total_seeds={swarm_seeds})')
+                continue
+            action = 'WOULD remove' if dry_run else 'removing'
+            log.info(f'[seed-tracking] {action} stalled seed: {info.get("name")} '
+                     f'(+{gained/1e6:.1f}MB uploaded since last week\'s check, '
+                     f'{swarm_seeds} other swarm seeds)')
+            candidates.append({
+                'hash': h,
+                'name': info.get('name'),
+                'label': info.get('label'),
+                'seeding_days': round(info.get('seeding_time', 0) / 86400, 1),
+                'uploaded_since_last_check_mb': round(gained / 1e6, 1),
+                'swarm_seeds': swarm_seeds,
+            })
+            if not dry_run:
+                remove_torrent(h)
+                state.pop(h, None)
+            removed += 1
         if not dry_run:
             for h in list(state.keys()):
                 if h not in torrents:
@@ -848,7 +870,7 @@ def cleanup_stalled_seeds(dry_run=False):
         log.info(f'Stalled-seed review complete{" (DRY RUN)" if dry_run else ""}: '
                  f'{"would remove" if dry_run else "removed"} {removed}')
         if removed and not dry_run:
-            record_activity('cleanup', f'Removed {removed} stalled seed(s) (≥{STALL_SEED_MIN_DAYS}d seeded, negligible upload since last week)')
+            record_activity('cleanup', f'Removed {removed} stalled seed(s) (≥{STALL_SEED_MIN_DAYS}d seeded, negligible upload since last week, >{STALL_MIN_SWARM_SEEDS} other swarm seeds)')
     except Exception as e:
         log.error(f'Stalled-seed review failed: {e}')
     return candidates
