@@ -50,6 +50,14 @@ RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
 OLD_GAP_YEARS     = int(os.environ.get('OLD_GAP_YEARS', '10'))
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
+# Weekly stalled-seed review (any torrent, any label): a torrent must have
+# seeded at least this many days AND uploaded less than the byte threshold
+# since the previous week's check to be considered "not meaningfully
+# seeding" and removed.
+STALL_SEED_MIN_DAYS = int(os.environ.get('STALL_SEED_MIN_DAYS', '21'))
+STALL_UPLOAD_THRESHOLD_BYTES = int(os.environ.get('STALL_UPLOAD_THRESHOLD_BYTES', str(10 * 1024 * 1024)))
+STALL_CHECK_INTERVAL = int(os.environ.get('STALL_CHECK_INTERVAL', str(7 * 86400)))
+SEED_STATE_PATH = os.environ.get('SEED_STATE_PATH', '/data/seed_tracking.json')
 # Root of the movies library from the CONTAINER's perspective — used by
 # /orphan-scan. Radarr may report paths from the host's perspective, so
 # matching is done by filename basename rather than absolute path.
@@ -274,7 +282,7 @@ def get_all_torrents():
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrents_status',
-            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress', 'state']],
+            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress', 'state', 'total_uploaded']],
             'id': 6
         },
         timeout=10
@@ -752,6 +760,65 @@ def cleanup_unpacked_torrents():
             record_activity('cleanup', f'Removed {removed} unpacked RAR torrent(s) past the 21-day window')
     except Exception as e:
         log.error(f'Unpacked-torrent cleanup failed: {e}')
+
+
+def _load_seed_state():
+    try:
+        with open(SEED_STATE_PATH) as f:
+            return _json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+def _save_seed_state(state):
+    try:
+        with open(SEED_STATE_PATH, 'w') as f:
+            _json.dump(state, f)
+    except Exception as e:
+        log.warning(f'[seed-tracking] failed to persist state: {e}')
+
+def cleanup_stalled_seeds():
+    """Weekly review of every torrent currently seeding (any label): if a
+    torrent has seeded at least STALL_SEED_MIN_DAYS and uploaded less than
+    STALL_UPLOAD_THRESHOLD_BYTES since the last weekly check, it's dead
+    weight — remove it. First time a torrent is seen it only gets a
+    baseline recorded (no prior week to compare against, so no removal)."""
+    log.info('Running weekly stalled-seed review...')
+    try:
+        deluge_login()
+        torrents = get_all_torrents()
+        state = _load_seed_state()
+        removed = 0
+        for h, info in torrents.items():
+            if info.get('state') in ('Queued', 'Downloading', 'Checking', 'Allocating'):
+                continue
+            uploaded = info.get('total_uploaded', 0)
+            prev = state.get(h)
+            state[h] = {'total_uploaded': uploaded}
+            if prev is None:
+                continue
+            if info.get('seeding_time', 0) < STALL_SEED_MIN_DAYS * 86400:
+                continue
+            gained = uploaded - prev.get('total_uploaded', 0)
+            if gained < STALL_UPLOAD_THRESHOLD_BYTES:
+                log.info(f'[seed-tracking] removing stalled seed: {info.get("name")} '
+                         f'(+{gained/1e6:.1f}MB uploaded since last week\'s check)')
+                remove_torrent(h)
+                state.pop(h, None)
+                removed += 1
+        for h in list(state.keys()):
+            if h not in torrents:
+                state.pop(h, None)
+        _save_seed_state(state)
+        log.info(f'Stalled-seed review complete: removed {removed}')
+        if removed:
+            record_activity('cleanup', f'Removed {removed} stalled seed(s) (≥{STALL_SEED_MIN_DAYS}d seeded, negligible upload since last week)')
+    except Exception as e:
+        log.error(f'Stalled-seed review failed: {e}')
+
+def stalled_seed_scheduler():
+    while True:
+        time.sleep(STALL_CHECK_INTERVAL)
+        cleanup_stalled_seeds()
 
 
 def cleanup_radarr_queue_dupes():
@@ -4481,4 +4548,6 @@ if __name__ == '__main__':
     t5.start()
     t6 = threading.Thread(target=maintenance_scheduler, daemon=True)
     t6.start()
+    t7 = threading.Thread(target=stalled_seed_scheduler, daemon=True)
+    t7.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
