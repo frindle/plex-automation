@@ -342,6 +342,21 @@ def find_season_pack_hash(title_variants, season_term, torrents):
 def is_proper_repack(filename):
     return bool(PROPER_REPACK_RE.search(filename))
 
+# Trailing release-group token, e.g. "...WEB.H264-GROUP" -> "GROUP". Strips a
+# trailing tracker/site tag in brackets first (e.g. "-GROUP[TGx]") so that
+# doesn't get mistaken for the group. Exact-match only, no fuzzy comparison —
+# a false "same group" match is the only dangerous direction here (wrong
+# delete), so when the group can't be confidently determined this returns
+# None and the caller falls back to the safe supersede path.
+RELEASE_GROUP_RE = re.compile(r'-([A-Za-z0-9]+)$')
+
+def extract_release_group(name):
+    if not name:
+        return None
+    stripped = re.sub(r'(\[[^\]]*\])+$', '', name).strip()
+    m = RELEASE_GROUP_RE.search(stripped)
+    return m.group(1).lower() if m else None
+
 # ── Cleanup ──────────────────────────────────────────────────────────────────
 
 def cleanup_superseded():
@@ -1130,6 +1145,7 @@ def handle_upgrade_import(data, source):
     if source == 'Sonarr':
         episode_file = data.get('episodeFile', {})
         new_path = episode_file.get('path', '')
+        new_release_group = (episode_file.get('releaseGroup') or '').lower() or None
         episodes = data.get('episodes', [])
         if not episodes:
             log.warning(f'{source}: no episode info in payload, skipping')
@@ -1148,6 +1164,7 @@ def handle_upgrade_import(data, source):
     elif source == 'Radarr':
         movie_file = data.get('movieFile', {})
         new_path = movie_file.get('path', '')
+        new_release_group = (movie_file.get('releaseGroup') or '').lower() or None
         movie = data.get('movie', {})
         series_title = movie.get('title', '')
         search_term = str(movie.get('year', ''))
@@ -1243,12 +1260,27 @@ def handle_upgrade_import(data, source):
             continue
         name = info.get('name', '')
         if torrent_matches_any_title(name, title_variants) and search_term.lower() in name.lower():
-            if proper_repack:
-                log.info(f'{source}: immediately deleting {torrent_hash} - {name} (proper/repack)')
-                record_activity('supersede', f'{source}: deleted "{name}" (replaced by PROPER/REPACK)')
+            # A repack/proper is only a true immediate replacement (safe to
+            # delete outright) when it's from the SAME release group as the
+            # torrent it's replacing — a repack from a different group is a
+            # different release, not a guaranteed superset, so it goes
+            # through the normal supersede path (soft, reversible, cleaned
+            # up by cleanup_superseded after SEED_DAYS) like any other
+            # quality upgrade. Group is unknown → supersede, never delete;
+            # see extract_release_group / new_release_group.
+            old_release_group = extract_release_group(name)
+            same_group = bool(
+                proper_repack and new_release_group and old_release_group
+                and new_release_group == old_release_group
+            )
+            if same_group:
+                log.info(f'{source}: immediately deleting {torrent_hash} - {name} '
+                         f'(proper/repack, same group "{new_release_group}")')
+                record_activity('supersede', f'{source}: deleted "{name}" (replaced by same-group PROPER/REPACK)')
                 remove_torrent(torrent_hash)
             else:
-                log.info(f'{source}: superseding {torrent_hash} - {name}')
+                reason = 'proper/repack, different or unknown group' if proper_repack else 'quality upgrade'
+                log.info(f'{source}: superseding {torrent_hash} - {name} ({reason})')
                 record_activity('supersede', f'{source}: superseded "{name}" after upgrade import')
                 set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
                 move_torrent_storage(torrent_hash, SEEDING_DIR)
