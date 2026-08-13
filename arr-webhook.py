@@ -776,13 +776,19 @@ def _save_seed_state(state):
     except Exception as e:
         log.warning(f'[seed-tracking] failed to persist state: {e}')
 
-def cleanup_stalled_seeds():
+def cleanup_stalled_seeds(dry_run=False):
     """Weekly review of every torrent currently seeding (any label): if a
     torrent has seeded at least STALL_SEED_MIN_DAYS and uploaded less than
     STALL_UPLOAD_THRESHOLD_BYTES since the last weekly check, it's dead
     weight — remove it. First time a torrent is seen it only gets a
-    baseline recorded (no prior week to compare against, so no removal)."""
-    log.info('Running weekly stalled-seed review...')
+    baseline recorded (no prior week to compare against, so no removal).
+
+    dry_run=True reports what WOULD be removed without removing anything
+    and without touching the persisted state file (so a preview run
+    doesn't consume/reset the real week-over-week baseline). Returns a
+    list of candidate dicts for the caller (e.g. the preview endpoint)."""
+    log.info(f'Running weekly stalled-seed review{" (DRY RUN)" if dry_run else ""}...')
+    candidates = []
     try:
         deluge_login()
         torrents = get_all_torrents()
@@ -793,27 +799,40 @@ def cleanup_stalled_seeds():
                 continue
             uploaded = info.get('total_uploaded', 0)
             prev = state.get(h)
-            state[h] = {'total_uploaded': uploaded}
+            if not dry_run:
+                state[h] = {'total_uploaded': uploaded}
             if prev is None:
                 continue
             if info.get('seeding_time', 0) < STALL_SEED_MIN_DAYS * 86400:
                 continue
             gained = uploaded - prev.get('total_uploaded', 0)
             if gained < STALL_UPLOAD_THRESHOLD_BYTES:
-                log.info(f'[seed-tracking] removing stalled seed: {info.get("name")} '
+                action = 'WOULD remove' if dry_run else 'removing'
+                log.info(f'[seed-tracking] {action} stalled seed: {info.get("name")} '
                          f'(+{gained/1e6:.1f}MB uploaded since last week\'s check)')
-                remove_torrent(h)
-                state.pop(h, None)
+                candidates.append({
+                    'hash': h,
+                    'name': info.get('name'),
+                    'label': info.get('label'),
+                    'seeding_days': round(info.get('seeding_time', 0) / 86400, 1),
+                    'uploaded_since_last_check_mb': round(gained / 1e6, 1),
+                })
+                if not dry_run:
+                    remove_torrent(h)
+                    state.pop(h, None)
                 removed += 1
-        for h in list(state.keys()):
-            if h not in torrents:
-                state.pop(h, None)
-        _save_seed_state(state)
-        log.info(f'Stalled-seed review complete: removed {removed}')
-        if removed:
+        if not dry_run:
+            for h in list(state.keys()):
+                if h not in torrents:
+                    state.pop(h, None)
+            _save_seed_state(state)
+        log.info(f'Stalled-seed review complete{" (DRY RUN)" if dry_run else ""}: '
+                 f'{"would remove" if dry_run else "removed"} {removed}')
+        if removed and not dry_run:
             record_activity('cleanup', f'Removed {removed} stalled seed(s) (≥{STALL_SEED_MIN_DAYS}d seeded, negligible upload since last week)')
     except Exception as e:
         log.error(f'Stalled-seed review failed: {e}')
+    return candidates
 
 def stalled_seed_scheduler():
     while True:
@@ -3766,6 +3785,23 @@ def run_dedup():
 def run_cleanup():
     threading.Thread(target=cleanup_superseded, daemon=True).start()
     return jsonify({'ok': True, 'message': f'cleanup started; will remove superseded torrents seeded ≥ {SEED_DAYS} days'}), 200
+
+# Manual trigger for cleanup_stalled_seeds. GET (or POST without ?apply=1)
+# previews candidates without removing anything or touching the saved
+# upload-baseline state. ?apply=1 runs it for real. Note: a preview run
+# only finds candidates once a real (non-dry) run has recorded at least
+# one prior week's baseline — the first-ever run for a torrent always
+# just baselines it, dry or not.
+@app.route('/run-stalled-seeds', methods=['GET', 'POST'])
+def run_stalled_seeds():
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    candidates = cleanup_stalled_seeds(dry_run=not apply)
+    return jsonify({
+        'ok': True,
+        'dry_run': not apply,
+        'count': len(candidates),
+        'candidates': candidates,
+    }), 200
 
 # Scan an Incomplete directory for files not backed by any Deluge torrent.
 # Deluge parks in-progress downloads under DOWNLOADS_MOUNT/Incomplete; when
