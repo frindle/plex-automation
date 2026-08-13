@@ -50,13 +50,17 @@ RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
 OLD_GAP_YEARS     = int(os.environ.get('OLD_GAP_YEARS', '10'))
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
-# Weekly stalled-seed review (any torrent, any label): a torrent must have
-# seeded at least this many days AND uploaded less than the byte threshold
-# since the previous week's check AND have more than STALL_MIN_SWARM_SEEDS
-# other seeds already in the swarm (so removing our copy doesn't hurt
-# availability) to be considered "not meaningfully seeding" and removed.
-# For the "old library-seed torrents sitting around for months" use case,
-# set STALL_SEED_MIN_DAYS=180 (6 months) at deploy time.
+# Weekly stalled-seed review (every LABELED torrent, including
+# LIBRARY_SEED_LABEL -- that's the actual intended target; unlabeled/
+# unmanaged torrents are always skipped): a torrent must have seeded at
+# least this many days AND uploaded less than the byte threshold since the
+# previous week's check AND have more than STALL_MIN_SWARM_SEEDS other
+# seeds already in the swarm (so unseeding our copy doesn't hurt
+# availability) to be considered "not meaningfully seeding" and unseeded.
+# This only unseeds (Deluge stops tracking it) -- the file(s) on disk are
+# never deleted, since for library-seed torrents the file IS the live
+# Plex media. For the "old library-seed torrents sitting around for
+# months" use case, set STALL_SEED_MIN_DAYS=180 (6 months) at deploy time.
 STALL_SEED_MIN_DAYS = int(os.environ.get('STALL_SEED_MIN_DAYS', '21'))
 STALL_UPLOAD_THRESHOLD_BYTES = int(os.environ.get('STALL_UPLOAD_THRESHOLD_BYTES', str(10 * 1024 * 1024)))
 STALL_CHECK_INTERVAL = int(os.environ.get('STALL_CHECK_INTERVAL', str(7 * 86400)))
@@ -280,14 +284,14 @@ def move_torrent_storage(torrent_hash, dest):
     resp.raise_for_status()
     log.info(f'Moved {torrent_hash} to {dest}')
 
-def remove_torrent(torrent_hash):
+def remove_torrent(torrent_hash, remove_data=True):
     resp = session.post(
         f'{DELUGE_URL}/json',
-        json={'method': 'core.remove_torrent', 'params': [torrent_hash, True], 'id': 7},
+        json={'method': 'core.remove_torrent', 'params': [torrent_hash, remove_data], 'id': 7},
         timeout=30
     )
     resp.raise_for_status()
-    log.info(f'Removed torrent {torrent_hash} and deleted files')
+    log.info(f'Removed torrent {torrent_hash}' + (' and deleted files' if remove_data else ' (files left on disk)'))
 
 def get_all_torrents():
     resp = session.post(
@@ -804,15 +808,23 @@ def _save_seed_state(state):
         log.warning(f'[seed-tracking] failed to persist state: {e}')
 
 def cleanup_stalled_seeds(dry_run=False):
-    """Weekly review of every torrent currently seeding (any label): if a
-    torrent has seeded at least STALL_SEED_MIN_DAYS and uploaded less than
-    STALL_UPLOAD_THRESHOLD_BYTES since the last weekly check, AND the swarm
-    already has more than STALL_MIN_SWARM_SEEDS other seeds (tracker's
-    total_seeds), it's dead weight — remove it. First time a torrent is seen
-    it only gets a baseline recorded (no prior week to compare against, so
-    no removal). If total_seeds is unavailable (tracker hasn't scraped yet,
-    reported as -1/missing), the swarm size is unknown and the torrent is
-    NOT removed — missing data means "don't know", never "safe to remove".
+    """Weekly review of every labeled torrent currently seeding (unlabeled/
+    unmanaged torrents are skipped -- this app doesn't know what they are).
+    This explicitly includes LIBRARY_SEED_LABEL: those are the intended
+    target -- old library-seed torrents sitting quiet for months where the
+    seeded file IS the live Plex media. If a torrent has seeded at least
+    STALL_SEED_MIN_DAYS and uploaded less than STALL_UPLOAD_THRESHOLD_BYTES
+    since the last weekly check, AND the swarm already has more than
+    STALL_MIN_SWARM_SEEDS other seeds (tracker's total_seeds), it's dead
+    weight -- unseed it. First time a torrent is seen it only gets a
+    baseline recorded (no prior week to compare against, so no removal). If
+    total_seeds is unavailable (tracker hasn't scraped yet, reported as
+    -1/missing), the swarm size is unknown and the torrent is NOT removed —
+    missing data means "don't know", never "safe to remove".
+
+    This only unseeds (remove_data=False) -- Deluge stops tracking/seeding
+    the torrent but the file(s) on disk are left completely untouched. For
+    library-seed torrents the file is the live media, so it must survive.
 
     dry_run=True reports what WOULD be removed without removing anything
     and without touching the persisted state file (so a preview run
@@ -826,6 +838,8 @@ def cleanup_stalled_seeds(dry_run=False):
         state = _load_seed_state()
         removed = 0
         for h, info in torrents.items():
+            if not (info.get('label') or '').strip():
+                continue  # unlabeled/unmanaged torrent -- not ours to touch
             if info.get('state') in ('Queued', 'Downloading', 'Checking', 'Allocating'):
                 continue
             uploaded = info.get('total_uploaded', 0)
@@ -846,7 +860,7 @@ def cleanup_stalled_seeds(dry_run=False):
                 log.info(f'[seed-tracking] skipping stalled candidate (swarm seeds unknown/low, '
                          f'safety gate): {info.get("name")} (total_seeds={swarm_seeds})')
                 continue
-            action = 'WOULD remove' if dry_run else 'removing'
+            action = 'WOULD unseed' if dry_run else 'unseeding (files kept on disk)'
             log.info(f'[seed-tracking] {action} stalled seed: {info.get("name")} '
                      f'(+{gained/1e6:.1f}MB uploaded since last week\'s check, '
                      f'{swarm_seeds} other swarm seeds)')
@@ -859,7 +873,7 @@ def cleanup_stalled_seeds(dry_run=False):
                 'swarm_seeds': swarm_seeds,
             })
             if not dry_run:
-                remove_torrent(h)
+                remove_torrent(h, remove_data=False)
                 state.pop(h, None)
             removed += 1
         if not dry_run:
@@ -870,7 +884,7 @@ def cleanup_stalled_seeds(dry_run=False):
         log.info(f'Stalled-seed review complete{" (DRY RUN)" if dry_run else ""}: '
                  f'{"would remove" if dry_run else "removed"} {removed}')
         if removed and not dry_run:
-            record_activity('cleanup', f'Removed {removed} stalled seed(s) (≥{STALL_SEED_MIN_DAYS}d seeded, negligible upload since last week, >{STALL_MIN_SWARM_SEEDS} other swarm seeds)')
+            record_activity('cleanup', f'Unseeded {removed} stalled torrent(s), files left on disk (≥{STALL_SEED_MIN_DAYS}d seeded, negligible upload since last week, >{STALL_MIN_SWARM_SEEDS} other swarm seeds)')
     except Exception as e:
         log.error(f'Stalled-seed review failed: {e}')
     return candidates
