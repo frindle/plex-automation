@@ -5,7 +5,7 @@ import time
 import logging
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 
 from media_share import share_bp, init_db as init_share_db
@@ -30,6 +30,55 @@ def record_activity(category, summary):
             }) + '\n')
     except OSError as e:
         log.debug(f'activity log write failed: {e}')
+
+ACTIVITY_LOG_RETENTION_DAYS = int(os.environ.get('ACTIVITY_LOG_RETENTION_DAYS', '7'))
+
+def trim_activity_log(retention_days=ACTIVITY_LOG_RETENTION_DAYS):
+    """Drop entries older than retention_days, keeping the file bounded
+    while still covering things like tracker Hit & Run windows (typically
+    7 days) that need real evidence to diagnose after the fact. Rewrites
+    the whole file rather than trimming in place -- this log is written to
+    frequently but read/trimmed only once a day, so a full rewrite here is
+    cheap relative to append cost on every real event."""
+    cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat(timespec='seconds')
+    try:
+        with open(ACTIVITY_LOG) as f:
+            lines = f.readlines()
+    except OSError:
+        return 0
+    kept = []
+    dropped = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = _json.loads(line)
+        except ValueError:
+            kept.append(line)  # don't silently discard unparseable lines
+            continue
+        if e.get('ts', '') < cutoff:
+            dropped += 1
+        else:
+            kept.append(line)
+    if dropped:
+        try:
+            with open(ACTIVITY_LOG, 'w') as f:
+                f.write('\n'.join(kept) + ('\n' if kept else ''))
+            log.info(f'[activity-log] trimmed {dropped} entries older than {retention_days}d')
+        except OSError as e:
+            log.warning(f'[activity-log] trim write failed: {e}')
+            return 0
+    return dropped
+
+def activity_log_trim_scheduler():
+    time.sleep(300)  # let the app finish booting first
+    while True:
+        try:
+            trim_activity_log()
+        except Exception as e:
+            log.error(f'[activity-log] trim failed: {e}')
+        time.sleep(86400)
 
 app = Flask(__name__)
 app.register_blueprint(share_bp)
@@ -782,6 +831,7 @@ def cleanup_unpacked_torrents():
             age = now - state[h].get('first_seen_rar_at', now)
             if age >= threshold:
                 log.info(f'[unpack] removing rar-torrent aged {age/86400:.1f}d: {state[h].get("name")}')
+                record_activity('cleanup', f'Removed rar-torrent "{state[h].get("name")}" (aged {age/86400:.1f}d past the {SEED_DAYS}-day window)')
                 remove_torrent(h)
                 state.pop(h, None)
                 removed += 1
@@ -4082,6 +4132,7 @@ def torrent_purge():
         return jsonify({'ok': True, 'apply': False, 'target': result}), 200
     try:
         remove_torrent(torrent_hash)
+        record_activity('cleanup', f'Manually purged "{info.get("name")}" via /torrent-purge (label: {info.get("label")})')
         result['result'] = 'removed torrent + files'
     except Exception as e:
         result['result'] = f'FAILED: {e}'
@@ -4734,4 +4785,6 @@ if __name__ == '__main__':
     t7.start()
     t8 = threading.Thread(target=tracker_stall_scheduler, daemon=True)
     t8.start()
+    t9 = threading.Thread(target=activity_log_trim_scheduler, daemon=True)
+    t9.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
