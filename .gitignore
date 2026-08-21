@@ -5,3 +5,5 @@ data/
 .memsearch/
 TODO.md
 .DS_Store
+
+graphify-out/
