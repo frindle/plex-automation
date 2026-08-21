@@ -1134,6 +1134,76 @@ def import_blocked_scheduler():
             log.error(f'[importBlocked] scheduler tick failed: {e}')
         time.sleep(IMPORTBLOCKED_INTERVAL)
 
+# Newly-added torrents can sit for ~15min before Deluge's own passive retry
+# gets them talking to the tracker (comm errors, tracker throttling, or the
+# torrent genuinely hasn't registered with the tracker yet). Deluge exposes
+# `core.force_reannounce` to trigger an immediate re-announce -- this poller
+# finds recently-added torrents stuck in an error/no-peer state and forces
+# one, rather than waiting out Deluge's own passive retry interval.
+TRACKER_STALL_INTERVAL = int(os.environ.get('TRACKER_STALL_INTERVAL', '60'))
+TRACKER_STALL_WINDOW = int(os.environ.get('TRACKER_STALL_WINDOW', '900'))  # only act within 15min of add
+TRACKER_STALL_MIN_GAP = 90  # don't re-force the same torrent more than once per this many seconds
+_last_reannounce = {}  # torrent hash -> unix timestamp of last forced reannounce
+_last_reannounce_lock = threading.Lock()
+
+def check_tracker_stalls():
+    resp = session.post(
+        f'{DELUGE_URL}/json',
+        json={
+            'method': 'core.get_torrents_status',
+            'params': [{}, ['name', 'state', 'time_added', 'tracker_status', 'num_peers']],
+            'id': 90,
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    torrents = resp.json().get('result') or {}
+    now = time.time()
+    to_reannounce = []
+    for torrent_hash, info in torrents.items():
+        age = now - info.get('time_added', now)
+        if age > TRACKER_STALL_WINDOW:
+            continue
+        tracker_status = (info.get('tracker_status') or '').lower()
+        stalled = (
+            info.get('state') == 'Error'
+            or 'error' in tracker_status
+            or (info.get('num_peers', 0) == 0 and 'announce ok' not in tracker_status and tracker_status != '')
+        )
+        if not stalled:
+            continue
+        with _last_reannounce_lock:
+            last = _last_reannounce.get(torrent_hash, 0)
+            if now - last < TRACKER_STALL_MIN_GAP:
+                continue
+            _last_reannounce[torrent_hash] = now
+        to_reannounce.append((torrent_hash, info.get('name', torrent_hash)))
+
+    if to_reannounce:
+        session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.force_reannounce', 'params': [[h for h, _ in to_reannounce]], 'id': 91},
+            timeout=10,
+        ).raise_for_status()
+        for _, name in to_reannounce:
+            log.info(f'[trackerStall] forced reannounce: {name}')
+
+    # Prune old entries so the dict doesn't grow forever.
+    with _last_reannounce_lock:
+        cutoff = now - TRACKER_STALL_WINDOW
+        for h in [h for h, ts in _last_reannounce.items() if ts < cutoff]:
+            del _last_reannounce[h]
+
+def tracker_stall_scheduler():
+    time.sleep(30)
+    while True:
+        try:
+            deluge_login()
+            check_tracker_stalls()
+        except Exception as e:
+            log.error(f'[trackerStall] scheduler tick failed: {e}')
+        time.sleep(TRACKER_STALL_INTERVAL)
+
 # ── Core upgrade handler ─────────────────────────────────────────────────────
 
 def relabel_download_to_base(download_id, source):
@@ -4662,4 +4732,6 @@ if __name__ == '__main__':
     t6.start()
     t7 = threading.Thread(target=stalled_seed_scheduler, daemon=True)
     t7.start()
+    t8 = threading.Thread(target=tracker_stall_scheduler, daemon=True)
+    t8.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
