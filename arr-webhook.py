@@ -939,6 +939,20 @@ def cleanup_stalled_seeds(dry_run=False):
         log.error(f'Stalled-seed review failed: {e}')
     return candidates
 
+def queue_dupe_cleanup_scheduler():
+    """Once a week, remove duplicate Radarr queue entries for the same movie,
+    keeping the highest-scoring one (ties broken by keeping whichever was
+    queued first). Added 2026-08-22 after investigating repeated re-grabs
+    from monthly_upgrade_cycle's bulk upgrade searches -- those are expected
+    (the search is designed to keep chasing better releases over time), but
+    the brief multi-entry window they create in the queue was only ever
+    cleaned up on-demand by cleanup_radarr_queue_dupes(), never on a
+    schedule of its own."""
+    while True:
+        time.sleep(7 * 24 * 3600)  # weekly
+        cleanup_radarr_queue_dupes()
+
+
 def stalled_seed_scheduler():
     if not STALL_AUTOMATION_ENABLED:
         log.info('Stalled-seed automation disabled (STALL_AUTOMATION_ENABLED=false) — '
@@ -976,8 +990,12 @@ def cleanup_radarr_queue_dupes():
         for movie_id, items in by_movie.items():
             if len(items) <= 1:
                 continue
-            # Sort by custom format score descending, keep highest
-            items.sort(key=lambda x: x.get('customFormatScore', 0), reverse=True)
+            # Sort by custom format score descending, keep highest. On a tie,
+            # explicitly keep whichever was queued first (lower queue "id" --
+            # Radarr assigns these as auto-incrementing primary keys in
+            # insertion order) rather than relying on Python's sort being
+            # stable against whatever order the API happened to return.
+            items.sort(key=lambda x: (-x.get('customFormatScore', 0), x.get('id', 0)))
             best = items[0]
             log.info(f'Radarr queue: movie {movie_id} has {len(items)} entries, keeping "{best.get("title")}" (score: {best.get("customFormatScore", 0)})')
             for item in items[1:]:
@@ -4993,4 +5011,6 @@ if __name__ == '__main__':
     t8.start()
     t9 = threading.Thread(target=activity_log_trim_scheduler, daemon=True)
     t9.start()
+    t10 = threading.Thread(target=queue_dupe_cleanup_scheduler, daemon=True)
+    t10.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
