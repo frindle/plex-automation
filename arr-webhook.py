@@ -1863,6 +1863,83 @@ def relabel_sonarr_upgrades():
     except Exception as e:
         log.error(f'Sonarr upgrade relabeling failed: {e}')
 
+def verify_and_fix_labels(services=('radarr', 'sonarr')):
+    """Final safety pass, distinct from relabel_radarr_upgrades/relabel_sonarr_upgrades:
+    those two only ever look at torrents ALREADY labeled 'radarr'/'sonarr' and decide
+    whether to promote them to the upgrade label. This instead checks EVERY current
+    torrent against Radarr/Sonarr's queue by hash and computes what its label should
+    be from scratch -- catching two gaps those functions can't: a torrent whose
+    grab-time label from Radarr/Sonarr's own Deluge integration never landed at all
+    (blank label), and a torrent that only appeared in Deluge after the normal
+    relabel pass already ran (a real risk on a fast manual run via skip_waits=1,
+    where the wait before relabeling is cut from 5min to 30s).
+    """
+    log.info(f'Verifying torrent labels for {services}...')
+    fixed = []
+    try:
+        deluge_login()
+        torrents = get_all_torrents()
+        if not torrents:
+            return fixed
+
+        if 'radarr' in services:
+            try:
+                movies_r = requests.get(f'{RADARR_URL}/api/v3/movie', headers={'X-Api-Key': RADARR_API_KEY}, timeout=15)
+                movies_r.raise_for_status()
+                movies = {m['id']: m for m in movies_r.json()}
+                q = requests.get(f'{RADARR_URL}/api/v3/queue', headers={'X-Api-Key': RADARR_API_KEY}, params={'pageSize': 500}, timeout=15)
+                q.raise_for_status()
+                download_to_movie = {rec['downloadId'].lower(): rec.get('movieId') for rec in q.json().get('records', []) if rec.get('downloadId')}
+                for torrent_hash, info in torrents.items():
+                    movie_id = download_to_movie.get(torrent_hash.lower())
+                    if not movie_id:
+                        continue
+                    movie = movies.get(movie_id)
+                    if not movie:
+                        continue
+                    correct_label = RADARR_UPG_LABEL if movie.get('hasFile') else 'radarr'
+                    current_label = info.get('label', '')
+                    if current_label != correct_label:
+                        log.info(f'Verify pass: fixing label on "{info.get("name")}" ({current_label!r} -> {correct_label!r})')
+                        set_torrent_label(torrent_hash, correct_label)
+                        fixed.append({'name': info.get('name'), 'from': current_label, 'to': correct_label})
+            except Exception as e:
+                log.error(f'Radarr label verification failed: {e}')
+
+        if 'sonarr' in services:
+            try:
+                q = requests.get(f'{SONARR_URL}/api/v3/queue', headers={'X-Api-Key': SONARR_API_KEY}, params={'pageSize': 500}, timeout=15)
+                q.raise_for_status()
+                download_to_episode = {}
+                for rec in q.json().get('records', []):
+                    dl = rec.get('downloadId')
+                    ep = rec.get('episodeId')
+                    if dl and ep:
+                        download_to_episode.setdefault(dl.lower(), ep)
+                for torrent_hash, info in torrents.items():
+                    episode_id = download_to_episode.get(torrent_hash.lower())
+                    if not episode_id:
+                        continue
+                    try:
+                        er = requests.get(f'{SONARR_URL}/api/v3/episode/{episode_id}', headers={'X-Api-Key': SONARR_API_KEY}, timeout=10)
+                        er.raise_for_status()
+                        has_file = er.json().get('hasFile', False)
+                    except Exception as e:
+                        log.warning(f'Sonarr episode {episode_id} lookup failed during verify: {e}')
+                        continue
+                    correct_label = SONARR_UPG_LABEL if has_file else 'sonarr'
+                    current_label = info.get('label', '')
+                    if current_label != correct_label:
+                        log.info(f'Verify pass: fixing label on "{info.get("name")}" ({current_label!r} -> {correct_label!r})')
+                        set_torrent_label(torrent_hash, correct_label)
+                        fixed.append({'name': info.get('name'), 'from': current_label, 'to': correct_label})
+            except Exception as e:
+                log.error(f'Sonarr label verification failed: {e}')
+    except Exception as e:
+        log.error(f'Label verification pass failed: {e}')
+    log.info(f'Label verification complete: fixed {len(fixed)} torrent(s)')
+    return fixed
+
 def purge_stalled_upgrade_torrents(label=RADARR_UPG_LABEL):
     """Remove <label> torrents that haven't downloaded more than 5MB.
     Defaults to the Radarr upgrade lane; the Sonarr monthly cycle passes
@@ -4243,7 +4320,9 @@ def run_monthly_upgrade():
         log.info(f'Manual monthly upgrade cycle starting ({service}, skip_waits={skip_waits})')
         for svc in services:
             monthly_upgrade_cycle(svc, *waits)
-        log.info('Manual monthly upgrade cycle complete')
+        log.info('Running final label verification pass before marking cycle complete...')
+        fixed = verify_and_fix_labels(services)
+        log.info(f'Manual monthly upgrade cycle complete (verification fixed {len(fixed)} torrent(s))')
     threading.Thread(target=_cycle, daemon=True).start()
     return jsonify({
         'ok': True,
@@ -4251,6 +4330,19 @@ def run_monthly_upgrade():
         'skip_waits': skip_waits,
         'message': 'monthly upgrade cycle started; watch container logs',
     }), 200
+
+# Standalone label-verification pass -- can be run any time independent of a
+# full monthly-upgrade cycle, e.g. to catch stragglers after a fast manual
+# run. Synchronous (a handful of quick API calls), so the response itself
+# reports what was fixed rather than needing to check container logs.
+@app.route('/verify-labels', methods=['GET', 'POST'])
+def verify_labels_route():
+    service = (request.args.get('service') or 'both').lower()
+    if service not in ('radarr', 'sonarr', 'both'):
+        return jsonify({'ok': False, 'error': 'service must be radarr, sonarr or both'}), 400
+    services = ('radarr', 'sonarr') if service == 'both' else (service,)
+    fixed = verify_and_fix_labels(services)
+    return jsonify({'ok': True, 'service': service, 'fixed_count': len(fixed), 'fixed': fixed}), 200
 
 # Compare files on disk in MOVIES_LIBRARY against Radarr's tracked
 # movieFile.path values. Anything on disk that Radarr isn't tracking is
