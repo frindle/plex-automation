@@ -15,6 +15,11 @@ services:
       RADARR_UPGRADE_LABEL: "radarr-upgrade"
       PORT: "9876"
       SEEDING_DIR: "/data/Downloads/Just4Seeding"
+      # Top-level folder names under Complete that /complete-orphans must
+      # never delete regardless of tracked/age status -- the long-term
+      # library folders Radarr/Sonarr/Lidarr point at directly, plus the
+      # permanent seeding dir. ?apply=1 is refused entirely if this is empty.
+      COMPLETE_PROTECTED_NAMES: "radarr,sonarr,lidarr,Just4Seeding"
       # Errored-torrent repair: rechecks are automatic, relocations are only
       # reported. Flip to "1" to let it move_storage too -- note that
       # library-seeding torrents seed the media files themselves, so a relink

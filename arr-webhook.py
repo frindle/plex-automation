@@ -4228,6 +4228,21 @@ def complete_orphans():
         if entry in tracked_names:
             kept.append(rec)
             continue
+        # Untracked alone isn't enough to call something safe to delete --
+        # a file mid-import (not yet picked up by Radarr/Sonarr) would also
+        # look untracked for a brief window. Gate on age too, same SEED_DAYS
+        # threshold already used elsewhere in this file for "safe to clean
+        # up" decisions -- only something untracked AND stale for that long
+        # is treated as a real orphan eligible for deletion.
+        try:
+            age_days = (time.time() - os.path.getmtime(full)) / 86400
+        except Exception:
+            age_days = 0
+        rec['age_days'] = round(age_days, 1)
+        if age_days < SEED_DAYS:
+            rec['reason'] = f'untracked but only {age_days:.1f}d old (< {SEED_DAYS}d threshold) -- not deleted'
+            kept.append(rec)
+            continue
         if apply:
             try:
                 if os.path.isdir(full):
@@ -4244,6 +4259,7 @@ def complete_orphans():
         'apply': apply,
         'complete_dir': complete_dir,
         'protected_names': sorted(protected),
+        'min_age_days': SEED_DAYS,
         'counts': {'orphans': len(orphans), 'tracked': len(kept), 'protected': len(protected_hit)},
         'orphans': orphans,
         'tracked': kept,
