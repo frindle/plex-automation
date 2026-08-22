@@ -4152,6 +4152,104 @@ def incomplete_orphans():
         'tracked': kept,
     }), 200
 
+# Same purpose as /incomplete-orphans, for the Complete directory instead.
+# Complete is riskier than Incomplete: it also holds the long-term library
+# folder(s) Radarr/Sonarr point at directly, not just in-flight downloads --
+# a naive top-level scan would flag those folders themselves as "orphans"
+# (nothing in Deluge is literally named "radarr" or "sonarr") and rmtree the
+# entire library. COMPLETE_PROTECTED_NAMES (comma-separated top-level names,
+# case-insensitive) must be set and non-empty before ?apply=1 is allowed to
+# delete anything -- dry-run (default) still works without it configured, so
+# you can see what's actually at the top level of Complete and its sizes
+# before deciding what to protect. Any entry matching a protected name is
+# always kept, regardless of tracked status.
+@app.route('/complete-orphans', methods=['GET', 'POST'])
+def complete_orphans():
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    downloads_root = os.environ.get('DOWNLOADS_MOUNT', '/data/Downloads')
+    complete_dir = os.path.join(downloads_root, 'Complete')
+    if not os.path.isdir(complete_dir):
+        return jsonify({'ok': False, 'error': f'{complete_dir} not a directory'}), 400
+    protected_raw = os.environ.get('COMPLETE_PROTECTED_NAMES', '')
+    protected = {p.strip().lower() for p in protected_raw.split(',') if p.strip()}
+    if apply and not protected:
+        return jsonify({
+            'ok': False,
+            'error': (
+                'COMPLETE_PROTECTED_NAMES is not set -- refusing to apply deletions on Complete '
+                'until the long-term library folder name(s) are explicitly protected. Run a '
+                'dry-run first (no ?apply) to see the top-level names, set COMPLETE_PROTECTED_NAMES '
+                '(comma-separated, e.g. "radarr,sonarr") in docker-compose.yml, then retry.'
+            ),
+        }), 400
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={
+                'method': 'core.get_torrents_status',
+                'params': [{}, ['name', 'save_path', 'files']],
+                'id': 97,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'deluge fetch failed: {e}'}), 500
+    tracked_names = set()
+    for info in torrents.values():
+        n = info.get('name')
+        if n:
+            tracked_names.add(n)
+        for f in (info.get('files') or []):
+            p = f.get('path') if isinstance(f, dict) else str(f)
+            if p:
+                tracked_names.add(p.split('/', 1)[0])
+    orphans = []
+    kept = []
+    protected_hit = []
+    for entry in sorted(os.listdir(complete_dir)):
+        full = os.path.join(complete_dir, entry)
+        try:
+            size = _du(full)
+        except Exception:
+            size = 0
+        rec = {
+            'name': entry,
+            'path': full,
+            'size_gb': round(size / (1024**3), 2),
+            'is_dir': os.path.isdir(full),
+        }
+        if entry.lower() in protected:
+            rec['reason'] = 'protected (long-term library folder)'
+            protected_hit.append(rec)
+            continue
+        if entry in tracked_names:
+            kept.append(rec)
+            continue
+        if apply:
+            try:
+                if os.path.isdir(full):
+                    import shutil
+                    shutil.rmtree(full)
+                else:
+                    os.remove(full)
+                rec['result'] = 'deleted'
+            except Exception as e:
+                rec['result'] = f'FAILED: {e}'
+        orphans.append(rec)
+    return jsonify({
+        'ok': True,
+        'apply': apply,
+        'complete_dir': complete_dir,
+        'protected_names': sorted(protected),
+        'counts': {'orphans': len(orphans), 'tracked': len(kept), 'protected': len(protected_hit)},
+        'orphans': orphans,
+        'tracked': kept,
+        'protected': protected_hit,
+    }), 200
+
 def _du(path):
     if not os.path.exists(path):
         return 0
