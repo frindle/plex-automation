@@ -496,15 +496,33 @@ def _strip_release_ext(s):
             return s[:-len(ext)]
     return s
 
+# Containment matching is only meaningful when BOTH sides are substantial.
+# Confirmed live 2026-08-23: with no floor on the *entry* side, `_find_torrent_data`
+# walked into macOS app bundles and matched two-letter locale directories against
+# release names -- `en` inside "Halloween.Ends", `vi` inside "DoVi", `de` inside
+# "Deepwater", `ms` inside "Backrooms". It proposed relinking eight UHD torrents to
+# FileZilla's and CHIRP's locale folders and reported `missing: 0`, when in fact
+# none of those torrents had any data on disk at all. The old `len(stem) >= 20`
+# guard measured only the torrent name, which is always long, so it never fired.
+_MIN_CONTAINMENT_LEN = 20
+
 def _torrent_name_matches_file(torrent_name, tracked_relative_path):
     """True if the torrent name looks like the tracked file (fuzzy match on
     name minus extension). Radarr's relativePath is like 'Movie 2022...mkv';
-    the Deluge torrent name may lack the extension or match exactly."""
+    the Deluge torrent name may lack the extension or match exactly.
+
+    An exact stem match always counts. Containment in either direction requires
+    both sides to be at least _MIN_CONTAINMENT_LEN characters, so a short
+    directory or file name can never match an arbitrary release."""
     if not tracked_relative_path:
         return False
     name = _strip_release_ext(torrent_name.lower())
     tracked = _strip_release_ext(tracked_relative_path.lower())
-    return name == tracked or tracked in name or name in tracked
+    if name == tracked:
+        return True
+    if len(name) < _MIN_CONTAINMENT_LEN or len(tracked) < _MIN_CONTAINMENT_LEN:
+        return False
+    return tracked in name or name in tracked
 
 def _sonarr_series_imported_download_ids(series_id):
     """Set of lowercase downloadIds Sonarr has actually imported for this
