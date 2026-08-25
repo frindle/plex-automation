@@ -347,13 +347,37 @@ def get_all_torrents():
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrents_status',
-            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress', 'state', 'total_uploaded', 'total_seeds']],
+            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress', 'state', 'total_uploaded', 'total_seeds', 'tracker_status']],
             'id': 6
         },
         timeout=10
     )
     resp.raise_for_status()
     return resp.json().get('result', {})
+
+# ── Hit-and-run protection ───────────────────────────────────────────────────
+
+# Phrases a tracker uses to say a torrent is no longer in its database. Once
+# that's true the torrent can't accrue seeding credit and can't cause a
+# hit-and-run, so deleting it is free. Until then it can, whatever else is
+# true about it.
+UNREGISTERED_MARKERS = (
+    'unregistered',
+    'not registered',
+    'torrent not found',
+    'infohash not found',
+    'torrent does not exist',
+)
+
+
+def torrent_is_unregistered(info):
+    """True only when the tracker has affirmatively said it doesn't know this
+    torrent. Unknown / empty / transient-error statuses return False: the
+    fail-safe direction is 'keep seeding', because the cost of being wrong is
+    a hit-and-run on the tracker and the cost of being right late is disk."""
+    status = (info.get('tracker_status') or '').lower()
+    return any(marker in status for marker in UNREGISTERED_MARKERS)
+
 
 # ── Matching helpers ─────────────────────────────────────────────────────────
 
@@ -453,6 +477,13 @@ def queued_superseded_targets(torrents):
         {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state')}
         for h, info in torrents.items()
         if info.get('label') == SUPERSEDED_LABEL and info.get('state') == 'Queued'
+        # "Nothing to lose" holds only while nothing has been downloaded. A
+        # Queued torrent sitting at partial or full progress HAS taken data
+        # from the tracker and can still owe seed time, so purging it is a
+        # hit-and-run in the same way the same-group delete was. Once the
+        # tracker has dropped the torrent it can't owe anything, so that
+        # releases the brake.
+        and ((info.get('progress') or 0) == 0 or torrent_is_unregistered(info))
     ]
 
 def purge_queued_superseded(targets):
@@ -1465,13 +1496,26 @@ def handle_upgrade_import(data, source):
                 proper_repack and new_release_group and old_release_group
                 and new_release_group == old_release_group
             )
-            if same_group:
+            # Same group alone is NOT enough to delete outright. A torrent the
+            # tracker still knows about can still take a hit-and-run, and this
+            # branch used to remove torrents hours into their seed window --
+            # four confirmed HnRs on 2026-08-25 (Fate of the Furious, Sully,
+            # Rogue Nation, Disclosure Day), all deleted between 10 and 46
+            # hours in. SEED_DAYS only ever guarded the soft path.
+            # Deleting is free once the tracker has dropped the torrent, so
+            # that -- not the release group -- is the condition.
+            if same_group and torrent_is_unregistered(info):
                 log.info(f'{source}: immediately deleting {torrent_hash} - {name} '
-                         f'(proper/repack, same group "{new_release_group}")')
-                record_activity('supersede', f'{source}: deleted "{name}" (replaced by same-group PROPER/REPACK)')
+                         f'(proper/repack, same group "{new_release_group}", tracker: unregistered)')
+                record_activity('supersede', f'{source}: deleted "{name}" (replaced by same-group PROPER/REPACK, unregistered at tracker)')
                 remove_torrent(torrent_hash)
             else:
-                reason = 'proper/repack, different or unknown group' if proper_repack else 'quality upgrade'
+                if same_group:
+                    reason = 'proper/repack, same group but still registered at tracker — seeding on to avoid a hit-and-run'
+                elif proper_repack:
+                    reason = 'proper/repack, different or unknown group'
+                else:
+                    reason = 'quality upgrade'
                 log.info(f'{source}: superseding {torrent_hash} - {name} ({reason})')
                 record_activity('supersede', f'{source}: superseded "{name}" after upgrade import')
                 set_torrent_label(torrent_hash, SUPERSEDED_LABEL)

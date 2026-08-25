@@ -187,12 +187,31 @@ def run():
         os.unlink(state_path)
 
     # ── shared queued-superseded filter ──────────────────────────────────
+    # 'd' and 'e' are the hit-and-run cases: a Queued torrent that has already
+    # taken data still owes the tracker seed time, so state alone was never a
+    # safe reason to purge it. Only the tracker dropping the torrent is.
     targets = aw.queued_superseded_targets({
         'a': {'label': aw.SUPERSEDED_LABEL, 'state': 'Queued', 'name': 'a', 'progress': 0},
         'b': {'label': aw.SUPERSEDED_LABEL, 'state': 'Seeding', 'name': 'b', 'progress': 100},
         'c': {'label': 'radarr', 'state': 'Queued', 'name': 'c', 'progress': 0},
+        'd': {'label': aw.SUPERSEDED_LABEL, 'state': 'Queued', 'name': 'd', 'progress': 100,
+              'tracker_status': 'Announce OK'},
+        'e': {'label': aw.SUPERSEDED_LABEL, 'state': 'Queued', 'name': 'e', 'progress': 100,
+              'tracker_status': 'Error: Unregistered torrent'},
     })
-    assert [t['hash'] for t in targets] == ['a'], targets
+    assert [t['hash'] for t in targets] == ['a', 'e'], targets
+
+    # ── tracker "unregistered" detection ─────────────────────────────────
+    # Unknown/blank/transient statuses must read as "still registered": the
+    # fail-safe direction is to keep seeding, because guessing wrong here is
+    # what produced the four HnRs.
+    assert aw.torrent_is_unregistered({'tracker_status': 'Error: Unregistered torrent'})
+    assert aw.torrent_is_unregistered({'tracker_status': 'Torrent not registered with this tracker'})
+    assert aw.torrent_is_unregistered({'tracker_status': 'torrent not found'})
+    assert not aw.torrent_is_unregistered({'tracker_status': 'Announce OK'})
+    assert not aw.torrent_is_unregistered({'tracker_status': 'Error: timed out'})
+    assert not aw.torrent_is_unregistered({'tracker_status': ''})
+    assert not aw.torrent_is_unregistered({})
 
     print('test_maintenance: all assertions passed')
 
