@@ -1014,6 +1014,29 @@ def stalled_seed_scheduler():
         cleanup_stalled_seeds()
 
 
+# Both queue-dupe passes below run from three places now: the daily
+# cleanup_scheduler, the weekly queue_dupe_cleanup_scheduler, and -- new --
+# dedupe_grabbed_release() on the Grab webhook's own thread. Two Grab
+# webhooks for the same movie land seconds apart (that is the whole reason
+# this feature exists), so two passes can otherwise interleave: each reads
+# the candidate set before the other writes, and if their progress readings
+# straddle a score tie they can pick DIFFERENT keepers and remove both
+# copies. Serializing the passes makes each one read a settled world. A
+# grab-time caller blocking behind a scheduled sweep costs nothing -- it is
+# already a detached daemon thread and the webhook has been answered.
+_queue_dupe_lock = threading.RLock()
+
+
+def _serialized(fn):
+    """Run fn under _queue_dupe_lock. Reentrant, so a pass may call another."""
+    def wrapper(*args, **kwargs):
+        with _queue_dupe_lock:
+            return fn(*args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
 def _radarr_grab_identity(download_id):
     """(movieId, customFormatScore) for a torrent hash, from Radarr's grab
     history. Returns (None, 0) when Radarr has no grab on record.
@@ -1056,9 +1079,19 @@ def _dupe_candidate_sort_key(c):
     return (-c['score'], -c['progress'], c['order'])
 
 
-def cleanup_radarr_queue_dupes():
+@_serialized
+def cleanup_radarr_queue_dupes(movie_id=None):
     """Remove duplicate downloads of the same movie, keeping the highest
     scoring one.
+
+    Pass movie_id to restrict the comparison to a single film. That is the
+    grab-time entry point (see dedupe_grabbed_release): a duplicate then
+    lives for seconds instead of up to a day, and the second copy is
+    dropped before it has pulled anything. Scoping narrows what is
+    COMPARED, not what is read -- a lane torrent's movieId is only
+    knowable from its grab history, so the candidate set is still gathered
+    the same way; nothing outside the named movie's group is touched.
+    Returns the number of entries removed.
 
     Radarr's own /api/v3/queue is NOT a complete view of what Radarr has
     grabbed, and that blind spot is what let the duplicate grabs pile up:
@@ -1080,10 +1113,11 @@ def cleanup_radarr_queue_dupes():
     as before; losers that don't are relabeled SUPERSEDED_LABEL, handing
     them to the existing cleanup_superseded / queued_superseded_targets
     path rather than deleting data from under the tracker."""
-    log.info('Running Radarr queue duplicate cleanup...')
+    scope = f' (movie {movie_id})' if movie_id is not None else ''
+    log.info(f'Running Radarr queue duplicate cleanup{scope}...')
     if not RADARR_API_KEY:
         log.info('  no RADARR_API_KEY, skip')
-        return
+        return 0
     try:
         r = requests.get(
             f'{RADARR_URL}/api/v3/queue',
@@ -1095,14 +1129,14 @@ def cleanup_radarr_queue_dupes():
         records = r.json().get('records', [])
     except Exception as e:
         log.error(f'Radarr queue cleanup failed: {e}')
-        return
+        return 0
 
     # Group queue items by movieId
     by_movie = {}
     queue_hashes = set()
     for item in records:
-        movie_id = item.get('movieId')
-        if not movie_id:
+        item_movie_id = item.get('movieId')
+        if not item_movie_id:
             continue
         dl = (item.get('downloadId') or '').lower()
         if dl:
@@ -1112,7 +1146,7 @@ def cleanup_radarr_queue_dupes():
         if sizeleft is None:
             sizeleft = size
         progress = (1 - (sizeleft / size)) * 100 if size else 0
-        by_movie.setdefault(movie_id, []).append({
+        by_movie.setdefault(item_movie_id, []).append({
             'source': 'queue',
             'queue_id': item.get('id'),
             'hash': dl,
@@ -1140,10 +1174,10 @@ def cleanup_radarr_queue_dupes():
         progress = info.get('progress') or 0
         if progress >= 99.0:
             continue
-        movie_id, score = _radarr_grab_identity(h)
-        if not movie_id:
+        lane_movie_id, score = _radarr_grab_identity(h)
+        if not lane_movie_id:
             continue
-        by_movie.setdefault(movie_id, []).append({
+        by_movie.setdefault(lane_movie_id, []).append({
             'source': 'throttled',
             'queue_id': None,
             'hash': h.lower(),
@@ -1153,13 +1187,16 @@ def cleanup_radarr_queue_dupes():
             'order': float('inf'),
         })
 
+    if movie_id is not None:
+        by_movie = {k: v for k, v in by_movie.items() if k == movie_id}
+
     removed = 0
-    for movie_id, items in by_movie.items():
+    for group_movie_id, items in by_movie.items():
         if len(items) <= 1:
             continue
         items.sort(key=_dupe_candidate_sort_key)
         best = items[0]
-        log.info(f'Radarr queue: movie {movie_id} has {len(items)} entries, keeping "{best["title"]}" (score: {best["score"]})')
+        log.info(f'Radarr queue: movie {group_movie_id} has {len(items)} entries, keeping "{best["title"]}" (score: {best["score"]})')
         for item in items[1:]:
             # Per-item try/except: one failed removal (a queue record that
             # vanished between fetch and delete, a Deluge hiccup) must not
@@ -1180,9 +1217,10 @@ def cleanup_radarr_queue_dupes():
                 removed += 1
             except Exception as e:
                 log.warning(f'Radarr queue dedupe: could not drop "{item["title"]}": {e}')
-    log.info(f'Radarr queue cleanup complete: removed {removed} duplicate entries')
+    log.info(f'Radarr queue cleanup complete{scope}: removed {removed} duplicate entries')
     if removed:
         record_activity('dedup', f'Radarr queue: removed {removed} duplicate queue entr(y/ies)')
+    return removed
 
 
 def _sonarr_grab_identity(download_id):
@@ -1243,9 +1281,20 @@ def _sonarr_dupe_candidate_sort_key(c):
     return (-len(c['episodes']), -c['score'], -c['progress'], c['order'])
 
 
-def cleanup_sonarr_queue_dupes():
+@_serialized
+def cleanup_sonarr_queue_dupes(series_id=None):
     """Remove duplicate downloads of the same episodes, keeping the best
     covering release.
+
+    Pass series_id to restrict the comparison to a single series. That is
+    the grab-time entry point (see dedupe_grabbed_release). Note the scope
+    is the SERIES, not the episode set: whether the release just grabbed is
+    redundant can only be decided against every other in-flight release of
+    that series -- a season pack already downloading may cover it. Inside
+    the group the identity and subset rules below are unchanged, which is
+    what keeps grab-time dedupe from doing what naive seriesId grouping
+    does (delete a legitimate second episode). Scoping narrows what is
+    COMPARED, not what is read. Returns the number of downloads removed.
 
     Sonarr's /api/v3/queue is NOT a complete view of what Sonarr has
     grabbed, and that blind spot is what lets duplicate grabs pile up:
@@ -1281,10 +1330,11 @@ def cleanup_sonarr_queue_dupes():
     API; losers that don't are relabeled SUPERSEDED_LABEL, handing them to
     the existing cleanup_superseded / queued_superseded_targets path
     rather than deleting data from under the tracker."""
-    log.info('Running Sonarr queue duplicate cleanup...')
+    scope = f' (series {series_id})' if series_id is not None else ''
+    log.info(f'Running Sonarr queue duplicate cleanup{scope}...')
     if not SONARR_API_KEY:
         log.info('  no SONARR_API_KEY, skip')
-        return
+        return 0
     try:
         r = requests.get(
             f'{SONARR_URL}/api/v3/queue',
@@ -1296,7 +1346,7 @@ def cleanup_sonarr_queue_dupes():
         records = r.json().get('records', [])
     except Exception as e:
         log.error(f'Sonarr queue cleanup failed: {e}')
-        return
+        return 0
 
     # Fold the per-episode queue records back into one candidate per
     # download. Keyed by downloadId where there is one; a record without a
@@ -1305,8 +1355,8 @@ def cleanup_sonarr_queue_dupes():
     by_download = {}
     queue_hashes = set()
     for item in records:
-        series_id = item.get('seriesId')
-        if not series_id:
+        item_series_id = item.get('seriesId')
+        if not item_series_id:
             continue
         dl = (item.get('downloadId') or '').lower()
         if dl:
@@ -1324,7 +1374,7 @@ def cleanup_sonarr_queue_dupes():
                 'queue_ids': [],
                 'hash': dl,
                 'title': item.get('title'),
-                'series_id': series_id,
+                'series_id': item_series_id,
                 'episodes': set(),
                 'score': 0,
                 'progress': progress,
@@ -1367,23 +1417,26 @@ def cleanup_sonarr_queue_dupes():
         progress = info.get('progress') or 0
         if progress >= 99.0:
             continue
-        series_id, episodes, score = _sonarr_grab_identity(h)
-        if not (series_id and episodes):
+        lane_series_id, episodes, score = _sonarr_grab_identity(h)
+        if not (lane_series_id and episodes):
             continue
-        by_series.setdefault(series_id, []).append({
+        by_series.setdefault(lane_series_id, []).append({
             'source': 'throttled',
             'queue_ids': [],
             'hash': h.lower(),
             'title': info.get('name'),
-            'series_id': series_id,
+            'series_id': lane_series_id,
             'episodes': set(episodes),
             'score': score,
             'progress': progress,
             'order': float('inf'),
         })
 
+    if series_id is not None:
+        by_series = {k: v for k, v in by_series.items() if k == series_id}
+
     removed = 0
-    for series_id, items in by_series.items():
+    for group_series_id, items in by_series.items():
         if len(items) <= 1:
             continue
         items.sort(key=_sonarr_dupe_candidate_sort_key)
@@ -1396,7 +1449,7 @@ def cleanup_sonarr_queue_dupes():
                 losers.append((c, covered_by))
         if not losers:
             continue
-        log.info(f'Sonarr queue: series {series_id} has {len(items)} in-flight release(s), '
+        log.info(f'Sonarr queue: series {group_series_id} has {len(items)} in-flight release(s), '
                  f'keeping {len(keepers)} ({", ".join(repr(k["title"]) for k in keepers)})')
         for item, keeper in losers:
             # Per-item try/except: one failed removal (a queue record that
@@ -1422,9 +1475,10 @@ def cleanup_sonarr_queue_dupes():
                 removed += 1
             except Exception as e:
                 log.warning(f'Sonarr queue dedupe: could not drop "{item["title"]}": {e}')
-    log.info(f'Sonarr queue cleanup complete: removed {removed} duplicate entries')
+    log.info(f'Sonarr queue cleanup complete{scope}: removed {removed} duplicate entries')
     if removed:
         record_activity('dedup', f'Sonarr queue: removed {removed} duplicate download(s)')
+    return removed
 
 
 # ── Pushover ─────────────────────────────────────────────────────────────────
@@ -1970,6 +2024,79 @@ def is_upgrade_radarr(data):
         log.error(f"Radarr upgrade check failed: {e}")
         return None
 
+# How long the grab-time dedupe will wait for the *arr to have written its
+# grab history for the download we were just told about. Six tries five
+# seconds apart = ~25s of waiting worst case, on a detached daemon thread.
+GRAB_DEDUPE_TRIES = int(os.environ.get('GRAB_DEDUPE_TRIES', 6))
+GRAB_DEDUPE_DELAY = float(os.environ.get('GRAB_DEDUPE_DELAY', 5))
+
+
+def dedupe_grabbed_release(source, download_id):
+    """Dedupe the throttled lane NOW, scoped to the one movie/series just
+    grabbed, instead of waiting for the daily/weekly sweep.
+
+    Why this exists: the *arr relabels a throttled upgrade out of its own
+    download-client category (see cleanup_radarr_queue_dupes), which blinds
+    the *arr's own QueueSpecification -- so it happily grabs a SECOND
+    release of the same film. The scheduled passes do catch that, but a
+    duplicate could sit there burning bandwidth for up to a day first. Run
+    at grab time the second copy is dropped before it has really started.
+
+    Called only after this grab is confirmed to be sitting in the throttled
+    lane, which is what makes it observable to the pass:
+      * the torrent exists in Deluge and carries the -upgrade label, so the
+        pass's lane scan sees it;
+      * its queue record is on its way out (the relabel just happened), and
+        while it is still stale-visible the pass's queue_hashes check keeps
+        it from being counted twice.
+    The remaining race is the *arr's own history: the Grab notification can
+    beat the 'grabbed' record being queryable by downloadId, and without
+    that record the torrent has no identity and the pass would silently
+    skip it. So we POLL for the identity rather than sleeping a guessed
+    interval, and if it never resolves we do nothing at all -- an
+    unresolvable identity is never grounds for a removal, and the scheduled
+    passes remain the backstop for this and for every grab that happened
+    while the service was down or whose webhook was missed.
+
+    Never raises: this runs on the webhook thread and must not be able to
+    turn a dedupe hiccup into a failed throttle."""
+    try:
+        if source == 'Radarr' and not RADARR_API_KEY:
+            return 0
+        if source == 'Sonarr' and not SONARR_API_KEY:
+            return 0
+        scope = None
+        for attempt in range(1, GRAB_DEDUPE_TRIES + 1):
+            if source == 'Radarr':
+                scope, _ = _radarr_grab_identity(download_id)
+            else:
+                series_id, episodes, _ = _sonarr_grab_identity(download_id)
+                # A seriesId with no episodes resolved is not an identity:
+                # the pass compares episode SETS, so it would ignore this
+                # torrent anyway. Keep waiting for the per-episode records.
+                scope = series_id if episodes else None
+            if scope:
+                break
+            if attempt < GRAB_DEDUPE_TRIES:
+                log.info(f'{source}: grab-time dedupe: no grab history for {download_id[:8]} yet '
+                         f'(try {attempt}/{GRAB_DEDUPE_TRIES}), waiting')
+                time.sleep(GRAB_DEDUPE_DELAY)
+        if not scope:
+            log.warning(f'{source}: grab-time dedupe: could not resolve {download_id[:8]} to a '
+                        f'movie/series, leaving it for the scheduled pass')
+            return 0
+        if source == 'Radarr':
+            removed = cleanup_radarr_queue_dupes(movie_id=scope) or 0
+        else:
+            removed = cleanup_sonarr_queue_dupes(series_id=scope) or 0
+        if removed:
+            log.info(f'{source}: grab-time dedupe dropped {removed} duplicate download(s)')
+        return removed
+    except Exception as e:
+        log.error(f'{source}: grab-time dedupe failed for {download_id[:8]}: {e}')
+        return 0
+
+
 def handle_grab(data, source):
     """
     Fires when Sonarr/Radarr sends a grab to Deluge.
@@ -2042,6 +2169,10 @@ def handle_grab(data, source):
                     f"{source}: in-flight grab {download_id} has save_path "
                     f"'{existing_save_path}' outside {downloads_root} — investigate"
                 )
+            # Already in the lane, so still worth a scoped dedupe: a re-fired
+            # webhook is a free second chance at a grab whose first webhook
+            # was missed or arrived while the service was down.
+            dedupe_grabbed_release(source, download_id)
             return
         if existing_label == SUPERSEDED_LABEL and existing_progress >= 99.0:
             base_label = 'sonarr' if source == 'Sonarr' else 'radarr'
@@ -2081,6 +2212,10 @@ def handle_grab(data, source):
             timeout=10
         )
         log.info(f"{source}: moved {download_id} to bottom of queue")
+        # Only now, with the torrent confirmed in the throttled lane, is it
+        # visible to the dedupe pass at all -- so this is the earliest point
+        # the check can be both immediate and correct. Never raises.
+        dedupe_grabbed_release(source, download_id)
     except Exception as e:
         log.error(f"{source}: failed to label upgrade torrent: {e}")
 
