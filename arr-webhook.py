@@ -500,6 +500,7 @@ def cleanup_scheduler():
     while True:
         cleanup_superseded()
         cleanup_radarr_queue_dupes()
+        cleanup_sonarr_queue_dupes()
         dedup_via_radarr()
         dedup_via_sonarr()
         cleanup_unpacked_torrents()
@@ -989,9 +990,9 @@ def cleanup_stalled_seeds(dry_run=False):
     return candidates
 
 def queue_dupe_cleanup_scheduler():
-    """Once a week, remove duplicate Radarr queue entries for the same movie,
-    keeping the highest-scoring one (ties broken by keeping whichever was
-    queued first). Added 2026-08-22 after investigating repeated re-grabs
+    """Once a week, remove duplicate Radarr/Sonarr downloads of the same
+    movie or episodes, keeping the best one (ties broken by keeping whichever
+    was queued first). Added 2026-08-22 after investigating repeated re-grabs
     from monthly_upgrade_cycle's bulk upgrade searches -- those are expected
     (the search is designed to keep chasing better releases over time), but
     the brief multi-entry window they create in the queue was only ever
@@ -1000,6 +1001,7 @@ def queue_dupe_cleanup_scheduler():
     while True:
         time.sleep(7 * 24 * 3600)  # weekly
         cleanup_radarr_queue_dupes()
+        cleanup_sonarr_queue_dupes()
 
 
 def stalled_seed_scheduler():
@@ -1181,6 +1183,249 @@ def cleanup_radarr_queue_dupes():
     log.info(f'Radarr queue cleanup complete: removed {removed} duplicate entries')
     if removed:
         record_activity('dedup', f'Radarr queue: removed {removed} duplicate queue entr(y/ies)')
+
+
+def _sonarr_grab_identity(download_id):
+    """(seriesId, frozenset(episodeIds), customFormatScore) for a torrent
+    hash, from Sonarr's grab history. Returns (None, frozenset(), 0) when
+    Sonarr has no grab on record.
+
+    Needed because a throttled torrent is NOT in Sonarr's queue (see the
+    blind-spot note on cleanup_sonarr_queue_dupes), so its identity has to
+    come from history instead of from a queue record.
+
+    Sonarr's history is per-episode: one 'grabbed' record is written for
+    EVERY episode a release covers, all sharing the one downloadId. So a
+    season pack's identity is the union of those records' episodeIds --
+    that union is exactly the set of episodes this torrent will deliver,
+    which is what makes two grabs duplicates of each other."""
+    if not (SONARR_API_KEY and download_id):
+        return None, frozenset(), 0
+    try:
+        r = requests.get(
+            f'{SONARR_URL}/api/v3/history',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'downloadId': download_id.upper(), 'pageSize': 200},
+            timeout=15,
+        )
+        r.raise_for_status()
+        records = r.json().get('records') or []
+    except Exception as e:
+        log.warning(f'Sonarr queue dedupe: history lookup for {download_id[:8]} failed: {e}')
+        return None, frozenset(), 0
+    grabs = [rec for rec in records if rec.get('eventType') == 'grabbed']
+    if not grabs:
+        return None, frozenset(), 0
+    grabs.sort(key=lambda rec: rec.get('date') or '')
+    episodes = {rec.get('episodeId') for rec in grabs if rec.get('episodeId')}
+    latest = grabs[-1]
+    try:
+        score = int((latest.get('data') or {}).get('customFormatScore') or 0)
+    except (TypeError, ValueError):
+        score = 0
+    return latest.get('seriesId'), frozenset(episodes), score
+
+
+def _sonarr_dupe_candidate_sort_key(c):
+    """Keeper preference within one series, best first.
+
+    COVERAGE comes before score, which is the one real departure from the
+    Radarr key. A movie grab is all-or-nothing, but a TV grab covers a set
+    of episodes, and dropping a 10-episode season pack because one
+    single-episode grab inside it scores higher would leave nine episodes
+    with nothing in flight and force a fresh search. Keeping the pack only
+    costs a later per-episode upgrade, which Sonarr does on its own. After
+    that it is the Radarr key: highest custom-format score, then whichever
+    has actually pulled bytes (throwing away a part-finished download
+    wastes the bandwidth already spent), then whichever was grabbed first
+    -- queue ids are Sonarr's auto-incrementing primary keys, and torrents
+    with no queue record at all sort last."""
+    return (-len(c['episodes']), -c['score'], -c['progress'], c['order'])
+
+
+def cleanup_sonarr_queue_dupes():
+    """Remove duplicate downloads of the same episodes, keeping the best
+    covering release.
+
+    Sonarr's /api/v3/queue is NOT a complete view of what Sonarr has
+    grabbed, and that blind spot is what lets duplicate grabs pile up:
+    Sonarr's Deluge client only reports torrents carrying its configured
+    category label (Deluge.GetItems -> GetTorrentsByLabel(TvCategory)), so
+    the moment this service relabels a throttled upgrade from 'sonarr' to
+    SONARR_UPG_LABEL -- which handle_grab does within seconds of the Grab
+    webhook -- the torrent drops out of the download-client item list and
+    its queue record disappears. Every throttled upgrade is therefore
+    invisible here. (Same blind spot defeats Sonarr's own
+    QueueSpecification, which is why a second release for the same episode
+    gets grabbed in the first place.) This is the Sonarr counterpart of
+    cleanup_radarr_queue_dupes, which had no Sonarr equivalent at all.
+
+    Identity is where the two services genuinely differ. A movie is one
+    movieId; a TV grab is a SET of episodes -- one episode, a multi-episode
+    file, or a whole season pack -- so seriesId alone is not an identity at
+    all (two different episodes of one series are not duplicates). Two
+    grabs are duplicates only where their episode sets actually overlap,
+    and a candidate is only dropped when its episode set is a SUBSET of a
+    keeper's, i.e. the keeper delivers everything the loser would. Packs
+    that merely straddle each other (S01E01-05 vs S01E04-10) are both
+    kept: neither is redundant and dropping either loses episodes. So is a
+    candidate covered only by the union of two separate keepers -- its
+    episodes would then depend on two downloads both succeeding.
+
+    Sonarr also writes one queue record PER EPISODE, so a season pack is N
+    records sharing a downloadId; those are folded back into one candidate
+    before anything is compared, and removed together through the queue
+    bulk endpoint.
+
+    Losers that still have a queue record are removed through the queue
+    API; losers that don't are relabeled SUPERSEDED_LABEL, handing them to
+    the existing cleanup_superseded / queued_superseded_targets path
+    rather than deleting data from under the tracker."""
+    log.info('Running Sonarr queue duplicate cleanup...')
+    if not SONARR_API_KEY:
+        log.info('  no SONARR_API_KEY, skip')
+        return
+    try:
+        r = requests.get(
+            f'{SONARR_URL}/api/v3/queue',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'pageSize': 1000, 'includeUnknownSeriesItems': False},
+            timeout=15
+        )
+        r.raise_for_status()
+        records = r.json().get('records', [])
+    except Exception as e:
+        log.error(f'Sonarr queue cleanup failed: {e}')
+        return
+
+    # Fold the per-episode queue records back into one candidate per
+    # download. Keyed by downloadId where there is one; a record without a
+    # downloadId can't be grouped with anything, so it stands alone under
+    # its own queue id.
+    by_download = {}
+    queue_hashes = set()
+    for item in records:
+        series_id = item.get('seriesId')
+        if not series_id:
+            continue
+        dl = (item.get('downloadId') or '').lower()
+        if dl:
+            queue_hashes.add(dl)
+        size = item.get('size') or 0
+        sizeleft = item.get('sizeleft')
+        if sizeleft is None:
+            sizeleft = size
+        progress = (1 - (sizeleft / size)) * 100 if size else 0
+        key = dl or f'queue:{item.get("id")}'
+        c = by_download.get(key)
+        if c is None:
+            c = by_download[key] = {
+                'source': 'queue',
+                'queue_ids': [],
+                'hash': dl,
+                'title': item.get('title'),
+                'series_id': series_id,
+                'episodes': set(),
+                'score': 0,
+                'progress': progress,
+                'order': float('inf'),
+            }
+        if item.get('id') is not None:
+            c['queue_ids'].append(item['id'])
+            c['order'] = min(c['order'], item['id'])
+        # episodeId is the v3 field; tolerate an episodeIds list too.
+        if item.get('episodeId'):
+            c['episodes'].add(item['episodeId'])
+        for ep_id in (item.get('episodeIds') or []):
+            if ep_id:
+                c['episodes'].add(ep_id)
+        c['score'] = max(c['score'], item.get('customFormatScore') or 0)
+        c['progress'] = max(c['progress'], progress)
+
+    by_series = {}
+    for c in by_download.values():
+        # No episodes resolved means no identity, so no way to tell whether
+        # this duplicates anything. Leave it alone.
+        if c['episodes']:
+            by_series.setdefault(c['series_id'], []).append(c)
+
+    # Fold in the throttled lane, which the queue can't see.
+    try:
+        deluge_login()
+        torrents = get_all_torrents()
+    except Exception as e:
+        log.warning(f'Sonarr queue dedupe: Deluge unreachable, queue-only pass: {e}')
+        torrents = {}
+    for h, info in torrents.items():
+        if info.get('label') != SONARR_UPG_LABEL:
+            continue
+        if h.lower() in queue_hashes:
+            continue
+        # Only in-flight downloads compete for bandwidth. A finished one is
+        # the import path's business, and relabeling something that's
+        # seeding would risk a hit-and-run.
+        progress = info.get('progress') or 0
+        if progress >= 99.0:
+            continue
+        series_id, episodes, score = _sonarr_grab_identity(h)
+        if not (series_id and episodes):
+            continue
+        by_series.setdefault(series_id, []).append({
+            'source': 'throttled',
+            'queue_ids': [],
+            'hash': h.lower(),
+            'title': info.get('name'),
+            'series_id': series_id,
+            'episodes': set(episodes),
+            'score': score,
+            'progress': progress,
+            'order': float('inf'),
+        })
+
+    removed = 0
+    for series_id, items in by_series.items():
+        if len(items) <= 1:
+            continue
+        items.sort(key=_sonarr_dupe_candidate_sort_key)
+        keepers, losers = [], []
+        for c in items:
+            covered_by = next((k for k in keepers if c['episodes'] <= k['episodes']), None)
+            if covered_by is None:
+                keepers.append(c)
+            else:
+                losers.append((c, covered_by))
+        if not losers:
+            continue
+        log.info(f'Sonarr queue: series {series_id} has {len(items)} in-flight release(s), '
+                 f'keeping {len(keepers)} ({", ".join(repr(k["title"]) for k in keepers)})')
+        for item, keeper in losers:
+            # Per-item try/except: one failed removal (a queue record that
+            # vanished between fetch and delete, a Deluge hiccup) must not
+            # abort the whole pass and leave every later series duplicated.
+            try:
+                eps = len(item['episodes'])
+                if item['source'] == 'queue':
+                    log.info(f'Sonarr queue: removing duplicate "{item["title"]}" '
+                             f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
+                    del_r = requests.delete(
+                        f'{SONARR_URL}/api/v3/queue/bulk',
+                        headers={'X-Api-Key': SONARR_API_KEY},
+                        params={'removeFromClient': True, 'blocklist': False},
+                        json={'ids': item['queue_ids']},
+                        timeout=15
+                    )
+                    del_r.raise_for_status()
+                else:
+                    log.info(f'Sonarr queue: superseding throttled duplicate "{item["title"]}" '
+                             f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
+                    set_torrent_label(item['hash'], SUPERSEDED_LABEL)
+                removed += 1
+            except Exception as e:
+                log.warning(f'Sonarr queue dedupe: could not drop "{item["title"]}": {e}')
+    log.info(f'Sonarr queue cleanup complete: removed {removed} duplicate entries')
+    if removed:
+        record_activity('dedup', f'Sonarr queue: removed {removed} duplicate download(s)')
+
 
 # ── Pushover ─────────────────────────────────────────────────────────────────
 
