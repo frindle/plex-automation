@@ -7,3 +7,4 @@ TODO.md
 .DS_Store
 
 graphify-out/
+.venv/

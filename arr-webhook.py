@@ -1012,9 +1012,76 @@ def stalled_seed_scheduler():
         cleanup_stalled_seeds()
 
 
+def _radarr_grab_identity(download_id):
+    """(movieId, customFormatScore) for a torrent hash, from Radarr's grab
+    history. Returns (None, 0) when Radarr has no grab on record.
+
+    Needed because a throttled torrent is NOT in Radarr's queue (see the
+    blind-spot note on cleanup_radarr_queue_dupes), so its movieId has to
+    come from history instead of from a queue record."""
+    if not (RADARR_API_KEY and download_id):
+        return None, 0
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/history',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            params={'downloadId': download_id.upper(), 'pageSize': 50},
+            timeout=15,
+        )
+        r.raise_for_status()
+        records = r.json().get('records') or []
+    except Exception as e:
+        log.warning(f'Radarr queue dedupe: history lookup for {download_id[:8]} failed: {e}')
+        return None, 0
+    grabs = [rec for rec in records if rec.get('eventType') == 'grabbed']
+    if not grabs:
+        return None, 0
+    grabs.sort(key=lambda rec: rec.get('date') or '')
+    latest = grabs[-1]
+    try:
+        score = int((latest.get('data') or {}).get('customFormatScore') or 0)
+    except (TypeError, ValueError):
+        score = 0
+    return latest.get('movieId'), score
+
+
+def _dupe_candidate_sort_key(c):
+    """Keep the highest custom-format score. On a tie prefer whichever has
+    actually pulled bytes (throwing away a part-finished download wastes the
+    bandwidth already spent), then whichever was grabbed first -- queue ids
+    are Radarr's auto-incrementing primary keys, and torrents with no queue
+    record at all sort last."""
+    return (-c['score'], -c['progress'], c['order'])
+
+
 def cleanup_radarr_queue_dupes():
-    """Remove duplicate queue entries for the same movie, keeping the highest scoring one."""
+    """Remove duplicate downloads of the same movie, keeping the highest
+    scoring one.
+
+    Radarr's own /api/v3/queue is NOT a complete view of what Radarr has
+    grabbed, and that blind spot is what let the duplicate grabs pile up:
+    Radarr's Deluge client only reports torrents carrying its configured
+    category label (Deluge.GetItems -> GetTorrentsByLabel(MovieCategory)),
+    so the moment this service relabels a throttled upgrade from 'radarr' to
+    RADARR_UPG_LABEL -- which handle_grab does within seconds of the Grab
+    webhook -- the torrent drops out of the download-client item list and
+    its queue record disappears. Every throttled upgrade is therefore
+    invisible here, so grouping queue records alone always found one entry
+    per movie and removed nothing, exactly for the population this pass
+    exists to police. (Same blind spot defeats Radarr's own
+    QueueSpecification, which is why a second release for the same movie
+    gets grabbed in the first place.)
+
+    So the candidate set is the queue PLUS the in-flight torrents sitting in
+    the throttled lane, whose movieId comes from Radarr's grab history.
+    Losers that still have a queue record are removed through the queue API
+    as before; losers that don't are relabeled SUPERSEDED_LABEL, handing
+    them to the existing cleanup_superseded / queued_superseded_targets
+    path rather than deleting data from under the tracker."""
     log.info('Running Radarr queue duplicate cleanup...')
+    if not RADARR_API_KEY:
+        log.info('  no RADARR_API_KEY, skip')
+        return
     try:
         r = requests.get(
             f'{RADARR_URL}/api/v3/queue',
@@ -1024,45 +1091,96 @@ def cleanup_radarr_queue_dupes():
         )
         r.raise_for_status()
         records = r.json().get('records', [])
-
-        # Group queue items by movieId
-        by_movie = {}
-        for item in records:
-            movie_id = item.get('movieId')
-            if not movie_id:
-                continue
-            if movie_id not in by_movie:
-                by_movie[movie_id] = []
-            by_movie[movie_id].append(item)
-
-        removed = 0
-        for movie_id, items in by_movie.items():
-            if len(items) <= 1:
-                continue
-            # Sort by custom format score descending, keep highest. On a tie,
-            # explicitly keep whichever was queued first (lower queue "id" --
-            # Radarr assigns these as auto-incrementing primary keys in
-            # insertion order) rather than relying on Python's sort being
-            # stable against whatever order the API happened to return.
-            items.sort(key=lambda x: (-x.get('customFormatScore', 0), x.get('id', 0)))
-            best = items[0]
-            log.info(f'Radarr queue: movie {movie_id} has {len(items)} entries, keeping "{best.get("title")}" (score: {best.get("customFormatScore", 0)})')
-            for item in items[1:]:
-                queue_id = item.get('id')
-                log.info(f'Radarr queue: removing duplicate "{item.get("title")}" (score: {item.get("customFormatScore", 0)})')
-                del_r = requests.delete(
-                    f'{RADARR_URL}/api/v3/queue/{queue_id}',
-                    headers={'X-Api-Key': RADARR_API_KEY},
-                    params={'removeFromClient': True, 'blocklist': False},
-                    timeout=15
-                )
-                del_r.raise_for_status()
-                removed += 1
-        log.info(f'Radarr queue cleanup complete: removed {removed} duplicate entries')
-        if removed:
-            record_activity('dedup', f'Radarr queue: removed {removed} duplicate queue entr(y/ies)')
     except Exception as e:
         log.error(f'Radarr queue cleanup failed: {e}')
+        return
+
+    # Group queue items by movieId
+    by_movie = {}
+    queue_hashes = set()
+    for item in records:
+        movie_id = item.get('movieId')
+        if not movie_id:
+            continue
+        dl = (item.get('downloadId') or '').lower()
+        if dl:
+            queue_hashes.add(dl)
+        size = item.get('size') or 0
+        sizeleft = item.get('sizeleft')
+        if sizeleft is None:
+            sizeleft = size
+        progress = (1 - (sizeleft / size)) * 100 if size else 0
+        by_movie.setdefault(movie_id, []).append({
+            'source': 'queue',
+            'queue_id': item.get('id'),
+            'hash': dl,
+            'title': item.get('title'),
+            'score': item.get('customFormatScore') or 0,
+            'progress': progress,
+            'order': item.get('id') or 0,
+        })
+
+    # Fold in the throttled lane, which the queue can't see.
+    try:
+        deluge_login()
+        torrents = get_all_torrents()
+    except Exception as e:
+        log.warning(f'Radarr queue dedupe: Deluge unreachable, queue-only pass: {e}')
+        torrents = {}
+    for h, info in torrents.items():
+        if info.get('label') != RADARR_UPG_LABEL:
+            continue
+        if h.lower() in queue_hashes:
+            continue
+        # Only in-flight downloads compete for bandwidth. A finished one is
+        # the import path's business, and relabeling something that's
+        # seeding would risk a hit-and-run.
+        progress = info.get('progress') or 0
+        if progress >= 99.0:
+            continue
+        movie_id, score = _radarr_grab_identity(h)
+        if not movie_id:
+            continue
+        by_movie.setdefault(movie_id, []).append({
+            'source': 'throttled',
+            'queue_id': None,
+            'hash': h.lower(),
+            'title': info.get('name'),
+            'score': score,
+            'progress': progress,
+            'order': float('inf'),
+        })
+
+    removed = 0
+    for movie_id, items in by_movie.items():
+        if len(items) <= 1:
+            continue
+        items.sort(key=_dupe_candidate_sort_key)
+        best = items[0]
+        log.info(f'Radarr queue: movie {movie_id} has {len(items)} entries, keeping "{best["title"]}" (score: {best["score"]})')
+        for item in items[1:]:
+            # Per-item try/except: one failed removal (a queue record that
+            # vanished between fetch and delete, a Deluge hiccup) must not
+            # abort the whole pass and leave every later movie duplicated.
+            try:
+                if item['source'] == 'queue':
+                    log.info(f'Radarr queue: removing duplicate "{item["title"]}" (score: {item["score"]})')
+                    del_r = requests.delete(
+                        f'{RADARR_URL}/api/v3/queue/{item["queue_id"]}',
+                        headers={'X-Api-Key': RADARR_API_KEY},
+                        params={'removeFromClient': True, 'blocklist': False},
+                        timeout=15
+                    )
+                    del_r.raise_for_status()
+                else:
+                    log.info(f'Radarr queue: superseding throttled duplicate "{item["title"]}" (score: {item["score"]})')
+                    set_torrent_label(item['hash'], SUPERSEDED_LABEL)
+                removed += 1
+            except Exception as e:
+                log.warning(f'Radarr queue dedupe: could not drop "{item["title"]}": {e}')
+    log.info(f'Radarr queue cleanup complete: removed {removed} duplicate entries')
+    if removed:
+        record_activity('dedup', f'Radarr queue: removed {removed} duplicate queue entr(y/ies)')
 
 # ── Pushover ─────────────────────────────────────────────────────────────────
 
