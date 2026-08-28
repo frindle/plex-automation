@@ -1080,7 +1080,7 @@ def _dupe_candidate_sort_key(c):
 
 
 @_serialized
-def cleanup_radarr_queue_dupes(movie_id=None):
+def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
     """Remove duplicate downloads of the same movie, keeping the highest
     scoring one.
 
@@ -1191,6 +1191,7 @@ def cleanup_radarr_queue_dupes(movie_id=None):
         by_movie = {k: v for k, v in by_movie.items() if k == movie_id}
 
     removed = 0
+    report_list = []
     for group_movie_id, items in by_movie.items():
         if len(items) <= 1:
             continue
@@ -1202,7 +1203,12 @@ def cleanup_radarr_queue_dupes(movie_id=None):
             # vanished between fetch and delete, a Deluge hiccup) must not
             # abort the whole pass and leave every later movie duplicated.
             try:
-                if item['source'] == 'queue':
+                if dry_run:
+                    if item['source'] == 'queue':
+                        log.info(f'[dry-run] Radarr queue: would remove duplicate "{item["title"]}" (score: {item["score"]})')
+                    else:
+                        log.info(f'[dry-run] Radarr queue: would supersede throttled duplicate "{item["title"]}" (score: {item["score"]})')
+                elif item['source'] == 'queue':
                     log.info(f'Radarr queue: removing duplicate "{item["title"]}" (score: {item["score"]})')
                     del_r = requests.delete(
                         f'{RADARR_URL}/api/v3/queue/{item["queue_id"]}',
@@ -1217,10 +1223,20 @@ def cleanup_radarr_queue_dupes(movie_id=None):
                 removed += 1
             except Exception as e:
                 log.warning(f'Radarr queue dedupe: could not drop "{item["title"]}": {e}')
-    log.info(f'Radarr queue cleanup complete{scope}: removed {removed} duplicate entries')
-    if removed:
+        if dry_run:
+            report_list.append({
+                'movie_id': group_movie_id,
+                'keep': {'title': best['title'], 'score': best['score'], 'source': best['source']},
+                'would_drop': [
+                    {'title': item['title'], 'score': item['score'], 'source': item['source'], 'hash': item.get('hash')}
+                    for item in items[1:]
+                ],
+            })
+    log.info(f'Radarr queue cleanup complete{scope}{" (DRY RUN)" if dry_run else ""}: '
+             f'{"would remove" if dry_run else "removed"} {removed} duplicate entries')
+    if removed and not dry_run:
         record_activity('dedup', f'Radarr queue: removed {removed} duplicate queue entr(y/ies)')
-    return removed
+    return report_list if dry_run else removed
 
 
 def _sonarr_grab_identity(download_id):
@@ -1282,7 +1298,7 @@ def _sonarr_dupe_candidate_sort_key(c):
 
 
 @_serialized
-def cleanup_sonarr_queue_dupes(series_id=None):
+def cleanup_sonarr_queue_dupes(series_id=None, dry_run=False):
     """Remove duplicate downloads of the same episodes, keeping the best
     covering release.
 
@@ -1436,6 +1452,7 @@ def cleanup_sonarr_queue_dupes(series_id=None):
         by_series = {k: v for k, v in by_series.items() if k == series_id}
 
     removed = 0
+    report_list = []
     for group_series_id, items in by_series.items():
         if len(items) <= 1:
             continue
@@ -1457,7 +1474,14 @@ def cleanup_sonarr_queue_dupes(series_id=None):
             # abort the whole pass and leave every later series duplicated.
             try:
                 eps = len(item['episodes'])
-                if item['source'] == 'queue':
+                if dry_run:
+                    if item['source'] == 'queue':
+                        log.info(f'[dry-run] Sonarr queue: would remove duplicate "{item["title"]}" '
+                                 f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
+                    else:
+                        log.info(f'[dry-run] Sonarr queue: would supersede throttled duplicate "{item["title"]}" '
+                                 f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
+                elif item['source'] == 'queue':
                     log.info(f'Sonarr queue: removing duplicate "{item["title"]}" '
                              f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
                     del_r = requests.delete(
@@ -1475,10 +1499,21 @@ def cleanup_sonarr_queue_dupes(series_id=None):
                 removed += 1
             except Exception as e:
                 log.warning(f'Sonarr queue dedupe: could not drop "{item["title"]}": {e}')
-    log.info(f'Sonarr queue cleanup complete{scope}: removed {removed} duplicate entries')
-    if removed:
+        if dry_run:
+            report_list.append({
+                'series_id': group_series_id,
+                'keep': [{'title': k['title'], 'score': k['score'], 'episodes': len(k['episodes'])} for k in keepers],
+                'would_drop': [
+                    {'title': item['title'], 'score': item['score'], 'episodes': len(item['episodes']),
+                     'source': item['source'], 'hash': item.get('hash'), 'covered_by': keeper['title']}
+                    for item, keeper in losers
+                ],
+            })
+    log.info(f'Sonarr queue cleanup complete{scope}{" (DRY RUN)" if dry_run else ""}: '
+             f'{"would remove" if dry_run else "removed"} {removed} duplicate entries')
+    if removed and not dry_run:
         record_activity('dedup', f'Sonarr queue: removed {removed} duplicate download(s)')
-    return removed
+    return report_list if dry_run else removed
 
 
 # ── Pushover ─────────────────────────────────────────────────────────────────
@@ -4173,6 +4208,20 @@ def unlabeled_tv_scan():
         'total_gb': round(total_gb, 2),
         'torrents': hits,
     }), 200
+
+# Read-only preview of the queue-duplicate cleanup passes: runs both
+# passes in dry-run mode and reports what WOULD be removed/superseded
+# without deleting or relabeling anything. ?service=radarr|sonarr|both
+# (default both).
+@app.route('/queue-dupe-scan', methods=['GET'])
+def queue_dupe_scan():
+    service = (request.args.get('service') or 'both').lower()
+    result = {'ok': True, 'service': service}
+    if service in ('both', 'radarr'):
+        result['radarr'] = cleanup_radarr_queue_dupes(dry_run=True)
+    if service in ('both', 'sonarr'):
+        result['sonarr'] = cleanup_sonarr_queue_dupes(dry_run=True)
+    return jsonify(result), 200
 
 # Cross-reference Deluge completed torrents against Radarr/Sonarr state
 # to surface the "grabbed → downloaded → never imported" failures that
