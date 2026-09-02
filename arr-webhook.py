@@ -723,6 +723,73 @@ def _sonarr_keeper_pack_info(series_id):
         log.warning(f'Sonarr keeper lookup failed for series {series_id}: {e}')
         return set(), set()
 
+def _sonarr_keeper_single_seasons(series_id):
+    """Ask Sonarr which download is the CURRENT keeper for each episode (the
+    MOST-RECENT DownloadFolderImported per episodeId, eventType=3) and return
+    the set of season numbers whose current keeper is a SINGLE — i.e. a
+    downloadId that covers EXACTLY ONE episode.
+
+    Mirror of _sonarr_keeper_pack_info with the pack rule inverted: there a
+    keeper downloadId covering >= 2 episodes means "pack kept this season";
+    here a keeper downloadId covering exactly one episode is POSITIVE evidence
+    that Sonarr keeps this season via singles (each episode imported by its own
+    single-episode import). That positive evidence is what lets the inverse
+    supersede pass safely touch a redundant season-PACK torrent: a season with
+    NO single keepers may simply have nothing imported at all, in which case
+    the pack could be the ONLY copy and must never be touched.
+
+    Same history+episode fetch pattern as _sonarr_keeper_pack_info (latest per
+    episodeId from /api/v3/history/series eventType=3, then /api/v3/episode for
+    episodeId -> seasonNumber). Blank downloadIds are skipped. Returns set() on
+    any failure — fail safe: no evidence of single keepers means the caller
+    selects nothing."""
+    try:
+        r = requests.get(
+            f'{SONARR_URL}/api/v3/history/series',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'seriesId': series_id, 'eventType': 3},
+            timeout=15,
+        )
+        r.raise_for_status()
+        latest = {}  # episodeId -> (date_str, downloadId_lower)
+        for e in r.json():
+            did = (e.get('downloadId') or '').lower()
+            if not did:
+                continue
+            ep_id = e.get('episodeId')
+            date = e.get('date') or ''
+            prev = latest.get(ep_id)
+            if prev is None or date >= prev[0]:
+                latest[ep_id] = (date, did)
+        if not latest:
+            return set()
+        # Count episodes each keeper downloadId currently holds; a single holds exactly 1.
+        ep_count = {}
+        for _, did in latest.values():
+            ep_count[did] = ep_count.get(did, 0) + 1
+        single_dids = {did for did, n in ep_count.items() if n == 1}
+        if not single_dids:
+            return set()
+        # Map episodeId -> seasonNumber to name the single-kept seasons.
+        er = requests.get(
+            f'{SONARR_URL}/api/v3/episode',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'seriesId': series_id},
+            timeout=20,
+        )
+        er.raise_for_status()
+        ep_season = {ep.get('id'): ep.get('seasonNumber') for ep in er.json()}
+        seasons = set()
+        for ep_id, (_, did) in latest.items():
+            if did in single_dids:
+                season = ep_season.get(ep_id)
+                if season is not None:
+                    seasons.add(int(season))
+        return seasons
+    except Exception as e:
+        log.warning(f'Sonarr keeper-single lookup failed for series {series_id}: {e}')
+        return set()
+
 def _sonarr_latest_keeper_by_episode_key(series_id):
     """Map each episode of this series to the downloadId Sonarr most recently
     imported for it — { "S04E03": "<downloadId lowercased>", ... }.
@@ -955,6 +1022,60 @@ def select_singles_superseded_by_pack(torrent_names, keeper_ids, keeper_pack_sea
         selected.append(h)
     return selected
 
+def select_pack_superseded_by_singles(torrent_names, keeper_ids, keeper_single_seasons):
+    """Pure decision for the INVERSE season-pack ⇄ singles supersede case.
+
+    When Sonarr's current keepers for a season are the SINGLES (each episode
+    kept by its own single-episode import) but a season-PACK torrent is still
+    seeding in the sonarr-labeled Deluge set, that pack is redundant — it seeds
+    forever because it carries no SxxExx token and so never joins an episode
+    group. This selects those packs for soft-supersede.
+
+    Args:
+        torrent_names: {hash: release_name} for the series' sonarr-labeled
+            torrents already filtered to progress >= 99% and title-matched.
+        keeper_ids: set of lowercase downloadIds that are the CURRENT keeper for
+            at least one episode (from _sonarr_keeper_pack_info). A pack whose
+            OWN hash is in here is itself the live file and must be spared.
+        keeper_single_seasons: set of season numbers with POSITIVE evidence of
+            >= 1 single-episode current keeper, from
+            _sonarr_keeper_single_seasons. This is the safety key: a season
+            merely ABSENT from keeper_pack_seasons could mean nothing was
+            imported for it at all (the pack might be the only copy), so we
+            never touch a pack without positive single-keeper evidence.
+
+    Returns the list of redundant season-PACK hashes — safe to soft-supersede.
+    Strictly scoped:
+
+      * A candidate is a pack iff SEASON_RE matches AND EPISODE_RE does NOT;
+        individual-episode torrents are NEVER returned, so singles-vs-singles
+        is untouched (that's the per-episode pass's job).
+      * Only packs in seasons present in keeper_single_seasons are ever
+        selected — a pack in any other season is never touched.
+      * A pack that is itself the current keeper for its episodes is never
+        selected.
+      * Empty keeper_single_seasons -> [] (no evidence, no action).
+    """
+    seasons = set(keeper_single_seasons)
+    if not seasons:
+        return []
+    keepers = {(d or '').lower() for d in keeper_ids}
+    selected = []
+    for h, name in torrent_names.items():
+        name = name or ''
+        sm = SEASON_RE.search(name)
+        if not sm:
+            continue  # no season token -> can't be a season pack
+        if EPISODE_RE.search(name):
+            continue  # individual-episode torrents are never selected here
+        season = int(sm.group(1))
+        if season not in seasons:
+            continue  # no single-keeper evidence for this season -> may be the only copy
+        if h.lower() in keepers:
+            continue  # this pack is itself the current keeper -> never touch
+        selected.append(h)
+    return selected
+
 def select_episode_dupe_losers(ep_key, hashes, latest_keeper_map):
     """Given the SxxExx key, the list of torrent hashes matched to that episode,
     and {ep_key: latest_keeper_downloadId_lower}, return the hashes to supersede
@@ -1077,6 +1198,36 @@ def dedup_via_sonarr(dry_run=False):
                 if not dry_run:
                     supersede_torrent(h)
                 relabeled += 1
+            # Inverse case (Make That Movie S01): Sonarr's current keepers for a
+            # season are the SINGLES but a season-PACK torrent is still seeding in
+            # the sonarr-labeled set — that pack is redundant and would seed
+            # forever. Keyed on POSITIVE evidence of single keepers (a season
+            # merely absent from keeper_pack_seasons could have nothing imported
+            # at all, where the pack might be the only copy), so a pack in any
+            # other season is never touched.
+            keeper_single_seasons = _sonarr_keeper_single_seasons(series_id)
+            superseded_redundant_packs = set(
+                select_pack_superseded_by_singles(matched_names, keeper_ids, keeper_single_seasons)
+            )
+            for h in superseded_redundant_packs:
+                name = sonarr_torrents[h].get('name', '') or ''
+                sm = SEASON_RE.search(name)
+                season = int(sm.group(1)) if sm else None
+                action = 'WOULD relabel' if dry_run else 'relabeling'
+                log.info(f'  {action} superseded (singles are the keepers): "{name}" (series {series_id}: {series.get("title")}, S{season:02d})')
+                report.append({
+                    'series_id': series_id,
+                    'series': series.get('title'),
+                    'season': season,
+                    'pack_hash': h,
+                    'pack_name': name,
+                })
+                if not dry_run:
+                    supersede_torrent(h)
+                relabeled += 1
+            # Skip these packs in the per-episode grouping below (they carry no
+            # SxxExx token anyway, but keep the skip set explicit).
+            superseded_by_pack.update(superseded_redundant_packs)
             by_episode = {}
             for h in matched_hashes:
                 if h in superseded_by_pack:
