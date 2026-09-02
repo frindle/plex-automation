@@ -407,6 +407,21 @@ def torrent_is_unregistered(info):
     return any(marker in status for marker in UNREGISTERED_MARKERS)
 
 
+def should_hard_delete_on_upgrade(info, same_group):
+    """True only when deleting a superseded torrent's DATA outright is safe:
+    same release group AND the tracker has unregistered it AND its seed
+    obligation is met (seeding_time >= SEED_DAYS * 86400 seconds). Otherwise the
+    caller MUST soft-supersede (keep seeding) — a private tracker routinely
+    unregisters a superseded torrent the moment the repack is posted while still
+    enforcing its minimum seed time (The Diplomat S03E02, deleted same-day
+    2026-09-01 -> hit-and-run). 'unregistered' != 'seed obligation waived'."""
+    if not same_group:
+        return False
+    if not torrent_is_unregistered(info):
+        return False
+    return (info.get('seeding_time') or 0) >= SEED_DAYS * 86400
+
+
 # ── Matching helpers ─────────────────────────────────────────────────────────
 
 def torrent_matches_any_title(torrent_name, title_variants):
@@ -2168,14 +2183,14 @@ def handle_upgrade_import(data, source):
             # hours in. SEED_DAYS only ever guarded the soft path.
             # Deleting is free once the tracker has dropped the torrent, so
             # that -- not the release group -- is the condition.
-            if same_group and torrent_is_unregistered(info):
+            if should_hard_delete_on_upgrade(info, same_group):
                 log.info(f'{source}: immediately deleting {torrent_hash} - {name} '
                          f'(proper/repack, same group "{new_release_group}", tracker: unregistered)')
                 record_activity('supersede', f'{source}: deleted "{name}" (replaced by same-group PROPER/REPACK, unregistered at tracker)')
                 remove_torrent(torrent_hash)
             else:
                 if same_group:
-                    reason = 'proper/repack, same group but still registered at tracker — seeding on to avoid a hit-and-run'
+                    reason = 'proper/repack, same group but not safe to hard-delete yet (registered, or seed time not yet met) — seeding on to avoid a hit-and-run'
                 elif proper_repack:
                     reason = 'proper/repack, different or unknown group'
                 else:
