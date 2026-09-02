@@ -780,6 +780,63 @@ def _sonarr_latest_keeper_by_episode_key(series_id):
         log.warning(f'Sonarr latest-keeper lookup failed for series {series_id}: {e}')
         return {}
 
+def _sonarr_latest_source_title_by_episode_key(series_id):
+    """Map each episode of this series to the sourceTitle Sonarr most recently
+    imported for it — { "S10E08": "<sourceTitle>", ... }.
+
+    Mirror of _sonarr_latest_keeper_by_episode_key with ONE difference: keep
+    the newest import's `sourceTitle` per episode REGARDLESS of a blank
+    downloadId. That is the whole point — Sonarr history events carry
+    sourceTitle (the raw release name) even when downloadId is blank, and
+    those rows are exactly the ones _sonarr_latest_keeper_by_episode_key
+    drops (confirmed live: MAFS UK S10E08). Same "latest per episodeId"
+    logic: GET /api/v3/history/series with eventType=3, keep the row with max
+    `date` per episodeId, then map episodeId → SxxExx via /api/v3/episode.
+
+    Returns {} on any failure — fail safe: the caller falls back to its
+    existing history/filename keeper logic."""
+    try:
+        r = requests.get(
+            f'{SONARR_URL}/api/v3/history/series',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'seriesId': series_id, 'eventType': 3},
+            timeout=15,
+        )
+        r.raise_for_status()
+        latest = {}  # episodeId -> (date_str, sourceTitle)
+        for e in r.json():
+            st = e.get('sourceTitle')
+            if not isinstance(st, str) or not st:
+                continue
+            ep_id = e.get('episodeId')
+            date = e.get('date') or ''
+            prev = latest.get(ep_id)
+            if prev is None or date >= prev[0]:
+                latest[ep_id] = (date, st)
+        if not latest:
+            return {}
+        er = requests.get(
+            f'{SONARR_URL}/api/v3/episode',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'seriesId': series_id},
+            timeout=20,
+        )
+        er.raise_for_status()
+        out = {}
+        for ep in er.json():
+            st = latest.get(ep.get('id'))
+            if not st:
+                continue
+            season = ep.get('seasonNumber')
+            number = ep.get('episodeNumber')
+            if season is None or number is None:
+                continue
+            out[f'S{int(season):02d}E{int(number):02d}'] = st[1]
+        return out
+    except Exception as e:
+        log.warning(f'Sonarr latest-sourceTitle lookup failed for series {series_id}: {e}')
+        return {}
+
 def _radarr_last_imported_download_id(movie_id):
     """Ask Radarr for the most recent successful import for a movie —
     that's Radarr's chosen keeper, and its downloadId maps to a Deluge
@@ -972,6 +1029,25 @@ def select_episode_dupe_losers(ep_key, hashes, latest_keeper_map):
     return [h for h in hashes if h != keeper]
 
 
+def select_episode_keeper_by_source_title(hashes, torrent_names, source_title):
+    """Given the candidate torrent hashes for one episode, {hash: release_name},
+    and the newest import's sourceTitle for that episode (may be None), return
+    the SINGLE hash whose name — extension-stripped via _strip_release_ext and
+    lowercased — equals the same treatment of `source_title`.
+
+    Returns None (fall back, never guess) when: `source_title` is falsy or not
+    a string; zero hashes match; or MORE than one hash matches. Case-insensitive.
+    Never raises on a non-string/None sourceTitle or a missing name entry."""
+    if not isinstance(source_title, str) or not source_title:
+        return None
+    target = _strip_release_ext(source_title.lower())
+    names = torrent_names or {}
+    matches = [h for h in hashes if _strip_release_ext((names.get(h) or '').lower()) == target]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
 def dedup_via_sonarr(dry_run=False):
     """Sonarr → Deluge dedup pass. When dry_run is True nothing is mutated
     (no supersede_torrent, no label/move, no record_activity) — it only logs
@@ -1047,6 +1123,10 @@ def dedup_via_sonarr(dry_run=False):
             # exactly as before.
             imported_ids = _sonarr_series_imported_download_ids(series_id)
             latest_keeper_map = _sonarr_latest_keeper_by_episode_key(series_id)
+            # sourceTitle of the newest import per episode — fallback keeper
+            # signal for episodes whose kept import has a blank downloadId
+            # (both downloadId methods above drop those rows).
+            source_title_map = _sonarr_latest_source_title_by_episode_key(series_id)
             # Season-pack ⇄ singles pass. A season pack has no SxxExx token, so
             # it never joins an episode group below; without this the singles it
             # replaced keep seeding forever. Coverage is decided from Sonarr's
@@ -1121,6 +1201,17 @@ def dedup_via_sonarr(dry_run=False):
                     )]
                     if len(exact) == 1:
                         keeper, keeper_source = exact[0], 'filename-exact'
+                if keeper is None:
+                    # Fallback for episodes whose kept import has a blank
+                    # downloadId (both history methods above drop those rows):
+                    # match the newest import's sourceTitle against the
+                    # candidate release names. Only fires on exactly one match;
+                    # otherwise we still skip rather than guess.
+                    st_keeper = select_episode_keeper_by_source_title(
+                        hashes, matched_names, source_title_map.get(ep)
+                    )
+                    if st_keeper is not None:
+                        keeper, keeper_source = st_keeper, 'sourceTitle'
                 if keeper is None:
                     log.warning(f'  skip {ep} (series {series_id}: {series.get("title")}): {len(hashes)} torrents matched, no single keeper identified via history or filename — not relabeling anything')
                     continue
