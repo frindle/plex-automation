@@ -332,6 +332,30 @@ def move_torrent_storage(torrent_hash, dest):
     )
     resp.raise_for_status()
     log.info(f'Moved {torrent_hash} to {dest}')
+    
+    # Verify the move actually succeeded by checking the save_path
+    status_resp = session.post(
+        f'{DELUGE_URL}/json',
+        json={
+            'method': 'core.get_torrents_status',
+            'params': [{}, ['save_path']],
+            'id': 6,
+        },
+        timeout=10
+    )
+    try:
+        status_result = status_resp.json().get('result', {})
+        if torrent_hash in status_result:
+            save_path = status_result[torrent_hash].get('save_path', '')
+            if not save_path.startswith(dest):
+                log.error(f'Move verification failed: {torrent_hash} did not land at expected destination {dest}')
+                record_activity('supersede-move-failed', f'torrent {torrent_hash} move to {dest} failed')
+    except Exception as e:
+        log.warning(f'Failed to verify move for {torrent_hash}: {e}')
+
+def supersede_torrent(torrent_hash):
+    set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
+    move_torrent_storage(torrent_hash, SEEDING_DIR)
 
 def remove_torrent(torrent_hash, remove_data=True):
     resp = session.post(
@@ -687,7 +711,7 @@ def dedup_via_radarr(dry_run=False):
                 action = 'WOULD relabel' if dry_run else 'relabeling'
                 log.info(f'  {action} superseded: "{name}" (movie {movie["id"]}: {movie.get("title")})')
                 if not dry_run:
-                    set_torrent_label(h, SUPERSEDED_LABEL)
+                    supersede_torrent(h)
                 relabeled += 1
         log.info(f'Radarr dedup complete{" (DRY RUN)" if dry_run else ""}: {"would relabel" if dry_run else "relabeled"} {relabeled} superseded torrent(s)')
         if relabeled and not dry_run:
@@ -798,7 +822,7 @@ def dedup_via_sonarr():
                     if h == keeper:
                         continue
                     log.info(f'  relabeling superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")}, {ep})')
-                    set_torrent_label(h, SUPERSEDED_LABEL)
+                    supersede_torrent(h)
                     relabeled += 1
         log.info(f'Sonarr dedup complete: relabeled {relabeled} superseded torrent(s)')
         if relabeled:
@@ -1219,7 +1243,7 @@ def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
                     del_r.raise_for_status()
                 else:
                     log.info(f'Radarr queue: superseding throttled duplicate "{item["title"]}" (score: {item["score"]})')
-                    set_torrent_label(item['hash'], SUPERSEDED_LABEL)
+                    supersede_torrent(item['hash'])
                 removed += 1
             except Exception as e:
                 log.warning(f'Radarr queue dedupe: could not drop "{item["title"]}": {e}')
@@ -1495,7 +1519,7 @@ def cleanup_sonarr_queue_dupes(series_id=None, dry_run=False):
                 else:
                     log.info(f'Sonarr queue: superseding throttled duplicate "{item["title"]}" '
                              f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
-                    set_torrent_label(item['hash'], SUPERSEDED_LABEL)
+                    supersede_torrent(item['hash'])
                 removed += 1
             except Exception as e:
                 log.warning(f'Sonarr queue dedupe: could not drop "{item["title"]}": {e}')
@@ -1970,8 +1994,7 @@ def handle_upgrade_import(data, source):
                     reason = 'quality upgrade'
                 log.info(f'{source}: superseding {torrent_hash} - {name} ({reason})')
                 record_activity('supersede', f'{source}: superseded "{name}" after upgrade import')
-                set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
-                move_torrent_storage(torrent_hash, SEEDING_DIR)
+                supersede_torrent(torrent_hash)
 
     # Event-driven version of /purge-unstarted-superseded: an upgrade import
     # is exactly when stale duplicates pile up, so sweep the superseded
@@ -4025,8 +4048,7 @@ def plex_dupe_fix():
             if apply:
                 try:
                     if h and tinfo:
-                        set_torrent_label(h, SUPERSEDED_LABEL)
-                        move_torrent_storage(h, SEEDING_DIR)
+                        supersede_torrent(h)
                         action['result'] = f'torrent superseded + moved to {SEEDING_DIR}'
                     else:
                         # No torrent seeding it — delete the physical file.
