@@ -2180,9 +2180,14 @@ def handle_upgrade_import(data, source):
             # branch used to remove torrents hours into their seed window --
             # four confirmed HnRs on 2026-08-25 (Fate of the Furious, Sully,
             # Rogue Nation, Disclosure Day), all deleted between 10 and 46
-            # hours in. SEED_DAYS only ever guarded the soft path.
-            # Deleting is free once the tracker has dropped the torrent, so
-            # that -- not the release group -- is the condition.
+            # hours in. Before the seed-time gate, SEED_DAYS guarded only the
+            # soft path; it now guards this one too.
+            # Unregistered is necessary but NOT sufficient: a private tracker
+            # will unregister a superseded torrent the moment the repack is
+            # posted while still enforcing its minimum seed time (The Diplomat
+            # S03E02, deleted same-day 2026-09-01 -> HnR). All three conditions
+            # -- same group, unregistered, AND seed obligation met -- are
+            # required; see should_hard_delete_on_upgrade.
             if should_hard_delete_on_upgrade(info, same_group):
                 log.info(f'{source}: immediately deleting {torrent_hash} - {name} '
                          f'(proper/repack, same group "{new_release_group}", tracker: unregistered)')
