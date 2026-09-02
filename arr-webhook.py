@@ -214,6 +214,27 @@ session = requests.Session()
 
 # ── Arr API helpers ──────────────────────────────────────────────────────────
 
+def add_year_stripped_variants(variants):
+    """Additively extend a set of lowercased title variants with year-stripped
+    forms, so a series stored as 'Very Important People (2023)' also matches
+    releases named without the disambiguation year. Originals are always kept;
+    only trailing 4-digit years are stripped — never when the year IS the whole
+    title ('1923'), and never non-year parentheticals ('the office (us)')."""
+    out = set()
+    for v in variants:
+        if not isinstance(v, str) or not v:
+            continue
+        out.add(v)
+        stripped = re.sub(r'\s*\(\d{4}\)\s*$', '', v)
+        if stripped == v:
+            # Bare trailing year, but only when preceded by other words.
+            stripped = re.sub(r'\s+\d{4}$', '', v)
+        stripped = stripped.strip()
+        if (stripped and stripped != v
+                and max((len(w) for w in stripped.split()), default=0) >= 3):
+            out.add(stripped)
+    return out
+
 def get_sonarr_series_titles(series_id):
     """Return a set of title variants for a Sonarr series. Alt titles
     ignored — same reason as Radarr: TMDB alt titles have caused
@@ -228,6 +249,7 @@ def get_sonarr_series_titles(series_id):
         data = r.json()
         titles = {data.get('title', ''), data.get('originalTitle', '')}
         normalized = {t.lower() for t in titles if t}
+        normalized = add_year_stripped_variants(normalized)
         log.info(f'Sonarr series {series_id} title variants: {normalized}')
         return normalized
     except Exception as e:
