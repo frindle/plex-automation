@@ -701,6 +701,63 @@ def _sonarr_keeper_pack_info(series_id):
         log.warning(f'Sonarr keeper lookup failed for series {series_id}: {e}')
         return set(), set()
 
+def _sonarr_latest_keeper_by_episode_key(series_id):
+    """Map each episode of this series to the downloadId Sonarr most recently
+    imported for it — { "S04E03": "<downloadId lowercased>", ... }.
+
+    Same "latest per episodeId" logic as _sonarr_keeper_pack_info (GET
+    /api/v3/history/series with eventType=3, keep the row with max `date` per
+    episodeId, downloadId lowercased, blank downloadIds skipped), but keyed by
+    SxxExx instead of downloadId. This is what lets dedup_via_sonarr's
+    per-episode pass pick a keeper when an episode was imported twice (an
+    upgrade): the flat set from _sonarr_series_imported_download_ids contains
+    BOTH downloads and can't choose between them, but the latest import is
+    unambiguous.
+
+    Returns {} on any failure — fail safe: the caller falls back to its
+    existing history/filename keeper logic."""
+    try:
+        r = requests.get(
+            f'{SONARR_URL}/api/v3/history/series',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'seriesId': series_id, 'eventType': 3},
+            timeout=15,
+        )
+        r.raise_for_status()
+        latest = {}  # episodeId -> (date_str, downloadId_lower)
+        for e in r.json():
+            did = (e.get('downloadId') or '').lower()
+            if not did:
+                continue
+            ep_id = e.get('episodeId')
+            date = e.get('date') or ''
+            prev = latest.get(ep_id)
+            if prev is None or date >= prev[0]:
+                latest[ep_id] = (date, did)
+        if not latest:
+            return {}
+        er = requests.get(
+            f'{SONARR_URL}/api/v3/episode',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'seriesId': series_id},
+            timeout=20,
+        )
+        er.raise_for_status()
+        out = {}
+        for ep in er.json():
+            did = latest.get(ep.get('id'))
+            if not did:
+                continue
+            season = ep.get('seasonNumber')
+            number = ep.get('episodeNumber')
+            if season is None or number is None:
+                continue
+            out[f'S{int(season):02d}E{int(number):02d}'] = did[1]
+        return out
+    except Exception as e:
+        log.warning(f'Sonarr latest-keeper lookup failed for series {series_id}: {e}')
+        return {}
+
 def _radarr_last_imported_download_id(movie_id):
     """Ask Radarr for the most recent successful import for a movie —
     that's Radarr's chosen keeper, and its downloadId maps to a Deluge
@@ -876,6 +933,22 @@ def select_singles_superseded_by_pack(torrent_names, keeper_ids, keeper_pack_sea
         selected.append(h)
     return selected
 
+def select_episode_dupe_losers(ep_key, hashes, latest_keeper_map):
+    """Given the SxxExx key, the list of torrent hashes matched to that episode,
+    and {ep_key: latest_keeper_downloadId_lower}, return the hashes to supersede
+    (everything that is NOT the latest-import keeper). Returns None to signal
+    'cannot decide from latest-import history, fall back' when: no entry for
+    ep_key, OR the latest keeper downloadId is not present exactly once among
+    `hashes`. NEVER returns the keeper hash. Case-insensitive on hashes."""
+    keeper_did = (latest_keeper_map or {}).get(ep_key)
+    if not keeper_did:
+        return None
+    keeper_hashes = [h for h in hashes if h.lower() == keeper_did]
+    if len(keeper_hashes) != 1:
+        return None
+    keeper = keeper_hashes[0]
+    return [h for h in hashes if h != keeper]
+
 
 def dedup_via_sonarr(dry_run=False):
     """Sonarr → Deluge dedup pass. When dry_run is True nothing is mutated
@@ -951,6 +1024,7 @@ def dedup_via_sonarr(dry_run=False):
             # flat, append-only keeper set. Used by the per-episode pass below,
             # exactly as before.
             imported_ids = _sonarr_series_imported_download_ids(series_id)
+            latest_keeper_map = _sonarr_latest_keeper_by_episode_key(series_id)
             # Season-pack ⇄ singles pass. A season pack has no SxxExx token, so
             # it never joins an episode group below; without this the singles it
             # replaced keep seeding forever. Coverage is decided from Sonarr's
@@ -1002,6 +1076,17 @@ def dedup_via_sonarr(dry_run=False):
             # same safety-first philosophy as before, just per-episode now.
             # (imported_ids already fetched above for the season-pack pass.)
             for ep, hashes in multi.items():
+                losers = select_episode_dupe_losers(ep, hashes, latest_keeper_map)
+                if losers is not None:
+                    keeper = next(h for h in hashes if h not in losers)
+                    log.info(f'  {ep} (series {series_id}: {series.get("title")}): keeper via sonarr-latest-history = {keeper[:12]}')
+                    for h in losers:
+                        action = 'WOULD relabel' if dry_run else 'relabeling'
+                        log.info(f'  {action} superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")}, {ep})')
+                        if not dry_run:
+                            supersede_torrent(h)
+                        relabeled += 1
+                    continue
                 keeper = None
                 keeper_source = None
                 history_keepers = [h for h in hashes if h.lower() in imported_ids]
