@@ -2,6 +2,8 @@ services:
   arr-webhook:
     build: .
     container_name: arr-webhook
+    labels:
+      net.unraid.docker.icon: "https://raw.githubusercontent.com/frindle/plex-automation/main/icon.png"
     restart: unless-stopped
     entrypoint: ["python", "-u", "arr-webhook.py"]
     environment:
