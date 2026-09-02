@@ -931,6 +931,39 @@ def _radarr_last_imported_download_id(movie_id):
         log.warning(f'Radarr history lookup failed for movie {movie_id}: {e}')
         return None
 
+def _radarr_last_imported_source_title(movie_id):
+    """Ask Radarr for the most recent successful import's sourceTitle —
+    the raw release name of the file Radarr actually kept. Unlike
+    `_radarr_last_imported_download_id`, this returns the newest event's
+    `sourceTitle` REGARDLESS of a blank downloadId (blank-downloadId imports
+    are exactly the case that needs it). Returns str or None (no events /
+    no usable sourceTitle / on any error)."""
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/history/movie',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            params={'movieId': movie_id, 'eventType': 'downloadFolderImported'},
+            timeout=15,
+        )
+        r.raise_for_status()
+        # Response is a list; take the most recent import event.
+        events = r.json()
+        if not events:
+            return None
+        # Sort by date desc, then take the newest event that actually has a
+        # usable sourceTitle -- iterate like _radarr_last_imported_download_id
+        # rather than trust events[0], whose sourceTitle can be blank/missing
+        # while an older import still carries a good one (gate finding).
+        events.sort(key=lambda e: e.get('date', ''), reverse=True)
+        for e in events:
+            st = e.get('sourceTitle')
+            if isinstance(st, str) and st:
+                return st
+        return None
+    except Exception as e:
+        log.warning(f'Radarr history sourceTitle lookup failed for movie {movie_id}: {e}')
+        return None
+
 def dedup_via_radarr(dry_run=False):
     log.info(f'Running Radarr → Deluge dedup pass{" (DRY RUN)" if dry_run else ""}...')
     if not RADARR_API_KEY:
@@ -1001,6 +1034,20 @@ def dedup_via_radarr(dry_run=False):
                     # imported_hash is lowercase; find the matching original-case hash
                     keepers = [h for h in matched_hashes if h.lower() == imported_hash]
                     keeper_source = 'radarr-history'
+            if not keepers:
+                # Fallback for movies whose newest import has a blank
+                # downloadId (the history lookup above drops those rows):
+                # match that import's sourceTitle against the candidate
+                # release names. Only fires on exactly one match; otherwise
+                # we still skip rather than guess.
+                st_keeper = select_episode_keeper_by_source_title(
+                    matched_hashes,
+                    {h: radarr_torrents[h].get('name', '') for h in matched_hashes},
+                    _radarr_last_imported_source_title(movie['id']),
+                )
+                if st_keeper is not None:
+                    keepers = [st_keeper]
+                    keeper_source = 'sourceTitle'
             if not keepers:
                 log.warning(f'  skip movie {movie["id"]} ({movie.get("title")}): {len(matched_hashes)} torrents matched title but no keeper identified (filename mismatch + no Radarr history) — not relabeling anything')
                 continue
