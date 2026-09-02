@@ -205,6 +205,10 @@ SONARR_BULK_SEARCH_BATCH = int(os.environ.get('SONARR_BULK_SEARCH_BATCH', '10'))
 
 PROPER_REPACK_RE = re.compile(r'\b(PROPER|REPACK|RERIP)\b', re.IGNORECASE)
 EPISODE_RE       = re.compile(r'S\d{2}E\d{2}', re.IGNORECASE)
+# Season token (S01, S01E02, ...). Group 1 is the season number. Defined here
+# (alongside EPISODE_RE) so the season-pack helpers can use it; re-used by the
+# /fix-stuck-upgrade-tags route far below.
+SEASON_RE = re.compile(r'[Ss](\d{1,2})(?:[Ee]\d{1,3})?')
 
 session = requests.Session()
 
@@ -603,6 +607,85 @@ def _sonarr_series_imported_download_ids(series_id):
         log.warning(f'Sonarr history lookup failed for series {series_id}: {e}')
         return set()
 
+def _sonarr_keeper_pack_info(series_id):
+    """Ask Sonarr which download is the CURRENT keeper for each episode (the
+    MOST-RECENT DownloadFolderImported per episodeId, eventType=3) and derive
+    the two facts the season-pack ⇄ singles decision needs:
+
+      keeper_ids          — set of lowercase downloadIds that are the current
+                            keeper for at least one episode. A single whose OWN
+                            downloadId is in here is the live file for its
+                            episode (e.g. a repack imported AFTER a pack) and
+                            must be spared.
+      keeper_pack_seasons — set of season numbers whose current keeper is a
+                            season pack / multi-episode file.
+
+    How a pack is detected: a season-pack import records a DownloadFolderImported
+    event for EACH episode it delivered, all sharing the SAME downloadId, so the
+    keeper downloadId for those episodes covers >= 2 episodes. A single covers
+    exactly one. (The event's sourceTitle can NOT be used — Sonarr writes a
+    per-episode SxxExx sourceTitle even for a pack import, confirmed live on The
+    Agency S02 where all ten events carry the pack's downloadId but per-episode
+    S02Exx titles.) A 2-parter multi-ep file trips the same >=2 rule, which is
+    fine: it too legitimately replaced the singles for the episodes it covers.
+
+    Coverage is derived from Sonarr's history, NOT from a Deluge torrent, on
+    purpose: the pack is the authoritative keeper even when its own torrent is
+    gone from the sonarr-labeled set — the real The Agency case (pack imported,
+    pack torrent absent, ten singles still seeding). Distinct from
+    _sonarr_series_imported_download_ids (flat historical set), which still
+    contains the OLD singles a pack replaced and so cannot be used here."""
+    try:
+        r = requests.get(
+            f'{SONARR_URL}/api/v3/history/series',
+            headers={'X-Api-Key': SONARR_API_KEY},
+            params={'seriesId': series_id, 'eventType': 3},
+            timeout=15,
+        )
+        r.raise_for_status()
+        latest = {}  # episodeId -> (date_str, downloadId_lower)
+        for e in r.json():
+            did = (e.get('downloadId') or '').lower()
+            if not did:
+                continue
+            ep_id = e.get('episodeId')
+            date = e.get('date') or ''
+            prev = latest.get(ep_id)
+            if prev is None or date >= prev[0]:
+                latest[ep_id] = (date, did)
+        keeper_ids = {did for _, did in latest.values()}
+        # Count episodes each keeper downloadId currently holds; a pack holds >=2.
+        ep_count = {}
+        for _, did in latest.values():
+            ep_count[did] = ep_count.get(did, 0) + 1
+        pack_dids = {did for did, n in ep_count.items() if n >= 2}
+        if not pack_dids:
+            return keeper_ids, set()
+        # Map episodeId -> seasonNumber to name the pack-kept seasons.
+        ep_season = {}
+        try:
+            er = requests.get(
+                f'{SONARR_URL}/api/v3/episode',
+                headers={'X-Api-Key': SONARR_API_KEY},
+                params={'seriesId': series_id},
+                timeout=20,
+            )
+            er.raise_for_status()
+            ep_season = {ep.get('id'): ep.get('seasonNumber') for ep in er.json()}
+        except Exception as ee:
+            log.warning(f'Sonarr episode lookup failed for series {series_id}: {ee}')
+            return keeper_ids, set()
+        keeper_pack_seasons = set()
+        for ep_id, (_, did) in latest.items():
+            if did in pack_dids:
+                season = ep_season.get(ep_id)
+                if season is not None:
+                    keeper_pack_seasons.add(int(season))
+        return keeper_ids, keeper_pack_seasons
+    except Exception as e:
+        log.warning(f'Sonarr keeper lookup failed for series {series_id}: {e}')
+        return set(), set()
+
 def _radarr_last_imported_download_id(movie_id):
     """Ask Radarr for the most recent successful import for a movie —
     that's Radarr's chosen keeper, and its downloadId maps to a Deluge
@@ -719,11 +802,77 @@ def dedup_via_radarr(dry_run=False):
     except Exception as e:
         log.error(f'Radarr dedup failed: {e}')
 
-def dedup_via_sonarr():
-    log.info('Running Sonarr → Deluge dedup pass...')
+def select_singles_superseded_by_pack(torrent_names, keeper_ids, keeper_pack_seasons):
+    """Pure decision for the season-pack ⇄ singles supersede case.
+
+    A season pack (e.g. "The.Agency.2024.S02.1080p...-Riyadh") carries no
+    SxxExx token, so it never joins an episode group in dedup_via_sonarr's
+    per-episode logic. Without this, the individual-episode singles the pack
+    replaced (which DO carry SxxExx) each land alone in their own group of
+    length 1 and are never superseded — they keep seeding forever alongside
+    the pack that made them redundant.
+
+    Args:
+        torrent_names: {hash: release_name} for the series' sonarr-labeled
+            torrents already filtered to progress >= 99% and title-matched.
+        keeper_ids: set of lowercase downloadIds that are the CURRENT keeper for
+            at least one episode (latest DownloadFolderImported per episode,
+            from _sonarr_keeper_pack_info). A single whose OWN hash is in here is
+            the live file for its episode and is spared. NOTE: must be the
+            latest-per-episode set, NOT the flat historical set from
+            _sonarr_series_imported_download_ids — an OLD single a pack replaced
+            is still in the flat set and using it here would spare exactly the
+            singles we must supersede.
+        keeper_pack_seasons: set of season numbers whose CURRENT keeper is a
+            season pack, from _sonarr_keeper_pack_info. Derived from Sonarr's
+            import history (not from a Deluge torrent) so a pack that has already
+            finished importing still counts even when its own torrent is no
+            longer in the sonarr-labeled Deluge set — the real The Agency case.
+
+    Returns the list of single-episode hashes that a keeper season pack covers
+    and that are NOT themselves the current keeper — safe to soft-supersede.
+    Strictly scoped:
+
+      * Only seasons whose live keeper is a pack (keeper_pack_seasons) are ever
+        considered; a season Sonarr still keeps via singles yields nothing.
+      * Only individual-episode torrents (EPISODE_RE present) are ever selected;
+        packs are never returned, so pack-vs-pack is untouched.
+      * A single that is itself the current keeper for its episode is never
+        selected — the REPACK caveat (a repack single imported AFTER the pack is
+        the keeper for its episode and survives).
+      * A season with only singles (no keeper pack) yields nothing — current
+        behavior for that season is preserved exactly.
+    """
+    seasons = set(keeper_pack_seasons)
+    if not seasons:
+        return []
+    keepers = {(d or '').lower() for d in keeper_ids}
+    selected = []
+    for h, name in torrent_names.items():
+        name = name or ''
+        em = EPISODE_RE.search(name)
+        if not em:
+            continue  # only individual-episode torrents are candidates
+        season = int(em.group(0)[1:3])
+        if season not in seasons:
+            continue  # no covering keeper pack for this episode's season
+        if h.lower() in keepers:
+            continue  # this single is itself the current keeper -> never touch
+        selected.append(h)
+    return selected
+
+
+def dedup_via_sonarr(dry_run=False):
+    """Sonarr → Deluge dedup pass. When dry_run is True nothing is mutated
+    (no supersede_torrent, no label/move, no record_activity) — it only logs
+    and RETURNS a report list of the season-pack ⇄ singles decisions it would
+    make: one dict per would-be-superseded single, plus the keeper pack that
+    covers it. Live-safe read-only smoketest entry."""
+    report = []  # season-pack pass decisions, populated in dry_run for review
+    log.info(f'Running Sonarr → Deluge dedup pass{" (DRY RUN)" if dry_run else ""}...')
     if not SONARR_API_KEY:
         log.info('  no SONARR_API_KEY, skip')
-        return
+        return report
     try:
         deluge_login()
         ensure_label_exists()
@@ -731,7 +880,7 @@ def dedup_via_sonarr():
         sonarr_torrents = {h: i for h, i in torrents.items() if i.get('label') in ('sonarr', SONARR_UPG_LABEL)}
         if not sonarr_torrents:
             log.info('  no sonarr-labeled torrents to check')
-            return
+            return report
         # Sonarr episodeFile lookup: per series, gather all tracked file
         # relativePaths, then per torrent that matches the series title,
         # relabel superseded if its name doesn't correspond to any tracked file.
@@ -783,8 +932,44 @@ def dedup_via_sonarr():
             ]
             if not matched_hashes:
                 continue
+            # Sonarr's own import history (downloadIds it actually used) — the
+            # flat, append-only keeper set. Used by the per-episode pass below,
+            # exactly as before.
+            imported_ids = _sonarr_series_imported_download_ids(series_id)
+            # Season-pack ⇄ singles pass. A season pack has no SxxExx token, so
+            # it never joins an episode group below; without this the singles it
+            # replaced keep seeding forever. Coverage is decided from Sonarr's
+            # import history (keeper_pack_seasons = seasons whose CURRENT keeper
+            # is a pack), NOT from a pack torrent being present in Deluge — the
+            # real The Agency case had the pack imported and gone from the
+            # sonarr-labeled set while the 10 singles kept seeding. A single that
+            # is itself the current keeper (repack imported after the pack) is
+            # spared. Seasons Sonarr still keeps via singles are left untouched.
+            keeper_ids, keeper_pack_seasons = _sonarr_keeper_pack_info(series_id)
+            matched_names = {h: sonarr_torrents[h].get('name', '') for h in matched_hashes}
+            superseded_by_pack = set(
+                select_singles_superseded_by_pack(matched_names, keeper_ids, keeper_pack_seasons)
+            )
+            for h in superseded_by_pack:
+                name = sonarr_torrents[h].get('name', '') or ''
+                em = EPISODE_RE.search(name)
+                season = int(em.group(0)[1:3]) if em else None
+                action = 'WOULD relabel' if dry_run else 'relabeling'
+                log.info(f'  {action} superseded (season pack covers it): "{name}" (series {series_id}: {series.get("title")}, S{season:02d})')
+                report.append({
+                    'series_id': series_id,
+                    'series': series.get('title'),
+                    'season': season,
+                    'single_hash': h,
+                    'single_name': name,
+                })
+                if not dry_run:
+                    supersede_torrent(h)
+                relabeled += 1
             by_episode = {}
             for h in matched_hashes:
+                if h in superseded_by_pack:
+                    continue  # already handled by the season-pack pass
                 name = sonarr_torrents[h].get('name', '')
                 m = EPISODE_RE.search(name)
                 if not m:
@@ -800,7 +985,7 @@ def dedup_via_sonarr():
             #     fallback for series where history lookup fails/is thin.
             # If neither identifies exactly one keeper, skip and warn —
             # same safety-first philosophy as before, just per-episode now.
-            imported_ids = _sonarr_series_imported_download_ids(series_id)
+            # (imported_ids already fetched above for the season-pack pass.)
             for ep, hashes in multi.items():
                 keeper = None
                 keeper_source = None
@@ -821,14 +1006,17 @@ def dedup_via_sonarr():
                 for h in hashes:
                     if h == keeper:
                         continue
-                    log.info(f'  relabeling superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")}, {ep})')
-                    supersede_torrent(h)
+                    action = 'WOULD relabel' if dry_run else 'relabeling'
+                    log.info(f'  {action} superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")}, {ep})')
+                    if not dry_run:
+                        supersede_torrent(h)
                     relabeled += 1
-        log.info(f'Sonarr dedup complete: relabeled {relabeled} superseded torrent(s)')
-        if relabeled:
+        log.info(f'Sonarr dedup complete{" (DRY RUN)" if dry_run else ""}: {"would relabel" if dry_run else "relabeled"} {relabeled} superseded torrent(s)')
+        if relabeled and not dry_run:
             record_activity('dedup', f'Sonarr dedup: relabeled {relabeled} duplicate torrent(s) as superseded')
     except Exception as e:
         log.error(f'Sonarr dedup failed: {e}')
+    return report
 
 
 # ── Unpackerr — remove torrents that had to be extracted ────────────────────
@@ -4391,7 +4579,7 @@ def import_audit():
 #
 # Defaults to dry-run (?apply=1 to actually flip labels), matching the
 # convention every other bulk-action endpoint here already uses.
-SEASON_RE = re.compile(r'[Ss](\d{1,2})(?:[Ee]\d{1,3})?')
+# (SEASON_RE is defined near EPISODE_RE at the top of the file.)
 
 @app.route('/fix-stuck-upgrade-tags', methods=['GET', 'POST'])
 def fix_stuck_upgrade_tags():
@@ -4694,7 +4882,7 @@ def torrent_relabel():
 def run_dedup():
     dry_run = request.args.get('dry_run', '').lower() in ('1', 'true', 'yes')
     threading.Thread(target=dedup_via_radarr, args=(dry_run,), daemon=True).start()
-    threading.Thread(target=dedup_via_sonarr, daemon=True).start()
+    threading.Thread(target=dedup_via_sonarr, args=(dry_run,), daemon=True).start()
     return jsonify({
         'ok': True,
         'dry_run': dry_run,
