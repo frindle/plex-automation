@@ -3299,6 +3299,43 @@ def priority_scheduler():
         time.sleep(3600)
         prioritize_normal_torrents()
 
+def refresh_metadata_on_grab(data, source):
+    """Best-effort metadata refresh on Grab.
+
+    Penn hit this live: an episode downloaded but Sonarr refused to import
+    because the episode title in its DB was still 'TBA' (metadata never
+    refreshed after grab). Pulling fresh metadata at grab time via a
+    RefreshSeries/RefreshMovie command fixes it. Best-effort only — any
+    failure is logged and swallowed, never raised out of this function.
+    """
+    try:
+        if source == 'Sonarr':
+            series_id = (data.get('series') or {}).get('id')
+            if not series_id:
+                log.warning('refresh_metadata_on_grab: no series.id in Grab payload; skipping RefreshSeries')
+                return
+            requests.post(
+                f'{SONARR_URL}/api/v3/command',
+                headers={'X-Api-Key': SONARR_API_KEY, 'Content-Type': 'application/json'},
+                json={'name': 'RefreshSeries', 'seriesId': series_id},
+                timeout=20,
+            ).raise_for_status()
+        elif source == 'Radarr':
+            movie_id = (data.get('movie') or {}).get('id')
+            if not movie_id:
+                log.warning('refresh_metadata_on_grab: no movie.id in Grab payload; skipping RefreshMovie')
+                return
+            requests.post(
+                f'{RADARR_URL}/api/v3/command',
+                headers={'X-Api-Key': RADARR_API_KEY, 'Content-Type': 'application/json'},
+                json={'name': 'RefreshMovie', 'movieIds': [movie_id]},
+                timeout=20,
+            ).raise_for_status()
+        else:
+            log.warning(f'refresh_metadata_on_grab: unknown source {source!r}; skipping')
+    except Exception as e:
+        log.warning(f'refresh_metadata_on_grab ({source}) failed (best-effort): {e}')
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 
@@ -3309,6 +3346,7 @@ def radarr_webhook():
     log.info(f'Radarr event: {event} | isUpgrade: {data.get("isUpgrade")} | downloadId: {data.get("downloadId")}')
     if event == 'Grab':
         threading.Thread(target=handle_grab, args=(data, 'Radarr'), daemon=True).start()
+        threading.Thread(target=refresh_metadata_on_grab, args=(data, 'Radarr'), daemon=True).start()
     elif event == 'Download':
         if data.get('isUpgrade'):
             handle_upgrade_import(data, 'Radarr')
@@ -3325,6 +3363,7 @@ def sonarr_webhook():
     log.info(f'Sonarr event: {event} | isUpgrade: {data.get("isUpgrade")} | downloadId: {data.get("downloadId")}')
     if event == 'Grab':
         threading.Thread(target=handle_grab, args=(data, 'Sonarr'), daemon=True).start()
+        threading.Thread(target=refresh_metadata_on_grab, args=(data, 'Sonarr'), daemon=True).start()
     elif event == 'Download':
         if data.get('isUpgrade'):
             handle_upgrade_import(data, 'Sonarr')
