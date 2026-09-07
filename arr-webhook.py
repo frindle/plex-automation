@@ -1501,10 +1501,11 @@ def cleanup_unpacked_torrents():
                 # torrent no longer in Deluge, drop from state
                 state.pop(h, None)
                 continue
-            age = now - state[h].get('first_seen_rar_at', now)
-            if age >= threshold:
-                log.info(f'[unpack] removing rar-torrent aged {age/86400:.1f}d: {state[h].get("name")}')
-                record_activity('cleanup', f'Removed rar-torrent "{state[h].get("name")}" (aged {age/86400:.1f}d past the {SEED_DAYS}-day window)')
+            info = torrents[h]
+            seeded = info.get('seeding_time', 0) or 0
+            if seeded >= threshold:
+                log.info(f'[unpack] removing rar-torrent (seeded {seeded/86400:.1f}d): {state[h].get("name")}')
+                record_activity('cleanup', f'Removed rar-torrent "{state[h].get("name")}" (seeded {seeded/86400:.1f}d, past the {SEED_DAYS}-day window)')
                 remove_torrent(h)
                 state.pop(h, None)
                 removed += 1
