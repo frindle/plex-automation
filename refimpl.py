@@ -33,16 +33,14 @@ def route_series_to_asian(data):
         if series.get('rootFolderPath') == ASIAN_TV_ROOT:
             return None
         requests.put(f'{SONARR_URL}/api/v3/series/editor',
-                     headers={'X-Api-Key': SONARR_API_KEY},
+                     headers={'X-Api-Key': SONARR_API_KEY}, timeout=30,
                      json={'seriesIds': [series_id],
                            'rootFolderPath': ASIAN_TV_ROOT,
-                           'moveFiles': True},
-                     timeout=30)
+                           'moveFiles': True})
         log.info(f'Asian TV routing: moved series {series_id} ({lang}) to {ASIAN_TV_ROOT}')
         return ASIAN_TV_ROOT
     except Exception as e:
-        log.error(f'Asian TV routing failed: {e}')
-        return None
+        log.error(f'Asian TV routing failed: {e}')  # falls through to implicit None
 
 
 '''
