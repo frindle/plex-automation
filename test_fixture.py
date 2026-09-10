@@ -134,6 +134,34 @@ def get_called_for(data):
     return calls['n'] > 0
 
 
+def moved_when_get_errors(series_obj):
+    """A 5xx from Sonarr's series GET must NOT move the series -- the error is
+    caught and routing aborts. Kills a mutant that drops `raise_for_status()`:
+    without it, the bad response would be treated as a real CJK series and moved."""
+    cap = {}
+
+    def fake_get(url, *a, **k):
+        r = _Resp(series_obj)
+        def boom():
+            raise Exception('500 Server Error')
+        r.raise_for_status = boom
+        return r
+
+    def fake_put(url, *a, **k):
+        cap['put'] = True
+        return _Resp({})
+
+    orig_get, orig_put = target.requests.get, target.requests.put
+    target.requests.get = fake_get
+    target.requests.put = fake_put
+    try:
+        target.route_series_to_asian({'series': {'id': series_obj.get('id')}})
+    finally:
+        target.requests.get = orig_get
+        target.requests.put = orig_put
+    return cap.get('put', False)
+
+
 _KOREAN = {'id': 1, 'originalLanguage': {'name': 'Korean'}, 'rootFolderPath': DEFAULT}
 _ENGLISH = {'id': 2, 'originalLanguage': {'name': 'English'}, 'rootFolderPath': DEFAULT}
 _JP_ALREADY = {'id': 3, 'originalLanguage': {'name': 'Japanese'}, 'rootFolderPath': ASIAN}
@@ -167,6 +195,8 @@ CASES = [
      lambda: get_called_for({'series': {}}), False),
     ("unknown event (not Grab/Download/SeriesAdd) does NOT route",
      lambda: webhook_routes('Test', _KOREAN), False),
+    ("Sonarr GET 5xx -> series NOT moved (error caught)",
+     lambda: moved_when_get_errors(_KOREAN), False),
 ]
 
 
