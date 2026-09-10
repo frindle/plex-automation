@@ -114,6 +114,26 @@ def webhook_routes(event, series_obj):
     return got
 
 
+def get_called_for(data):
+    """True iff route_series_to_asian issues the Sonarr GET for this payload.
+    Proves the `if not series_id` guard short-circuits BEFORE any HTTP (a case
+    that just checks the return value can't -- the exception path also yields
+    None)."""
+    calls = {'n': 0}
+
+    def fake_get(url, *a, **k):
+        calls['n'] += 1
+        return _Resp({})
+
+    orig = target.requests.get
+    target.requests.get = fake_get
+    try:
+        target.route_series_to_asian(data)
+    finally:
+        target.requests.get = orig
+    return calls['n'] > 0
+
+
 _KOREAN = {'id': 1, 'originalLanguage': {'name': 'Korean'}, 'rootFolderPath': DEFAULT}
 _ENGLISH = {'id': 2, 'originalLanguage': {'name': 'English'}, 'rootFolderPath': DEFAULT}
 _JP_ALREADY = {'id': 3, 'originalLanguage': {'name': 'Japanese'}, 'rootFolderPath': ASIAN}
@@ -143,6 +163,10 @@ CASES = [
     # --- the SeriesAdd WIRING in sonarr_webhook() (direct calls can't see it) ---
     ("SeriesAdd webhook routes a korean series", lambda: webhook_routes('SeriesAdd', _KOREAN), True),
     ("Grab webhook does NOT route (wrong event)", lambda: webhook_routes('Grab', _KOREAN), False),
+    ("missing series id -> no Sonarr GET (guard short-circuits)",
+     lambda: get_called_for({'series': {}}), False),
+    ("unknown event (not Grab/Download/SeriesAdd) does NOT route",
+     lambda: webhook_routes('Test', _KOREAN), False),
 ]
 
 
