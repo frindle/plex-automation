@@ -93,10 +93,6 @@ SUPERSEDED_LABEL  = 'superseded'
 LIBRARY_SEED_LABEL = 'library-seed'
 SONARR_UPG_LABEL  = os.environ.get('SONARR_UPGRADE_LABEL', 'sonarr-upgrade')
 RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
-# Rolling cutoff: Radarr grabs for movies released more than N years ago
-# get throttled into the -upgrade lane even on first fetch. Ages
-# automatically.
-OLD_GAP_YEARS     = int(os.environ.get('OLD_GAP_YEARS', '10'))
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
 # Weekly stalled-seed review (every LABELED torrent, including
@@ -2660,10 +2656,13 @@ def is_upgrade_sonarr(data):
 
 def is_upgrade_radarr(data):
     """
-    Return a reason string if this grab should be throttled:
-      - 'upgrade' — movie already has a file
-      - 'old_gap' — no file, but release year is older than the rolling cutoff
-    Returns None otherwise.
+    Return 'upgrade' only when this grab is a genuine upgrade -- i.e. the movie
+    already has a file on disk. Otherwise None.
+
+    The '-upgrade' throttle label is reserved for real upgrades. A first-time
+    grab of an old catalog title is a NEW download, not an upgrade, and must
+    keep the plain 'radarr' label (previously such old, no-file grabs were
+    mislabeled '-upgrade' via an 'old_gap' branch -- removed).
     """
     try:
         movie_id = data.get('movie', {}).get('id')
@@ -2678,9 +2677,6 @@ def is_upgrade_radarr(data):
         movie = r.json()
         if movie.get('hasFile'):
             return 'upgrade'
-        year = movie.get('year')
-        if year and year < (datetime.now().year - OLD_GAP_YEARS):
-            return 'old_gap'
         return None
     except Exception as e:
         log.error(f"Radarr upgrade check failed: {e}")

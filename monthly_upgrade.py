@@ -1,13 +1,7 @@
 import os
 import time
-from datetime import datetime
 
 import requests
-
-# Rolling cutoff: gap-fills for movies released more than N years ago
-# ride the throttled -upgrade lane. Keeps aging automatic — no manual
-# year bumps every January.
-OLD_GAP_YEARS = int(os.environ.get('OLD_GAP_YEARS', '10'))
 
 DELUGE_URL = os.environ.get('DELUGE_URL')
 DELUGE_PASSWORD = os.environ.get('DELUGE_PASSWORD')
@@ -86,16 +80,12 @@ for torrent_hash, info in radarr_torrents.items():
     if not movie_id:
         continue
     movie = movies.get(movie_id)
-    # Two throttle cases:
-    #   1. hasFile=True → real upgrade of an existing file
-    #   2. hasFile=False + year older than the rolling cutoff → filling an
-    #      old library gap; not urgent, don't let it hog bandwidth from
-    #      active releases.
-    year = movie.get('year') if movie else None
-    old_cutoff = datetime.now().year - OLD_GAP_YEARS
-    is_old_gap = movie and not movie.get('hasFile') and year and year < old_cutoff
-    if movie and (movie.get('hasFile') or is_old_gap):
-        reason = 'upgrade' if movie.get('hasFile') else f'old gap-fill (year={year}, cutoff={old_cutoff})'
+    # Throttle ONLY genuine upgrades (hasFile=True → replacing an existing
+    # file). The '-upgrade' label is reserved for real upgrades; a first-time
+    # grab of an old catalog title is a NEW download and keeps the plain
+    # 'radarr' label (the old 'old_gap' throttle branch was removed).
+    if movie and movie.get('hasFile'):
+        reason = 'upgrade'
         print(f'  Relabeling ({reason}): {info.get("name")}')
         # Ensure label exists
         labels_r = s.post(f'{DELUGE_URL}/json', json={'method':'label.get_labels','params':[],'id':4})
