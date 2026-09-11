@@ -3352,6 +3352,47 @@ def radarr_webhook():
             threading.Thread(target=handle_import_relabel, args=(data, 'Radarr'), daemon=True).start()
     return jsonify({'status': 'ok'}), 200
 
+ASIAN_TV_ROOT = '/data/Media/TV Shows - Asian'
+ASIAN_LANGUAGES = {'korean', 'japanese', 'chinese', 'cantonese', 'mandarin'}
+
+def route_series_to_asian(data):
+    """Route a newly added CJK series to the separate Asian TV library.
+
+    Sonarr drops every new series into the default root; this pulls the fresh
+    series record, and if its originalLanguage is Korean/Japanese/Chinese
+    (incl. Cantonese/Mandarin) it moves the series — files included — to
+    /data/Media/TV Shows - Asian so Plex's 'Asian TV' library picks it up.
+    Best-effort only: any failure is logged and swallowed, never raised out of
+    the webhook thread. Returns the Asian root on a successful move, else None.
+    """
+    try:
+        series_id = (data.get('series') or {}).get('id')
+        if not series_id:
+            return None
+        resp = requests.get(
+            f'{SONARR_URL}/api/v3/series/{series_id}',
+            headers={'X-Api-Key': SONARR_API_KEY}, timeout=20,
+        )
+        resp.raise_for_status()
+        series = resp.json() or {}
+        language = (series.get('originalLanguage') or {}).get('name', '')
+        if str(language).lower() not in ASIAN_LANGUAGES:
+            return None
+        root = (series.get('rootFolderPath') or '').strip().lower()
+        if root == ASIAN_TV_ROOT.lower():
+            log.info(f'Series {series_id} already in Asian root; skipping move')
+            return None
+        requests.put(
+            f'{SONARR_URL}/api/v3/series/editor',
+            headers={'X-Api-Key': SONARR_API_KEY, 'Content-Type': 'application/json'}, timeout=60,
+            json={'seriesIds': [series_id], 'rootFolderPath': ASIAN_TV_ROOT, 'moveFiles': True},
+        ).raise_for_status()
+        log.info(f'Routed series {series_id} ({language}) to {ASIAN_TV_ROOT}')
+        return ASIAN_TV_ROOT
+    except Exception as e:
+        # Best-effort: log and fall through to the implicit None return.
+        log.warning(f'route_series_to_asian failed (best-effort): {e}')
+
 @app.route('/webhook/sonarr', methods=['POST'])
 def sonarr_webhook():
     data = request.get_json(force=True, silent=True) or {}
@@ -3360,6 +3401,9 @@ def sonarr_webhook():
     if event == 'Grab':
         threading.Thread(target=handle_grab, args=(data, 'Sonarr'), daemon=True).start()
         threading.Thread(target=refresh_metadata_on_grab, args=(data, 'Sonarr'), daemon=True).start()
+    elif event == 'SeriesAdd':
+        # New series land in the default root; route CJK ones to the Asian library.
+        threading.Thread(target=route_series_to_asian, args=(data,), daemon=True).start()
     elif event == 'Download':
         if data.get('isUpgrade'):
             handle_upgrade_import(data, 'Sonarr')
