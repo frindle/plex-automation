@@ -375,9 +375,50 @@ def move_torrent_storage(torrent_hash, dest):
     except Exception as e:
         log.warning(f'Failed to verify move for {torrent_hash}: {e}')
 
+def _torrent_has_local_data(torrent_hash):
+    """True if Deluge reports data on disk for this torrent (total_done > 0).
+
+    FAIL-SAFE toward 'has data': on any lookup error, missing torrent, or
+    ambiguous result this returns True, so we never withhold the normal
+    supersede move (or trigger the orphan reaper) on a transient glitch. A
+    mount race makes a *complete* torrent momentarily read total_done=0 —
+    treating 'unknown' as 'has data' is what keeps us from acting on that."""
+    try:
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.get_torrents_status',
+                  'params': [{'id': [torrent_hash]}, ['total_done']], 'id': 8},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        st = (resp.json().get('result') or {}).get(torrent_hash)
+        if not st:
+            return True  # unknown torrent -> don't withhold the move
+        return (st.get('total_done') or 0) > 0
+    except Exception as e:
+        log.warning(f'{torrent_hash}: data-size probe failed ({e}); assuming data present')
+        return True
+
 def supersede_torrent(torrent_hash):
     set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
-    move_torrent_storage(torrent_hash, SEEDING_DIR)
+    # Guard the move: core.move_storage on a torrent whose files are already
+    # gone does NOT fail — it relocates the now-fileless torrent to SEEDING_DIR,
+    # where it sits at 0% forever, never accrues seeding_time, and so
+    # cleanup_superseded (which gates on the seed window) can never reap it.
+    # That is exactly the pile of 0%/paused "superseded" orphans. Only move
+    # when the data is actually present. Hardlinked imports (the intended *arr
+    # config) keep the download inode, so this guard is a no-op in the normal
+    # case; it only bites when a non-hardlinked import already destroyed the
+    # old copy before the supersede ran.
+    if _torrent_has_local_data(torrent_hash):
+        move_torrent_storage(torrent_hash, SEEDING_DIR)
+    else:
+        log.warning(f'{torrent_hash}: no local data at supersede time — labeled '
+                    f'superseded but NOT moved (a move would create a 0% orphan '
+                    f'at {SEEDING_DIR})')
+        record_activity('supersede-no-data',
+                        f'torrent {torrent_hash} superseded with no local data — '
+                        f'not moved (orphan avoided; reaped by cleanup)')
 
 def remove_torrent(torrent_hash, remove_data=True):
     resp = session.post(
@@ -514,6 +555,12 @@ def cleanup_superseded():
             log.warning("Cleanup: no torrents returned from Deluge, skipping")
             return
         threshold_seconds = SEED_DAYS * 86400
+        # Mount-health gate for the orphan reaper below: if the shfs mount
+        # dropped, EVERY torrent reads 0% and looks like an orphan — the exact
+        # 54-errored mount-race signature. Only reap 0%-no-data orphans when at
+        # least one torrent clearly has data (mount is up); otherwise skip the
+        # orphan path this cycle and let the mount recover.
+        mount_healthy = any((i.get('progress') or 0) > 0 for i in torrents.values())
         removed = 0
         for torrent_hash, info in torrents.items():
             if info.get('label') != SUPERSEDED_LABEL:
@@ -521,6 +568,22 @@ def cleanup_superseded():
             if info.get('seeding_time', 0) >= threshold_seconds:
                 log.info(f'Cleanup: removing {info.get("name")} (seeded {info["seeding_time"]/86400:.1f} days)')
                 remove_torrent(torrent_hash)
+                removed += 1
+                continue
+            # Orphan reaper: a superseded torrent stuck at 0% with no data on
+            # disk never accrues seeding_time, so the seed-window gate above can
+            # NEVER reap it — it piles up forever (the 40 paused-0% orphans from
+            # the pre-hardlink supersede-after-delete bug). It owes no seed
+            # obligation (you can't hit-and-run on data you don't have), so it's
+            # safe to drop. remove_data=False so a transient mount-race false 0%
+            # can never delete real files; a true orphan has no files to leave.
+            if mount_healthy and (info.get('progress') or 0) == 0 \
+                    and not _torrent_has_local_data(torrent_hash):
+                log.info(f'Cleanup: removing 0% superseded orphan {info.get("name")} '
+                         f'(no local data — would never meet the seed window)')
+                remove_torrent(torrent_hash, remove_data=False)
+                record_activity('cleanup',
+                                f'Removed superseded orphan "{info.get("name")}" (no data on disk)')
                 removed += 1
         log.info(f'Cleanup complete: removed {removed} superseded torrents')
         if removed:
