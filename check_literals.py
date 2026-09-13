@@ -30,7 +30,7 @@ import sys
 TARGET = pathlib.Path('arr-webhook.py')
 
 # frozen from TASK.md -- re-run `ollama-dispatch-scaffold --freeze-literals .`
-LITERALS = [[None, 'HnR guard'], [None, 'hnr-guard'], [None, 'remove_data = False'], [None, 'info=None'], [None, 'in <path>:'], ['app/api/x/route.ts', '- in app/api/x/route.ts: ']]
+LITERALS = [[None, 'HnR guard'], [None, 'hnr-guard'], [None, 'remove_data = False'], [None, 'info=None']]
 
 
 def _parse_must_contain(task_text):

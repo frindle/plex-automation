@@ -64,12 +64,6 @@ Behaviour that must NOT change:
 while one of these is absent from the changed files, the verify does not
 enforce the spec -- that is a benign verify, caught mechanically.)
 
-(A bare bullet checks the default target. To PIN a literal to a specific file --
-useful when a fix spans a helper file and the route/wiring that calls it --
-prefix the bullet with `in <path>:`, e.g.
-`- in app/api/x/route.ts: ` followed by a backtick-quoted token. Then that
-token is required in THAT file, not the target.)
-
 ## Scope
 
 Only edit `arr-webhook.py`; do not edit `verify.sh`, `test_fixture.py` or `TASK.md`.
