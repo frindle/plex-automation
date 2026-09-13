@@ -420,7 +420,25 @@ def supersede_torrent(torrent_hash):
                         f'torrent {torrent_hash} superseded with no local data — '
                         f'not moved (orphan avoided; reaped by cleanup)')
 
-def remove_torrent(torrent_hash, remove_data=True):
+def remove_torrent(torrent_hash, remove_data=True, info=None):
+    if remove_data:
+        if info is None:
+            try:
+                resp = session.post(
+                    f'{DELUGE_URL}/json',
+                    json={'method': 'core.get_torrent_status',
+                          'params': [torrent_hash, ['tracker_status', 'seeding_time']], 'id': 8},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                info = (resp.json().get('result') or {})
+            except Exception as e:
+                log.warning(f'{torrent_hash}: status fetch failed ({e}); assuming still registered — keeping files'); info = {}  # noqa: E702
+        seeding_time = info.get('seeding_time') or 0
+        if not torrent_is_unregistered(info) and seeding_time < SEED_DAYS * 86400:
+            log.warning(f'HnR guard {torrent_hash}: tracker still knows it (seeded {seeding_time}s < {SEED_DAYS}d) — removing entry only, keeping files')
+            record_activity('hnr-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (registered, seeded {seeding_time}s < {SEED_DAYS * 86400}s)')
+            remove_data = False
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={'method': 'core.remove_torrent', 'params': [torrent_hash, remove_data], 'id': 7},
@@ -3265,11 +3283,8 @@ def purge_stalled_upgrade_torrents(label=RADARR_UPG_LABEL):
                 else:
                     log.info(f'Skipping in-progress upgrade: {i.get("name")} ({total_done/1024/1024:.1f}MB downloaded)')
         if to_remove:
-            session.post(
-                f'{DELUGE_URL}/json',
-                json={'method': 'core.remove_torrents', 'params': [to_remove, False], 'id': 9},
-                timeout=30
-            )
+            for _h in to_remove:
+                remove_torrent(_h, remove_data=False)
             log.info(f'Purged {len(to_remove)} stalled upgrade torrents')
         else:
             log.info('No stalled upgrade torrents to purge')
@@ -3722,11 +3737,7 @@ def purge_non_radarr():
             chunk = hashes[i:i + BATCH]
             for h in chunk:
                 try:
-                    session.post(
-                        f'{DELUGE_URL}/json',
-                        json={'method': 'core.remove_torrent', 'params': [h, True], 'id': 66},
-                        timeout=15,
-                    ).raise_for_status()
+                    remove_torrent(h)
                     removed += 1
                 except Exception as e:
                     errors.append({'hash': h, 'error': str(e)})
