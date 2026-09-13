@@ -29,10 +29,13 @@ BIG = SEED_SECS + 1                       # obligation met
 
 
 class _Resp:
-    def __init__(self, payload):
+    def __init__(self, payload, raise_error=False):
         self._payload = payload
+        self._raise_error = raise_error
 
     def raise_for_status(self):
+        if self._raise_error:
+            raise RuntimeError('HTTP 500 from Deluge')
         return None
 
     def json(self):
@@ -41,11 +44,16 @@ class _Resp:
 
 class _FakeSession:
     """Intercepts every Deluge RPC. Returns the configured status for
-    core.get_torrent_status; records (hash, remove_data) for every remove."""
-    def __init__(self, status_result=None, raise_on_status=False):
-        self.status_result = status_result
-        self.raise_on_status = raise_on_status
-        self.removes = []  # list of (hash_or_'BATCH', remove_data_bool)
+    core.get_torrent_status (and records how it was called); records
+    (hash, remove_data) for every remove RPC."""
+    def __init__(self, status_result=None, raise_on_status=False,
+                 status_http_error=False, status_json_result=None):
+        self.status_result = status_result            # info dict .json() returns
+        self.raise_on_status = raise_on_status         # the fetch POST itself raises
+        self.status_http_error = status_http_error     # response.raise_for_status() raises
+        self.status_json_result = status_json_result   # info seen ONLY if raise_for_status is skipped
+        self.removes = []   # list of (hash_or_'BATCH', remove_data_bool)
+        self.fetch = None   # (rpc_id, timeout, sorted(fields)) of the status fetch
 
     def post(self, url, json=None, timeout=None):
         method = (json or {}).get('method')
@@ -53,7 +61,11 @@ class _FakeSession:
         if method == 'core.get_torrent_status':
             if self.raise_on_status:
                 raise RuntimeError('deluge unreachable')
-            return _Resp({'result': self.status_result})
+            fields = params[1] if len(params) > 1 else []
+            self.fetch = ((json or {}).get('id'), timeout, sorted(fields))
+            payload = {'result': self.status_json_result if self.status_http_error
+                       else self.status_result}
+            return _Resp(payload, raise_error=self.status_http_error)
         if method == 'core.remove_torrent':
             self.removes.append((params[0], bool(params[1])))
             return _Resp({'result': True})
@@ -63,20 +75,35 @@ class _FakeSession:
         return _Resp({'result': None})
 
 
-def deleted_data(status_result=None, raise_on_status=False, **kwargs):
-    """Call the real wrapper with a fake session; return whether the actual
-    core.remove_torrent RPC that fired asked Deluge to DELETE the data."""
-    fake = _FakeSession(status_result=status_result, raise_on_status=raise_on_status)
+def _run(status_result=None, raise_on_status=False, status_http_error=False,
+         status_json_result=None, **kwargs):
+    fake = _FakeSession(status_result=status_result, raise_on_status=raise_on_status,
+                        status_http_error=status_http_error,
+                        status_json_result=status_json_result)
     orig = target.session
     target.session = fake
     try:
         target.remove_torrent('abc123hash', **kwargs)
     finally:
         target.session = orig
-    # the guarded wrapper always fires exactly one core.remove_torrent
+    return fake
+
+
+def deleted_data(**kw):
+    """Return whether the actual core.remove_torrent RPC that fired asked Deluge
+    to DELETE the data -- the guard DECISION, not a proxy."""
+    fake = _run(**kw)
     single = [rd for (h, rd) in fake.removes if h != 'BATCH']
     assert single, 'wrapper fired no core.remove_torrent'
     return single[-1]
+
+
+def fetch_meta():
+    """The (rpc_id, timeout, sorted fields) the guard used to fetch status when
+    the caller passed no info. Pins id/timeout/fields so a mutant of any of them
+    is caught, and proves the fetch actually requests the fields the guard reads."""
+    fake = _run(status_result=info(REG, SMALL))
+    return fake.fetch
 
 
 def info(tracker_status, seeding_time):
@@ -95,7 +122,7 @@ def _fn_src(name):
     return None
 
 
-def bypass_routed(fn_name, forbidden_rpc):
+def bypass_routed(fn_name, forbidden_rpc, must_contain=None):
     src = _fn_src(fn_name)
     if src is None:
         return 'MISSING_FN'
@@ -104,6 +131,11 @@ def bypass_routed(fn_name, forbidden_rpc):
         return 'STILL_DIRECT_RPC'
     if 'remove_torrent(' not in src:
         return 'NO_WRAPPER_CALL'
+    # for the unseed bypass: the wrapper must be called keeping files, so a
+    # mutant that flips remove_data=False -> True (re-arming a data delete on
+    # the stalled-upgrade sweep) is caught here.
+    if must_contain is not None and must_contain not in src:
+        return 'WRONG_REMOVE_DATA'
     return 'ROUTED'
 
 
@@ -120,6 +152,12 @@ CASES = [
     # (d) status fetch fails -> must fail SAFE (assume registered, keep files)
     ("status fetch fails -> data delete REFUSED (fail-safe)",
      lambda: deleted_data(raise_on_status=True), False),
+    # (d2) response.raise_for_status() must be honoured: an HTTP-error status
+    # response must NOT be parsed as valid info. If the guard skips
+    # raise_for_status it would read UNREG+BIG and wrongly ALLOW deletion; with
+    # it, the error is caught -> info={} -> fail-safe REFUSE.
+    ("http-error status response -> raise_for_status honoured -> REFUSED",
+     lambda: deleted_data(status_http_error=True, status_json_result=info(UNREG, BIG)), False),
     # (e) explicit remove_data=False must stay False regardless (unseed path)
     ("explicit remove_data=False stays entry-only (files kept)",
      lambda: deleted_data(status_result=info(REG, BIG), remove_data=False), False),
@@ -139,8 +177,13 @@ CASES = [
     ("purge_non_radarr routed through wrapper",
      lambda: bypass_routed('purge_non_radarr', 'core.remove_torrent'), 'ROUTED'),
     # (k) bypass routing: purge_stalled_upgrade_torrents no longer hits raw RPC
-    ("purge_stalled_upgrade_torrents routed through wrapper",
-     lambda: bypass_routed('purge_stalled_upgrade_torrents', 'core.remove_torrents'), 'ROUTED'),
+    #     AND still keeps files (remove_data=False) -- catches a False->True flip
+    ("purge_stalled_upgrade_torrents routed through wrapper, keeps files",
+     lambda: bypass_routed('purge_stalled_upgrade_torrents', 'core.remove_torrents',
+                           must_contain='remove_data=False'), 'ROUTED'),
+    # (l) the guard fetches status with the exact id/timeout/fields the spec pins
+    ("guard fetches status with id 8, timeout 10, the two read fields",
+     lambda: fetch_meta(), (8, 10, ['seeding_time', 'tracker_status'])),
 ]
 
 
