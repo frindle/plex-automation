@@ -274,8 +274,8 @@ def _is_admin(email):
 
 def safe_join(root, rel_path):
     rel_path = rel_path or ''
-    full = os.path.normpath(os.path.join(root, rel_path))
-    root_n = os.path.normpath(root)
+    full = os.path.realpath(os.path.join(root, rel_path))
+    root_n = os.path.realpath(root)
     if full != root_n and not full.startswith(root_n + os.sep):
         raise ValueError('Path traversal attempt')
     return full
