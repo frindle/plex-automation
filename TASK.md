@@ -31,11 +31,10 @@ any data (`progress == 0`, nothing to owe). Tracker registration status is NOT
 a licence to delete: unregistered + seed-unmet MUST keep the files. This mirrors
 the seed gate already in `should_hard_delete_on_upgrade`.
 
-## Entry points (edit ONLY `arr-webhook.py` and `test_maintenance.py`)
-Only edit `arr-webhook.py` and `test_maintenance.py`.
+## Entry points (edit ONLY `arr-webhook.py`)
+Only edit `arr-webhook.py`.
 - `arr-webhook.py:438` — the HnR guard `if` line inside `remove_torrent`.
 - `arr-webhook.py:628` — the final `and (...)` condition in `queued_superseded_targets`.
-- `test_maintenance.py:202` — the assertion that reads `== ['a', 'e']`.
 
 Do NOT touch `should_hard_delete_on_upgrade` (already correct), any other
 function, or `verify.sh` / `fixture_hnr.py`.
@@ -49,8 +48,6 @@ function, or `verify.sh` / `fixture_hnr.py`.
 2. In `queued_superseded_targets`, replace the `torrent_is_unregistered(info)`
    branch with a seed-met test so only zero-progress OR seed-met torrents purge:
    `and ((info.get('progress') or 0) == 0 or (info.get('seeding_time') or 0) >= SEED_DAYS * 86400)`
-3. In `test_maintenance.py`, change the expectation from `== ['a', 'e']` to
-   `== ['a']` (the unregistered-but-seed-unmet case `'e'` must no longer purge).
 
 ## Must contain (literal tokens that must appear in arr-webhook.py after the change)
 - `if seeding_time < SEED_DAYS * 86400:`
@@ -58,4 +55,4 @@ function, or `verify.sh` / `fixture_hnr.py`.
 
 ## Loop
 Run `bash verify.sh` after every edit and fix the named FAILs until it prints
-`VERIFY_OK`. Only edit the three files named above; do not edit `verify.sh`.
+`VERIFY_OK`. Only edit `arr-webhook.py`; do not edit `verify.sh`.
