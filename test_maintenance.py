@@ -199,7 +199,7 @@ def run():
         'e': {'label': aw.SUPERSEDED_LABEL, 'state': 'Queued', 'name': 'e', 'progress': 100,
               'tracker_status': 'Error: Unregistered torrent'},
     })
-    assert [t['hash'] for t in targets] == ['a', 'e'], targets
+    assert [t['hash'] for t in targets] == ['a'], targets
 
     # ── tracker "unregistered" detection ─────────────────────────────────
     # Unknown/blank/transient statuses must read as "still registered": the
