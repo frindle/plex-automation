@@ -435,9 +435,9 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
             except Exception as e:
                 log.warning(f'{torrent_hash}: status fetch failed ({e}); assuming still registered — keeping files'); info = {}  # noqa: E702
         seeding_time = info.get('seeding_time') or 0
-        if not torrent_is_unregistered(info) and seeding_time < SEED_DAYS * 86400:
-            log.warning(f'HnR guard {torrent_hash}: tracker still knows it (seeded {seeding_time}s < {SEED_DAYS}d) — removing entry only, keeping files')
-            record_activity('hnr-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (registered, seeded {seeding_time}s < {SEED_DAYS * 86400}s)')
+        if seeding_time < SEED_DAYS * 86400:
+            log.warning(f'HnR guard {torrent_hash}: seed obligation unmet (seeded {seeding_time}s < {SEED_DAYS}d) — removing entry only, keeping files')
+            record_activity('hnr-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (seed obligation unmet: seeded {seeding_time}s < {SEED_DAYS * 86400}s)')
             remove_data = False
     resp = session.post(
         f'{DELUGE_URL}/json',
@@ -622,10 +622,13 @@ def queued_superseded_targets(torrents):
         # "Nothing to lose" holds only while nothing has been downloaded. A
         # Queued torrent sitting at partial or full progress HAS taken data
         # from the tracker and can still owe seed time, so purging it is a
-        # hit-and-run in the same way the same-group delete was. Once the
-        # tracker has dropped the torrent it can't owe anything, so that
+        # hit-and-run in the same way the same-group delete was. Tracker
+        # registration status is NOT a licence to delete: an unregistered
+        # torrent that hasn't met its seed window still owes the tracker
+        # (private trackers enforce minimum seed time even after dropping a
+        # superseded release). Only zero progress or a met seed obligation
         # releases the brake.
-        and ((info.get('progress') or 0) == 0 or torrent_is_unregistered(info))
+        and ((info.get('progress') or 0) == 0 or (info.get('seeding_time') or 0) >= SEED_DAYS * 86400)
     ]
 
 def purge_queued_superseded(targets):
