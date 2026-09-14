@@ -5990,7 +5990,7 @@ def orphan_scan():
         log.warning(f'orphan-scan: Deluge cross-check failed ({e}) — treating all dupes as seeding for safety')
         seeding_basenames = None  # sentinel: unknown, be cautious
 
-    buckets = {'sample': [], 'dupe': [], 'dupe_seeding': [], 'untracked': []}
+    buckets = {'sample': [], 'dupe': [], 'dupe_seeding': [], 'untracked': [], 'untracked_seeding': []}
     video_exts = ('.mkv', '.mp4', '.avi', '.m4v', '.mov')
     for root, _, files in os.walk(MOVIES_LIBRARY):
         for f in files:
@@ -6011,9 +6011,9 @@ def orphan_scan():
             # torrent with this filename. nlink checks are useless on
             # Unraid's /mnt/user FUSE (always reports 1 through shfs), so
             # Deluge is the source of truth for what's actively serving.
-            if cat == 'dupe':
+            if cat in ('dupe', 'untracked'):
                 if seeding_basenames is None or f in seeding_basenames:
-                    cat = 'dupe_seeding'
+                    cat = cat + '_seeding'
             buckets[cat].append({'path': full, 'size': size, 'nlink': nlink})
 
     # Which categories to actually delete. `mode` query param picks:
