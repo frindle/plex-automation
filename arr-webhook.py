@@ -83,6 +83,23 @@ def activity_log_trim_scheduler():
 app = Flask(__name__)
 app.register_blueprint(share_bp)
 
+_DESTRUCTIVE_GET_GUARD_PATHS = {
+    '/torrent-purge', '/purge-unstarted-superseded', '/complete-orphans',
+    '/incomplete-orphans', '/run-stalled-seeds', '/auto-rescue', '/run-deluge-repair',
+}
+
+@app.before_request
+def _require_post_for_mutations():
+    if request.method != 'GET':
+        return
+    if request.path not in _DESTRUCTIVE_GET_GUARD_PATHS:
+        return
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    dry_run = request.args.get('dry_run', '').lower() in ('1', 'true', 'yes')
+    mutating = apply or (request.path in ('/auto-rescue', '/run-deluge-repair') and not dry_run)
+    if mutating:
+        return jsonify({'ok': False, 'error': 'mutation requires POST'}), 405
+
 DELUGE_URL       = os.environ.get('DELUGE_URL', 'http://10.0.0.2:8112')
 DELUGE_PASSWORD  = os.environ.get('DELUGE_PASSWORD', 'PASSWORDHERE')
 SONARR_URL       = os.environ.get('SONARR_URL', 'http://10.0.0.8:8989')
