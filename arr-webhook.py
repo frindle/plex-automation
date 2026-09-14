@@ -224,6 +224,8 @@ EPISODE_RE       = re.compile(r'S\d{2}E\d{2}', re.IGNORECASE)
 SEASON_RE = re.compile(r'[Ss](\d{1,2})(?:[Ee]\d{1,3})?')
 
 session = requests.Session()
+_recent_upgrade_download_ids = set()
+_upgrade_dedupe_lock = threading.Lock()
 
 # ── Arr API helpers ──────────────────────────────────────────────────────────
 
@@ -2537,6 +2539,13 @@ def relabel_download_to_base(download_id, source):
 
 
 def handle_upgrade_import(data, source):
+    _dedup_id = (data.get('downloadId') or '').lower()
+    if _dedup_id:
+        with _upgrade_dedupe_lock:
+            if _dedup_id in _recent_upgrade_download_ids:
+                log.info(f'{source}: duplicate upgrade-import for {_dedup_id}, skipping')
+                return
+            _recent_upgrade_download_ids.add(_dedup_id)
     if source == 'Sonarr':
         episode_file = data.get('episodeFile', {})
         new_path = episode_file.get('path', '')
@@ -3443,7 +3452,7 @@ def radarr_webhook():
         threading.Thread(target=refresh_metadata_on_grab, args=(data, 'Radarr'), daemon=True).start()
     elif event == 'Download':
         if data.get('isUpgrade'):
-            handle_upgrade_import(data, 'Radarr')
+            threading.Thread(target=handle_upgrade_import, args=(data, 'Radarr'), daemon=True).start()
         else:
             # Gap-fill imports arrive with isUpgrade=false but may wear an
             # -upgrade label from the grab throttle — flip it back.
@@ -3504,7 +3513,7 @@ def sonarr_webhook():
         threading.Thread(target=route_series_to_asian, args=(data,), daemon=True).start()
     elif event == 'Download':
         if data.get('isUpgrade'):
-            handle_upgrade_import(data, 'Sonarr')
+            threading.Thread(target=handle_upgrade_import, args=(data, 'Sonarr'), daemon=True).start()
         else:
             # Gap-fill imports arrive with isUpgrade=false but may wear an
             # -upgrade label from the grab throttle — flip it back.
