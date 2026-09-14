@@ -546,7 +546,6 @@ def find_new_torrent_hash(new_filename, torrents):
     """Find the new torrent by exact filename match."""
     new_name = new_filename.lower()
     for torrent_hash, info in torrents.items():
-        torrent_name = info.get('name', '').lower()
         if torrent_matches_any_title(new_name, [info.get('name', '')]):
             log.info(f'Identified new torrent: {torrent_hash} - {info.get("name")}')
             return torrent_hash
