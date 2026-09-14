@@ -31,11 +31,12 @@ Do not change the delete loop, `_classify`, the mode handling, `verify.sh`, or `
    with
        if cat in ('dupe', 'untracked'):
            if seeding_basenames is None or f in seeding_basenames:
-               cat = 'dupe_seeding' if cat == 'dupe' else 'untracked_seeding'
+               cat = cat + '_seeding'
 
 ## Must contain
 - `'untracked_seeding'`
 - `cat in ('dupe', 'untracked')`
+- `cat + '_seeding'`
 
 ## Loop
 Run `bash verify.sh` after every edit and fix the named FAILs until it prints `VERIFY_OK`.
