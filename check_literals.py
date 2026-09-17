@@ -31,11 +31,6 @@ TARGET = pathlib.Path('arr-webhook.py')
 
 # frozen from TASK.md -- re-run `ollama-dispatch-scaffold --freeze-literals .`
 LITERALS = [[None, 'def codec_rank(name):'], [None, 'return 2'], [None, 'return 1'], [None, 'return 0']]
-    [None, 'def codec_rank(name):'],
-    [None, 'return 2'],
-    [None, 'return 1'],
-    [None, 'return 0'],
-]
 
 
 def _parse_must_contain(task_text):
