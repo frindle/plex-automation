@@ -11,8 +11,8 @@ This fixture drives the REAL Flask app through its test client (POST to
 module boundary, and asserts on status codes, response bodies, and the exact
 ordered sequence of Deluge JSON-RPC calls handle_grab makes:
 
-  * a NEW (non-upgrade) grab must produce core.queue_top with [downloadId]
-    -- for both Radarr and Sonarr payloads
+  * a NEW (non-upgrade) grab must produce core.queue_top with [downloadId],
+    JSON-RPC id 92, and timeout=10 -- for both Radarr and Sonarr payloads
   * an upgrade grab over 10GB must STILL be throttled to core.queue_bottom
     and must NOT be topped (a fix that tops everything fails this)
   * an upgrade grab under 10GB keeps its old behaviour: no Deluge calls at all
@@ -69,6 +69,7 @@ class _World:
         self.has_file = has_file
         self.deluge_down = deluge_down
         self.posts = []          # (method, params) in call order
+        self.calls = []          # full Deluge JSON-RPC requests: method/params/id/timeout
         self.logins = 0
         self.thread_errors = []
 
@@ -110,6 +111,10 @@ class _World:
         method = (json or {}).get('method')
         if '/json' in url:  # Deluge JSON-RPC endpoint
             self.posts.append((method, (json or {}).get('params')))
+            self.calls.append({'url': url, 'method': method,
+                               'params': (json or {}).get('params'),
+                               'id': (json or {}).get('id'),
+                               'timeout': timeout})
             if self.deluge_down:
                 raise ConnectionError('deluge unreachable')
             if method == 'label.get_labels':
@@ -133,7 +138,7 @@ def _run(route, payload, has_file=False, deluge_down=False):
     try:
         resp = target.app.test_client().post(route, json=payload)
         return (resp.status_code, resp.get_json(), list(w.posts), w.logins,
-                list(w.thread_errors), list(_CAP.records))
+                list(w.thread_errors), list(_CAP.records), list(w.calls))
     finally:
         w.restore(real)
 
@@ -183,6 +188,18 @@ CASES = [
      lambda: (lambda r: (r[0], r[1], bool(r[4]), any('failed to move' in m for m in r[5])))(
          _run('/webhook/radarr', _new_radarr(), deluge_down=True)),
      (200, {'status': 'ok'}, False, True)),
+
+    ("the queue_top JSON-RPC request carries id 92 under the key 'id' -- a "
+     "renamed key ('id_X') or a shifted value (91/93) breaks the Deluge call",
+     lambda: (lambda r: next((c['id'] for c in r[6] if c['method'] == 'core.queue_top'), None))(
+         _run('/webhook/radarr', _new_radarr())),
+     92),
+
+    ("the queue_top request is sent with timeout=10 -- a drifted constant "
+     "(9/11) changes the Deluge call contract",
+     lambda: (lambda r: next((c['timeout'] for c in r[6] if c['method'] == 'core.queue_top'), None))(
+         _run('/webhook/radarr', _new_radarr())),
+     10),
 ]
 
 
