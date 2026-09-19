@@ -223,6 +223,14 @@ EPISODE_RE       = re.compile(r'S\d{2}E\d{2}', re.IGNORECASE)
 # /fix-stuck-upgrade-tags route far below.
 SEASON_RE = re.compile(r'[Ss](\d{1,2})(?:[Ee]\d{1,3})?')
 
+def codec_rank(name):
+    n = (name or '').lower()
+    if re.search(r'hevc|x265|h\.?265', n):
+        return 2
+    if re.search(r'avc|x264|h\.?264', n):
+        return 1
+    return 0
+
 session = requests.Session()
 _recent_upgrade_download_ids = set()
 _upgrade_dedupe_lock = threading.Lock()
