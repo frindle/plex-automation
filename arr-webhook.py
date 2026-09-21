@@ -2671,6 +2671,15 @@ def handle_upgrade_import(data, source):
             continue
         name = info.get('name', '')
         if torrent_matches_any_title(name, title_variants) and search_term.lower() in name.lower():
+            # Codec floor: an import of a LOWER-rank codec (e.g. x264) must not
+            # supersede or hard-delete an existing HIGHER-rank release of the
+            # same title (x265/HEVC) — that's a quality downgrade, not an
+            # upgrade. One-directional: same-codec and genuine higher-codec
+            # upgrades fall through untouched.
+            if codec_rank(name) > codec_rank(new_filename):
+                log.info(f'{source}: codec floor — keeping {torrent_hash} - {name}')
+                record_activity('supersede-skip', f'{source}: kept "{name}" (codec floor: existing release outranks incoming import "{new_filename}")')
+                continue
             # A repack/proper is only a true immediate replacement (safe to
             # delete outright) when it's from the SAME release group as the
             # torrent it's replacing — a repack from a different group is a
