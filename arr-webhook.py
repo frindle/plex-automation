@@ -1805,7 +1805,7 @@ def _dupe_candidate_sort_key(c):
     bandwidth already spent), then whichever was grabbed first -- queue ids
     are Radarr's auto-incrementing primary keys, and torrents with no queue
     record at all sort last."""
-    return (-c['score'], -c['progress'], c['order'])
+    return (-codec_rank(c['title']), -c['score'], -c['progress'], c['order'])
 
 
 @_serialized
@@ -2023,7 +2023,7 @@ def _sonarr_dupe_candidate_sort_key(c):
     wastes the bandwidth already spent), then whichever was grabbed first
     -- queue ids are Sonarr's auto-incrementing primary keys, and torrents
     with no queue record at all sort last."""
-    return (-len(c['episodes']), -c['score'], -c['progress'], c['order'])
+    return (-len(c['episodes']), -codec_rank(c['title']), -c['score'], -c['progress'], c['order'])
 
 
 @_serialized
