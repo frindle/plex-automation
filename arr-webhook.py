@@ -132,6 +132,7 @@ STALL_CHECK_INTERVAL = int(os.environ.get('STALL_CHECK_INTERVAL', str(7 * 86400)
 # not zero) -- treated as "don't know, don't touch", never as safe to remove.
 STALL_MIN_SWARM_SEEDS = int(os.environ.get('STALL_MIN_SWARM_SEEDS', '5'))
 SEED_STATE_PATH = os.environ.get('SEED_STATE_PATH', '/data/seed_tracking.json')
+UPGRADE_STATE_PATH = os.environ.get('UPGRADE_STATE_PATH', '/data/upgrade_batch_state.json')
 # Off by default until proven safe. The manual preview endpoint
 # (/run-stalled-seeds, dry-run by default) still works regardless of this
 # flag — this only gates the automatic weekly background removal.
@@ -1617,6 +1618,13 @@ def cleanup_unpacked_torrents():
     except Exception as e:
         log.error(f'Unpacked-torrent cleanup failed: {e}')
 
+
+def _load_upgrade_state():
+    try:
+        with open(UPGRADE_STATE_PATH) as f:
+            return _json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
 
 def _load_seed_state():
     try:
