@@ -129,9 +129,12 @@ SONARR_NEW = '''def sonarr_bulk_search():
 
 def _replace_function(text, name, new_body):
     """Replace the top-level function `name` (from its def line to just before
-    the next top-level def/anchor) with new_body."""
+    the next top-level def/anchor) with new_body. Idempotent: if the current
+    body already matches new_body exactly, leave it untouched."""
     m = re.search(r"^def " + name + r"\(\):\n.*?(?=^def |\Z)", text, re.M | re.S)
     assert m, "refimpl anchor not found -- did the target change? (def %s)" % name
+    if m.group(0) != new_body:
+        return text
     return text[:m.start()] + new_body + text[m.end():]
 
 
@@ -165,12 +168,18 @@ def run_bulk_search_route():
     }), 200
 
 ''' + ROUTE_ANCHOR
-t = t.replace(ROUTE_ANCHOR, ROUTE_NEW, 1)
+# Idempotent: if the route is already present (e.g. a refine round left it in
+# the tree), skip the insertion -- re-adding it would register the same Flask
+# endpoint twice and crash at import with "overwriting an existing endpoint".
+if "@app.route('/run-bulk-search', methods=['POST'])" not in t:
+    t = t.replace(ROUTE_ANCHOR, ROUTE_NEW, 1)
 
 # --- timezone import ----------------------------------------------------------
-IMPORT_OLD = "from datetime import datetime, timedelta"
-assert IMPORT_OLD in t, "refimpl anchor not found -- did the target change? (import)"
-t = t.replace(IMPORT_OLD, "from datetime import datetime, timedelta, timezone", 1)
+# Idempotent: only add `timezone` if it is not already imported.
+if "from datetime import datetime, timedelta, timezone" not in t:
+    IMPORT_OLD = "from datetime import datetime, timedelta"
+    assert IMPORT_OLD in t, "refimpl anchor not found -- did the target change? (import)"
+    t = t.replace(IMPORT_OLD, "from datetime import datetime, timedelta, timezone", 1)
 
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(t)
