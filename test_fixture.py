@@ -63,6 +63,41 @@ def _one_poll(state):
             pass
     return calls
 
+class _PinnedDatetime(datetime):
+    """datetime whose now() returns a fixed instant (naive or tz-aware)."""
+    _fixed = None
+    @classmethod
+    def now(cls, tz=None):
+        if cls._fixed is not None:
+            return cls._fixed.replace(tzinfo=tz) if tz else cls._fixed
+        return super().now(tz)
+
+def _one_poll_pinned(state, fixed_now_utc):
+    """Like _one_poll but with the scheduler's clock pinned to `fixed_now_utc`
+    so a timestamp exactly UPGRADE_BATCH_INTERVAL_DAYS old yields elapsed_days
+    that is EXACTLY the interval -- where >= and > diverge. The scheduler does
+    `import datetime` inside its loop, so we swap sys.modules['datetime'] for
+    a module whose datetime class has now() pinned."""
+    calls = []
+    fixed = fixed_now_utc.astimezone(timezone.utc).replace(tzinfo=None)
+    _PinnedDatetime._fixed = fixed
+    fake_mod = types.ModuleType('datetime')
+    fake_mod.datetime = _PinnedDatetime
+    fake_mod.timezone = timezone  # refimpl calls datetime.now(datetime.timezone.utc)
+    try:
+        with patch.object(target.time, 'sleep', side_effect=StopIteration), \
+             patch.dict(sys.modules, {'datetime': fake_mod}), \
+             patch.object(target, '_load_upgrade_state', return_value=state), \
+             patch.object(target, 'monthly_upgrade_cycle',
+                          side_effect=lambda svc: calls.append(svc)):
+            try:
+                target.monthly_search_scheduler()
+            except StopIteration:
+                pass
+    finally:
+        _PinnedDatetime._fixed = None
+    return calls
+
 def _route(method, url):
     """Drive the real Flask app through its test client; (status, body)."""
     with target.app.test_client() as c:
@@ -102,6 +137,16 @@ CASES = [
          'radarr': {'last_run': _iso(datetime.now(timezone.utc) - timedelta(days=target.UPGRADE_BATCH_INTERVAL_DAYS, seconds=1))},
          'sonarr': {'last_run': _iso(datetime.now(timezone.utc) - timedelta(hours=1))},
      }), ['radarr']),
+
+    # --- EXACT boundary, clock pinned: elapsed_days == interval exactly -------
+    # With now() frozen and last_run exactly UPGRADE_BATCH_INTERVAL_DAYS old,
+    # elapsed_days is precisely the interval (no ms of fixture overhead). A
+    # `>` comparison would skip this service; only `>=` fires it.
+    ("exactly-interval-elapsed with pinned clock is due",
+     lambda: _one_poll_pinned({
+         'radarr': {'last_run': _iso(datetime(2026, 9, 1, 0, 0, 0) - timedelta(days=target.UPGRADE_BATCH_INTERVAL_DAYS))},
+         'sonarr': {'last_run': _iso(datetime(2026, 9, 1, 0, 0, 0) - timedelta(hours=1))},
+     }, datetime(2026, 9, 1, 0, 0, 0)), ['radarr']),
 
     # --- per-service independence: only the stale one runs --------------------
     ("only the stale service is due",
