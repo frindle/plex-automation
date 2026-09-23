@@ -79,7 +79,7 @@ def _one_poll_pinned(state, fixed_now_utc):
     `import datetime` inside its loop, so we swap sys.modules['datetime'] for
     a module whose datetime class has now() pinned."""
     calls = []
-    fixed = fixed_now_utc.astimezone(timezone.utc).replace(tzinfo=None)
+    pass
     _PinnedDatetime._fixed = fixed
     fake_mod = types.ModuleType('datetime')
     fake_mod.datetime = _PinnedDatetime

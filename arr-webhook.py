@@ -3436,17 +3436,27 @@ def monthly_search_scheduler():
     5. Relabel new upgrade torrents to the throttled lane, queue them last
     """
     import datetime
-    last_run_month = None
     while True:
-        now = datetime.datetime.now()
-        if now.day == 1 and now.month != last_run_month:
-            last_run_month = now.month
-            log.info('Monthly upgrade cycle starting')
-            monthly_upgrade_cycle('radarr')
-            # Sonarr runs after Radarr rather than in parallel so the two
-            # bulk searches don't stack announces on the same tracker.
-            monthly_upgrade_cycle('sonarr')
-            log.info('Monthly upgrade cycle complete')
+        # last_run stamps are persisted in UTC (see radarr_bulk_search /
+        # sonarr_bulk_search), so compare against a naive-UTC clock.
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        state = _load_upgrade_state()
+        for service in ('radarr', 'sonarr'):
+            entry = state.get(service) or {}
+            last_run = entry.get('last_run')
+            if not last_run:
+                due = True  # first run: no persisted timestamp yet
+            else:
+                try:
+                    elapsed_days = (now - datetime.datetime.fromisoformat(last_run)).total_seconds() / 86400.0
+                except ValueError:
+                    elapsed_days = float('inf')  # unparseable stamp -> treat as due
+                due = elapsed_days >= UPGRADE_BATCH_INTERVAL_DAYS
+            if due:
+                log.info(f'{service}: upgrade batch interval reached, starting monthly cycle')
+                # Services run sequentially rather than in parallel so the two
+                # bulk searches don't stack announces on the same tracker.
+                monthly_upgrade_cycle(service)
         time.sleep(3600)  # check every hour
 
 
