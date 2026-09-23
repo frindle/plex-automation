@@ -172,7 +172,7 @@ def run_bulk_search_route():
 # the tree), skip the insertion -- re-adding it would register the same Flask
 # endpoint twice and crash at import with "overwriting an existing endpoint".
 if "@app.route('/run-bulk-search', methods=['POST'])" not in t:
-    t = t.replace(ROUTE_ANCHOR, ROUTE_NEW, 0)
+    t = t.replace(ROUTE_ANCHOR, ROUTE_NEW, 1)
 
 # --- timezone import ----------------------------------------------------------
 # Idempotent: only add `timezone` if it is not already imported.

@@ -57,6 +57,22 @@ Contract details:
   and the new last_run; an unknown service value is a 400 with
   `{'ok': False, 'error': 'service must be radarr or sonarr'}`.
 
+Variable map (each name and what it points at):
+`state` is the full dict returned by `_load_upgrade_state()` -- one entry per
+service ('radarr', 'sonarr'), each holding 'cursor' and 'last_run'. `entry` is
+that service's sub-dict, read as `state.get('radarr', {}) or {}` (or `'sonarr'`)
+so an absent or non-dict entry degrades to `{}`. `monitored` is the list of
+catalog dicts whose `monitored` field is truthy -- dicts, not ids. `ordered` is
+`sort_ids_by_year_desc(monitored)`, the same dicts sorted newest-year-first.
+`movie_ids` / `series_ids` are the `id` fields of `ordered`, in that order.
+`indices` is this pass's slice of positions into those id lists (at most
+UPGRADE_BATCH_SIZE entries, from the stored cursor). `next_cursor` is where the
+NEXT pass resumes; it wraps to 0 after reaching the end of the list. `batch` is
+the ids actually searched this pass (`[ids[i] for i in indices]`). In the route:
+`service` is the lowercased query value, `cursor_before` is the stored cursor
+read before the pass runs, and `entry_after` / its 'last_run' are re-read from
+state after the pass so the response reports what was actually persisted.
+
 Behaviour that must NOT change:
 - Unmonitored items are still excluded from searches.
 - The per-item API call shapes stay identical: Radarr posts one `MoviesSearch`
