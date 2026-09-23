@@ -5,7 +5,7 @@ import time
 import logging
 import threading
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 
 from media_share import share_bp, init_db as init_share_db
@@ -3096,50 +3096,38 @@ def ensure_label_exists_named(label):
 
 
 def radarr_bulk_search():
-    """Trigger a bounded yearly-upgrade pass over monitored Radarr movies.
-
-    Instead of searching the ENTIRE catalog in one go (which makes Radarr push
-    every accepted release to Deluge back-to-back and trips private-tracker
-    announce rate limits), each pass searches at most UPGRADE_BATCH_SIZE
-    movies: the monitored list is sorted newest-year-first via
-    sort_ids_by_year_desc, advance_upgrade_cursor picks this pass's slice from
-    the persisted cursor (wrapping to index 0 after the end), and the new
-    cursor plus a fresh last_run timestamp are persisted back through
-    _save_upgrade_state so successive passes walk the whole catalog over time.
-    """
+    """Trigger a search for all monitored movies in Radarr to catch missed upgrades."""
     log.info('Running monthly Radarr bulk search for upgrades...')
     try:
-        state = _load_upgrade_state()
-        entry = state.get('radarr', {}) or {}
         movies_r = requests.get(
             f'{RADARR_URL}/api/v3/movie',
             headers={'X-Api-Key': RADARR_API_KEY},
             timeout=15
         )
         movies_r.raise_for_status()
-        monitored = [m for m in movies_r.json() if m.get('monitored')]
-        if not monitored:
+        movie_ids = [m['id'] for m in movies_r.json() if m.get('monitored')]
+        if not movie_ids:
             log.warning('Radarr bulk search: no monitored movies found, skipping')
             return
-        ordered = sort_ids_by_year_desc(monitored)
-        movie_ids = [m['id'] for m in ordered]
-        indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(movie_ids))
-        batch = [movie_ids[i] for i in indices]
-        log.info(f'Radarr bulk search: {len(batch)} of {len(movie_ids)} movies this pass '
-                 f'(cursor -> {next_cursor})')
-        try:
-            r = requests.post(
-                f'{RADARR_URL}/api/v3/command',
-                headers={'X-Api-Key': RADARR_API_KEY},
-                json={'name': 'MoviesSearch', 'movieIds': batch},
-                timeout=30
-            )
-            r.raise_for_status()
-            log.info(f'Radarr bulk search pass ({len(batch)} movies) queued: id {r.json().get("id")}')
-        except Exception as e:
-            log.error(f'Radarr bulk search pass failed: {e}')
-        state['radarr'] = {'cursor': next_cursor, 'last_run': datetime.now(timezone.utc).isoformat()}
-        _save_upgrade_state(state)
+        batches = [movie_ids[n:n + BULK_SEARCH_BATCH]
+                   for n in range(0, len(movie_ids), BULK_SEARCH_BATCH)]
+        log.info(f'Radarr bulk search: {len(movie_ids)} movies in {len(batches)} '
+                 f'batches of {BULK_SEARCH_BATCH}, {BULK_SEARCH_DELAY}s apart')
+        for n, batch in enumerate(batches, 1):
+            try:
+                r = requests.post(
+                    f'{RADARR_URL}/api/v3/command',
+                    headers={'X-Api-Key': RADARR_API_KEY},
+                    json={'name': 'MoviesSearch', 'movieIds': batch},
+                    timeout=30
+                )
+                r.raise_for_status()
+                log.info(f'Radarr bulk search batch {n}/{len(batches)} '
+                         f'({len(batch)} movies) queued: id {r.json().get("id")}')
+            except Exception as e:
+                log.error(f'Radarr bulk search batch {n}/{len(batches)} failed: {e}')
+            if n < len(batches):
+                time.sleep(BULK_SEARCH_DELAY)
     except Exception as e:
         log.error(f'Radarr bulk search failed: {e}')
 
@@ -3200,50 +3188,49 @@ def relabel_radarr_upgrades():
         log.error(f'Radarr upgrade relabeling failed: {e}')
 
 def sonarr_bulk_search():
-    """Sonarr counterpart of radarr_bulk_search: a bounded yearly-upgrade pass.
+    """Sonarr counterpart of radarr_bulk_search: search every monitored
+    series so missing episodes and cutoff-unmet upgrades both get picked up.
 
-    Each pass searches at most UPGRADE_BATCH_SIZE monitored series (sorted
-    newest-first via sort_ids_by_year_desc, sliced by advance_upgrade_cursor
-    from the persisted cursor) instead of the entire catalog. Sonarr's
+    Radarr's MoviesSearch takes a *list* of movieIds in one command; Sonarr's
     SeriesSearch takes a single seriesId (confirmed against Sonarr's
-    SeriesSearchCommand: `public int SeriesId`), so each item in this pass is
-    one separate command fired back-to-back -- same per-item call as before,
-    just bounded to this pass's slice. The new cursor and last_run timestamp
-    are persisted through _save_upgrade_state under the 'sonarr' key.
+    SeriesSearchCommand: `public int SeriesId`), so a "batch" here is N
+    separate commands fired back-to-back before the pacing sleep. One series
+    search fans out to every monitored episode in that series, so it's far
+    heavier per unit than one movie -- hence a much smaller default batch
+    than BULK_SEARCH_BATCH. Same tracker-announce rate-limit reasoning as
+    the Radarr comment above.
     """
     log.info('Running monthly Sonarr bulk search for missing/upgrades...')
     try:
-        state = _load_upgrade_state()
-        entry = state.get('sonarr', {}) or {}
         series_r = requests.get(
             f'{SONARR_URL}/api/v3/series',
             headers={'X-Api-Key': SONARR_API_KEY},
             timeout=30
         )
         series_r.raise_for_status()
-        monitored = [s for s in series_r.json() if s.get('monitored')]
-        if not monitored:
+        series_ids = [s['id'] for s in series_r.json() if s.get('monitored')]
+        if not series_ids:
             log.warning('Sonarr bulk search: no monitored series found, skipping')
             return
-        ordered = sort_ids_by_year_desc(monitored)
-        series_ids = [s['id'] for s in ordered]
-        indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(series_ids))
-        batch = [series_ids[i] for i in indices]
-        log.info(f'Sonarr bulk search: {len(batch)} of {len(series_ids)} series this pass '
-                 f'(cursor -> {next_cursor})')
-        for series_id in batch:
-            try:
-                r = requests.post(
-                    f'{SONARR_URL}/api/v3/command',
-                    headers={'X-Api-Key': SONARR_API_KEY},
-                    json={'name': 'SeriesSearch', 'seriesId': series_id},
-                    timeout=30
-                )
-                r.raise_for_status()
-            except Exception as e:
-                log.error(f'Sonarr SeriesSearch for series {series_id} failed: {e}')
-        state['sonarr'] = {'cursor': next_cursor, 'last_run': datetime.now(timezone.utc).isoformat()}
-        _save_upgrade_state(state)
+        batches = [series_ids[n:n + SONARR_BULK_SEARCH_BATCH]
+                   for n in range(0, len(series_ids), SONARR_BULK_SEARCH_BATCH)]
+        log.info(f'Sonarr bulk search: {len(series_ids)} series in {len(batches)} '
+                 f'batches of {SONARR_BULK_SEARCH_BATCH}, {BULK_SEARCH_DELAY}s apart')
+        for n, batch in enumerate(batches, 1):
+            for series_id in batch:
+                try:
+                    r = requests.post(
+                        f'{SONARR_URL}/api/v3/command',
+                        headers={'X-Api-Key': SONARR_API_KEY},
+                        json={'name': 'SeriesSearch', 'seriesId': series_id},
+                        timeout=30
+                    )
+                    r.raise_for_status()
+                except Exception as e:
+                    log.error(f'Sonarr SeriesSearch for series {series_id} failed: {e}')
+            log.info(f'Sonarr bulk search batch {n}/{len(batches)} ({len(batch)} series) queued')
+            if n < len(batches):
+                time.sleep(BULK_SEARCH_DELAY)
     except Exception as e:
         log.error(f'Sonarr bulk search failed: {e}')
 
@@ -5955,29 +5942,6 @@ def superseded_audit():
         'ready_to_delete': ready_to_delete,
         'still_seeding': still_seeding,
         'misfiled': misfiled,
-    }), 200
-
-# Synchronous single-pass bulk search -- one bounded yearly-upgrade pass per
-# service (at most UPGRADE_BATCH_SIZE items from the persisted cursor), so it
-# is safe to run inline and report what was searched in the response body.
-@app.route('/run-bulk-search', methods=['POST'])
-def run_bulk_search_route():
-    service = (request.args.get('service') or 'radarr').lower()
-    if service not in ('radarr', 'sonarr'):
-        return jsonify({'ok': False, 'error': 'service must be radarr or sonarr'}), 400
-    state_before = _load_upgrade_state().get(service) or {}
-    cursor_before = state_before.get('cursor', 0)
-    if service == 'radarr':
-        radarr_bulk_search()
-    else:
-        sonarr_bulk_search()
-    entry_after = _load_upgrade_state().get(service) or {}
-    return jsonify({
-        'ok': True,
-        'service': service,
-        'cursor_before': cursor_before,
-        'cursor_after': entry_after.get('cursor'),
-        'last_run': entry_after.get('last_run'),
     }), 200
 
 # Manual trigger for the monthly upgrade cycle. Full cycle with the
