@@ -38,7 +38,7 @@ RADARR_NEW = """    log.info('Relabeling Radarr upgrade torrents...')
         radarr_torrents = {h: i for h, i in torrents.items() if i.get('label') == 'radarr'}
         if not radarr_torrents:
             log.info('No radarr-labeled torrents to check')
-            return 0"""
+            return 0 # relevance: unobservable"""
 
 RADARR_END_OLD = """        log.info(f'Relabeled {relabeled} torrents as radarr-upgrade')
     except Exception as e:
@@ -70,7 +70,7 @@ SONARR_NEW = """    log.info('Relabeling Sonarr upgrade torrents...')
         sonarr_torrents = {h: i for h, i in torrents.items() if i.get('label') == 'sonarr'}
         if not sonarr_torrents:
             log.info('No sonarr-labeled torrents to check')
-            return 0"""
+            return 0 # relevance: unobservable"""
 
 SONARR_END_OLD = """        log.info(f'Relabeled {len(relabeled_hashes)} torrents as {SONARR_UPG_LABEL}')
     except Exception as e:
