@@ -6470,32 +6470,6 @@ def maintenance_scheduler():
         time.sleep(DELUGE_REPAIR_INTERVAL)
 
 
-def sort_ids_by_year_desc(items):
-    """Return items sorted by effective release year, descending.
-
-    Effective year: the item's 'year' value when truthy; otherwise the first
-    four characters of its 'firstAired' string parsed as an int when those are
-    digits; otherwise 0. Zero-effective-year items sort LAST (after every real
-    year). Ties within the same effective year preserve original input order
-    (stable sort). The input list is not mutated."""
-    def _eff(item):
-        y = item.get('year') if isinstance(item, dict) else None
-        if y:
-            return int(y)
-        fa = item.get('firstAired') if isinstance(item, dict) else None
-        if isinstance(fa, str) and len(fa) >= 5 and fa[:4].isdigit():
-            return int(fa[:4])
-        return 0
-
-    def _key(item):
-        y = _eff(item)
-        # group 1 (zero-year) sorts after every real year; within a group,
-        # -y gives descending order. sorted() is stable, so ties keep input order.
-        return (1 if y == 0 else 0, -y)
-
-    return sorted(items, key=_key)
-
-
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 9876))
     log.info(f'Starting arr-webhook listener on port {port}')
