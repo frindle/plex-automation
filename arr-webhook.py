@@ -1924,11 +1924,40 @@ def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
             # vanished between fetch and delete, a Deluge hiccup) must not
             # abort the whole pass and leave every later movie duplicated.
             try:
+                # A "queue" record can still be sitting there long after its
+                # torrent finished downloading and started seeding -- Radarr
+                # only drops a queue entry on successful IMPORT, so a stuck
+                # import (Godzilla 2014, HnR 2026-09-22: repeated failed
+                # imports over 5 days while the torrent quietly seeded)
+                # leaves it visible here indefinitely. removeFromClient=True
+                # tells Radarr to delete straight from Deluge through its OWN
+                # download-client integration -- that never goes through
+                # remove_torrent()'s HnR guard at all. So: only hard-delete
+                # via the client when Deluge doesn't already know about this
+                # download (nothing seeding, nothing to protect); once it's
+                # a real Deluge torrent, drop the queue record without
+                # touching the client and hand it to supersede_torrent
+                # instead, same as the throttled-lane case below -- which
+                # feeds the SEED_DAYS-gated cleanup_superseded path rather
+                # than deleting out from under the tracker.
+                already_in_deluge = bool(item['hash']) and item['hash'] in torrents
                 if dry_run:
-                    if item['source'] == 'queue':
-                        log.info(f'[dry-run] Radarr queue: would remove duplicate "{item["title"]}" (score: {item["score"]})')
-                    else:
+                    if item['source'] != 'queue':
                         log.info(f'[dry-run] Radarr queue: would supersede throttled duplicate "{item["title"]}" (score: {item["score"]})')
+                    elif already_in_deluge:
+                        log.info(f'[dry-run] Radarr queue: would drop stuck queue record and supersede already-downloaded duplicate "{item["title"]}" (score: {item["score"]})')
+                    else:
+                        log.info(f'[dry-run] Radarr queue: would remove duplicate "{item["title"]}" (score: {item["score"]})')
+                elif item['source'] == 'queue' and already_in_deluge:
+                    log.info(f'Radarr queue: dropping stuck queue record for already-downloaded duplicate "{item["title"]}" (score: {item["score"]}) — superseding torrent instead of removing from client')
+                    del_r = requests.delete(
+                        f'{RADARR_URL}/api/v3/queue/{item["queue_id"]}',
+                        headers={'X-Api-Key': RADARR_API_KEY},
+                        params={'removeFromClient': False, 'blocklist': False},
+                        timeout=15
+                    )
+                    del_r.raise_for_status()
+                    supersede_torrent(item['hash'])
                 elif item['source'] == 'queue':
                     log.info(f'Radarr queue: removing duplicate "{item["title"]}" (score: {item["score"]})')
                     del_r = requests.delete(
@@ -2195,13 +2224,38 @@ def cleanup_sonarr_queue_dupes(series_id=None, dry_run=False):
             # abort the whole pass and leave every later series duplicated.
             try:
                 eps = len(item['episodes'])
+                # Same HnR gap as cleanup_radarr_queue_dupes: a queue record
+                # survives past its torrent finishing and starting to seed
+                # whenever import keeps failing, and removeFromClient=True
+                # deletes straight out of Deluge through Sonarr's own
+                # download-client integration -- never through
+                # remove_torrent()'s guard. Only hard-delete via the client
+                # when Deluge doesn't already have this download; once it's
+                # a real torrent, drop the queue record only and supersede
+                # it instead, same as the throttled-lane case below.
+                already_in_deluge = bool(item['hash']) and item['hash'] in torrents
                 if dry_run:
-                    if item['source'] == 'queue':
-                        log.info(f'[dry-run] Sonarr queue: would remove duplicate "{item["title"]}" '
-                                 f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
-                    else:
+                    if item['source'] != 'queue':
                         log.info(f'[dry-run] Sonarr queue: would supersede throttled duplicate "{item["title"]}" '
                                  f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
+                    elif already_in_deluge:
+                        log.info(f'[dry-run] Sonarr queue: would drop stuck queue record and supersede already-downloaded duplicate "{item["title"]}" '
+                                 f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
+                    else:
+                        log.info(f'[dry-run] Sonarr queue: would remove duplicate "{item["title"]}" '
+                                 f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
+                elif item['source'] == 'queue' and already_in_deluge:
+                    log.info(f'Sonarr queue: dropping stuck queue record for already-downloaded duplicate "{item["title"]}" '
+                             f'({eps} ep(s), score: {item["score"]}) — superseding torrent instead of removing from client')
+                    del_r = requests.delete(
+                        f'{SONARR_URL}/api/v3/queue/bulk',
+                        headers={'X-Api-Key': SONARR_API_KEY},
+                        params={'removeFromClient': False, 'blocklist': False},
+                        json={'ids': item['queue_ids']},
+                        timeout=15
+                    )
+                    del_r.raise_for_status()
+                    supersede_torrent(item['hash'])
                 elif item['source'] == 'queue':
                     log.info(f'Sonarr queue: removing duplicate "{item["title"]}" '
                              f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
