@@ -3424,6 +3424,27 @@ def purge_stalled_upgrade_torrents(label=RADARR_UPG_LABEL):
     except Exception as e:
         log.error(f'Purge stalled upgrades failed: {e}')
 
+def upgrade_batch_due(entry, now=None):
+    """Interval gate for the yearly-upgrade batch passes.
+
+    A service is due when it has never run (no last_run stamp -- first-ever
+    poll with empty state), or when at least UPGRADE_BATCH_INTERVAL_DAYS have
+    elapsed since its last_run. An unparseable stamp is treated as due rather
+    than wedging the scheduler forever. `now` defaults to a naive-UTC clock;
+    stamps are persisted in UTC (see radarr_bulk_search / sonarr_bulk_search).
+    """
+    import datetime
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    last_run = (entry or {}).get('last_run')
+    if not last_run:
+        return True  # first run: no persisted timestamp yet
+    try:
+        elapsed_days = (now - datetime.datetime.fromisoformat(last_run)).total_seconds() / 86400.0
+    except ValueError:
+        return True  # unparseable stamp -> treat as due
+    return elapsed_days >= UPGRADE_BATCH_INTERVAL_DAYS
+
 def monthly_search_scheduler():
     """
     On the 1st of each month, Radarr first and then the identical Sonarr
@@ -3443,15 +3464,7 @@ def monthly_search_scheduler():
         state = _load_upgrade_state()
         for service in ('radarr', 'sonarr'):
             entry = state.get(service) or {}
-            last_run = entry.get('last_run')
-            if not last_run:
-                due = True  # first run: no persisted timestamp yet
-            else:
-                try:
-                    elapsed_days = (now - datetime.datetime.fromisoformat(last_run)).total_seconds() / 86400.0
-                except ValueError:
-                    elapsed_days = float('inf')  # unparseable stamp -> treat as due
-                due = elapsed_days >= UPGRADE_BATCH_INTERVAL_DAYS
+            due = upgrade_batch_due(entry, now)
             if due:
                 log.info(f'{service}: upgrade batch interval reached, starting monthly cycle')
                 # Services run sequentially rather than in parallel so the two
