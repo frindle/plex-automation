@@ -215,6 +215,25 @@ BULK_SEARCH_DELAY = int(os.environ.get('BULK_SEARCH_DELAY', '180'))  # secs betw
 # Yearly upgrade batched pass: how many movies/series per pass, and the
 # minimum whole days between passes for a given service.
 UPGRADE_BATCH_SIZE = int(os.environ.get('UPGRADE_BATCH_SIZE', '12'))
+
+
+def advance_upgrade_cursor(cursor, total):
+    """Advance the yearly-upgrade batch cursor by one pass.
+
+    Returns (indices, next_cursor): up to UPGRADE_BATCH_SIZE consecutive
+    indices starting at the clamped cursor, wrapping past the end back to 0,
+    and where to resume on the next pass. A stale cursor from a larger catalog
+    is clamped into range so it never indexes out of bounds; when total is
+    zero there is nothing to search this pass.
+    """
+    if total <= 0:
+        return [], 0
+    clamped = max(0, min(cursor, total - 1))
+    count = min(UPGRADE_BATCH_SIZE, total)
+    indices = [(clamped + i) % total for i in range(count)]
+    next_cursor = (clamped + count) % total
+    return indices, next_cursor
+
 UPGRADE_BATCH_INTERVAL_DAYS = int(os.environ.get('UPGRADE_BATCH_INTERVAL_DAYS', '3'))
 # Sonarr batches are much smaller: one SeriesSearch fans out to every
 # monitored episode in that series, so 50 series is an order of magnitude
