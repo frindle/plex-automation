@@ -58,6 +58,13 @@ NEW = r'''    import datetime
                 monthly_upgrade_cycle(service)
         time.sleep(3600)  # check every hour'''
 
-assert OLD in t, "refimpl anchor not found -- did the target change?"
-p.write_text(t.replace(OLD, NEW, 1))
-print("refimpl applied")
+if NEW in t:
+    # Idempotent re-apply: a previous round already landed this edit (it was
+    # sealed into the baseline). The gate still needs the apply step to SUCCEED
+    # so its required-literals check can run against the target.
+    print("refimpl already applied -- no-op")
+elif OLD in t:
+    p.write_text(t.replace(OLD, NEW, 1))
+    print("refimpl applied")
+else:
+    raise SystemExit("refimpl anchor not found and new code absent -- did the target change?")
