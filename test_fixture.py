@@ -35,8 +35,6 @@ def _tmp_path():
     return path
 
 
-# Model-drafted; NOT yet read by a human.
-DRAFT_UNCONFIRMED = True
 
 CASES = [
     ("saves the state dict as JSON at UPGRADE_STATE_PATH",
