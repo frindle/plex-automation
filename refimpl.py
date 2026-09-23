@@ -97,8 +97,13 @@ def monthly_search_scheduler():
             due = upgrade_batch_due(entry, now)
             if due:'''
 
-assert OLD in t, "refimpl anchor not found -- did the target change?"
-p.write_text(t.replace(OLD, NEW, 1))
+# Idempotent: on a sealed tree the solution is already present (NEW block in,
+# OLD anchor gone), so there is nothing to patch. Only hard-fail when NEITHER
+# form matches -- that means the target genuinely changed under us.
+if OLD in t:
+    p.write_text(t.replace(OLD, NEW, 1))
+elif NEW not in t:
+    raise SystemExit("refimpl anchor not found -- did the target change?")
 
 # The solution also lands the new test file (the INTENT's deliverable), using
 # the same importlib + monkeypatch idioms as test_radarr_upgrade_label.py.
