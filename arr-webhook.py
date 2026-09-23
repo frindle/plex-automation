@@ -211,6 +211,10 @@ IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  #
 # Lower batch / higher delay is gentler on the tracker.
 BULK_SEARCH_BATCH = int(os.environ.get('BULK_SEARCH_BATCH', '50'))
 BULK_SEARCH_DELAY = int(os.environ.get('BULK_SEARCH_DELAY', '180'))  # secs between batches
+# Yearly upgrade batched pass: how many movies/series per pass, and the
+# minimum whole days between passes for a given service.
+UPGRADE_BATCH_SIZE = int(os.environ.get('UPGRADE_BATCH_SIZE', '12'))
+UPGRADE_BATCH_INTERVAL_DAYS = int(os.environ.get('UPGRADE_BATCH_INTERVAL_DAYS', '3'))
 # Sonarr batches are much smaller: one SeriesSearch fans out to every
 # monitored episode in that series, so 50 series is an order of magnitude
 # more announces than 50 movies. Tune down further if the tracker complains.
