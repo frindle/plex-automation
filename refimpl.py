@@ -40,9 +40,10 @@ NEW = r'''def sort_ids_by_year_desc(items):
 
     def _key(item):
         y = _eff(item)
-        # group 1 (zero-year) sorts after every real year; within a group,
-        # -y gives descending order. sorted() is stable, so ties keep input order.
-        return (1 if y == 0 else 0, -y)
+        # -y gives descending order, and -0 == 0 is greater than every negative
+        # real year, so zero-year items land last without a separate group key.
+        # sorted() is stable, so ties keep input order.
+        return -y
 
     return sorted(items, key=_key)
 

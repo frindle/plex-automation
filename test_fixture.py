@@ -82,6 +82,15 @@ CASES = [
     ("empty list returns empty list",
      lambda: target.sort_ids_by_year_desc([]),
      []),
+
+    # firstAired exactly 4 chars (the >= 4 boundary itself) must still parse;
+    # a mutant that flips >= to > or 4 to 5 would drop this to effective year 0
+    # and sort it last instead of between 2019 and 2016.
+    ("firstAired of exactly 4 chars parses at the length boundary",
+     lambda: _ids(target.sort_ids_by_year_desc(
+         [{'id': 'p', 'year': 2019}, {'id': 'q', 'firstAired': '2018'},
+          {'id': 'r', 'year': 2016}])),
+     ['p', 'q', 'r']),
 ]
 
 
