@@ -1652,6 +1652,13 @@ def _load_seed_state():
     except (FileNotFoundError, ValueError):
         return {}
 
+def _save_upgrade_state(state):
+    try:
+        with open(UPGRADE_STATE_PATH, 'w') as f:
+            _json.dump(state, f)
+    except Exception as e:
+        log.warning(f'[upgrade-batches] failed to persist state: {e}')
+
 def _save_seed_state(state):
     try:
         with open(SEED_STATE_PATH, 'w') as f:
