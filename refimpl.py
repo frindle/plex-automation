@@ -133,7 +133,7 @@ def _replace_function(text, name, new_body):
     body already matches new_body exactly, leave it untouched."""
     m = re.search(r"^def " + name + r"\(\):\n.*?(?=^def |\Z)", text, re.M | re.S)
     assert m, "refimpl anchor not found -- did the target change? (def %s)" % name
-    if m.group(0) != new_body:
+    if m.group(0) == new_body:
         return text
     return text[:m.start()] + new_body + text[m.end():]
 
@@ -172,7 +172,7 @@ def run_bulk_search_route():
 # the tree), skip the insertion -- re-adding it would register the same Flask
 # endpoint twice and crash at import with "overwriting an existing endpoint".
 if "@app.route('/run-bulk-search', methods=['POST'])" not in t:
-    t = t.replace(ROUTE_ANCHOR, ROUTE_NEW, 1)
+    t = t.replace(ROUTE_ANCHOR, ROUTE_NEW, 0)
 
 # --- timezone import ----------------------------------------------------------
 # Idempotent: only add `timezone` if it is not already imported.

@@ -3228,7 +3228,7 @@ def sonarr_bulk_search():
         ordered = sort_ids_by_year_desc(monitored)
         series_ids = [s['id'] for s in ordered]
         indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(series_ids))
-        pass
+        batch = [series_ids[i] for i in indices]
         log.info(f'Sonarr bulk search: {len(batch)} of {len(series_ids)} series this pass '
                  f'(cursor -> {next_cursor})')
         for series_id in batch:
