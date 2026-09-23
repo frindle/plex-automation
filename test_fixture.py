@@ -63,6 +63,9 @@ def _corrupt_file():
     return path
 
 
+# Model-drafted; NOT yet read by a human.
+DRAFT_UNCONFIRMED = True
+
 CASES = [
     ("UPGRADE_STATE_PATH defaults to /data/upgrade_batch_state.json",
      lambda: target.UPGRADE_STATE_PATH, '/data/upgrade_batch_state.json'),
