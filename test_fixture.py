@@ -100,7 +100,78 @@ CASES = [
      lambda: target.should_hard_delete_on_upgrade(
          {'tracker_status': 'unregistered', 'seeding_time': 365 * 86400}, False),
      False),
+
+    # --- end-to-end wiring through dedup_via_radarr (dry run) ---------------
+    # The gate must sit in the DECISION loop itself, not just be present in
+    # the source: a REGISTERED candidate still gets the relabel action, and
+    # an UNREGISTERED one is skipped before any action.
+    ("dedup_via_radarr still offers to supersede a registered candidate",
+     lambda: _run_dedup_gate_case('Seeding, 3 peers') == 1,
+     True),
+
+    ("dedup_via_radarr skips the unregistered candidate (no relabel action)",
+     lambda: _run_dedup_gate_case('Torrent is unregistered') == 0,
+     True),
 ]
+
+
+def _run_dedup_gate_case(candidate_tracker_status):
+    """Drive dedup_via_radarr with one keeper + one candidate and return the
+    number of 'WOULD relabel superseded' actions logged for the candidate.
+
+    Keeper   : exact filename match against movieFile.relativePath (spared).
+    Candidate: same title/year, progress 100 -- its fate is decided purely by
+               the gate on tracker_status.
+
+    Mutants this kills:
+      * deleting the `continue` after the skip log -> the unregistered
+        candidate falls through to the relabel action (case 2 sees 1).
+      * negating/dropping the gate condition -> the registered candidate is
+        skipped instead (case 1 sees 0), and the unregistered one is
+        relabeled (case 2 sees 1).
+    """
+    import unittest.mock as mock
+
+    keeper_name = 'Shang-Chi.and.the.Legion.of.Ringmasters.2021.UHD.BluRay.x265-keeper.mkv'
+    cand_name = 'Shang-Chi.and.the.Legion.of.Ringmasters.2021.UHD.BluRay.x265-j3rico'
+
+    movie_json = [{
+        'id': 7,
+        'title': 'Shang-Chi and the Legion of Ringmasters',
+        'year': 2021,
+        'hasFile': True,
+        'movieFile': {'relativePath': keeper_name},
+    }]
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    with mock.patch.object(target, 'RADARR_API_KEY', 'test-key'), \
+         mock.patch.object(target, 'deluge_login'), \
+         mock.patch.object(target, 'ensure_label_exists'), \
+         mock.patch.object(target, 'get_all_torrents', return_value={
+             'KEEPERHASH0001': {'name': keeper_name, 'label': 'radarr', 'progress': 100.0},
+             'CANDIDATEHSH01': {'name': cand_name, 'label': 'radarr', 'progress': 100.0,
+                                'tracker_status': candidate_tracker_status},
+         }), \
+         mock.patch.object(target, 'supersede_torrent'), \
+         mock.patch.object(target, 'record_activity'), \
+         mock.patch.object(target.requests, 'get', side_effect=[
+             _Resp(movie_json),  # /api/v3/movie list
+             _Resp({'title': 'Shang-Chi and the Legion of Ringmasters', 'originalTitle': ''}),  # movie detail (titles)
+         ]), \
+         mock.patch.object(target.log, 'info') as log_info:
+        target.dedup_via_radarr(dry_run=True)
+
+    lines = [str(c.args[0]) for c in log_info.call_args_list]
+    return len([l for l in lines if 'WOULD relabel superseded' in l and cand_name in l])
 
 
 def main():

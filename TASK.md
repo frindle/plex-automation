@@ -37,8 +37,8 @@ token is required in THAT file, not the target.)
 
 ## Scope
 
-Only edit `arr-webhook.py`; do not edit `verify.sh`, `test_fixture.py` or `TASK.md`.
-test_fixture.py is the test fixture -- changing it invalidates the check.
+Only edit `arr-webhook.py` (the fix) and `test_fixture.py` (adversarial cases only -- never weaken or delete existing ones); do not edit `verify.sh`.
+test_fixture.py is the test fixture; it may only GROW with new adversarial cases.
 
 ## Keep every changed line exercised (relevance)
 
