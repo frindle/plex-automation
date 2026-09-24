@@ -256,6 +256,9 @@ def _case_manual_endpoint_records_quota():
     return 'ok'
 
 
+# Model-drafted; NOT yet read by a human.
+DRAFT_UNCONFIRMED = True
+
 CASES = [
     ("exhausted weekly quota skips the poll entirely (no service runs)", _case_exhausted_quota_skips_poll, "ok"),
     ("exhausted quota poll still sleeps exactly 3600s before retrying", _case_exhausted_sleeps_exactly_one_hour, "ok"),
