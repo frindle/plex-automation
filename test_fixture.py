@@ -90,6 +90,60 @@ def _case_exhausted_quota_skips_poll():
     return 'ok'
 
 
+def _case_exhausted_sleeps_exactly_one_hour():
+    """Exhausted quota -> the poll still sleeps exactly 3600s before retrying.
+
+    A longer/shorter cadence (e.g. a typo'd constant) would let the gate
+    re-poll on the wrong schedule, so assert the exact duration."""
+    _write_state({'quota': {'count': 10, 'week_start': target.datetime.now(target.timezone.utc).replace(tzinfo=None).isoformat()}})
+    sleeps = []
+    def _sleep(*a, **k):
+        sleeps.append(a[0] if a else k.get('seconds'))
+        raise _StopPoll()
+    with mock.patch.object(target.time, 'sleep', side_effect=_sleep), \
+         mock.patch.object(target, 'monthly_upgrade_cycle') as cycle:
+        try:
+            target.monthly_search_scheduler()
+        except _StopPoll:
+            pass
+    if sleeps != [3600]:
+        return f'exhausted poll must sleep exactly 3600s once, got {sleeps}'
+    if cycle.call_count != 0:
+        return f'cycle ran despite exhausted quota ({cycle.call_count} calls)'
+    return 'ok'
+
+
+def _case_exhausted_poll_runs_nothing():
+    """Exhausted quota -> the poll must NOT fall through to service selection.
+
+    No monthly_upgrade_cycle call, no next_service flip/persist: the iteration
+    ends at the sleep."""
+    cycle_calls = []
+    _write_state({'next_service': 'sonarr',
+                  'quota': {'count': 10, 'week_start': target.datetime.now(target.timezone.utc).replace(tzinfo=None).isoformat()}})
+    # The FIRST sleep must return normally (not raise): if the exhausted branch
+    # falls through to service selection instead of `continue`-ing back to the
+    # top of the loop, that fall-through only becomes visible once control gets
+    # past the first sleep. The second sleep then ends the run.
+    sleeps = {'n': 0}
+    def _sleep(*a, **k):
+        sleeps['n'] += 1
+        if sleeps['n'] >= 2:
+            raise _StopPoll()
+    with mock.patch.object(target.time, 'sleep', side_effect=_sleep), \
+         mock.patch.object(target, 'monthly_upgrade_cycle', side_effect=lambda svc: cycle_calls.append(svc)):
+        try:
+            target.monthly_search_scheduler()
+        except _StopPoll:
+            pass
+    if cycle_calls != []:
+        return f'services ran despite exhausted quota: {cycle_calls}'
+    st = _read_state()
+    if st.get('next_service') != 'sonarr':
+        return f'exhausted poll must not touch next_service (was sonarr, now {st.get("next_service")!r})'
+    return 'ok'
+
+
 def _case_alternation_and_default():
     """Empty state -> radarr first (default), then sonarr, alternating; one service per poll."""
     cycle_calls = []
@@ -114,6 +168,27 @@ def _case_alternation_and_default():
         return f'wrong 3-poll order: {cycle_calls}'
     if _read_state().get('next_service') != 'sonarr':
         return f"after 3 polls next_service should be sonarr, got {_read_state().get('next_service')!r}"
+    return 'ok'
+
+
+def _case_invalid_next_service_falls_back_to_radarr():
+    """A corrupted/stale 'next_service' value must fall back to 'radarr', not be
+    passed through to monthly_upgrade_cycle (which would run the radarr path
+    silently for an unknown service name)."""
+    cycle_calls = []
+    _write_state({'next_service': 'radarr_X',
+                  'quota': {'count': 0, 'week_start': target.datetime.now(target.timezone.utc).replace(tzinfo=None).isoformat()}})
+    with mock.patch.object(target.time, 'sleep', side_effect=lambda *a, **k: (_ for _ in ()).throw(_StopPoll())), \
+         mock.patch.object(target, 'monthly_upgrade_cycle', side_effect=lambda svc: cycle_calls.append(svc)):
+        try:
+            target.monthly_search_scheduler()
+        except _StopPoll:
+            pass
+    if cycle_calls != ['radarr']:
+        return f"invalid next_service must fall back to radarr, got {cycle_calls}"
+    st = _read_state()
+    if st.get('next_service') != 'sonarr':
+        return f"after running the fallback service, next_service should flip to sonarr, got {st.get('next_service')!r}"
     return 'ok'
 
 
@@ -183,7 +258,10 @@ def _case_manual_endpoint_records_quota():
 
 CASES = [
     ("exhausted weekly quota skips the poll entirely (no service runs)", _case_exhausted_quota_skips_poll, "ok"),
+    ("exhausted quota poll still sleeps exactly 3600s before retrying", _case_exhausted_sleeps_exactly_one_hour, "ok"),
+    ("exhausted quota poll runs nothing and does not flip next_service", _case_exhausted_poll_runs_nothing, "ok"),
     ("one service per poll, alternating radarr/sonarr via persisted next_service (default radarr)", _case_alternation_and_default, "ok"),
+    ("invalid/corrupted next_service value falls back to radarr and still flips the key", _case_invalid_next_service_falls_back_to_radarr, "ok"),
     ("monthly_upgrade_cycle records relabel()'s integer count via record_upgrades_found", _case_cycle_records_relabel_count, "ok"),
     ("manual /run-monthly-upgrade endpoint works and routes its relabel count through the shared quota", _case_manual_endpoint_records_quota, "ok"),
 ]

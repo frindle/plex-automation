@@ -18,7 +18,14 @@ return an int) is discarded in `monthly_upgrade_cycle`.
 
 arr-webhook.py:3490 (`def monthly_search_scheduler():`) and arr-webhook.py:3518
 (`def monthly_upgrade_cycle(...)`); the manual endpoint at ~line 6052
-(`/run-monthly-upgrade`) goes through `monthly_upgrade_cycle` too.
+(`/run-monthly-upgrade`, `@app.route('/run-monthly-upgrade', methods=['POST'])`)
+goes through `monthly_upgrade_cycle` too.
+
+Variables named in this task (all module-level, defined earlier in arr-webhook.py):
+- `WEEKLY_UPGRADE_QUOTA` (line 218) -- the shared radarr+sonarr weekly upgrade cap; an int read from env with a default.
+- `weekly_quota_state(state, now)` (line 1663) -- returns the current rolling-7-day quota entry dict (`{'count': int, 'week_start': ISO-8601}`), or a fresh zeroed entry when absent/expired; never mutates its input.
+- `record_upgrades_found(state, n)` (line 1688) -- adds `n` to the current quota entry's count and persists via `_save_upgrade_state`.
+- `state['next_service']` -- a NEW top-level key in the upgrade-state JSON file (`UPGRADE_STATE_PATH`, written by `_load_upgrade_state`/`_save_upgrade_state` at lines 1642/1656); values `'radarr'` or `'sonarr'`, defaulting to `'radarr'` when absent.
 
 ## Required change
 

@@ -64,7 +64,7 @@ NEW_SCHEDULER = r'''def monthly_search_scheduler():
     is no longer consulted here; both stay defined for backward compatibility."""
     import datetime
     while True:
-        # last_run stamps are persisted in UTC, so compare against a naive-UTC clock.
+        # last_run stamps are persisted in UTC, so compare against a naive-UTC clock.  # relevance: unobservable
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         state = _load_upgrade_state()
         quota_entry = weekly_quota_state(state, now)
