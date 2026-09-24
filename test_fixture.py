@@ -116,6 +116,9 @@ def test_record_with_expired_window_starts_fresh():
     assert delta < 5
 
 
+# Model-drafted; NOT yet read by a human.
+DRAFT_UNCONFIRMED = True
+
 CASES = [
     ("WEEKLY_UPGRADE_QUOTA is an int read from env with default 10", test_quota_constant, None),
     ("absent 'quota' key -> fresh {'count': 0} entry, state not mutated", test_absent_key_defaults_fresh_and_does_not_mutate, None),
