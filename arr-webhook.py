@@ -215,6 +215,7 @@ BULK_SEARCH_DELAY = int(os.environ.get('BULK_SEARCH_DELAY', '180'))  # secs betw
 # Yearly upgrade batched pass: how many movies/series per pass, and the
 # minimum whole days between passes for a given service.
 UPGRADE_BATCH_SIZE = int(os.environ.get('UPGRADE_BATCH_SIZE', '12'))
+WEEKLY_UPGRADE_QUOTA = int(os.environ.get('WEEKLY_UPGRADE_QUOTA', '10'))
 
 
 def advance_upgrade_cursor(cursor, total):
@@ -1658,6 +1659,43 @@ def _save_upgrade_state(state):
             _json.dump(state, f)
     except Exception as e:
         log.warning(f'[upgrade-batches] failed to persist state: {e}')
+
+def weekly_quota_state(state, now=None):
+    """Shared radarr+sonarr upgrade quota for the rolling 7-day window.
+
+    Reads the top-level 'quota' entry ({'count': int, 'week_start': ISO-8601})
+    from the upgrade state dict. When the key is absent, or week_start is
+    unparseable, or at least 7 days have elapsed since it, the window has
+    expired and a FRESH {'count': 0, 'week_start': <now>} entry is returned as
+    a new dict -- the passed-in state is never mutated. Otherwise the existing
+    entry is returned unchanged. `now` defaults to a naive-UTC clock (same
+    convention as upgrade_batch_due). Callers check remaining capacity via
+    WEEKLY_UPGRADE_QUOTA - entry['count'] before running a pass."""
+    if now is None:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+    fresh = {'count': 0, 'week_start': now.isoformat()}
+    entry = (state or {}).get('quota')
+    if not isinstance(entry, dict):
+        return fresh
+    try:
+        week_start = datetime.fromisoformat(entry.get('week_start'))
+    except (TypeError, ValueError):
+        return fresh  # unparseable stamp -> window expired, never wedge
+    if (now - week_start).total_seconds() >= 7 * 86400:
+        return fresh
+    return entry
+
+def record_upgrades_found(state, n):
+    """Record n upgrades confirmed queued against the shared weekly quota.
+
+    Takes the current quota entry (resetting to a fresh window first if it has
+    expired), adds n to its 'count', writes it back into state['quota'] and
+    persists via _save_upgrade_state. Does NOT enforce the cap itself --
+    callers check WEEKLY_UPGRADE_QUOTA - entry['count'] before deciding
+    whether to run a pass."""
+    entry = weekly_quota_state(state)
+    state['quota'] = {'count': entry.get('count', 0) + n, 'week_start': entry['week_start']}
+    _save_upgrade_state(state)
 
 def _save_seed_state(state):
     try:
