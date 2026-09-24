@@ -111,6 +111,35 @@ def _case_radarr_source_not_prioritized():
     return prio is None or not prio.called
 
 
+def _case_queue_top_request_shape():
+    """The core.queue_top RPC must be exactly right: deluge_login() runs first,
+    then a post whose json is EXACTLY {'method': 'core.queue_top',
+    'params': [[hash]], 'id': 92} and whose timeout is 10. Pinning the full
+    request shape (not just method+params) means a dropped login, an id drift
+    or rename, or a timeout change all fail here."""
+    post = MagicMock()
+    target.session = MagicMock(post=post)
+    target.is_upgrade_sonarr = lambda data: False
+    real_login = target.deluge_login
+    login_mock = MagicMock()  # no real Deluge in this environment
+    target.deluge_login = login_mock
+    try:
+        target.handle_grab(_sonarr_grab(), "Sonarr")
+    finally:
+        del target.is_upgrade_sonarr
+        target.deluge_login = real_login
+    if not login_mock.called:
+        return False  # the helper must authenticate before issuing RPC
+    tops = [c for c in post.call_args_list
+            if isinstance(c.kwargs.get("json"), dict)
+            and c.kwargs["json"].get("method") == "core.queue_top"]
+    if not tops:
+        return False
+    req = tops[0].kwargs["json"]
+    want = {"method": "core.queue_top", "params": [["abc123"]], "id": 92}
+    return req == want and tops[0].kwargs.get("timeout") == 10
+
+
 def _case_deluge_failure_does_not_raise():
     """A Deluge error in the prioritization path must be swallowed (logged),
     never raised out of handle_grab -- same contract as the other grab-time
