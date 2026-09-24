@@ -3150,12 +3150,12 @@ def relabel_radarr_upgrades():
         deluge_login()
         torrents = get_all_torrents()
         if not torrents:
-            return
+            return 0
         # Get all radarr-labeled torrents that aren't already upgrade-labeled
         radarr_torrents = {h: i for h, i in torrents.items() if i.get('label') == 'radarr'}
         if not radarr_torrents:
             log.info('No radarr-labeled torrents to check')
-            return
+            return 0
         # Check each against Radarr API to see if movie already has a file
         r = requests.get(
             f'{RADARR_URL}/api/v3/movie',
@@ -3196,8 +3196,10 @@ def relabel_radarr_upgrades():
             )
             log.info(f'Moved {len(relabeled_hashes)} upgrade torrents to bottom of queue')
         log.info(f'Relabeled {relabeled} torrents as radarr-upgrade')
+        return relabeled
     except Exception as e:
         log.error(f'Radarr upgrade relabeling failed: {e}')
+        return 0
 
 def sonarr_bulk_search():
     """Sonarr counterpart of radarr_bulk_search: a bounded yearly-upgrade pass.
@@ -3263,11 +3265,11 @@ def relabel_sonarr_upgrades():
         deluge_login()
         torrents = get_all_torrents()
         if not torrents:
-            return
+            return 0
         sonarr_torrents = {h: i for h, i in torrents.items() if i.get('label') == 'sonarr'}
         if not sonarr_torrents:
             log.info('No sonarr-labeled torrents to check')
-            return
+            return 0
         q = requests.get(
             f'{SONARR_URL}/api/v3/queue',
             headers={'X-Api-Key': SONARR_API_KEY},
@@ -3310,8 +3312,10 @@ def relabel_sonarr_upgrades():
             )
             log.info(f'Moved {len(relabeled_hashes)} sonarr upgrade torrents to bottom of queue')
         log.info(f'Relabeled {len(relabeled_hashes)} torrents as {SONARR_UPG_LABEL}')
+        return len(relabeled_hashes)
     except Exception as e:
         log.error(f'Sonarr upgrade relabeling failed: {e}')
+        return 0
 
 def verify_and_fix_labels(services=('radarr', 'sonarr')):
     """Final safety pass, distinct from relabel_radarr_upgrades/relabel_sonarr_upgrades:
