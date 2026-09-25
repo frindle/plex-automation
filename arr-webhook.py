@@ -1286,6 +1286,61 @@ def select_pack_superseded_by_singles(torrent_names, keeper_ids, keeper_single_s
         selected.append(h)
     return selected
 
+def select_same_season_pack_losers(series_id, torrent_names, keeper_ids, imported_ids):
+    """Pure decision for the SAME-SEASON pack-vs-pack supersede case.
+
+    When TWO season packs for the same series+season both seed in the
+    sonarr-labeled set (e.g. an x264 and an HEVC rip of S01), no other pass
+    touches them: packs carry no SxxExx token so they never join a per-episode
+    group, and neither pack-vs-single pass compares packs against each other —
+    both keep seeding forever. This selects the lower-codec loser(s).
+
+    Args:
+        series_id: Sonarr series id (part of the grouping key; comparison is
+            always scoped to one series' matched names here).
+        torrent_names: {hash: release_name} for the series' sonarr-labeled
+            torrents already filtered to progress >= 99% and title-matched.
+        keeper_ids: set of lowercase downloadIds that are the CURRENT keeper
+            (from _sonarr_keeper_pack_info). A pack whose OWN hash is in here
+            is itself the live file and must be spared — even with a lower
+            codec_rank than its same-season rival.
+        imported_ids: flat historical import set from
+            _sonarr_series_imported_download_ids; tie-break signal when two
+            packs share a codec_rank (the one Sonarr actually imported wins).
+
+    Returns the list of loser pack hashes — safe to soft-supersede. Strictly
+    scoped:
+
+      * A candidate is a pack iff SEASON_RE matches AND EPISODE_RE does NOT;
+        individual-episode torrents are NEVER returned.
+      * Packs are grouped into `same_season_packs` keyed by (series_id, season)
+        and ONLY compared within their own key — packs in different seasons
+        never compete against each other.
+      * A lone pack for its series+season is the only copy and is never
+        selected: it is trivially its own group's keeper, so `h != keeper`
+        yields nothing for a single-pack group.
+      * Keeper order within a multi-pack group: current-keeper signal first
+        (a live file is spared even with a lower codec_rank), then imported
+        history, then the higher codec_rank, then hash as deterministic last
+        resort.
+    """
+    same_season_packs = {}
+    for h, name in (torrent_names or {}).items():
+        name = name or ''
+        sm = SEASON_RE.search(name)
+        if not sm:
+            continue  # no season token -> can't be a season pack
+        if EPISODE_RE.search(name):
+            continue  # individual-episode torrents are never selected here
+        same_season_packs.setdefault((series_id, int(sm.group(1))), []).append(h)
+    keepers = {(d or '').lower() for d in (keeper_ids or set())}
+    imported = {(d or '').lower() for d in (imported_ids or set())}
+    selected = []
+    for key, packs in same_season_packs.items():
+        keeper = max(packs, key=lambda h: (h.lower() in keepers, h.lower() in imported, codec_rank((torrent_names or {}).get(h) or ''), h))
+        selected.extend(h for h in packs if h != keeper)
+    return selected
+
 def select_episode_dupe_losers(ep_key, hashes, latest_keeper_map):
     """Given the SxxExx key, the list of torrent hashes matched to that episode,
     and {ep_key: latest_keeper_downloadId_lower}, return the hashes to supersede
@@ -1458,9 +1513,36 @@ def dedup_via_sonarr(dry_run=False):
                 if not dry_run:
                     supersede_torrent(h)
                 relabeled += 1
+            # Same-season pack-vs-pack pass: two season packs for the SAME
+            # series+season both seeding (e.g. an x264 and an HEVC rip of S01)
+            # are invisible to every other pass — packs carry no SxxExx token,
+            # so they never join a per-episode group, and neither pack-vs-single
+            # pass compares packs against each other. Keep the higher-codec
+            # pack (tie-break on keeper signals), supersede the loser(s). A lone
+            # pack for its season is the only copy and is never touched.
+            same_season_losers = set(
+                select_same_season_pack_losers(series_id, matched_names, keeper_ids, imported_ids)
+            )
+            for h in same_season_losers:
+                name = sonarr_torrents[h].get('name', '') or ''
+                sm = SEASON_RE.search(name)
+                season = int(sm.group(1)) if sm else None
+                action = 'WOULD relabel' if dry_run else 'relabeling'
+                log.info(f'  {action} superseded (same-season pack, lower codec): "{name}" (series {series_id}: {series.get("title")}, S{season:02d})')
+                report.append({
+                    'series_id': series_id,
+                    'series': series.get('title'),
+                    'season': season,
+                    'pack_hash': h,
+                    'pack_name': name,
+                })
+                if not dry_run:
+                    supersede_torrent(h)
+                relabeled += 1
             # Skip these packs in the per-episode grouping below (they carry no
             # SxxExx token anyway, but keep the skip set explicit).
             superseded_by_pack.update(superseded_redundant_packs)
+            superseded_by_pack.update(same_season_losers)
             by_episode = {}
             for h in matched_hashes:
                 if h in superseded_by_pack:
