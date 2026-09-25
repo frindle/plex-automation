@@ -3489,9 +3489,11 @@ def upgrade_batch_due(entry, now=None):
 
 def monthly_search_scheduler():
     """
-    On the 1st of each month, Radarr first and then the identical Sonarr
-    cycle (Sonarr was silently missing a lot of episodes because nothing
-    ever bulk-searched it):
+    Hourly poll, shared radarr+sonarr weekly upgrade quota: at most one
+    service runs per poll (they alternate via the persisted 'next_service'
+    key so neither starves), and no pass starts once WEEKLY_UPGRADE_QUOTA
+    confirmed upgrades have been queued in the rolling 7-day window. Each
+    run is the full monthly cycle for that service:
     1. Purge stalled <service>-upgrade torrents
     2. Wait 30 minutes
     3. Trigger bulk search
@@ -3500,23 +3502,35 @@ def monthly_search_scheduler():
     """
     import datetime
     while True:
-        # last_run stamps are persisted in UTC (see radarr_bulk_search /
+        # Quota stamps are persisted in UTC (see radarr_bulk_search /
         # sonarr_bulk_search), so compare against a naive-UTC clock.
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         state = _load_upgrade_state()
-        for service in ('radarr', 'sonarr'):
-            entry = state.get(service) or {}
-            due = upgrade_batch_due(entry, now)
-            if due:
-                log.info(f'{service}: upgrade batch interval reached, starting monthly cycle')
-                # Services run sequentially rather than in parallel so the two
-                # bulk searches don't stack announces on the same tracker.
-                monthly_upgrade_cycle(service)
+        quota_entry = weekly_quota_state(state, now)
+        if WEEKLY_UPGRADE_QUOTA - quota_entry['count'] <= 0:
+            log.info(f'weekly upgrade quota exhausted ({quota_entry["count"]}/{WEEKLY_UPGRADE_QUOTA}); skipping this poll')
+        else:
+            # Services run one at a time rather than in parallel so the two
+            # bulk searches don't stack announces on the same tracker; the
+            # persisted 'next_service' key alternates whose turn it is.
+            service = state.get('next_service') or 'radarr'
+            if service not in ('radarr', 'sonarr'):
+                service = 'radarr'  # corrupted/stale value -> safe default, never pass through
+            log.info(f'{service}: weekly quota has room ({quota_entry["count"]}/{WEEKLY_UPGRADE_QUOTA}), starting monthly cycle')
+            monthly_upgrade_cycle(service)
+            # Reload: the cycle may have advanced the shared quota on disk.
+            state = _load_upgrade_state()
+            state['next_service'] = 'sonarr' if service == 'radarr' else 'radarr'
+            _save_upgrade_state(state)
         time.sleep(3600)  # check every hour
 
 
 def monthly_upgrade_cycle(service, wait_before_search=1800, wait_before_relabel=300):
-    """One service's monthly purge → bulk search → relabel pass."""
+    """One service's monthly purge → bulk search → relabel pass.
+
+    The shared weekly quota only advances on CONFIRMED queued upgrades: the
+    integer count returned by the relabel step is recorded via
+    record_upgrades_found -- searches merely attempted never touch it."""
     if service == 'sonarr':
         label, bulk_search, relabel = SONARR_UPG_LABEL, sonarr_bulk_search, relabel_sonarr_upgrades
     else:
@@ -3528,8 +3542,10 @@ def monthly_upgrade_cycle(service, wait_before_search=1800, wait_before_relabel=
     bulk_search()
     log.info(f'{service}: waiting {wait_before_relabel}s before relabeling upgrades...')
     time.sleep(wait_before_relabel)
-    relabel()
-    log.info(f'{service}: monthly cycle complete')
+    count = relabel()
+    state = _load_upgrade_state()
+    record_upgrades_found(state, count)
+    log.info(f'{service}: monthly cycle complete ({count} upgrade(s) confirmed queued against the weekly quota)')
 
 
 def prioritize_normal_torrents():
