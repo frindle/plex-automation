@@ -5,7 +5,7 @@ import time
 import logging
 import threading
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 
 from media_share import share_bp, init_db as init_share_db
@@ -132,6 +132,7 @@ STALL_CHECK_INTERVAL = int(os.environ.get('STALL_CHECK_INTERVAL', str(7 * 86400)
 # not zero) -- treated as "don't know, don't touch", never as safe to remove.
 STALL_MIN_SWARM_SEEDS = int(os.environ.get('STALL_MIN_SWARM_SEEDS', '5'))
 SEED_STATE_PATH = os.environ.get('SEED_STATE_PATH', '/data/seed_tracking.json')
+UPGRADE_STATE_PATH = os.environ.get('UPGRADE_STATE_PATH', '/data/upgrade_batch_state.json')
 # Off by default until proven safe. The manual preview endpoint
 # (/run-stalled-seeds, dry-run by default) still works regardless of this
 # flag — this only gates the automatic weekly background removal.
@@ -211,6 +212,30 @@ IMPORTBLOCKED_INTERVAL = int(os.environ.get('IMPORTBLOCKED_INTERVAL', '900'))  #
 # Lower batch / higher delay is gentler on the tracker.
 BULK_SEARCH_BATCH = int(os.environ.get('BULK_SEARCH_BATCH', '50'))
 BULK_SEARCH_DELAY = int(os.environ.get('BULK_SEARCH_DELAY', '180'))  # secs between batches
+# Yearly upgrade batched pass: how many movies/series per pass, and the
+# minimum whole days between passes for a given service.
+UPGRADE_BATCH_SIZE = int(os.environ.get('UPGRADE_BATCH_SIZE', '12'))
+WEEKLY_UPGRADE_QUOTA = int(os.environ.get('WEEKLY_UPGRADE_QUOTA', '10'))
+
+
+def advance_upgrade_cursor(cursor, total):
+    """Advance the yearly-upgrade batch cursor by one pass.
+
+    Returns (indices, next_cursor): up to UPGRADE_BATCH_SIZE consecutive
+    indices starting at the clamped cursor, wrapping past the end back to 0,
+    and where to resume on the next pass. A stale cursor from a larger catalog
+    is clamped into range so it never indexes out of bounds; when total is
+    zero there is nothing to search this pass.
+    """
+    if total <= 0:
+        return [], 0
+    clamped = max(0, min(cursor, total - 1))
+    count = min(UPGRADE_BATCH_SIZE, total)
+    indices = [(clamped + i) % total for i in range(count)]
+    next_cursor = (clamped + count) % total
+    return indices, next_cursor
+
+UPGRADE_BATCH_INTERVAL_DAYS = int(os.environ.get('UPGRADE_BATCH_INTERVAL_DAYS', '3'))
 # Sonarr batches are much smaller: one SeriesSearch fans out to every
 # monitored episode in that series, so 50 series is an order of magnitude
 # more announces than 50 movies. Tune down further if the tracker complains.
@@ -1704,12 +1729,63 @@ def cleanup_unpacked_torrents():
         log.error(f'Unpacked-torrent cleanup failed: {e}')
 
 
+def _load_upgrade_state():
+    try:
+        with open(UPGRADE_STATE_PATH) as f:
+            return _json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
 def _load_seed_state():
     try:
         with open(SEED_STATE_PATH) as f:
             return _json.load(f)
     except (FileNotFoundError, ValueError):
         return {}
+
+def _save_upgrade_state(state):
+    try:
+        with open(UPGRADE_STATE_PATH, 'w') as f:
+            _json.dump(state, f)
+    except Exception as e:
+        log.warning(f'[upgrade-batches] failed to persist state: {e}')
+
+def weekly_quota_state(state, now=None):
+    """Shared radarr+sonarr upgrade quota for the rolling 7-day window.
+
+    Reads the top-level 'quota' entry ({'count': int, 'week_start': ISO-8601})
+    from the upgrade state dict. When the key is absent, or week_start is
+    unparseable, or at least 7 days have elapsed since it, the window has
+    expired and a FRESH {'count': 0, 'week_start': <now>} entry is returned as
+    a new dict -- the passed-in state is never mutated. Otherwise the existing
+    entry is returned unchanged. `now` defaults to a naive-UTC clock (same
+    convention as upgrade_batch_due). Callers check remaining capacity via
+    WEEKLY_UPGRADE_QUOTA - entry['count'] before running a pass."""
+    if now is None:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+    fresh = {'count': 0, 'week_start': now.isoformat()}
+    entry = (state or {}).get('quota')
+    if not isinstance(entry, dict):
+        return fresh
+    try:
+        week_start = datetime.fromisoformat(entry.get('week_start'))
+    except (TypeError, ValueError):
+        return fresh  # unparseable stamp -> window expired, never wedge
+    if (now - week_start).total_seconds() >= 7 * 86400:
+        return fresh
+    return entry
+
+def record_upgrades_found(state, n):
+    """Record n upgrades confirmed queued against the shared weekly quota.
+
+    Takes the current quota entry (resetting to a fresh window first if it has
+    expired), adds n to its 'count', writes it back into state['quota'] and
+    persists via _save_upgrade_state. Does NOT enforce the cap itself --
+    callers check WEEKLY_UPGRADE_QUOTA - entry['count'] before deciding
+    whether to run a pass."""
+    entry = weekly_quota_state(state)
+    state['quota'] = {'count': entry.get('count', 0) + n, 'week_start': entry['week_start']}
+    _save_upgrade_state(state)
 
 def _save_seed_state(state):
     try:
@@ -3157,38 +3233,50 @@ def ensure_label_exists_named(label):
 
 
 def radarr_bulk_search():
-    """Trigger a search for all monitored movies in Radarr to catch missed upgrades."""
+    """Trigger a bounded yearly-upgrade pass over monitored Radarr movies.
+
+    Instead of searching the ENTIRE catalog in one go (which makes Radarr push
+    every accepted release to Deluge back-to-back and trips private-tracker
+    announce rate limits), each pass searches at most UPGRADE_BATCH_SIZE
+    movies: the monitored list is sorted newest-year-first via
+    sort_ids_by_year_desc, advance_upgrade_cursor picks this pass's slice from
+    the persisted cursor (wrapping to index 0 after the end), and the new
+    cursor plus a fresh last_run timestamp are persisted back through
+    _save_upgrade_state so successive passes walk the whole catalog over time.
+    """
     log.info('Running monthly Radarr bulk search for upgrades...')
     try:
+        state = _load_upgrade_state()
+        entry = state.get('radarr', {}) or {}
         movies_r = requests.get(
             f'{RADARR_URL}/api/v3/movie',
             headers={'X-Api-Key': RADARR_API_KEY},
             timeout=15
         )
         movies_r.raise_for_status()
-        movie_ids = [m['id'] for m in movies_r.json() if m.get('monitored')]
-        if not movie_ids:
+        monitored = [m for m in movies_r.json() if m.get('monitored')]
+        if not monitored:
             log.warning('Radarr bulk search: no monitored movies found, skipping')
             return
-        batches = [movie_ids[n:n + BULK_SEARCH_BATCH]
-                   for n in range(0, len(movie_ids), BULK_SEARCH_BATCH)]
-        log.info(f'Radarr bulk search: {len(movie_ids)} movies in {len(batches)} '
-                 f'batches of {BULK_SEARCH_BATCH}, {BULK_SEARCH_DELAY}s apart')
-        for n, batch in enumerate(batches, 1):
-            try:
-                r = requests.post(
-                    f'{RADARR_URL}/api/v3/command',
-                    headers={'X-Api-Key': RADARR_API_KEY},
-                    json={'name': 'MoviesSearch', 'movieIds': batch},
-                    timeout=30
-                )
-                r.raise_for_status()
-                log.info(f'Radarr bulk search batch {n}/{len(batches)} '
-                         f'({len(batch)} movies) queued: id {r.json().get("id")}')
-            except Exception as e:
-                log.error(f'Radarr bulk search batch {n}/{len(batches)} failed: {e}')
-            if n < len(batches):
-                time.sleep(BULK_SEARCH_DELAY)
+        ordered = sort_ids_by_year_desc(monitored)
+        movie_ids = [m['id'] for m in ordered]
+        indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(movie_ids))
+        batch = [movie_ids[i] for i in indices]
+        log.info(f'Radarr bulk search: {len(batch)} of {len(movie_ids)} movies this pass '
+                 f'(cursor -> {next_cursor})')
+        try:
+            r = requests.post(
+                f'{RADARR_URL}/api/v3/command',
+                headers={'X-Api-Key': RADARR_API_KEY},
+                json={'name': 'MoviesSearch', 'movieIds': batch},
+                timeout=30
+            )
+            r.raise_for_status()
+            log.info(f'Radarr bulk search pass ({len(batch)} movies) queued: id {r.json().get("id")}')
+        except Exception as e:
+            log.error(f'Radarr bulk search pass failed: {e}')
+        state['radarr'] = {'cursor': next_cursor, 'last_run': datetime.now(timezone.utc).isoformat()}
+        _save_upgrade_state(state)
     except Exception as e:
         log.error(f'Radarr bulk search failed: {e}')
 
@@ -3199,12 +3287,12 @@ def relabel_radarr_upgrades():
         deluge_login()
         torrents = get_all_torrents()
         if not torrents:
-            return
+            return 0
         # Get all radarr-labeled torrents that aren't already upgrade-labeled
         radarr_torrents = {h: i for h, i in torrents.items() if i.get('label') == 'radarr'}
         if not radarr_torrents:
             log.info('No radarr-labeled torrents to check')
-            return
+            return 0
         # Check each against Radarr API to see if movie already has a file
         r = requests.get(
             f'{RADARR_URL}/api/v3/movie',
@@ -3245,53 +3333,56 @@ def relabel_radarr_upgrades():
             )
             log.info(f'Moved {len(relabeled_hashes)} upgrade torrents to bottom of queue')
         log.info(f'Relabeled {relabeled} torrents as radarr-upgrade')
+        return relabeled
     except Exception as e:
         log.error(f'Radarr upgrade relabeling failed: {e}')
+        return 0
 
 def sonarr_bulk_search():
-    """Sonarr counterpart of radarr_bulk_search: search every monitored
-    series so missing episodes and cutoff-unmet upgrades both get picked up.
+    """Sonarr counterpart of radarr_bulk_search: a bounded yearly-upgrade pass.
 
-    Radarr's MoviesSearch takes a *list* of movieIds in one command; Sonarr's
+    Each pass searches at most UPGRADE_BATCH_SIZE monitored series (sorted
+    newest-first via sort_ids_by_year_desc, sliced by advance_upgrade_cursor
+    from the persisted cursor) instead of the entire catalog. Sonarr's
     SeriesSearch takes a single seriesId (confirmed against Sonarr's
-    SeriesSearchCommand: `public int SeriesId`), so a "batch" here is N
-    separate commands fired back-to-back before the pacing sleep. One series
-    search fans out to every monitored episode in that series, so it's far
-    heavier per unit than one movie -- hence a much smaller default batch
-    than BULK_SEARCH_BATCH. Same tracker-announce rate-limit reasoning as
-    the Radarr comment above.
+    SeriesSearchCommand: `public int SeriesId`), so each item in this pass is
+    one separate command fired back-to-back -- same per-item call as before,
+    just bounded to this pass's slice. The new cursor and last_run timestamp
+    are persisted through _save_upgrade_state under the 'sonarr' key.
     """
     log.info('Running monthly Sonarr bulk search for missing/upgrades...')
     try:
+        state = _load_upgrade_state()
+        entry = state.get('sonarr', {}) or {}
         series_r = requests.get(
             f'{SONARR_URL}/api/v3/series',
             headers={'X-Api-Key': SONARR_API_KEY},
             timeout=30
         )
         series_r.raise_for_status()
-        series_ids = [s['id'] for s in series_r.json() if s.get('monitored')]
-        if not series_ids:
+        monitored = [s for s in series_r.json() if s.get('monitored')]
+        if not monitored:
             log.warning('Sonarr bulk search: no monitored series found, skipping')
             return
-        batches = [series_ids[n:n + SONARR_BULK_SEARCH_BATCH]
-                   for n in range(0, len(series_ids), SONARR_BULK_SEARCH_BATCH)]
-        log.info(f'Sonarr bulk search: {len(series_ids)} series in {len(batches)} '
-                 f'batches of {SONARR_BULK_SEARCH_BATCH}, {BULK_SEARCH_DELAY}s apart')
-        for n, batch in enumerate(batches, 1):
-            for series_id in batch:
-                try:
-                    r = requests.post(
-                        f'{SONARR_URL}/api/v3/command',
-                        headers={'X-Api-Key': SONARR_API_KEY},
-                        json={'name': 'SeriesSearch', 'seriesId': series_id},
-                        timeout=30
-                    )
-                    r.raise_for_status()
-                except Exception as e:
-                    log.error(f'Sonarr SeriesSearch for series {series_id} failed: {e}')
-            log.info(f'Sonarr bulk search batch {n}/{len(batches)} ({len(batch)} series) queued')
-            if n < len(batches):
-                time.sleep(BULK_SEARCH_DELAY)
+        ordered = sort_ids_by_year_desc(monitored)
+        series_ids = [s['id'] for s in ordered]
+        indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(series_ids))
+        batch = [series_ids[i] for i in indices]
+        log.info(f'Sonarr bulk search: {len(batch)} of {len(series_ids)} series this pass '
+                 f'(cursor -> {next_cursor})')
+        for series_id in batch:
+            try:
+                r = requests.post(
+                    f'{SONARR_URL}/api/v3/command',
+                    headers={'X-Api-Key': SONARR_API_KEY},
+                    json={'name': 'SeriesSearch', 'seriesId': series_id},
+                    timeout=30
+                )
+                r.raise_for_status()
+            except Exception as e:
+                log.error(f'Sonarr SeriesSearch for series {series_id} failed: {e}')
+        state['sonarr'] = {'cursor': next_cursor, 'last_run': datetime.now(timezone.utc).isoformat()}
+        _save_upgrade_state(state)
     except Exception as e:
         log.error(f'Sonarr bulk search failed: {e}')
 
@@ -3311,11 +3402,11 @@ def relabel_sonarr_upgrades():
         deluge_login()
         torrents = get_all_torrents()
         if not torrents:
-            return
+            return 0
         sonarr_torrents = {h: i for h, i in torrents.items() if i.get('label') == 'sonarr'}
         if not sonarr_torrents:
             log.info('No sonarr-labeled torrents to check')
-            return
+            return 0
         q = requests.get(
             f'{SONARR_URL}/api/v3/queue',
             headers={'X-Api-Key': SONARR_API_KEY},
@@ -3358,8 +3449,10 @@ def relabel_sonarr_upgrades():
             )
             log.info(f'Moved {len(relabeled_hashes)} sonarr upgrade torrents to bottom of queue')
         log.info(f'Relabeled {len(relabeled_hashes)} torrents as {SONARR_UPG_LABEL}')
+        return len(relabeled_hashes)
     except Exception as e:
         log.error(f'Sonarr upgrade relabeling failed: {e}')
+        return 0
 
 def verify_and_fix_labels(services=('radarr', 'sonarr')):
     """Final safety pass, distinct from relabel_radarr_upgrades/relabel_sonarr_upgrades:
@@ -3472,11 +3565,34 @@ def purge_stalled_upgrade_torrents(label=RADARR_UPG_LABEL):
     except Exception as e:
         log.error(f'Purge stalled upgrades failed: {e}')
 
+def upgrade_batch_due(entry, now=None):
+    """Interval gate for the yearly-upgrade batch passes.
+
+    A service is due when it has never run (no last_run stamp -- first-ever
+    poll with empty state), or when at least UPGRADE_BATCH_INTERVAL_DAYS have
+    elapsed since its last_run. An unparseable stamp is treated as due rather
+    than wedging the scheduler forever. `now` defaults to a naive-UTC clock;
+    stamps are persisted in UTC (see radarr_bulk_search / sonarr_bulk_search).
+    """
+    import datetime
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    last_run = (entry or {}).get('last_run')
+    if not last_run:
+        return True  # first run: no persisted timestamp yet
+    try:
+        elapsed_days = (now - datetime.datetime.fromisoformat(last_run)).total_seconds() / 86400.0
+    except ValueError:
+        return True  # unparseable stamp -> treat as due
+    return elapsed_days >= UPGRADE_BATCH_INTERVAL_DAYS
+
 def monthly_search_scheduler():
     """
-    On the 1st of each month, Radarr first and then the identical Sonarr
-    cycle (Sonarr was silently missing a lot of episodes because nothing
-    ever bulk-searched it):
+    Hourly poll, shared radarr+sonarr weekly upgrade quota: at most one
+    service runs per poll (they alternate via the persisted 'next_service'
+    key so neither starves), and no pass starts once WEEKLY_UPGRADE_QUOTA
+    confirmed upgrades have been queued in the rolling 7-day window. Each
+    run is the full monthly cycle for that service:
     1. Purge stalled <service>-upgrade torrents
     2. Wait 30 minutes
     3. Trigger bulk search
@@ -3484,22 +3600,36 @@ def monthly_search_scheduler():
     5. Relabel new upgrade torrents to the throttled lane, queue them last
     """
     import datetime
-    last_run_month = None
     while True:
-        now = datetime.datetime.now()
-        if now.day == 1 and now.month != last_run_month:
-            last_run_month = now.month
-            log.info('Monthly upgrade cycle starting')
-            monthly_upgrade_cycle('radarr')
-            # Sonarr runs after Radarr rather than in parallel so the two
-            # bulk searches don't stack announces on the same tracker.
-            monthly_upgrade_cycle('sonarr')
-            log.info('Monthly upgrade cycle complete')
+        # Quota stamps are persisted in UTC (see radarr_bulk_search /
+        # sonarr_bulk_search), so compare against a naive-UTC clock.
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        state = _load_upgrade_state()
+        quota_entry = weekly_quota_state(state, now)
+        if WEEKLY_UPGRADE_QUOTA - quota_entry['count'] <= 0:
+            log.info(f'weekly upgrade quota exhausted ({quota_entry["count"]}/{WEEKLY_UPGRADE_QUOTA}); skipping this poll')
+        else:
+            # Services run one at a time rather than in parallel so the two
+            # bulk searches don't stack announces on the same tracker; the
+            # persisted 'next_service' key alternates whose turn it is.
+            service = state.get('next_service') or 'radarr'
+            if service not in ('radarr', 'sonarr'):
+                service = 'radarr'  # corrupted/stale value -> safe default, never pass through
+            log.info(f'{service}: weekly quota has room ({quota_entry["count"]}/{WEEKLY_UPGRADE_QUOTA}), starting monthly cycle')
+            monthly_upgrade_cycle(service)
+            # Reload: the cycle may have advanced the shared quota on disk.
+            state = _load_upgrade_state()
+            state['next_service'] = 'sonarr' if service == 'radarr' else 'radarr'
+            _save_upgrade_state(state)
         time.sleep(3600)  # check every hour
 
 
 def monthly_upgrade_cycle(service, wait_before_search=1800, wait_before_relabel=300):
-    """One service's monthly purge → bulk search → relabel pass."""
+    """One service's monthly purge → bulk search → relabel pass.
+
+    The shared weekly quota only advances on CONFIRMED queued upgrades: the
+    integer count returned by the relabel step is recorded via
+    record_upgrades_found -- searches merely attempted never touch it."""
     if service == 'sonarr':
         label, bulk_search, relabel = SONARR_UPG_LABEL, sonarr_bulk_search, relabel_sonarr_upgrades
     else:
@@ -3511,8 +3641,10 @@ def monthly_upgrade_cycle(service, wait_before_search=1800, wait_before_relabel=
     bulk_search()
     log.info(f'{service}: waiting {wait_before_relabel}s before relabeling upgrades...')
     time.sleep(wait_before_relabel)
-    relabel()
-    log.info(f'{service}: monthly cycle complete')
+    count = relabel()
+    state = _load_upgrade_state()
+    record_upgrades_found(state, count)
+    log.info(f'{service}: monthly cycle complete ({count} upgrade(s) confirmed queued against the weekly quota)')
 
 
 def prioritize_normal_torrents():
@@ -6005,6 +6137,29 @@ def superseded_audit():
         'misfiled': misfiled,
     }), 200
 
+# Synchronous single-pass bulk search -- one bounded yearly-upgrade pass per
+# service (at most UPGRADE_BATCH_SIZE items from the persisted cursor), so it
+# is safe to run inline and report what was searched in the response body.
+@app.route('/run-bulk-search', methods=['POST'])
+def run_bulk_search_route():
+    service = (request.args.get('service') or 'radarr').lower()
+    if service not in ('radarr', 'sonarr'):
+        return jsonify({'ok': False, 'error': 'service must be radarr or sonarr'}), 400
+    state_before = _load_upgrade_state().get(service) or {}
+    cursor_before = state_before.get('cursor', 0)
+    if service == 'radarr':
+        radarr_bulk_search()
+    else:
+        sonarr_bulk_search()
+    entry_after = _load_upgrade_state().get(service) or {}
+    return jsonify({
+        'ok': True,
+        'service': service,
+        'cursor_before': cursor_before,
+        'cursor_after': entry_after.get('cursor'),
+        'last_run': entry_after.get('last_run'),
+    }), 200
+
 # Manual trigger for the monthly upgrade cycle. Full cycle with the
 # normal 30/5-minute waits by default; ?skip_waits=1 replaces them with
 # a short interval so you can watch the whole pipeline end-to-end.
@@ -6555,6 +6710,30 @@ def maintenance_scheduler():
         except Exception as e:
             log.error(f'Duplicate folder scan failed: {e}')
         time.sleep(DELUGE_REPAIR_INTERVAL)
+
+
+def sort_ids_by_year_desc(items):
+    """Order release items by effective release year, newest first.
+
+    Effective year is the item's 'year' when truthy, else the first four
+    characters of its 'firstAired' string parsed as an int when those are
+    digits, else 0. Zero-effective-year items sort last; ties within a year
+    keep their original input order (stable). The input list is not mutated."""
+
+    def _effective_year(item):
+        y = item.get('year')
+        if y:
+            return int(y)
+        aired = str(item.get('firstAired') or '')[:4]
+        if len(aired) >= 4 and aired.isdigit():
+            return int(aired)
+        return 0
+
+    def _key(item):
+        year = _effective_year(item)
+        return (year == 0, -year)
+
+    return sorted(items, key=_key)
 
 
 if __name__ == '__main__':
