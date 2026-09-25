@@ -144,6 +144,45 @@ def _case_exhausted_poll_runs_nothing():
     return 'ok'
 
 
+def _case_one_below_cap_still_runs():
+    """ADVERSARIAL boundary from the spec: count=9 with WEEKLY_UPGRADE_QUOTA=10 is
+    ONE upgrade of room. The gate is `remaining <= 0` -> skip; at 9 remaining is 1,
+    so exactly one service must still run and next_service must flip. An
+    off-by-one (`remaining <= 1`, `< 1` on the wrong side, `count >= QUOTA - 1`)
+    passes every count=10 and count=0 case and fails only here."""
+    cycle_calls, record_calls = [], []
+    _write_state({'next_service': 'sonarr',
+                  'quota': {'count': target.WEEKLY_UPGRADE_QUOTA - 1,
+                            'week_start': target.datetime.now(target.timezone.utc).replace(tzinfo=None).isoformat()}})
+    try:
+        _run_one_poll(cycle_calls, record_calls)
+    except Exception as e:
+        return f'raised {type(e).__name__}: {e}'
+    if cycle_calls != ['sonarr']:
+        return f'count={target.WEEKLY_UPGRADE_QUOTA - 1} (one below the cap) must run exactly one pass, got {cycle_calls}'
+    st = _read_state()
+    if st.get('next_service') != 'radarr':
+        return f"after the one-below-cap pass next_service should flip to radarr, got {st.get('next_service')!r}"
+    if st.get('quota', {}).get('count') != target.WEEKLY_UPGRADE_QUOTA - 1:
+        return f"the scheduler itself must not advance the quota (only relabel does), got {st.get('quota')!r}"
+    return 'ok'
+
+
+def _case_over_cap_skips_poll():
+    """count ABOVE the cap (11 > 10: a relabel pass can overshoot) is still exhausted:
+    `remaining <= 0` must hold for negatives too, not only `== 0`."""
+    cycle_calls, record_calls = [], []
+    _write_state({'quota': {'count': target.WEEKLY_UPGRADE_QUOTA + 1,
+                            'week_start': target.datetime.now(target.timezone.utc).replace(tzinfo=None).isoformat()}})
+    try:
+        _run_one_poll(cycle_calls, record_calls)
+    except Exception as e:
+        return f'raised {type(e).__name__}: {e}'
+    if cycle_calls != []:
+        return f'count over the cap must skip the poll, got {cycle_calls}'
+    return 'ok'
+
+
 def _case_alternation_and_default():
     """Empty state -> radarr first (default), then sonarr, alternating; one service per poll."""
     cycle_calls = []
@@ -261,6 +300,8 @@ CASES = [
     ("exhausted weekly quota skips the poll entirely (no service runs)", _case_exhausted_quota_skips_poll, "ok"),
     ("exhausted quota poll still sleeps exactly 3600s before retrying", _case_exhausted_sleeps_exactly_one_hour, "ok"),
     ("exhausted quota poll runs nothing and does not flip next_service", _case_exhausted_poll_runs_nothing, "ok"),
+    ("quota count one below the cap (9/10) still runs exactly one pass and flips next_service", _case_one_below_cap_still_runs, "ok"),
+    ("quota count over the cap (11/10) is exhausted too, poll skipped", _case_over_cap_skips_poll, "ok"),
     ("one service per poll, alternating radarr/sonarr via persisted next_service (default radarr)", _case_alternation_and_default, "ok"),
     ("invalid/corrupted next_service value falls back to radarr and still flips the key", _case_invalid_next_service_falls_back_to_radarr, "ok"),
     ("monthly_upgrade_cycle records relabel()'s integer count via record_upgrades_found", _case_cycle_records_relabel_count, "ok"),
