@@ -62,6 +62,9 @@ def _run_pass(torrents, boom=None):
     return (top, bottom)
 
 
+# Model-drafted; NOT yet read by a human.
+DRAFT_UNCONFIRMED = True
+
 CASES = [
     ("radarr-upgrade-recent is topped and appears in NO core.queue_bottom call",
      lambda: _run_pass({'h-rr': {'label': 'radarr-upgrade-recent'}}),
