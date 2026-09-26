@@ -97,8 +97,10 @@ Behaviour that must NOT change:
 
 ## Scope
 
-Only edit `arr-webhook.py`; do not edit `verify.sh`, `test_fixture.py` or `TASK.md`.
-test_fixture.py is the test fixture -- changing it invalidates the check.
+Only edit `arr-webhook.py` (via `refimpl.py`) and `test_fixture.py`; do not edit
+`verify.sh` or `check_literals.py`. test_fixture.py is the adversarial fixture --
+it must stay strict: every changed line of the reference impl is either asserted
+by a case in it, or carries an explicit `# relevance: unobservable` marker.
 
 ## Keep every changed line exercised (relevance)
 

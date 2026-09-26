@@ -64,7 +64,10 @@ class FakeSession:
     def post(self, url, json=None, timeout=None):
         method = (json or {}).get('method')
         params = (json or {}).get('params')
-        self.calls.append((method, params))
+        # Record the JSON-RPC id and timeout too: the reference impl uses a
+        # DISTINCT id per queue sweep (queue_top 'id': 12) and a fixed
+        # timeout=10 on those posts, so both are part of the observable call.
+        self.calls.append((method, params, (json or {}).get('id'), timeout))
         if method == 'label.get_labels':
             return _Resp({'result': []})
         if method == 'core.get_torrents_status':
@@ -102,7 +105,8 @@ def _sonarr_get(queue_records, episodes):
 def _labels_set(session):
     """{torrent_hash: label} from the recorded label.set_torrent calls."""
     out = {}
-    for method, params in session.calls:
+    for call in session.calls:
+        method, params = call[0], call[1]
         if method == 'label.set_torrent':
             h, lbl = params[0], params[1]
             out[h] = lbl
@@ -112,9 +116,33 @@ def _labels_set(session):
 def _queue_calls(session):
     """{method: [hashes]} for core.queue_top / core.queue_bottom."""
     out = {}
-    for method, params in session.calls:
+    for call in session.calls:
+        method, params = call[0], call[1]
         if method in ('core.queue_top', 'core.queue_bottom'):
             out.setdefault(method, []).extend(params[0])
+    return out
+
+
+def _queue_meta(session):
+    """{method: (id, timeout)} for core.queue_top / core.queue_bottom.
+
+    The reference impl posts the fast-track sweep with a distinct JSON-RPC id
+    ('id': 12) and a fixed timeout=10; both are observable on the wire."""
+    out = {}
+    for call in session.calls:
+        method, _params, rpc_id, timeout = call[0], call[1], call[2], call[3]
+        if method in ('core.queue_top', 'core.queue_bottom'):
+            out[method] = (rpc_id, timeout)
+    return out
+
+
+def _labels_created(session):
+    """Set of labels passed to label.add (i.e. created by ensure_label_exists_named)."""
+    out = set()
+    for call in session.calls:
+        method, params = call[0], call[1]
+        if method == 'label.add':
+            out.update(params)
     return out
 
 
@@ -131,7 +159,8 @@ def case_radarr_recent_this_year():
     )
     n = target.relabel_radarr_upgrades()
     got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
-           sorted(_queue_calls(s).get('core.queue_bottom', [])))
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
     return got
 
 
@@ -144,7 +173,8 @@ def case_radarr_recent_last_year():
     )
     n = target.relabel_radarr_upgrades()
     got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
-           sorted(_queue_calls(s).get('core.queue_bottom', [])))
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
     return got
 
 
@@ -157,7 +187,8 @@ def case_radarr_old_year():
     )
     n = target.relabel_radarr_upgrades()
     got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
-           sorted(_queue_calls(s).get('core.queue_bottom', [])))
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
     return got
 
 
@@ -170,7 +201,8 @@ def case_radarr_missing_year():
     )
     n = target.relabel_radarr_upgrades()
     got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
-           sorted(_queue_calls(s).get('core.queue_bottom', [])))
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
     return got
 
 
@@ -183,7 +215,46 @@ def case_radarr_nonnumeric_year():
     )
     n = target.relabel_radarr_upgrades()
     got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
-           sorted(_queue_calls(s).get('core.queue_bottom', [])))
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
+    return got
+
+
+def case_radarr_mixed_recent_and_old():
+    # Two upgrades in one pass: a recent movie AND an old one. Both lanes must
+    # fire -- priority label created + queue_top sweep, throttled label created
+    # + queue_bottom sweep -- and the returned count covers BOTH torrents.
+    s = FakeSession({
+        'H1': {'label': 'radarr', 'name': 'recent'},
+        'H2': {'label': 'radarr', 'name': 'old'},
+    })
+    _install(s)
+    target.requests.get = _radarr_get(
+        movies=[{'id': 1, 'hasFile': True, 'year': NOW_YEAR},
+                {'id': 2, 'hasFile': True, 'year': NOW_YEAR - 3}],
+        queue_records=[{'downloadId': 'H1', 'movieId': 1},
+                       {'downloadId': 'H2', 'movieId': 2}],
+    )
+    n = target.relabel_radarr_upgrades()
+    got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
+    return got
+
+
+def case_radarr_no_recent_no_queue_top():
+    # Only an old upgrade: the fast-track sweep must NOT fire at all -- no
+    # core.queue_top call, and the priority label is never even created.
+    s = FakeSession({'H1': {'label': 'radarr', 'name': 'old'}})
+    _install(s)
+    target.requests.get = _radarr_get(
+        movies=[{'id': 1, 'hasFile': True, 'year': NOW_YEAR - 5}],
+        queue_records=[{'downloadId': 'H1', 'movieId': 1}],
+    )
+    n = target.relabel_radarr_upgrades()
+    got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
     return got
 
 
@@ -198,7 +269,8 @@ def case_sonarr_recent_airdate():
     )
     n = target.relabel_sonarr_upgrades()
     got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
-           sorted(_queue_calls(s).get('core.queue_bottom', [])))
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
     return got
 
 
@@ -211,7 +283,8 @@ def case_sonarr_old_airdate():
     )
     n = target.relabel_sonarr_upgrades()
     got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
-           sorted(_queue_calls(s).get('core.queue_bottom', [])))
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
     return got
 
 
@@ -225,7 +298,8 @@ def case_sonarr_airdate_fallback():
     )
     n = target.relabel_sonarr_upgrades()
     got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
-           sorted(_queue_calls(s).get('core.queue_bottom', [])))
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
     return got
 
 
@@ -239,7 +313,78 @@ def case_sonarr_no_airdate():
     )
     n = target.relabel_sonarr_upgrades()
     got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
-           sorted(_queue_calls(s).get('core.queue_bottom', [])))
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
+    return got
+
+
+def case_sonarr_hasfile_false():
+    # Episode does NOT haveFile -> never relabeled at all: no label set, no
+    # queue sweep, no label created. (Catches has_file defaulting to True.)
+    s = FakeSession({'H1': {'label': 'sonarr', 'name': 'x'}})
+    _install(s)
+    target.requests.get = _sonarr_get(
+        queue_records=[{'downloadId': 'H1', 'episodeId': 7}],
+        episodes={7: {'hasFile': False, 'airDateUtc': f'{NOW_YEAR}-03-14'}},
+    )
+    n = target.relabel_sonarr_upgrades()
+    got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
+    return got
+
+
+def case_sonarr_hasfile_key_absent():
+    # Episode response with NO hasFile key at all -> must be treated as not-an-
+    # upgrade (default False), never relabeled. (Catches .get('hasFile', True).)
+    s = FakeSession({'H1': {'label': 'sonarr', 'name': 'x'}})
+    _install(s)
+    target.requests.get = _sonarr_get(
+        queue_records=[{'downloadId': 'H1', 'episodeId': 7}],
+        episodes={7: {'airDateUtc': f'{NOW_YEAR}-03-14'}},
+    )
+    n = target.relabel_sonarr_upgrades()
+    got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
+    return got
+
+
+def case_sonarr_mixed_recent_and_old():
+    # Two upgrades in one pass: a recent episode AND an old one. Both lanes must
+    # fire -- priority label created + queue_top sweep, throttled label created
+    # + queue_bottom sweep -- and the returned count covers BOTH torrents.
+    s = FakeSession({
+        'H1': {'label': 'sonarr', 'name': 'recent'},
+        'H2': {'label': 'sonarr', 'name': 'old'},
+    })
+    _install(s)
+    target.requests.get = _sonarr_get(
+        queue_records=[{'downloadId': 'H1', 'episodeId': 7},
+                       {'downloadId': 'H2', 'episodeId': 8}],
+        episodes={7: {'hasFile': True, 'airDateUtc': f'{NOW_YEAR}-03-14'},
+                  8: {'hasFile': True, 'airDateUtc': f'{NOW_YEAR - 3}-06-01'}},
+    )
+    n = target.relabel_sonarr_upgrades()
+    got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
+    return got
+
+
+def case_sonarr_no_recent_no_queue_top():
+    # Only an old upgrade: the fast-track sweep must NOT fire at all -- no
+    # core.queue_top call, and the priority label is never even created.
+    s = FakeSession({'H1': {'label': 'sonarr', 'name': 'old'}})
+    _install(s)
+    target.requests.get = _sonarr_get(
+        queue_records=[{'downloadId': 'H1', 'episodeId': 7}],
+        episodes={7: {'hasFile': True, 'airDateUtc': f'{NOW_YEAR - 5}-06-01'}},
+    )
+    n = target.relabel_sonarr_upgrades()
+    got = (n, _labels_set(s), sorted(_queue_calls(s).get('core.queue_top', [])),
+           sorted(_queue_calls(s).get('core.queue_bottom', [])),
+           sorted(_labels_created(s)), _queue_meta(s))
     return got
 
 
@@ -261,46 +406,123 @@ def case_prioritize_recent_never_bottomed():
     return got
 
 
+def case_prioritize_only_recent():
+    # Only recent-upgrade-labeled torrents present: they must be swept to TOP,
+    # and NO core.queue_bottom call may fire at all (they are never bottomed).
+    s = FakeSession({
+        'H1': {'label': target.RADARR_UPG_PRIORITY_LABEL},
+        'H2': {'label': target.SONARR_UPG_PRIORITY_LABEL},
+    })
+    _install(s)
+    target.prioritize_normal_torrents()
+    qc = _queue_calls(s)
+    got = (sorted(qc.get('core.queue_top', [])), sorted(qc.get('core.queue_bottom', [])))
+    return got
+
+
+def case_prioritize_only_old():
+    # Only old-upgrade-labeled torrents present: they must be swept to BOTTOM,
+    # and NO core.queue_top call may fire at all.
+    s = FakeSession({
+        'H5': {'label': target.RADARR_UPG_LABEL},
+        'H6': {'label': target.SONARR_UPG_LABEL},
+    })
+    _install(s)
+    target.prioritize_normal_torrents()
+    qc = _queue_calls(s)
+    got = (sorted(qc.get('core.queue_top', [])), sorted(qc.get('core.queue_bottom', [])))
+    return got
+
+
 CASES = [
-    ("radarr upgrade of a THIS-YEAR movie -> priority label + queue_top, never bottom",
+    ("radarr upgrade of a THIS-YEAR movie -> priority label + queue_top (id 12, timeout 10), never bottom",
      case_radarr_recent_this_year,
-     (1, {'H1': target.RADARR_UPG_PRIORITY_LABEL}, ['H1'], [])),
+     (1, {'H1': target.RADARR_UPG_PRIORITY_LABEL}, ['H1'], [],
+      [target.RADARR_UPG_PRIORITY_LABEL], {'core.queue_top': (12, 10)})),
 
     ("radarr upgrade of a LAST-YEAR movie (boundary) -> priority label + queue_top",
      case_radarr_recent_last_year,
-     (1, {'H1': target.RADARR_UPG_PRIORITY_LABEL}, ['H1'], [])),
+     (1, {'H1': target.RADARR_UPG_PRIORITY_LABEL}, ['H1'], [],
+      [target.RADARR_UPG_PRIORITY_LABEL], {'core.queue_top': (12, 10)})),
 
     ("radarr upgrade of an OLDER movie (year-2) -> throttled label + queue_bottom only",
      case_radarr_old_year,
-     (1, {'H1': target.RADARR_UPG_LABEL}, [], ['H1'])),
+     (1, {'H1': target.RADARR_UPG_LABEL}, [], ['H1'],
+      [target.RADARR_UPG_LABEL], {'core.queue_bottom': (10, 10)})),
 
     ("radarr movie with NO year field -> not recent -> throttled lane, no crash",
      case_radarr_missing_year,
-     (1, {'H1': target.RADARR_UPG_LABEL}, [], ['H1'])),
+     (1, {'H1': target.RADARR_UPG_LABEL}, [], ['H1'],
+      [target.RADARR_UPG_LABEL], {'core.queue_bottom': (10, 10)})),
 
     ("radarr movie with NON-NUMERIC year -> not recent -> throttled lane, no crash",
      case_radarr_nonnumeric_year,
-     (1, {'H1': target.RADARR_UPG_LABEL}, [], ['H1'])),
+     (1, {'H1': target.RADARR_UPG_LABEL}, [], ['H1'],
+      [target.RADARR_UPG_LABEL], {'core.queue_bottom': (10, 10)})),
+
+    ("radarr pass with BOTH recent and old upgrades -> both lanes fire, count covers both",
+     case_radarr_mixed_recent_and_old,
+     (2, {'H1': target.RADARR_UPG_PRIORITY_LABEL, 'H2': target.RADARR_UPG_LABEL},
+      ['H1'], ['H2'],
+      [target.RADARR_UPG_LABEL, target.RADARR_UPG_PRIORITY_LABEL],
+      {'core.queue_bottom': (10, 10), 'core.queue_top': (12, 10)})),
+
+    ("radarr pass with ONLY an old upgrade -> no queue_top sweep, priority label never created",
+     case_radarr_no_recent_no_queue_top,
+     (1, {'H1': target.RADARR_UPG_LABEL}, [], ['H1'],
+      [target.RADARR_UPG_LABEL], {'core.queue_bottom': (10, 10)})),
 
     ("sonarr upgrade of a RECENT episode (airDateUtc this year) -> priority + queue_top",
      case_sonarr_recent_airdate,
-     (1, {'H1': target.SONARR_UPG_PRIORITY_LABEL}, ['H1'], [])),
+     (1, {'H1': target.SONARR_UPG_PRIORITY_LABEL}, ['H1'], [],
+      [target.SONARR_UPG_PRIORITY_LABEL], {'core.queue_top': (12, 10)})),
 
     ("sonarr upgrade of an OLD episode (airDateUtc year-2) -> throttled + queue_bottom",
      case_sonarr_old_airdate,
-     (1, {'H1': target.SONARR_UPG_LABEL}, [], ['H1'])),
+     (1, {'H1': target.SONARR_UPG_LABEL}, [], ['H1'],
+      [target.SONARR_UPG_LABEL], {'core.queue_bottom': (10, 10)})),
 
     ("sonarr episode with airDateUtc ABSENT but recent airDate -> falls back, fast-tracks",
      case_sonarr_airdate_fallback,
-     (1, {'H1': target.SONARR_UPG_PRIORITY_LABEL}, ['H1'], [])),
+     (1, {'H1': target.SONARR_UPG_PRIORITY_LABEL}, ['H1'], [],
+      [target.SONARR_UPG_PRIORITY_LABEL], {'core.queue_top': (12, 10)})),
 
     ("sonarr episode with NO air date at all -> not recent -> throttled lane",
      case_sonarr_no_airdate,
-     (1, {'H1': target.SONARR_UPG_LABEL}, [], ['H1'])),
+     (1, {'H1': target.SONARR_UPG_LABEL}, [], ['H1'],
+      [target.SONARR_UPG_LABEL], {'core.queue_bottom': (10, 10)})),
+
+    ("sonarr episode with hasFile=False -> never relabeled at all",
+     case_sonarr_hasfile_false,
+     (0, {}, [], [], [], {})),
+
+    ("sonarr episode response MISSING the hasFile key -> treated as not-an-upgrade",
+     case_sonarr_hasfile_key_absent,
+     (0, {}, [], [], [], {})),
+
+    ("sonarr pass with BOTH recent and old upgrades -> both lanes fire, count covers both",
+     case_sonarr_mixed_recent_and_old,
+     (2, {'H1': target.SONARR_UPG_PRIORITY_LABEL, 'H2': target.SONARR_UPG_LABEL},
+      ['H1'], ['H2'],
+      [target.SONARR_UPG_LABEL, target.SONARR_UPG_PRIORITY_LABEL],
+      {'core.queue_bottom': (10, 10), 'core.queue_top': (12, 10)})),
+
+    ("sonarr pass with ONLY an old upgrade -> no queue_top sweep, priority label never created",
+     case_sonarr_no_recent_no_queue_top,
+     (1, {'H1': target.SONARR_UPG_LABEL}, [], ['H1'],
+      [target.SONARR_UPG_LABEL], {'core.queue_bottom': (10, 10)})),
 
     ("prioritize_normal_torrents: recent-upgrade labels swept to TOP only; old upgrades to BOTTOM",
      case_prioritize_recent_never_bottomed,
      (['H1', 'H2', 'H3', 'H4'], ['H5', 'H6'])),
+
+    ("prioritize_normal_torrents with ONLY recent-upgrade torrents -> top sweep fires, no bottom call",
+     case_prioritize_only_recent,
+     (['H1', 'H2'], [])),
+
+    ("prioritize_normal_torrents with ONLY old-upgrade torrents -> bottom sweep fires, no top call",
+     case_prioritize_only_old,
+     ([], ['H5', 'H6'])),
 ]
 
 

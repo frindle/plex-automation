@@ -139,8 +139,8 @@ OLD_4 = r"""            try:
         log.info(f'Relabeled {len(relabeled_hashes)} torrents as {SONARR_UPG_LABEL}')
         return len(relabeled_hashes)
 """
-NEW_4 = r"""            has_file = False
-            air_year = None
+NEW_4 = r"""            has_file = False # relevance: unobservable
+            air_year = None # relevance: unobservable
             try:
                 er = requests.get(
                     f'{SONARR_URL}/api/v3/episode/{episode_id}',
