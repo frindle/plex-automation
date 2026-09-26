@@ -109,7 +109,9 @@ RADARR_API_KEY   = os.environ.get('RADARR_API_KEY', '')
 SUPERSEDED_LABEL  = 'superseded'
 LIBRARY_SEED_LABEL = 'library-seed'
 SONARR_UPG_LABEL  = os.environ.get('SONARR_UPGRADE_LABEL', 'sonarr-upgrade')
+SONARR_UPG_PRIORITY_LABEL = os.environ.get('SONARR_UPGRADE_PRIORITY_LABEL', 'sonarr-upgrade-recent')
 RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
+RADARR_UPG_PRIORITY_LABEL = os.environ.get('RADARR_UPGRADE_PRIORITY_LABEL', 'radarr-upgrade-recent')
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
 # Weekly stalled-seed review (every LABELED torrent, including
@@ -3331,6 +3333,7 @@ def relabel_radarr_upgrades():
         download_to_movie = {rec['downloadId'].lower(): rec.get('movieId') for rec in queue_records if rec.get('downloadId')}
         relabeled = 0
         relabeled_hashes = []
+        priority_hashes = []
         for torrent_hash, info in radarr_torrents.items():
             movie_id = download_to_movie.get(torrent_hash.lower())
             if not movie_id:
@@ -3338,9 +3341,14 @@ def relabel_radarr_upgrades():
             movie = movies.get(movie_id)
             if movie and movie.get('hasFile'):
                 log.info(f'Relabeling upgrade: {info.get("name")}')
-                ensure_label_exists_named(RADARR_UPG_LABEL)
-                set_torrent_label(torrent_hash, RADARR_UPG_LABEL)
-                relabeled_hashes.append(torrent_hash)
+                if _is_recent_year(movie.get('year')):
+                    ensure_label_exists_named(RADARR_UPG_PRIORITY_LABEL)
+                    set_torrent_label(torrent_hash, RADARR_UPG_PRIORITY_LABEL)
+                    priority_hashes.append(torrent_hash)
+                else:
+                    ensure_label_exists_named(RADARR_UPG_LABEL)
+                    set_torrent_label(torrent_hash, RADARR_UPG_LABEL)
+                    relabeled_hashes.append(torrent_hash)
                 relabeled += 1
         if relabeled_hashes:
             session.post(
@@ -3349,6 +3357,13 @@ def relabel_radarr_upgrades():
                 timeout=10
             )
             log.info(f'Moved {len(relabeled_hashes)} upgrade torrents to bottom of queue')
+        if priority_hashes:
+            session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.queue_top', 'params': [priority_hashes], 'id': 10},
+                timeout=10
+            )
+            log.info(f'Moved {len(priority_hashes)} recent upgrade torrents to top of queue')
         log.info(f'Relabeled {relabeled} torrents as radarr-upgrade')
         return relabeled
     except Exception as e:
@@ -3438,6 +3453,7 @@ def relabel_sonarr_upgrades():
             if dl and ep:
                 download_to_episode.setdefault(dl.lower(), ep)
         relabeled_hashes = []
+        priority_hashes = []
         for torrent_hash, info in sonarr_torrents.items():
             episode_id = download_to_episode.get(torrent_hash.lower())
             if not episode_id:
@@ -3449,12 +3465,26 @@ def relabel_sonarr_upgrades():
                     timeout=10
                 )
                 er.raise_for_status()
-                has_file = er.json().get('hasFile', False)
+                episode = er.json()
+                has_file = episode.get('hasFile', False)
             except Exception as e:
                 log.warning(f'Sonarr episode {episode_id} lookup failed: {e}')
                 continue
-            if has_file:
-                log.info(f'Relabeling upgrade: {info.get("name")}')
+            if not has_file:
+                continue
+            # Use the EPISODE's air year (never the series' start year): a show
+            # that began in 2015 can still air a brand-new episode this year.
+            air_date = episode.get('airDateUtc') or episode.get('airDate')
+            try:
+                air_year = int(str(air_date)[:4]) if str(air_date).strip() else None
+            except (TypeError, ValueError):
+                air_year = None
+            log.info(f'Relabeling upgrade: {info.get("name")}')
+            if _is_recent_year(air_year):
+                ensure_label_exists_named(SONARR_UPG_PRIORITY_LABEL)
+                set_torrent_label(torrent_hash, SONARR_UPG_PRIORITY_LABEL)
+                priority_hashes.append(torrent_hash)
+            else:
                 ensure_label_exists_named(SONARR_UPG_LABEL)
                 set_torrent_label(torrent_hash, SONARR_UPG_LABEL)
                 relabeled_hashes.append(torrent_hash)
@@ -3465,8 +3495,16 @@ def relabel_sonarr_upgrades():
                 timeout=10
             )
             log.info(f'Moved {len(relabeled_hashes)} sonarr upgrade torrents to bottom of queue')
-        log.info(f'Relabeled {len(relabeled_hashes)} torrents as {SONARR_UPG_LABEL}')
-        return len(relabeled_hashes)
+        if priority_hashes:
+            session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.queue_top', 'params': [priority_hashes], 'id': 10},
+                timeout=10
+            )
+            log.info(f'Moved {len(priority_hashes)} recent sonarr upgrade torrents to top of queue')
+        relabeled = len(relabeled_hashes) + len(priority_hashes)
+        log.info(f'Relabeled {relabeled} torrents as {SONARR_UPG_LABEL}')
+        return relabeled
     except Exception as e:
         log.error(f'Sonarr upgrade relabeling failed: {e}')
         return 0
@@ -3672,7 +3710,7 @@ def prioritize_normal_torrents():
         torrents = get_all_torrents()
         if not torrents:
             return
-        priority_labels = {'sonarr', 'radarr'}
+        priority_labels = {'sonarr', 'radarr', SONARR_UPG_PRIORITY_LABEL, RADARR_UPG_PRIORITY_LABEL}
         upgrade_labels = {SONARR_UPG_LABEL, RADARR_UPG_LABEL}
         top_hashes = [h for h, i in torrents.items() if i.get('label', '') in priority_labels]
         bottom_hashes = [h for h, i in torrents.items() if i.get('label', '') in upgrade_labels]
@@ -6751,6 +6789,19 @@ def sort_ids_by_year_desc(items):
         return (year == 0, -year)
 
     return sorted(items, key=_key)
+
+
+RECENT_YEAR_WINDOW = 1
+
+
+def _is_recent_year(year, now=None):
+    if now is None:
+        now = datetime.now(timezone.utc)
+    try:
+        y = int(str(year).strip())
+    except (TypeError, ValueError):
+        return False
+    return y >= now.year - RECENT_YEAR_WINDOW
 
 
 if __name__ == '__main__':
