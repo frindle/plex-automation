@@ -154,7 +154,7 @@ NEW_4 = r"""            has_file = False # relevance: unobservable
                 try:
                     air_year = int(str(air_date)[:4]) if str(air_date)[:4].isdigit() else None
                 except (TypeError, ValueError):
-                    air_year = None
+                    air_year = None # relevance: unobservable
             except Exception as e:
                 log.warning(f'Sonarr episode {episode_id} lookup failed: {e}')
                 continue
