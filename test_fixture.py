@@ -160,6 +160,8 @@ def _case_deluge_failure_does_not_raise():
 CASES = [
     ("new (non-upgrade) Sonarr grab is moved to top of Deluge queue via core.queue_top",
      _case_new_sonarr_grab_goes_to_top, True),
+    ("core.queue_top RPC shape: deluge_login() first, exact json {'method','params','id': 92}, timeout=10",
+     _case_queue_top_request_shape, True),
     ("upgrade Sonarr grab does NOT get new-request prioritization",
      _case_upgrade_sonarr_grab_not_prioritized, True),
     ("Grab payload with no downloadId is skipped without any Deluge call",
