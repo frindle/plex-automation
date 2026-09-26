@@ -536,6 +536,20 @@ def torrent_is_unregistered(info):
     return any(marker in status for marker in UNREGISTERED_MARKERS)
 
 
+def should_supersede_candidate(info):
+    """Pure decision: may dedup_via_radarr relabel this candidate superseded?
+
+    A torrent the tracker has ALREADY unregistered can no longer accrue
+    seeding credit -- there is nothing left to seed and no hit-and-run risk,
+    so relabeling it "superseded" (and moving it into the seed dir) is pure
+    damage. Skip it: leave the label alone and let cleanup/hard-delete paths
+    handle its fate. Fail-safe toward 'may supersede' on unknown/empty status,
+    mirroring torrent_is_unregistered's direction of caution."""
+    if not isinstance(info, dict):
+        return True
+    return not torrent_is_unregistered(info)
+
+
 def should_hard_delete_on_upgrade(info, same_group):
     """True only when deleting a superseded torrent's DATA outright is safe:
     same release group AND the tracker has unregistered it AND its seed
@@ -1187,6 +1201,9 @@ def dedup_via_radarr(dry_run=False):
                 if h in keepers:
                     continue
                 name = radarr_torrents[h].get('name', '')
+                if not should_supersede_candidate(radarr_torrents[h]):
+                    log.info(f'  skip superseding "{name}" (tracker already unregistered it -- nothing left to seed)')
+                    continue
                 action = 'WOULD relabel' if dry_run else 'relabeling'
                 log.info(f'  {action} superseded: "{name}" (movie {movie["id"]}: {movie.get("title")})')
                 if not dry_run:
