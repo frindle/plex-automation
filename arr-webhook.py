@@ -109,6 +109,7 @@ RADARR_API_KEY   = os.environ.get('RADARR_API_KEY', '')
 SUPERSEDED_LABEL  = 'superseded'
 LIBRARY_SEED_LABEL = 'library-seed'
 SONARR_UPG_LABEL  = os.environ.get('SONARR_UPGRADE_LABEL', 'sonarr-upgrade')
+SONARR_UPG_PRIORITY_LABEL = os.environ.get('SONARR_UPGRADE_PRIORITY_LABEL', 'sonarr-upgrade-recent')
 RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
 RADARR_UPG_PRIORITY_LABEL = os.environ.get('RADARR_UPGRADE_PRIORITY_LABEL', 'radarr-upgrade-recent')
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
@@ -3435,6 +3436,7 @@ def relabel_sonarr_upgrades():
             if dl and ep:
                 download_to_episode.setdefault(dl.lower(), ep)
         relabeled_hashes = []
+        priority_hashes = []
         for torrent_hash, info in sonarr_torrents.items():
             episode_id = download_to_episode.get(torrent_hash.lower())
             if not episode_id:
@@ -3446,12 +3448,26 @@ def relabel_sonarr_upgrades():
                     timeout=10
                 )
                 er.raise_for_status()
-                has_file = er.json().get('hasFile', False)
+                episode = er.json()
+                has_file = episode.get('hasFile', False)
             except Exception as e:
                 log.warning(f'Sonarr episode {episode_id} lookup failed: {e}')
                 continue
-            if has_file:
-                log.info(f'Relabeling upgrade: {info.get("name")}')
+            if not has_file:
+                continue
+            # Use the EPISODE's air year (never the series' start year): a show
+            # that began in 2015 can still air a brand-new episode this year.
+            air_date = episode.get('airDateUtc') or episode.get('airDate')
+            try:
+                air_year = int(str(air_date)[:4]) if str(air_date).strip() else None
+            except (TypeError, ValueError):
+                air_year = None
+            log.info(f'Relabeling upgrade: {info.get("name")}')
+            if _is_recent_year(air_year):
+                ensure_label_exists_named(SONARR_UPG_PRIORITY_LABEL)
+                set_torrent_label(torrent_hash, SONARR_UPG_PRIORITY_LABEL)
+                priority_hashes.append(torrent_hash)
+            else:
                 ensure_label_exists_named(SONARR_UPG_LABEL)
                 set_torrent_label(torrent_hash, SONARR_UPG_LABEL)
                 relabeled_hashes.append(torrent_hash)
@@ -3462,8 +3478,16 @@ def relabel_sonarr_upgrades():
                 timeout=10
             )
             log.info(f'Moved {len(relabeled_hashes)} sonarr upgrade torrents to bottom of queue')
-        log.info(f'Relabeled {len(relabeled_hashes)} torrents as {SONARR_UPG_LABEL}')
-        return len(relabeled_hashes)
+        if priority_hashes:
+            session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.queue_top', 'params': [priority_hashes], 'id': 10},
+                timeout=10
+            )
+            log.info(f'Moved {len(priority_hashes)} recent sonarr upgrade torrents to top of queue')
+        relabeled = len(relabeled_hashes) + len(priority_hashes)
+        log.info(f'Relabeled {relabeled} torrents as {SONARR_UPG_LABEL}')
+        return relabeled
     except Exception as e:
         log.error(f'Sonarr upgrade relabeling failed: {e}')
         return 0
