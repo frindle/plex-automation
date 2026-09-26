@@ -41,12 +41,15 @@ class _Resp:
 def _run_case(episode_payload):
     """Run relabel_sonarr_upgrades() with one 'sonarr'-labeled queued torrent.
 
-    Returns (count, labels_set, top_hashes, bottom_hashes) where labels_set is
-    the list of (hash, label) pairs passed to set_torrent_label and the hash
-    lists are what was sent to core.queue_top / core.queue_bottom.
+    Returns a 5-tuple:
+      count        -- the value returned by relabel_sonarr_upgrades()
+      labels_set   -- (hash, label) pairs passed to set_torrent_label
+      ensured      -- labels passed to ensure_label_exists_named, in order
+      top          -- (hashes, id, timeout) of the core.queue_top POST, or None
+      bottom       -- (hashes, id, timeout) of the core.queue_bottom POST, or None
     """
     HASH = 'a' * 40
-    calls = {'labels': [], 'top': None, 'bottom': None}
+    calls = {'labels': [], 'ensured': [], 'top': None, 'bottom': None}
 
     def fake_get(url, **kw):
         if '/api/v3/queue' in url:
@@ -60,9 +63,9 @@ def _run_case(episode_payload):
         method = body.get('method')
         params = (body.get('params') or [None])[0]
         if method == 'core.queue_top':
-            calls['top'] = list(params)
+            calls['top'] = (list(params), body.get('id'), kw.get('timeout'))
         elif method == 'core.queue_bottom':
-            calls['bottom'] = list(params)
+            calls['bottom'] = (list(params), body.get('id'), kw.get('timeout'))
         return _Resp({'result': True})
 
     orig_get, orig_post = target.requests.get, target.session.post
@@ -72,39 +75,47 @@ def _run_case(episode_payload):
         target.deluge_login = lambda: None
         target.get_all_torrents = lambda: {HASH: {'label': 'sonarr', 'name': 'ep'}}
         target.set_torrent_label = lambda h, l: calls['labels'].append((h, l))
-        target.ensure_label_exists_named = lambda label: None
+        target.ensure_label_exists_named = lambda label: calls['ensured'].append(label)
         count = target.relabel_sonarr_upgrades()
     finally:
         target.requests.get = orig_get
         target.session.post = orig_post
 
-    return (count, tuple(calls['labels']), calls['top'], calls['bottom'])
+    return (count, tuple(calls['labels']), tuple(calls['ensured']),
+            calls['top'], calls['bottom'])
 
 
 PRIORITY_LABEL = 'sonarr-upgrade-recent'
 THROTTLED_LABEL = 'sonarr-upgrade'
 HASH = 'a' * 40
 
+TOP_POST = ([HASH], 10, 10)      # core.queue_top: hashes, json id, timeout
+BOTTOM_POST = ([HASH], 10, 10)   # core.queue_bottom: hashes, json id, timeout
+
 CASES = [
-    ("this-year airDateUtc -> priority label + queue_top, never bottomed, count 1",
+    ("this-year airDateUtc -> priority label + queue_top (id=10, timeout=10), never bottomed, count 1",
      lambda: _run_case({'hasFile': True, 'airDateUtc': '{}-03-14'.format(NOW_YEAR)}),
-     (1, ((HASH, PRIORITY_LABEL),), [HASH], None)),
+     (1, ((HASH, PRIORITY_LABEL),), (PRIORITY_LABEL,), TOP_POST, None)),
 
     ("airDateUtc ABSENT but recent airDate -> falls back and still fast-tracks",
      lambda: _run_case({'hasFile': True, 'airDate': '{}-01-05'.format(NOW_YEAR)}),
-     (1, ((HASH, PRIORITY_LABEL),), [HASH], None)),
+     (1, ((HASH, PRIORITY_LABEL),), (PRIORITY_LABEL,), TOP_POST, None)),
 
-    ("NO air date at all -> throttled lane (sonarr-upgrade + queue_bottom), no crash",
+    ("NO air date at all -> throttled lane (sonarr-upgrade + queue_bottom id=10 timeout=10), no crash",
      lambda: _run_case({'hasFile': True}),
-     (1, ((HASH, THROTTLED_LABEL),), None, [HASH])),
+     (1, ((HASH, THROTTLED_LABEL),), (THROTTLED_LABEL,), None, BOTTOM_POST)),
 
     ("decade-old airDateUtc -> sonarr-upgrade label + core.queue_bottom",
      lambda: _run_case({'hasFile': True, 'airDateUtc': '2015-06-01'}),
-     (1, ((HASH, THROTTLED_LABEL),), None, [HASH])),
+     (1, ((HASH, THROTTLED_LABEL),), (THROTTLED_LABEL,), None, BOTTOM_POST)),
+
+    ("unparseable airDateUtc -> parse must not raise; throttled lane",
+     lambda: _run_case({'hasFile': True, 'airDateUtc': 'not-a-date'}),
+     (1, ((HASH, THROTTLED_LABEL),), (THROTTLED_LABEL,), None, BOTTOM_POST)),
 
     ("regression: hasFile=False is NOT an upgrade -- no relabel, count 0",
      lambda: _run_case({'hasFile': False, 'airDateUtc': '{}-03-14'.format(NOW_YEAR)}),
-     (0, (), None, None)),
+     (0, (), (), None, None)),
 ]
 
 

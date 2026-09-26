@@ -49,7 +49,7 @@ NEW_BODY = r"""            if has_file:
                 try:
                     air_year = int(str(air_date)[:4])
                 except (TypeError, ValueError):
-                    air_year = 0
+                    air_year = 0  # relevance: unobservable
                 if _is_recent_year(air_year):
                     ensure_label_exists_named(SONARR_UPG_PRIORITY_LABEL)
                     set_torrent_label(torrent_hash, SONARR_UPG_PRIORITY_LABEL)
