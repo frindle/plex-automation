@@ -3693,7 +3693,7 @@ def prioritize_normal_torrents():
         torrents = get_all_torrents()
         if not torrents:
             return
-        priority_labels = {'sonarr', 'radarr'}
+        priority_labels = {'sonarr', 'radarr', SONARR_UPG_PRIORITY_LABEL, RADARR_UPG_PRIORITY_LABEL}
         upgrade_labels = {SONARR_UPG_LABEL, RADARR_UPG_LABEL}
         top_hashes = [h for h, i in torrents.items() if i.get('label', '') in priority_labels]
         bottom_hashes = [h for h, i in torrents.items() if i.get('label', '') in upgrade_labels]
