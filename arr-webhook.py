@@ -3609,13 +3609,24 @@ def verify_and_fix_labels(services=('radarr', 'sonarr')):
 def purge_stalled_upgrade_torrents(label=RADARR_UPG_LABEL):
     """Remove <label> torrents that haven't downloaded more than 5MB.
     Defaults to the Radarr upgrade lane; the Sonarr monthly cycle passes
-    SONARR_UPG_LABEL."""
+    SONARR_UPG_LABEL.
+
+    A torrent Deluge itself has put in state 'Queued' is waiting for a free
+    slot behind Deluge's own max-active-downloads limit -- that's normal
+    operation, not a stall, and total_done is 0 for every queued torrent by
+    definition regardless of how healthy it is. Skip those; only a torrent
+    Deluge is actually attempting to run and that still has 0 bytes is a
+    genuine stall (dead torrent / no seeders). Root-caused 2026-09-26: this
+    check used to ignore state entirely and purged the whole queued backlog
+    (~260 torrents) the first time this scheduler ran after being wired to
+    an hourly loop -- see escalations/plex-automation queue-wipe incident.
+    """
     log.info(f'Purging stalled {label} torrents...')
     try:
         deluge_login()
         resp = session.post(
             f'{DELUGE_URL}/json',
-            json={'method': 'core.get_torrents_status', 'params': [{}, ['name', 'label', 'progress', 'total_done']], 'id': 6},
+            json={'method': 'core.get_torrents_status', 'params': [{}, ['name', 'label', 'progress', 'total_done', 'state']], 'id': 6},
             timeout=10
         )
         resp.raise_for_status()
@@ -3625,6 +3636,8 @@ def purge_stalled_upgrade_torrents(label=RADARR_UPG_LABEL):
         to_remove = []
         for h, i in torrents.items():
             if i.get('label') == label:
+                if i.get('state') == 'Queued':
+                    continue  # waiting for a slot, not stalled -- never purge
                 total_done = i.get('total_done', 0)
                 if total_done < 5 * 1024 * 1024:  # less than 5MB downloaded
                     log.info(f'Purging stalled upgrade: {i.get("name")} ({total_done/1024/1024:.1f}MB downloaded)')
@@ -3635,6 +3648,7 @@ def purge_stalled_upgrade_torrents(label=RADARR_UPG_LABEL):
             for _h in to_remove:
                 remove_torrent(_h, remove_data=False)
             log.info(f'Purged {len(to_remove)} stalled upgrade torrents')
+            record_activity('cleanup', f'Purged {len(to_remove)} stalled {label} torrent(s) (< 5MB downloaded, not queued)')
         else:
             log.info('No stalled upgrade torrents to purge')
     except Exception as e:
