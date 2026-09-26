@@ -110,6 +110,7 @@ SUPERSEDED_LABEL  = 'superseded'
 LIBRARY_SEED_LABEL = 'library-seed'
 SONARR_UPG_LABEL  = os.environ.get('SONARR_UPGRADE_LABEL', 'sonarr-upgrade')
 RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
+RADARR_UPG_PRIORITY_LABEL = os.environ.get('RADARR_UPGRADE_PRIORITY_LABEL', 'radarr-upgrade-recent')
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
 # Weekly stalled-seed review (every LABELED torrent, including
@@ -3314,6 +3315,7 @@ def relabel_radarr_upgrades():
         download_to_movie = {rec['downloadId'].lower(): rec.get('movieId') for rec in queue_records if rec.get('downloadId')}
         relabeled = 0
         relabeled_hashes = []
+        priority_hashes = []
         for torrent_hash, info in radarr_torrents.items():
             movie_id = download_to_movie.get(torrent_hash.lower())
             if not movie_id:
@@ -3321,9 +3323,14 @@ def relabel_radarr_upgrades():
             movie = movies.get(movie_id)
             if movie and movie.get('hasFile'):
                 log.info(f'Relabeling upgrade: {info.get("name")}')
-                ensure_label_exists_named(RADARR_UPG_LABEL)
-                set_torrent_label(torrent_hash, RADARR_UPG_LABEL)
-                relabeled_hashes.append(torrent_hash)
+                if _is_recent_year(movie.get('year')):
+                    ensure_label_exists_named(RADARR_UPG_PRIORITY_LABEL)
+                    set_torrent_label(torrent_hash, RADARR_UPG_PRIORITY_LABEL)
+                    priority_hashes.append(torrent_hash)
+                else:
+                    ensure_label_exists_named(RADARR_UPG_LABEL)
+                    set_torrent_label(torrent_hash, RADARR_UPG_LABEL)
+                    relabeled_hashes.append(torrent_hash)
                 relabeled += 1
         if relabeled_hashes:
             session.post(
@@ -3332,6 +3339,13 @@ def relabel_radarr_upgrades():
                 timeout=10
             )
             log.info(f'Moved {len(relabeled_hashes)} upgrade torrents to bottom of queue')
+        if priority_hashes:
+            session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.queue_top', 'params': [priority_hashes], 'id': 10},
+                timeout=10
+            )
+            log.info(f'Moved {len(priority_hashes)} recent upgrade torrents to top of queue')
         log.info(f'Relabeled {relabeled} torrents as radarr-upgrade')
         return relabeled
     except Exception as e:
