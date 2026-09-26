@@ -3112,10 +3112,28 @@ def dedupe_grabbed_release(source, download_id):
         return 0
 
 
+def prioritize_new_sonarr_grab(download_id):
+    """Move a NEW (non-upgrade) Sonarr request ahead of everything already in
+    the Deluge queue. Without this it sits at the FIFO tail behind every
+    in-flight download, throttled upgrades included. Never raises: a Deluge
+    error is logged and swallowed, like the rest of the grab-time helpers."""
+    try:
+        deluge_login()
+        session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.queue_top', 'params': [[download_id]], 'id': 92},
+            timeout=10,
+        )
+        log.info(f"Sonarr: moved new request {download_id} to top of queue")
+    except Exception as e:
+        log.error(f"Sonarr: failed to prioritize new grab {download_id}: {e}")
+
+
 def handle_grab(data, source):
     """
     Fires when Sonarr/Radarr sends a grab to Deluge.
     Check via API if this is an upgrade, then throttle if over 10GB.
+    New (non-upgrade) Sonarr requests are moved ahead of the existing queue.
     """
     download_id = (data.get('downloadId') or '').lower()
     if not download_id:
@@ -3130,6 +3148,8 @@ def handle_grab(data, source):
 
     if not upgrade:
         log.info(f"{source}: grab {download_id} is a new release, not throttling")
+        if source == 'Sonarr':
+            prioritize_new_sonarr_grab(download_id)
         return
 
     # Only throttle if release is over 10GB
