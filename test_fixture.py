@@ -41,6 +41,9 @@ def _years_ago(n):
     return NOW.year - n
 
 
+# Model-drafted; NOT yet read by a human.
+DRAFT_UNCONFIRMED = True
+
 CASES = [
     # current year is recent
     ("current year is recent", lambda: target._is_recent_year(NOW.year, NOW), True),
