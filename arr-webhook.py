@@ -6736,6 +6736,19 @@ def sort_ids_by_year_desc(items):
     return sorted(items, key=_key)
 
 
+RECENT_YEAR_WINDOW = 3
+
+
+def _is_recent_year(year, now=None):
+    if now is None:
+        now = datetime.now()
+    try:
+        y = int(str(year).strip())
+    except (TypeError, ValueError):
+        return False
+    return now.year - RECENT_YEAR_WINDOW <= y <= now.year
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 9876))
     log.info(f'Starting arr-webhook listener on port {port}')
