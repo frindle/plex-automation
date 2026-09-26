@@ -92,8 +92,6 @@ HASH = 'a' * 40
 TOP_POST = ([HASH], 10, 10)      # core.queue_top: hashes, json id, timeout
 BOTTOM_POST = ([HASH], 10, 10)   # core.queue_bottom: hashes, json id, timeout
 
-# Model-drafted; NOT yet read by a human.
-DRAFT_UNCONFIRMED = True
 
 CASES = [
     ("this-year airDateUtc -> priority label + queue_top (id=10, timeout=10), never bottomed, count 1",
