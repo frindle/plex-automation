@@ -6736,17 +6736,17 @@ def sort_ids_by_year_desc(items):
     return sorted(items, key=_key)
 
 
-RECENT_YEAR_WINDOW = 3
+RECENT_YEAR_WINDOW = 1
 
 
 def _is_recent_year(year, now=None):
     if now is None:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
     try:
         y = int(str(year).strip())
     except (TypeError, ValueError):
         return False
-    return now.year - RECENT_YEAR_WINDOW <= y <= now.year
+    return y >= now.year - RECENT_YEAR_WINDOW
 
 
 if __name__ == '__main__':
