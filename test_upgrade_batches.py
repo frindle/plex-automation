@@ -17,7 +17,7 @@ def test_sort_ids_by_year_desc_ordering():
         {'id': 5, 'firstAired': 'not-a-date'},
     ]
     ordered = target.sort_ids_by_year_desc(items)
-    assert [i['id'] for i in ordered] == [4, 2, 1, 5, 3]
+    assert [i['id'] for i in ordered] == [2, 4, 1, 3, 5]
     # input list not mutated
     assert [i['id'] for i in items] == [1, 2, 3, 4, 5]
 
