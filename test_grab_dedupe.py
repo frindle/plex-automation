@@ -60,6 +60,7 @@ class _Stub:
         self.sonarr_queue = list(sonarr_queue)
         self.has_file = has_file
         self.deleted = []        # Radarr queue ids / Sonarr id batches
+        self.removed_from_client = []  # per-delete removeFromClient flag
         self.labeled = []        # (hash, label) writes
         self.history_calls = []  # every /api/v3/history lookup
         self.sleeps = []
@@ -114,7 +115,7 @@ class _Stub:
 
     def delete(self, url, headers=None, params=None, timeout=None, json=None, **kw):
         assert params.get('blocklist') is False, params
-        assert params.get('removeFromClient') is True, params
+        self.removed_from_client.append(params.get('removeFromClient'))
         if url.endswith('/api/v3/queue/bulk'):
             self.deleted.append(sorted(json['ids']))
         else:
@@ -231,7 +232,7 @@ def run():
         # ── 6. loser still visible in the queue goes through the queue API ─
         # The *arr refreshes its queue on a timer, so right after the relabel
         # the new grab can still have a stale queue record. It must then be
-        # removed properly (blocklist False, removeFromClient True) and NOT
+        # removed properly (blocklist False, removeFromClient False) and NOT
         # counted twice -- exactly one action for it.
         s = _Stub(aw,
                   torrents={'aaa': _lane('Father.Stu.2022.2160p.HDR-RUDR.mkv'),
@@ -240,6 +241,19 @@ def run():
                   radarr_queue=[_rqrec(31, 42, 'BBB', 'Father.Stu.2022.WEB-DL-OTHER.mkv', 50)])
         aw.handle_grab(_radarr_payload('BBB'), 'Radarr')
         assert s.deleted == [31], s.deleted
+        assert s.removed_from_client == [False], s.removed_from_client
+        assert s.labeled == [('bbb', 'radarr-upgrade'), ('bbb', aw.SUPERSEDED_LABEL)], s.labeled
+
+        # ── 6b. loser NOT in Deluge (only 'aaa' in torrents, stale queue 31) ─
+        # The loser 'bbb' is NOT yet a real Deluge torrent, so it gets a hard
+        # delete (removeFromClient True) and is NOT handed to supersede.
+        s = _Stub(aw,
+                  torrents={'aaa': _lane('Father.Stu.2022.2160p.HDR-RUDR.mkv')},
+                  history={'aaa': [_rgrab(42, 100)], 'bbb': [_rgrab(42, 50)]},
+                  radarr_queue=[_rqrec(31, 42, 'BBB', 'Father.Stu.2022.WEB-DL-OTHER.mkv', 50)])
+        aw.handle_grab(_radarr_payload('BBB'), 'Radarr')
+        assert s.deleted == [31], s.deleted
+        assert s.removed_from_client == [True], s.removed_from_client
         assert s.labeled == [('bbb', 'radarr-upgrade')], s.labeled
 
         # ── 7. the scoped pass touches ONLY the movie just grabbed ────────
