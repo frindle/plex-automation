@@ -453,7 +453,66 @@ def _torrent_has_local_data(torrent_hash):
         log.warning(f'{torrent_hash}: data-size probe failed ({e}); assuming data present')
         return True
 
+def _torrent_inflight_state(torrent_hash):
+    """(state, progress) when Deluge reports this torrent as NOT fully
+    downloaded, else None. FAIL-SAFE toward None ("complete / unknown"):
+    any lookup error, missing torrent or missing field returns None so the
+    caller falls back to the plain relabel path and never deletes on a glitch."""
+    try:
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.get_torrents_status',
+                  'params': [{'id': [torrent_hash]}, ['state', 'progress']], 'id': 8},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        st = (resp.json().get('result') or {}).get(torrent_hash)
+        if not st or st.get('state') is None or st.get('progress') is None:
+            return None
+        progress = float(st['progress'])
+        if progress >= 100.0:
+            return None
+        return st['state'], progress
+    except Exception as e:
+        log.warning(f'{torrent_hash}: in-flight probe failed ({e}); treating as complete')
+        return None
+
+
+def remove_incomplete_torrent(torrent_hash, reason=''):
+    """Remove a torrent that has NOT finished downloading, deleting its
+    partial files. remove_torrent()'s HnR guard (seeding_time < SEED_DAYS ->
+    keep files) is deliberately bypassed: hit-and-run is a penalty for
+    leaving a COMPLETED download early, and an incomplete torrent has
+    seeded nothing (seeding_time is 0 until it finishes), so the guard would
+    only strand partial data in Incomplete/ for the orphan scan."""
+    resp = session.post(
+        f'{DELUGE_URL}/json',
+        json={'method': 'core.remove_torrent', 'params': [torrent_hash, True], 'id': 7},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    log.info(f'Removed incomplete torrent {torrent_hash} and its partial files ({reason})')
+    record_activity('supersede-incomplete-removed',
+                    f'torrent {torrent_hash} removed with partial data: {reason}')
+
+
 def supersede_torrent(torrent_hash):
+    # A superseded label is a SEEDING-phase label: cleanup_superseded reaps on
+    # seed time and queued_superseded_targets only reaps Deluge-Queued
+    # torrents at 0%. A torrent that is still transferring (Downloading,
+    # Paused part-way, ...) would keep downloading under the label, nothing
+    # would import it (Radarr/Sonarr dropped the queue record), and nothing
+    # would ever reap it (Spider-Man: Brand New Day 2026-10-09). A partial
+    # download has seeded nothing, so remove it outright. A Queued torrent at
+    # 0% has taken nothing from the tracker; the existing reaper handles it.
+    inflight = _torrent_inflight_state(torrent_hash)
+    if inflight is not None:
+        state, progress = inflight
+        if not (state == 'Queued' and progress == 0):
+            remove_incomplete_torrent(
+                torrent_hash,
+                f'superseded while still downloading (state {state}, {progress:.2f}%)')
+            return
     set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
     # Guard the move: core.move_storage on a torrent whose files are already
     # gone does NOT fail — it relocates the now-fileless torrent to SEEDING_DIR,
@@ -1111,6 +1170,46 @@ def _radarr_last_imported_source_title(movie_id):
         log.warning(f'Radarr history sourceTitle lookup failed for movie {movie_id}: {e}')
         return None
 
+PENDING_IMPORT_GRACE_HOURS = float(os.environ.get('PENDING_IMPORT_GRACE_HOURS', '48'))
+
+
+def _radarr_import_pending(torrent_hash, now=None):
+    """True when Radarr grabbed this torrent recently (within
+    PENDING_IMPORT_GRACE_HOURS) and has recorded NO import for it yet -- i.e.
+    it is a finished upgrade still waiting for Radarr to import it (the
+    auto-rescue pass scans radarr/radarr-upgrade-labeled finished torrents
+    every 15 minutes). dedup_via_radarr treats "complete and not the tracked
+    file" as a duplicate, which is exactly what a not-yet-imported upgrade
+    looks like; superseding it hides it from Radarr and from auto-rescue, so
+    the upgrade can never import (Spider-Man: Brand New Day AMZN/NORDiC).
+    FAIL-SAFE toward True (protect it) on any lookup error; a torrent older
+    than the grace window is genuinely stuck/rejected and may be superseded."""
+    try:
+        r = requests.get(
+            f'{RADARR_URL}/api/v3/history',
+            headers={'X-Api-Key': RADARR_API_KEY},
+            params={'downloadId': torrent_hash.upper(), 'pageSize': 50},
+            timeout=15,
+        )
+        r.raise_for_status()
+        records = r.json().get('records') or []
+    except Exception as e:
+        log.warning(f'Radarr pending-import check for {torrent_hash[:8]} failed ({e}); protecting it')
+        return True
+    if any(rec.get('eventType') == 'downloadFolderImported' for rec in records):
+        return False
+    grabs = [rec.get('date') for rec in records if rec.get('eventType') == 'grabbed' and rec.get('date')]
+    if not grabs:
+        return False
+    try:
+        import datetime
+        last = datetime.datetime.fromisoformat(max(grabs).replace('Z', '+00:00'))
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        return (now - last) < datetime.timedelta(hours=PENDING_IMPORT_GRACE_HOURS)
+    except Exception:
+        return True
+
+
 def dedup_via_radarr(dry_run=False):
     log.info(f'Running Radarr → Deluge dedup pass{" (DRY RUN)" if dry_run else ""}...')
     if not RADARR_API_KEY:
@@ -1205,6 +1304,9 @@ def dedup_via_radarr(dry_run=False):
                 name = radarr_torrents[h].get('name', '')
                 if not should_supersede_candidate(radarr_torrents[h]):
                     log.info(f'  skip superseding "{name}" (tracker already unregistered it -- nothing left to seed)')
+                    continue
+                if _radarr_import_pending(h):
+                    log.info(f'  skip superseding "{name}" (grabbed recently, not imported yet -- awaiting import)')
                     continue
                 action = 'WOULD relabel' if dry_run else 'relabeling'
                 log.info(f'  {action} superseded: "{name}" (movie {movie["id"]}: {movie.get("title")})')
@@ -1976,6 +2078,28 @@ def _radarr_grab_identity(download_id):
     return latest.get('movieId'), score
 
 
+def _promote_keeper(torrent_hash, torrents):
+    """After a duplicate pass drops losers, move the surviving keeper to the
+    top of Deluge's queue if it is still incomplete. A throttled-lane keeper
+    sits at the BOTTOM of the queue (handle_grab queue_bottom), so while its
+    lower-scoring duplicates held the active-download slots it stayed Queued
+    at 0% -- Spider-Man: Brand New Day's DUDU keeper waited 36h while the
+    superseded-but-still-downloading AMZN/NORDiC losers ran, and none of
+    them ever imported. Best-effort: never raises."""
+    try:
+        info = torrents.get(torrent_hash) or {}
+        if not torrent_hash or not info or (info.get('progress') or 0) >= 99.0:
+            return
+        session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.queue_top', 'params': [[torrent_hash]], 'id': 12},
+            timeout=10,
+        ).raise_for_status()
+        log.info(f'Duplicate pass: moved surviving keeper {torrent_hash[:8]} to top of queue')
+    except Exception as e:
+        log.warning(f'Duplicate pass: could not promote keeper {torrent_hash[:8]}: {e}')
+
+
 def _dupe_candidate_sort_key(c):
     """Keep the highest custom-format score. On a tie prefer whichever has
     actually pulled bytes (throwing away a part-finished download wastes the
@@ -2158,6 +2282,8 @@ def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
                 removed += 1
             except Exception as e:
                 log.warning(f'Radarr queue dedupe: could not drop "{item["title"]}": {e}')
+        if not dry_run:
+            _promote_keeper(best['hash'], torrents)
         if dry_run:
             report_list.append({
                 'movie_id': group_movie_id,
@@ -2459,6 +2585,9 @@ def cleanup_sonarr_queue_dupes(series_id=None, dry_run=False):
                 removed += 1
             except Exception as e:
                 log.warning(f'Sonarr queue dedupe: could not drop "{item["title"]}": {e}')
+        if not dry_run:
+            for k in keepers:
+                _promote_keeper(k['hash'], torrents)
         if dry_run:
             report_list.append({
                 'series_id': group_series_id,
