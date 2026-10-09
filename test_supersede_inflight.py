@@ -1,10 +1,9 @@
 """Self-checks for the "superseded but still downloading" fix and the
 pending-import guard (Spider-Man: Brand New Day, 2026-10).
 
-Bug 1: cleanup_radarr_queue_dupes handed a duplicate loser that was still
-DOWNLOADING to supersede_torrent, which only relabels. The torrent kept
-transferring under the 'superseded' label, was no longer in Radarr's queue,
-and nothing reaped it. Bug 2: the keeper (bottom of the queue) starved while
+Bug 1: a duplicate loser still DOWNLOADING was relabeled 'superseded' but kept
+its 30 KB/s lane cap forever. Policy: never remove it; keep the label, lift the
+cap (resume if paused), let it finish and seed; cleanup_superseded reaps it. Bug 2: the keeper (bottom of the queue) starved while
 the losers held the download slots. Bug 3: dedup_via_radarr superseded a
 FINISHED upgrade that Radarr had not imported yet, hiding it from Radarr and
 auto-rescue forever.
@@ -56,30 +55,34 @@ def main():
     aw = __import__('arr-webhook')
     SUP = aw.SUPERSEDED_LABEL
 
-    # supersede_torrent: Downloading 0.11% -> removed WITH partial data, not relabeled
-    rec = _install(aw, {'H': {'state': 'Downloading', 'progress': 0.11, 'total_done': 5}})
-    aw.supersede_torrent('H')
-    assert _removed(rec) == [['H', True]], rec['rpc']
-    assert rec['label'] == [] and rec['move'] == []
-    assert 'supersede-incomplete-removed' in rec['activity']
+    def opts(rec):
+        return [p for m, p in rec['rpc'] if m == 'core.set_torrent_options']
 
-    # Paused part-way and Queued part-way are also stranded -> removed
-    for st, pr in (('Paused', 40.0), ('Queued', 12.5)):
-        rec = _install(aw, {'H': {'state': st, 'progress': pr, 'total_done': 9}})
+    def resumed(rec):
+        return [p for m, p in rec['rpc'] if m == 'core.resume_torrent']
+
+    # Incomplete torrent: NEVER removed; keeps `superseded` label; cap cleared;
+    # not moved mid-download.
+    for st, pr in (('Downloading', 0.11), ('Queued', 12.5), ('Paused', 40.0)):
+        rec = _install(aw, {'H': {'state': st, 'progress': pr, 'total_done': 5}})
         aw.supersede_torrent('H')
-        assert _removed(rec) == [['H', True]], (st, rec['rpc'])
+        assert _removed(rec) == [], (st, 'must never remove an incomplete torrent', rec['rpc'])
+        assert ('H', SUP) in rec['label'], st
+        assert opts(rec) == [[['H'], {'max_download_speed': -1}]], (st, rec['rpc'])
+        assert rec['move'] == [], 'no mid-download move'
+        assert (resumed(rec) == [[['H']]]) == (st == 'Paused'), (st, rec['rpc'])
 
-    # Queued at exactly 0% took nothing from the tracker: existing reaper path
+    # Queued at exactly 0%: still labeled (existing reaper path), nothing removed here
     rec = _install(aw, {'H': {'state': 'Queued', 'progress': 0, 'total_done': 0}})
     aw.supersede_torrent('H')
     assert _removed(rec) == [] and ('H', SUP) in rec['label']
 
-    # Finished (seeding) torrent: normal relabel + move, never removed (HnR)
+    # Finished (seeding) torrent: normal relabel + move, no cap change, never removed
     rec = _install(aw, {'H': {'state': 'Seeding', 'progress': 100.0, 'total_done': 99}})
     aw.supersede_torrent('H')
-    assert _removed(rec) == [] and ('H', SUP) in rec['label'] and ('H', aw.SEEDING_DIR) in rec['move']
+    assert _removed(rec) == [] and opts(rec) == [] and ('H', SUP) in rec['label'] and ('H', aw.SEEDING_DIR) in rec['move']
 
-    # Probe failure fails safe to the old relabel path, never a delete
+    # Probe failure fails safe to the relabel path
     rec = _install(aw, {}, boom=True)
     aw.supersede_torrent('H')
     assert _removed(rec) == [] and ('H', SUP) in rec['label']
@@ -106,8 +109,9 @@ def main():
         })()
         assert aw.cleanup_radarr_queue_dupes() == 1
         assert deleted == ['http://radarr/api/v3/queue/7']
-        assert _removed(rec) == [[loser, True]], 'downloading loser must be removed, not left transferring'
-        assert (loser, SUP) not in rec['label'], 'must not be left labeled superseded'
+        assert _removed(rec) == [], 'downloading loser must never be removed'
+        assert (loser, SUP) in rec['label'], 'loser stays labeled superseded'
+        assert ([[loser], {'max_download_speed': -1}]) in [p for m, p in rec['rpc'] if m == 'core.set_torrent_options'], 'cap must be lifted so it can finish'
         assert ('core.queue_top', [[keeper]]) in rec['rpc'], 'surviving keeper must be moved to the top'
 
         # ── pending-import guard ─────────────────────────────────────────

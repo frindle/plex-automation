@@ -457,7 +457,7 @@ def _torrent_inflight_state(torrent_hash):
     """(state, progress) when Deluge reports this torrent as NOT fully
     downloaded, else None. FAIL-SAFE toward None ("complete / unknown"):
     any lookup error, missing torrent or missing field returns None so the
-    caller falls back to the plain relabel path and never deletes on a glitch."""
+    caller falls back to the plain relabel+move path on a glitch."""
     try:
         resp = session.post(
             f'{DELUGE_URL}/json',
@@ -478,42 +478,46 @@ def _torrent_inflight_state(torrent_hash):
         return None
 
 
-def remove_incomplete_torrent(torrent_hash, reason=''):
-    """Remove a torrent that has NOT finished downloading, deleting its
-    partial files. remove_torrent()'s HnR guard (seeding_time < SEED_DAYS ->
-    keep files) is deliberately bypassed: hit-and-run is a penalty for
-    leaving a COMPLETED download early, and an incomplete torrent has
-    seeded nothing (seeding_time is 0 until it finishes), so the guard would
-    only strand partial data in Incomplete/ for the orphan scan."""
-    resp = session.post(
-        f'{DELUGE_URL}/json',
-        json={'method': 'core.remove_torrent', 'params': [torrent_hash, True], 'id': 7},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    log.info(f'Removed incomplete torrent {torrent_hash} and its partial files ({reason})')
-    record_activity('supersede-incomplete-removed',
-                    f'torrent {torrent_hash} removed with partial data: {reason}')
+def release_inflight_superseded(torrent_hash, state, progress):
+    """A superseded torrent that has NOT finished must be allowed to finish,
+    never removed (Penn's policy: the label is `superseded`, lift the speed
+    limit, let it download to 100% and seed; cleanup_superseded reaps it after
+    SEED_DAYS). The radarr-upgrade/sonarr-upgrade lanes carry a per-torrent
+    max_download_speed that PERSISTS after relabel (the `superseded` label has
+    apply_max False), so a 30 KB/s cap would otherwise crawl forever. Clear the
+    cap and resume a paused torrent. Best-effort: never raises."""
+    try:
+        session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.set_torrent_options',
+                  'params': [[torrent_hash], {'max_download_speed': -1}], 'id': 13},
+            timeout=10,
+        ).raise_for_status()
+        if state == 'Paused':
+            session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.resume_torrent', 'params': [[torrent_hash]], 'id': 14},
+                timeout=10,
+            ).raise_for_status()
+        log.info(f'{torrent_hash}: superseded while incomplete ({state}, {progress:.2f}%) -- '
+                 f'download cap cleared{", resumed" if state == "Paused" else ""}; will finish and seed')
+        record_activity('supersede-inflight-released',
+                        f'torrent {torrent_hash} superseded at {progress:.2f}% ({state}): cap cleared, left to finish')
+    except Exception as e:
+        log.warning(f'{torrent_hash}: could not release in-flight superseded torrent: {e}')
 
 
 def supersede_torrent(torrent_hash):
-    # A superseded label is a SEEDING-phase label: cleanup_superseded reaps on
-    # seed time and queued_superseded_targets only reaps Deluge-Queued
-    # torrents at 0%. A torrent that is still transferring (Downloading,
-    # Paused part-way, ...) would keep downloading under the label, nothing
-    # would import it (Radarr/Sonarr dropped the queue record), and nothing
-    # would ever reap it (Spider-Man: Brand New Day 2026-10-09). A partial
-    # download has seeded nothing, so remove it outright. A Queued torrent at
-    # 0% has taken nothing from the tracker; the existing reaper handles it.
+    # Never removes anything. An incomplete torrent keeps the `superseded`
+    # label but has its download cap lifted (and is resumed if paused) so it
+    # finishes, seeds, and is reaped by cleanup_superseded after SEED_DAYS.
+    # Its partial data is NOT moved mid-download. A Queued torrent at exactly
+    # 0% also stays on the existing queued_superseded_targets reaper path.
     inflight = _torrent_inflight_state(torrent_hash)
-    if inflight is not None:
-        state, progress = inflight
-        if not (state == 'Queued' and progress == 0):
-            remove_incomplete_torrent(
-                torrent_hash,
-                f'superseded while still downloading (state {state}, {progress:.2f}%)')
-            return
     set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
+    if inflight is not None:
+        release_inflight_superseded(torrent_hash, *inflight)
+        return
     # Guard the move: core.move_storage on a torrent whose files are already
     # gone does NOT fail — it relocates the now-fileless torrent to SEEDING_DIR,
     # where it sits at 0% forever, never accrues seeding_time, and so
@@ -1173,7 +1177,7 @@ def _radarr_last_imported_source_title(movie_id):
 PENDING_IMPORT_GRACE_HOURS = float(os.environ.get('PENDING_IMPORT_GRACE_HOURS', '48'))
 
 
-def _radarr_import_pending(torrent_hash, now=None):
+def _arr_import_pending(base_url, api_key, torrent_hash, now=None, who='Radarr'):
     """True when Radarr grabbed this torrent recently (within
     PENDING_IMPORT_GRACE_HOURS) and has recorded NO import for it yet -- i.e.
     it is a finished upgrade still waiting for Radarr to import it (the
@@ -1186,15 +1190,15 @@ def _radarr_import_pending(torrent_hash, now=None):
     than the grace window is genuinely stuck/rejected and may be superseded."""
     try:
         r = requests.get(
-            f'{RADARR_URL}/api/v3/history',
-            headers={'X-Api-Key': RADARR_API_KEY},
+            f'{base_url}/api/v3/history',
+            headers={'X-Api-Key': api_key},
             params={'downloadId': torrent_hash.upper(), 'pageSize': 50},
             timeout=15,
         )
         r.raise_for_status()
         records = r.json().get('records') or []
     except Exception as e:
-        log.warning(f'Radarr pending-import check for {torrent_hash[:8]} failed ({e}); protecting it')
+        log.warning(f'{who} pending-import check for {torrent_hash[:8]} failed ({e}); protecting it')
         return True
     if any(rec.get('eventType') == 'downloadFolderImported' for rec in records):
         return False
@@ -1208,6 +1212,17 @@ def _radarr_import_pending(torrent_hash, now=None):
         return (now - last) < datetime.timedelta(hours=PENDING_IMPORT_GRACE_HOURS)
     except Exception:
         return True
+
+
+def _radarr_import_pending(torrent_hash, now=None):
+    return _arr_import_pending(RADARR_URL, RADARR_API_KEY, torrent_hash, now=now, who='Radarr')
+
+
+def _sonarr_import_pending(torrent_hash, now=None):
+    """Sonarr counterpart: a finished season-pack/episode upgrade grabbed
+    within PENDING_IMPORT_GRACE_HOURS with no import recorded must not be
+    superseded as a 'duplicate' before Sonarr imports it."""
+    return _arr_import_pending(SONARR_URL, SONARR_API_KEY, torrent_hash, now=now, who='Sonarr')
 
 
 def dedup_via_radarr(dry_run=False):
@@ -1620,6 +1635,9 @@ def dedup_via_sonarr(dry_run=False):
                 name = sonarr_torrents[h].get('name', '') or ''
                 em = EPISODE_RE.search(name)
                 season = int(em.group(0)[1:3]) if em else None
+                if _sonarr_import_pending(h):
+                    log.info(f'  skip superseding "{sonarr_torrents[h].get("name")}" (grabbed recently, not imported yet -- awaiting import)')
+                    continue
                 action = 'WOULD relabel' if dry_run else 'relabeling'
                 log.info(f'  {action} superseded (season pack covers it): "{name}" (series {series_id}: {series.get("title")}, S{season:02d})')
                 report.append({
@@ -1647,6 +1665,9 @@ def dedup_via_sonarr(dry_run=False):
                 name = sonarr_torrents[h].get('name', '') or ''
                 sm = SEASON_RE.search(name)
                 season = int(sm.group(1)) if sm else None
+                if _sonarr_import_pending(h):
+                    log.info(f'  skip superseding "{sonarr_torrents[h].get("name")}" (grabbed recently, not imported yet -- awaiting import)')
+                    continue
                 action = 'WOULD relabel' if dry_run else 'relabeling'
                 log.info(f'  {action} superseded (singles are the keepers): "{name}" (series {series_id}: {series.get("title")}, S{season:02d})')
                 report.append({
@@ -1673,6 +1694,9 @@ def dedup_via_sonarr(dry_run=False):
                 name = sonarr_torrents[h].get('name', '') or ''
                 sm = SEASON_RE.search(name)
                 season = int(sm.group(1)) if sm else None
+                if _sonarr_import_pending(h):
+                    log.info(f'  skip superseding "{sonarr_torrents[h].get("name")}" (grabbed recently, not imported yet -- awaiting import)')
+                    continue
                 action = 'WOULD relabel' if dry_run else 'relabeling'
                 log.info(f'  {action} superseded (same-season pack, lower codec): "{name}" (series {series_id}: {series.get("title")}, S{season:02d})')
                 report.append({
@@ -1715,6 +1739,9 @@ def dedup_via_sonarr(dry_run=False):
                     keeper = next(h for h in hashes if h not in losers)
                     log.info(f'  {ep} (series {series_id}: {series.get("title")}): keeper via sonarr-latest-history = {keeper[:12]}')
                     for h in losers:
+                        if _sonarr_import_pending(h):
+                            log.info(f'  skip superseding "{sonarr_torrents[h].get("name")}" (grabbed recently, not imported yet -- awaiting import)')
+                            continue
                         action = 'WOULD relabel' if dry_run else 'relabeling'
                         log.info(f'  {action} superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")}, {ep})')
                         if not dry_run:
@@ -1750,6 +1777,9 @@ def dedup_via_sonarr(dry_run=False):
                 log.info(f'  {ep} (series {series_id}: {series.get("title")}): keeper via {keeper_source} = {keeper[:12]}')
                 for h in hashes:
                     if h == keeper:
+                        continue
+                    if _sonarr_import_pending(h):
+                        log.info(f'  skip superseding "{sonarr_torrents[h].get("name")}" (grabbed recently, not imported yet -- awaiting import)')
                         continue
                     action = 'WOULD relabel' if dry_run else 'relabeling'
                     log.info(f'  {action} superseded: "{sonarr_torrents[h].get("name")}" (series {series_id}: {series.get("title")}, {ep})')
