@@ -2935,6 +2935,36 @@ def relabel_download_to_base(download_id, source):
     return 'flipped', name
 
 
+def incoming_release_names(data, source):
+    result = []
+    seen = set()
+    release = data.get('release')
+    if isinstance(release, dict):
+        rt = release.get('releaseTitle')
+        if isinstance(rt, str) and rt:
+            if rt not in seen:
+                result.append(rt)
+                seen.add(rt)
+    if source == 'Radarr':
+        movie_file = data.get('movieFile')
+    elif source == 'Sonarr':
+        movie_file = data.get('episodeFile')
+    else:
+        movie_file = None
+    if isinstance(movie_file, dict):
+        sn = movie_file.get('sceneName')
+        if isinstance(sn, str) and sn:
+            if sn not in seen:
+                result.append(sn)
+                seen.add(sn)
+    st = data.get('sourceTitle')
+    if isinstance(st, str) and st:
+        if st not in seen:
+            result.append(st)
+            seen.add(st)
+    return result
+
+
 def handle_upgrade_import(data, source):
     _dedup_id = (data.get('downloadId') or '').lower()
     if _dedup_id:
@@ -3013,7 +3043,11 @@ def handle_upgrade_import(data, source):
         if not new_torrent_hash:
             log.warning(f'{source}: could not identify season pack torrent, will skip none')
     else:
-        new_torrent_hash = find_new_torrent_hash(new_filename, torrents)
+        candidate_names = incoming_release_names(data, source) + [new_filename]
+        for cn in candidate_names:
+            new_torrent_hash = find_new_torrent_hash(cn, torrents)
+            if new_torrent_hash:
+                break
         if not new_torrent_hash:
             log.warning(f'{source}: could not identify new torrent by filename, will skip none')
 
@@ -3039,6 +3073,8 @@ def handle_upgrade_import(data, source):
             )
         return
 
+    incoming_name = (torrents.get(new_torrent_hash) or {}).get('name') or (incoming_release_names(data, source) or [new_filename])[0]
+    proper_repack = proper_repack or is_proper_repack(incoming_name)
     log.info(f'{source}: will skip new torrent {new_torrent_hash}')
     # Fallback flip: if the new torrent was pinned by filename/season (empty or
     # mismatched downloadId) the early downloadId flip was a no-op — flip the
@@ -3066,9 +3102,10 @@ def handle_upgrade_import(data, source):
             # same title (x265/HEVC) — that's a quality downgrade, not an
             # upgrade. One-directional: same-codec and genuine higher-codec
             # upgrades fall through untouched.
-            if codec_rank(name) > codec_rank(new_filename):
+            incoming_codec = codec_rank(incoming_name)
+            if incoming_codec and codec_rank(name) > incoming_codec:
                 log.info(f'{source}: codec floor — keeping {torrent_hash} - {name}')
-                record_activity('supersede-skip', f'{source}: kept "{name}" (codec floor: existing release outranks incoming import "{new_filename}")')
+                record_activity('supersede-skip', f'{source}: kept "{name}" (codec floor: existing release outranks incoming import "{incoming_name}")')
                 continue
             # A repack/proper is only a true immediate replacement (safe to
             # delete outright) when it's from the SAME release group as the
