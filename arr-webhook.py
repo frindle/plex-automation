@@ -145,7 +145,6 @@ STALL_AUTOMATION_ENABLED = os.environ.get('STALL_AUTOMATION_ENABLED', 'false').l
 MOVIES_LIBRARY   = os.environ.get('MOVIES_LIBRARY', '/media/movies')
 PLEX_URL         = os.environ.get('PLEX_URL', 'http://10.0.0.6:32400')
 PLEX_TOKEN       = os.environ.get('PLEX_TOKEN', '')
-UNLIMITED_UPGRADE_SLOTS  = int(os.environ.get('UNLIMITED_UPGRADE_SLOTS', '2'))
 # Translate Plex-container paths → arr-webhook-container paths for
 # filesystem deletes. Comma-separated `plex_prefix:local_prefix` pairs.
 # Default handles the standard split-mount setup: Plex sees /data/...,
@@ -3184,10 +3183,6 @@ def handle_import_relabel(data, source):
         result, name = relabel_download_to_base(download_id, source)
         if result == 'flipped':
             record_activity('relabel', f'{source}: "{name}" upgrade → base after gap-fill import')
-        try:
-            maintain_unlimited_upgrade_slots()
-        except Exception:
-            pass
     except Exception as e:
         log.warning(f'{source}: non-upgrade post-import relabel failed for {download_id}: {e}')
 
@@ -3975,120 +3970,6 @@ def priority_scheduler():
     while True:
         time.sleep(3600)
         prioritize_normal_torrents()
-
-
-def _module_session():
-    """Return a requests.Session for module-level use."""
-    return requests.Session()
-
-
-def maintain_unlimited_upgrade_slots(session=None):
-    """Promote radarr-upgrade/sonarr-upgrade torrents to unlimited download speed.
-
-    Promotes unfinished upgrade torrents (progress < 100, not Paused/Error)
-    labeled radarr-upgrade/sonarr-upgrade/-recent to max_download_speed=-1,
-    keeping at most UNLIMITED_UPGRADE_SLOTS at -1. Re-caps extras to 30.
-
-    Returns the number of successful set_torrent_options writes.
-    """
-    _ms = globals().get('session')
-    s = session if session is not None else _ms
-    try:
-        deluge_login()
-    except Exception:
-        return 0
-    try:
-        resp = s.post(
-            f'{DELUGE_URL}/json',
-            json={
-                'method': 'core.get_torrents_status',
-                'params': [{}, ['state', 'label', 'progress', 'max_download_speed', 'queue']],
-                'id': 98
-            },
-            timeout=10
-        )
-        resp.raise_for_status()
-        torrents = resp.json().get('result') or {}
-    except Exception:
-        return 0
-
-    upgrade_labels = {RADARR_UPG_LABEL, SONARR_UPG_LABEL, RADARR_UPG_PRIORITY_LABEL, SONARR_UPG_PRIORITY_LABEL}
-    candidates = []
-    for h, info in torrents.items():
-        label = info.get('label', '')
-        if label not in upgrade_labels:
-            continue
-        prog = info.get('progress', 0)
-        state = info.get('state', '')
-        if prog >= 100 or state in ('Paused', 'Error'):
-            continue
-        candidates.append((h, info))
-
-    # Sort by queue position ascending (best queue position = lowest number)
-    candidates.sort(key=lambda x: x[1].get('queue', 999999))
-
-    n = UNLIMITED_UPGRADE_SLOTS
-    if n == 0:
-        return 0
-    unlimited_hashes = [c[0] for c in candidates if c[1].get('max_download_speed') == -1]
-    count = len(unlimited_hashes)
-    writes = []
-
-    # Promote best-queue-position candidates that are not yet at -1
-    promoted = []
-    for h, info in candidates:
-        if info.get('max_download_speed') == -1:
-            continue
-        if count >= n:
-            break
-        try:
-            resp = s.post(
-                f'{DELUGE_URL}/json',
-                json={
-                    'method': 'core.set_torrent_options',
-                    'params': [[h], {'max_download_speed': -1}],
-                    'id': 99
-                },
-                timeout=10
-            )
-            resp.raise_for_status()
-            writes.append((h, -1))
-            count += 1
-            promoted.append(h)
-        except Exception:
-            pass
-
-    # Re-cap extras to 30 (worst queue positions among those at -1)
-    if count > n:
-        excess = unlimited_hashes[n:]  # already sorted by queue (best first)
-        for h in excess:
-            try:
-                resp = s.post(
-                    f'{DELUGE_URL}/json',
-                    json={
-                        'method': 'core.set_torrent_options',
-                        'params': [[h], {'max_download_speed': 30}],
-                        'id': 99
-                    },
-                    timeout=10
-                )
-                resp.raise_for_status()
-                writes.append((h, 30))
-            except Exception:
-                pass
-
-    return len(writes)
-
-
-def upgrade_slots_scheduler():
-    """Run maintain_unlimited_upgrade_slots every 30 seconds."""
-    while True:
-        try:
-            maintain_unlimited_upgrade_slots()
-        except Exception as e:
-            log.error(f'[upgrade-slots] maintain failed: {e}')
-        time.sleep(30)
-
 
 def refresh_metadata_on_grab(data, source):
     """Best-effort metadata refresh on Grab.
@@ -7178,6 +7059,4 @@ if __name__ == '__main__':
     t9.start()
     t10 = threading.Thread(target=queue_dupe_cleanup_scheduler, daemon=True)
     t10.start()
-    t11 = threading.Thread(target=upgrade_slots_scheduler, daemon=True)
-    t11.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
