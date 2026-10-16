@@ -1498,6 +1498,13 @@ def select_same_season_pack_losers(series_id, torrent_names, keeper_ids, importe
     imported = {(d or '').lower() for d in (imported_ids or set())}
     selected = []
     for key, packs in same_season_packs.items():
+        # Fail safe: with NO import evidence for any pack in the group (e.g. the
+        # import events carry a blank downloadId, so keeper_ids/imported_ids are
+        # empty) the winner would be decided by codec_rank/hash alone and could
+        # be a pack Sonarr never imported, superseding the live copy (Slow
+        # Horses S05: HONE imported, ELiTE never imported). Touch nothing.
+        if not any(h.lower() in keepers or h.lower() in imported for h in packs):
+            continue
         keeper = max(packs, key=lambda h: (h.lower() in keepers, h.lower() in imported, codec_rank((torrent_names or {}).get(h) or ''), h))
         selected.extend(h for h in packs if h != keeper)
     return selected
