@@ -1,4 +1,5 @@
 import os
+import posixpath
 import re
 import json as _json
 import time
@@ -453,6 +454,29 @@ def _torrent_has_local_data(torrent_hash):
         log.warning(f'{torrent_hash}: data-size probe failed ({e}); assuming data present')
         return True
 
+
+def _torrent_save_path(torrent_hash):
+    """Return the torrent's save_path string, or None on any failure."""
+    try:
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.get_torrents_status',
+                  'params': [{'id': [torrent_hash]}, ['save_path']], 'id': 8},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        st = (resp.json().get('result') or {}).get(torrent_hash)
+        if not st or not isinstance(st, dict):
+            return None
+        sp = st.get('save_path')
+        if isinstance(sp, str):
+            return sp
+        return None
+    except Exception as e:
+        log.warning(f'{torrent_hash}: save_path probe failed ({e})')
+        return None
+
+
 def _torrent_inflight_state(torrent_hash):
     """(state, progress) when Deluge reports this torrent as NOT fully
     downloaded, else None. FAIL-SAFE toward None ("complete / unknown"):
@@ -507,6 +531,29 @@ def release_inflight_superseded(torrent_hash, state, progress):
         log.warning(f'{torrent_hash}: could not release in-flight superseded torrent: {e}')
 
 
+# Deluge-side library roots. A torrent whose save_path is under one of these
+# seeds straight out of the Plex library ("library-seed"): moving its storage
+# or deleting its data destroys library files.
+LIBRARY_ROOTS = ('/data/Media/Movies', '/data/Media/TV Shows', '/data/Media/TV Shows - Asian')
+
+
+def is_library_path(deluge_path):
+    if not isinstance(deluge_path, str) or not deluge_path:
+        return False
+    try:
+        p = posixpath.normpath(deluge_path)
+    except Exception:
+        return False
+    if not p.startswith('/'):
+        return False
+    lp = p.lower()
+    for root in LIBRARY_ROOTS:
+        rp = root.lower()
+        if p == root or p.startswith(root + '/') or lp == rp or lp.startswith(rp + '/'):
+            return True
+    return False
+
+
 def supersede_torrent(torrent_hash):
     # Never removes anything. An incomplete torrent keeps the `superseded`
     # label but has its download cap lifted (and is resumed if paused) so it
@@ -515,6 +562,13 @@ def supersede_torrent(torrent_hash):
     # 0% also stays on the existing queued_superseded_targets reaper path.
     inflight = _torrent_inflight_state(torrent_hash)
     set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
+    # Library-seed guard: skip both release_inflight and move for library paths.
+    save_path = _torrent_save_path(torrent_hash)
+    if is_library_path(save_path):
+        log.warning(f'{torrent_hash}: library-seed {save_path} — skipping release and move')
+        record_activity('supersede-library-seed',
+                        f'torrent {torrent_hash} superseded but seeds from the library ({save_path}) -- relabeled only, not moved')
+        return
     if inflight is not None:
         release_inflight_superseded(torrent_hash, *inflight)
         return
@@ -544,18 +598,31 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
                 resp = session.post(
                     f'{DELUGE_URL}/json',
                     json={'method': 'core.get_torrent_status',
-                          'params': [torrent_hash, ['tracker_status', 'seeding_time']], 'id': 8},
+                          'params': [torrent_hash, ['tracker_status', 'seeding_time', 'save_path']], 'id': 8},
                     timeout=10,
                 )
                 resp.raise_for_status()
                 info = (resp.json().get('result') or {})
             except Exception as e:
                 log.warning(f'{torrent_hash}: status fetch failed ({e}); assuming still registered — keeping files'); info = {}  # noqa: E702
-        seeding_time = info.get('seeding_time') or 0
-        if seeding_time < SEED_DAYS * 86400:
-            log.warning(f'HnR guard {torrent_hash}: seed obligation unmet (seeded {seeding_time}s < {SEED_DAYS}d) — removing entry only, keeping files')
-            record_activity('hnr-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (seed obligation unmet: seeded {seeding_time}s < {SEED_DAYS * 86400}s)')
+        else:
+            # Caller passed info without save_path — fetch it.
+            if 'save_path' not in info:
+                sp = _torrent_save_path(torrent_hash)
+                if sp is not None:
+                    info = {**info, 'save_path': sp}
+        # Library-seed guard: before HnR check, block data-delete for library paths.
+        if is_library_path(info.get('save_path')):
+            save_path = info['save_path']
+            log.warning(f'Library-seed guard {torrent_hash}: seed obligation skipped (library {save_path}) — keeping files')
+            record_activity('library-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (library save_path {save_path})')
             remove_data = False
+        else:
+            seeding_time = info.get('seeding_time') or 0
+            if seeding_time < SEED_DAYS * 86400:
+                log.warning(f'HnR guard {torrent_hash}: seed obligation unmet (seeded {seeding_time}s < {SEED_DAYS}d) — removing entry only, keeping files')
+                record_activity('hnr-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (seed obligation unmet: seeded {seeding_time}s < {SEED_DAYS * 86400}s)')
+                remove_data = False
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={'method': 'core.remove_torrent', 'params': [torrent_hash, remove_data], 'id': 7},
