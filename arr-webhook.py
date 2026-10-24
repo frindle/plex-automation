@@ -2182,9 +2182,59 @@ def _radarr_grab_identity(download_id):
     return latest.get('movieId'), score
 
 
+def reorder_deluge_queue(torrents, first=None):
+    """Policy P1 (strict lanes): normal sonarr/radarr torrents above recent
+    upgrades (*_UPG_PRIORITY_LABEL) above old upgrades (*_UPG_LABEL).
+
+    `torrents` is hash -> info for UNFINISHED torrents only (progress < 100);
+    finished ones are ignored defensively. One queue_bottom per upgrade lane
+    (recent first, then old, so old ends up lowest), then one queue_top for the
+    normals, which lands them above both lanes. `first` (optional hash) is
+    ordered ahead of the rest of its own lane, never across lanes. Only queue
+    positions change -- never speed limits. Best-effort: never raises."""
+    try:
+        normal_labels = {'sonarr', 'radarr'}
+        recent_labels = {SONARR_UPG_PRIORITY_LABEL, RADARR_UPG_PRIORITY_LABEL}
+        old_labels = {SONARR_UPG_LABEL, RADARR_UPG_LABEL}
+        lanes = {'normal': [], 'recent': [], 'old': []}
+        for h, i in (torrents or {}).items():
+            if (i.get('progress') or 0) >= 100:
+                continue
+            label = i.get('label', '') or ''
+            if label in normal_labels:
+                lanes['normal'].append(h)
+            elif label in recent_labels:
+                lanes['recent'].append(h)
+            elif label in old_labels:
+                lanes['old'].append(h)
+        if first:
+            for hs in lanes.values():
+                if first in hs:
+                    hs.remove(first)
+                    hs.insert(0, first)
+        for key, rid in (('recent', 21), ('old', 22)):
+            if lanes[key]:
+                session.post(
+                    f'{DELUGE_URL}/json',
+                    json={'method': 'core.queue_bottom', 'params': [lanes[key]], 'id': rid},
+                    timeout=10,
+                ).raise_for_status()
+        if lanes['normal']:
+            session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.queue_top', 'params': [lanes['normal']], 'id': 23},
+                timeout=10,
+            ).raise_for_status()
+        log.info(f"Queue lanes: {len(lanes['normal'])} normal > {len(lanes['recent'])} recent upgrades > "
+                 f"{len(lanes['old'])} old upgrades")
+    except Exception as e:
+        log.warning(f'Queue lane reorder failed: {e}')
+
+
 def _promote_keeper(torrent_hash, torrents):
     """After a duplicate pass drops losers, move the surviving keeper to the
-    top of Deluge's queue if it is still incomplete. A throttled-lane keeper
+    top of its upgrade lane (never above normal grabs) if it is still
+    incomplete. A throttled-lane keeper
     sits at the BOTTOM of the queue (handle_grab queue_bottom), so while its
     lower-scoring duplicates held the active-download slots it stayed Queued
     at 0% -- Spider-Man: Brand New Day's DUDU keeper waited 36h while the
@@ -2194,12 +2244,10 @@ def _promote_keeper(torrent_hash, torrents):
         info = torrents.get(torrent_hash) or {}
         if not torrent_hash or not info or (info.get('progress') or 0) >= 99.0:
             return
-        session.post(
-            f'{DELUGE_URL}/json',
-            json={'method': 'core.queue_top', 'params': [[torrent_hash]], 'id': 12},
-            timeout=10,
-        ).raise_for_status()
-        log.info(f'Duplicate pass: moved surviving keeper {torrent_hash[:8]} to top of queue')
+        # The keeper is an upgrade: lead its own lane, never jump normal grabs.
+        unfinished = {h: i for h, i in torrents.items() if (i.get('progress') or 0) < 100}
+        reorder_deluge_queue(unfinished, first=torrent_hash)
+        log.info(f'Duplicate pass: moved surviving keeper {torrent_hash[:8]} to top of its upgrade lane')
     except Exception as e:
         log.warning(f'Duplicate pass: could not promote keeper {torrent_hash[:8]}: {e}')
 
@@ -3382,28 +3430,47 @@ def dedupe_grabbed_release(source, download_id):
         return 0
 
 
-def prioritize_new_sonarr_grab(download_id):
-    """Move a NEW (non-upgrade) Sonarr request ahead of everything already in
-    the Deluge queue. Without this it sits at the FIFO tail behind every
-    in-flight download, throttled upgrades included. Never raises: a Deluge
-    error is logged and swallowed, like the rest of the grab-time helpers."""
+GRAB_PRIORITIZE_TRIES = int(os.environ.get('GRAB_PRIORITIZE_TRIES', '6'))
+GRAB_PRIORITIZE_DELAY = float(os.environ.get('GRAB_PRIORITIZE_DELAY', '2'))
+
+
+def prioritize_new_grab(source, download_id):
+    """Move a NEW (non-upgrade) Sonarr/Radarr request to the top of the Deluge
+    queue (it is a normal-lane torrent). Without this it sits at the FIFO tail
+    behind every in-flight download, throttled upgrades included. The Grab
+    webhook can beat Deluge registering the hash, so poll get_torrent_status a
+    few times before queue_top; if it never appears, do nothing. Never raises:
+    errors are logged and swallowed like the other grab-time helpers."""
     try:
         deluge_login()
+        for attempt in range(max(1, GRAB_PRIORITIZE_TRIES)):
+            status = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.get_torrent_status', 'params': [download_id, ['label']], 'id': 91},
+                timeout=10,
+            ).json().get('result') or {}
+            if status:
+                break
+            if attempt + 1 < GRAB_PRIORITIZE_TRIES:
+                time.sleep(GRAB_PRIORITIZE_DELAY)
+        else:
+            log.warning(f'{source}: new grab {download_id} never registered in Deluge, not prioritizing')
+            return
         session.post(
             f'{DELUGE_URL}/json',
             json={'method': 'core.queue_top', 'params': [[download_id]], 'id': 92},
             timeout=10,
         )
-        log.info(f"Sonarr: moved new request {download_id} to top of queue")
+        log.info(f"{source}: moved new request {download_id} to top of queue")
     except Exception as e:
-        log.error(f"Sonarr: failed to prioritize new grab {download_id}: {e}")
+        log.error(f"{source}: failed to prioritize new grab {download_id}: {e}")
 
 
 def handle_grab(data, source):
     """
     Fires when Sonarr/Radarr sends a grab to Deluge.
     Check via API if this is an upgrade, then throttle if over 10GB.
-    New (non-upgrade) Sonarr requests are moved ahead of the existing queue.
+    New (non-upgrade) requests are moved ahead of the existing queue.
     """
     download_id = (data.get('downloadId') or '').lower()
     if not download_id:
@@ -3418,8 +3485,7 @@ def handle_grab(data, source):
 
     if not upgrade:
         log.info(f"{source}: grab {download_id} is a new release, not throttling")
-        if source == 'Sonarr':
-            prioritize_new_sonarr_grab(download_id)
+        prioritize_new_grab(source, download_id)
         return
 
     # Only throttle if release is over 10GB
@@ -3589,6 +3655,19 @@ def radarr_bulk_search():
     except Exception as e:
         log.error(f'Radarr bulk search failed: {e}')
 
+def _reorder_after_relabel(torrents, changed, old_label, recent_label, old_hashes):
+    """Apply the strict-lane order after relabel_*_upgrades changed labels.
+    `torrents` is the pre-relabel Deluge snapshot, so patch in the new labels
+    for the `changed` hashes. Upgrades never get queue_top (see
+    reorder_deluge_queue); only unfinished torrents are considered."""
+    snap = {h: dict(i) for h, i in torrents.items() if (i.get('progress') or 0) < 100}
+    old_set = set(old_hashes)
+    for h in changed:
+        if h in snap:
+            snap[h]['label'] = old_label if h in old_set else recent_label
+    reorder_deluge_queue(snap)
+
+
 def relabel_radarr_upgrades():
     """Check radarr-labeled torrents in Deluge and relabel upgrades."""
     log.info('Relabeling Radarr upgrade torrents...')
@@ -3640,20 +3719,8 @@ def relabel_radarr_upgrades():
                     set_torrent_label(torrent_hash, RADARR_UPG_LABEL)
                     relabeled_hashes.append(torrent_hash)
                 relabeled += 1
-        if relabeled_hashes:
-            session.post(
-                f'{DELUGE_URL}/json',
-                json={'method': 'core.queue_bottom', 'params': [relabeled_hashes], 'id': 10},
-                timeout=10
-            )
-            log.info(f'Moved {len(relabeled_hashes)} upgrade torrents to bottom of queue')
-        if priority_hashes:
-            session.post(
-                f'{DELUGE_URL}/json',
-                json={'method': 'core.queue_top', 'params': [priority_hashes], 'id': 10},
-                timeout=10
-            )
-            log.info(f'Moved {len(priority_hashes)} recent upgrade torrents to top of queue')
+        if relabeled_hashes or priority_hashes:
+            _reorder_after_relabel(torrents, relabeled_hashes + priority_hashes, RADARR_UPG_LABEL, RADARR_UPG_PRIORITY_LABEL, relabeled_hashes)
         log.info(f'Relabeled {relabeled} torrents as radarr-upgrade')
         return relabeled
     except Exception as e:
@@ -3778,20 +3845,8 @@ def relabel_sonarr_upgrades():
                 ensure_label_exists_named(SONARR_UPG_LABEL)
                 set_torrent_label(torrent_hash, SONARR_UPG_LABEL)
                 relabeled_hashes.append(torrent_hash)
-        if relabeled_hashes:
-            session.post(
-                f'{DELUGE_URL}/json',
-                json={'method': 'core.queue_bottom', 'params': [relabeled_hashes], 'id': 10},
-                timeout=10
-            )
-            log.info(f'Moved {len(relabeled_hashes)} sonarr upgrade torrents to bottom of queue')
-        if priority_hashes:
-            session.post(
-                f'{DELUGE_URL}/json',
-                json={'method': 'core.queue_top', 'params': [priority_hashes], 'id': 10},
-                timeout=10
-            )
-            log.info(f'Moved {len(priority_hashes)} recent sonarr upgrade torrents to top of queue')
+        if relabeled_hashes or priority_hashes:
+            _reorder_after_relabel(torrents, relabeled_hashes + priority_hashes, SONARR_UPG_LABEL, SONARR_UPG_PRIORITY_LABEL, relabeled_hashes)
         relabeled = len(relabeled_hashes) + len(priority_hashes)
         log.info(f'Relabeled {relabeled} torrents as {SONARR_UPG_LABEL}')
         return relabeled
@@ -4007,35 +4062,20 @@ def monthly_upgrade_cycle(service, wait_before_search=1800, wait_before_relabel=
 
 
 def prioritize_normal_torrents():
-    """Every hour, move sonarr/radarr labeled torrents to top and upgrade-labeled torrents to bottom of Deluge queue."""
-    log.info('Reordering Deluge queue: normal downloads to top, upgrades to bottom...')
+    """Every hour, enforce strict queue lanes (policy P1) over unfinished
+    torrents: normal sonarr/radarr on top, then recent upgrades
+    (*-upgrade-recent), then old upgrades (*-upgrade) at the bottom."""
+    log.info('Reordering Deluge queue: normal > recent upgrades > old upgrades...')
     try:
         deluge_login()
         torrents = get_all_torrents()
         if not torrents:
             return
-        priority_labels = {'sonarr', 'radarr', SONARR_UPG_PRIORITY_LABEL, RADARR_UPG_PRIORITY_LABEL}
-        upgrade_labels = {SONARR_UPG_LABEL, RADARR_UPG_LABEL}
-        top_hashes = [h for h, i in torrents.items() if i.get('label', '') in priority_labels]
-        bottom_hashes = [h for h, i in torrents.items() if i.get('label', '') in upgrade_labels]
-        if top_hashes:
-            resp = session.post(
-                f'{DELUGE_URL}/json',
-                json={'method': 'core.queue_top', 'params': [top_hashes], 'id': 8},
-                timeout=10
-            )
-            resp.raise_for_status()
-            log.info(f'Moved {len(top_hashes)} sonarr/radarr torrents to top of queue')
-        if bottom_hashes:
-            resp = session.post(
-                f'{DELUGE_URL}/json',
-                json={'method': 'core.queue_bottom', 'params': [bottom_hashes], 'id': 11},
-                timeout=10
-            )
-            resp.raise_for_status()
-            log.info(f'Moved {len(bottom_hashes)} upgrade torrents to bottom of queue')
-        if not top_hashes and not bottom_hashes:
+        unfinished = {h: i for h, i in torrents.items() if (i.get('progress') or 0) < 100}
+        if not unfinished:
             log.info('No torrents to reprioritize')
+            return
+        reorder_deluge_queue(unfinished)
     except Exception as e:
         log.error(f'Queue prioritization failed: {e}')
 

@@ -112,7 +112,8 @@ def main():
         assert _removed(rec) == [], 'downloading loser must never be removed'
         assert (loser, SUP) in rec['label'], 'loser stays labeled superseded'
         assert ([[loser], {'max_download_speed': -1}]) in [p for m, p in rec['rpc'] if m == 'core.set_torrent_options'], 'cap must be lifted so it can finish'
-        assert ('core.queue_top', [[keeper]]) in rec['rpc'], 'surviving keeper must be moved to the top'
+        assert not [1 for m, p in rec['rpc'] if m == 'core.queue_top' and keeper in p[0]], 'keeper must never get queue_top over normals'
+        assert any(m == 'core.queue_bottom' and p[0][0] == keeper for m, p in rec['rpc']), 'keeper leads the upgrade lane'
 
         # ── pending-import guard ─────────────────────────────────────────
         now = datetime.datetime(2026, 10, 9, tzinfo=datetime.timezone.utc)
