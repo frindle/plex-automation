@@ -4658,7 +4658,38 @@ def deluge_lookup():
     return jsonify({'ok': True, 'count': len(hits), 'hits': hits}), 200
 
 AUTO_RESCUE_MAX_ATTEMPTS = 6  # ~90 min at 15-min intervals
-_rescue_attempts = {}  # hash → attempt count
+RESCUE_STATE_PATH = os.environ.get('RESCUE_STATE_PATH', '/data/rescue_attempts.json')
+
+def _load_rescue_state():
+    """(attempts dict hash->int, gave_up set of hashes) from RESCUE_STATE_PATH; empty on any error."""
+    attempts = {}
+    gave_up = set()
+    try:
+        with open(RESCUE_STATE_PATH) as f:
+            data = _json.load(f)
+        if isinstance(data, dict):
+            for k, v in data.get('attempts', {}).items():
+                if isinstance(k, str) and isinstance(v, int):
+                    attempts[k] = v
+            for item in data.get('gave_up', []):
+                if isinstance(item, str):
+                    gave_up.add(item)
+    except Exception:
+        pass
+    return attempts, gave_up
+
+_rescue_attempts, _rescue_gave_up = _load_rescue_state()
+
+def _save_rescue_state():
+    """Write rescue state to RESCUE_STATE_PATH. Never raises."""
+    try:
+        tmp = RESCUE_STATE_PATH + '.tmp'
+        data = {'attempts': dict(_rescue_attempts), 'gave_up': sorted(_rescue_gave_up)}
+        with open(tmp, 'w') as f:
+            _json.dump(data, f)
+        os.replace(tmp, RESCUE_STATE_PATH)
+    except Exception as e:
+        log.warning(f'_save_rescue_state failed: {e}')
 
 # Detect "grabbed but never imported" torrents and fire a scan to
 # recover them. Radarr/Sonarr sometimes silently drop imports (folder
@@ -4702,7 +4733,7 @@ def _auto_rescue(service, dry_run=False):
         return {'ok': False, 'error': f'deluge fetch failed: {e}'}
     stuck = []
     triggered = []
-    skipped_reasons = {'not_labeled': 0, 'not_complete': 0, 'no_grab': 0, 'already_imported': 0, 'max_attempts': 0}
+    skipped_reasons = {'not_labeled': 0, 'not_complete': 0, 'no_grab': 0, 'already_imported': 0, 'max_attempts': 0, 'library': 0}
     active_hashes = set()
     for h, info in torrents.items():
         if (info.get('label') or '').lower() not in labels:
@@ -4710,6 +4741,10 @@ def _auto_rescue(service, dry_run=False):
             continue
         if (info.get('progress') or 0) < 99.0:
             skipped_reasons['not_complete'] += 1
+            continue
+        # Library torrents are skipped entirely (no requests)
+        if is_library_path(info.get('save_path')):
+            skipped_reasons['library'] += 1
             continue
         try:
             hr = requests.get(
@@ -4759,15 +4794,16 @@ def _auto_rescue(service, dry_run=False):
         if last_import >= last_grab:
             skipped_reasons['already_imported'] += 1
             _rescue_attempts.pop(h, None)
+            _rescue_gave_up.discard(h)
             continue
         active_hashes.add(h)
         attempts = _rescue_attempts.get(h, 0)
         if attempts >= AUTO_RESCUE_MAX_ATTEMPTS:
             skipped_reasons['max_attempts'] += 1
-            if attempts == AUTO_RESCUE_MAX_ATTEMPTS:
-                log.warning(f'auto-rescue {service}: giving up on "{info.get("name")}" after {attempts} attempts — needs manual import')
-                record_activity('import-rescue', f'auto-rescue {service}: gave up on "{info.get("name")}" after {attempts} attempts')
-                _rescue_attempts[h] = attempts + 1
+            if h not in _rescue_gave_up and not dry_run:
+                log.warning(f'auto-rescue {service}: giving up on "{info.get("name")}" after {attempts} attempts -- needs manual import')
+                record_activity('rescue-gave-up', f'auto-rescue {service}: gave up on "{info.get("name")}" after {attempts} attempts -- needs manual import')
+                _rescue_gave_up.add(h)
             continue
         entry = {
             'hash': h,
@@ -4787,7 +4823,7 @@ def _auto_rescue(service, dry_run=False):
             cr = requests.post(
                 f'{url}/api/v3/command',
                 headers={'X-Api-Key': key, 'Content-Type': 'application/json'},
-                json={'name': scan_cmd, 'path': scan_path, 'importMode': 'auto'},
+                json={'name': scan_cmd, 'path': scan_path, 'importMode': 'auto', 'downloadClientId': h.upper()},
                 timeout=20,
             )
             cr.raise_for_status()
@@ -4804,6 +4840,9 @@ def _auto_rescue(service, dry_run=False):
                     and (torrents[k].get('label') or '').lower() in labels
                     and k not in active_hashes]:
         del _rescue_attempts[stale_h]
+        _rescue_gave_up.discard(stale_h)
+    if not dry_run:
+        _save_rescue_state()
     return {
         'ok': True,
         'service': service,
@@ -4834,6 +4873,8 @@ def auto_rescue_endpoint():
     dry_run = request.args.get('dry_run', '').lower() in ('1', 'true', 'yes')
     if request.args.get('reset', '').lower() in ('1', 'true', 'yes'):
         _rescue_attempts.clear()
+        _rescue_gave_up.clear()
+        _save_rescue_state()
         log.info('auto-rescue: retry counters reset')
     if service == 'both':
         return jsonify({
