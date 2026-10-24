@@ -26,11 +26,13 @@ class FakeDeluge:
     def post(self, url, json=None, timeout=None, **kw):
         m, p = json['method'], json['params']
         self.rpc.append((m, p))
+        # Deluge 2 ignores the order of the ids passed: it sorts them by
+        # current queue position, keeping their relative order.
         if m == 'core.queue_top':
-            hs = list(p[0])
+            hs = sorted(p[0], key=self.queue.index)
             self.queue = hs + [h for h in self.queue if h not in hs]
         elif m == 'core.queue_bottom':
-            hs = list(p[0])
+            hs = sorted(p[0], key=self.queue.index)
             self.queue = [h for h in self.queue if h not in hs] + hs
         elif m == 'core.get_torrent_status':
             return _Resp({'result': self.status.get(p[0]) or {}})

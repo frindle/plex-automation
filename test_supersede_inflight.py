@@ -113,7 +113,14 @@ def main():
         assert (loser, SUP) in rec['label'], 'loser stays labeled superseded'
         assert ([[loser], {'max_download_speed': -1}]) in [p for m, p in rec['rpc'] if m == 'core.set_torrent_options'], 'cap must be lifted so it can finish'
         assert not [1 for m, p in rec['rpc'] if m == 'core.queue_top' and keeper in p[0]], 'keeper must never get queue_top over normals'
-        assert any(m == 'core.queue_bottom' and p[0][0] == keeper for m, p in rec['rpc']), 'keeper leads the upgrade lane'
+        # replay on a Deluge-like queue (ids are sorted by current position)
+        q = [keeper, loser]
+        for m, p in rec['rpc']:
+            if m in ('core.queue_top', 'core.queue_bottom'):
+                hs = sorted(p[0], key=q.index)
+                rest = [h for h in q if h not in hs]
+                q = hs + rest if m == 'core.queue_top' else rest + hs
+        assert q == [loser, keeper], 'normal stays above the keeper: %r' % q
 
         # ── pending-import guard ─────────────────────────────────────────
         now = datetime.datetime(2026, 10, 9, tzinfo=datetime.timezone.utc)

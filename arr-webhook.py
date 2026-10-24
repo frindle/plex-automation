@@ -2190,7 +2190,7 @@ def reorder_deluge_queue(torrents, first=None):
     finished ones are ignored defensively. One queue_bottom per upgrade lane
     (recent first, then old, so old ends up lowest), then one queue_top for the
     normals, which lands them above both lanes. `first` (optional hash) is
-    ordered ahead of the rest of its own lane, never across lanes. Only queue
+    placed at the head of its own lane, never across lanes. Only queue
     positions change -- never speed limits. Best-effort: never raises."""
     try:
         normal_labels = {'sonarr', 'radarr'}
@@ -2207,24 +2207,36 @@ def reorder_deluge_queue(torrents, first=None):
                 lanes['recent'].append(h)
             elif label in old_labels:
                 lanes['old'].append(h)
-        if first:
-            for hs in lanes.values():
-                if first in hs:
-                    hs.remove(first)
-                    hs.insert(0, first)
-        for key, rid in (('recent', 21), ('old', 22)):
-            if lanes[key]:
-                session.post(
-                    f'{DELUGE_URL}/json',
-                    json={'method': 'core.queue_bottom', 'params': [lanes[key]], 'id': rid},
-                    timeout=10,
-                ).raise_for_status()
-        if lanes['normal']:
+        # Deluge sorts the ids of a queue_top/queue_bottom call by their current
+        # queue position, so the order passed in is ignored. To lead a lane with
+        # `first`, move it alone first and the rest of the lane after it.
+        def _move(method, hashes, rid):
             session.post(
                 f'{DELUGE_URL}/json',
-                json={'method': 'core.queue_top', 'params': [lanes['normal']], 'id': 23},
+                json={'method': method, 'params': [hashes], 'id': rid},
                 timeout=10,
             ).raise_for_status()
+
+        for key, rid in (('recent', 21), ('old', 22)):
+            hs = lanes[key]
+            if not hs:
+                continue
+            if first in hs:
+                _move('core.queue_bottom', [first], rid)
+                rest = [h for h in hs if h != first]
+                if rest:
+                    _move('core.queue_bottom', rest, rid)
+            else:
+                _move('core.queue_bottom', hs, rid)
+        hs = lanes['normal']
+        if hs:
+            if first in hs:
+                rest = [h for h in hs if h != first]
+                if rest:
+                    _move('core.queue_top', rest, 23)
+                _move('core.queue_top', [first], 23)
+            else:
+                _move('core.queue_top', hs, 23)
         log.info(f"Queue lanes: {len(lanes['normal'])} normal > {len(lanes['recent'])} recent upgrades > "
                  f"{len(lanes['old'])} old upgrades")
     except Exception as e:
