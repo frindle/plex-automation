@@ -4669,13 +4669,13 @@ def _load_rescue_state():
             data = _json.load(f)
         if isinstance(data, dict):
             for k, v in data.get('attempts', {}).items():
-                if isinstance(k, str) and isinstance(v, int):
+                if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool):
                     attempts[k] = v
             for item in data.get('gave_up', []):
                 if isinstance(item, str):
                     gave_up.add(item)
     except Exception:
-        pass
+        return {}, set()
     return attempts, gave_up
 
 _rescue_attempts, _rescue_gave_up = _load_rescue_state()
