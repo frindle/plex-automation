@@ -6788,8 +6788,7 @@ def _local_to_deluge(p):
 
 def deluge_force_recheck(torrent_hash):
     """core.force_recheck — re-verifies pieces against whatever is on disk.
-    Deluge's own force_recheck resumes the torrent afterwards, so no
-    separate resume call is needed."""
+    Deluge leaves a PAUSED torrent paused after a recheck; callers pause first."""
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={'method': 'core.force_recheck', 'params': [[torrent_hash]], 'id': 61},
@@ -6797,6 +6796,16 @@ def deluge_force_recheck(torrent_hash):
     )
     resp.raise_for_status()
     log.info(f'Forced recheck of {torrent_hash}')
+
+def deluge_pause_torrent(torrent_hash):
+    resp = session.post(f'{DELUGE_URL}/json',
+        json={'method': 'core.pause_torrent', 'params': [[torrent_hash]], 'id': 63}, timeout=30)
+    resp.raise_for_status()
+
+def deluge_resume_torrent(torrent_hash):
+    resp = session.post(f'{DELUGE_URL}/json',
+        json={'method': 'core.resume_torrent', 'params': [[torrent_hash]], 'id': 64}, timeout=30)
+    resp.raise_for_status()
 
 def _deluge_path_exists(path):
     """True/False from Deluge's own filesystem view; None if we couldn't ask.
@@ -6856,12 +6865,15 @@ def _report_once(key, category, summary, dry_run=False):
     _reported_deluge_errors.add(key)
     record_activity(category, summary)
 
+_repair_rechecked = set()  # hashes this process paused + rechecked, awaiting resume decision
+
 def deluge_error_repair(dry_run=False, relink=None):
     """Scan Deluge for errored torrents and self-heal what's safe to heal."""
     if relink is None:
         relink = DELUGE_RELINK
     result = {'ok': True, 'dry_run': dry_run, 'relink': relink,
-              'rechecked': [], 'relink_candidates': [], 'missing': [], 'errors': []}
+              'rechecked': [], 'relink_candidates': [], 'missing': [], 'errors': [],
+              'library': [], 'resumed': []}
     try:
         deluge_login()
         resp = session.post(
@@ -6879,6 +6891,46 @@ def deluge_error_repair(dry_run=False, relink=None):
         log.error(f'Deluge error scan failed: {e}')
         return {'ok': False, 'error': str(e)}
 
+    # Resume pass: handle torrents we previously paused + rechecked
+    for h in list(_repair_rechecked):
+        if h not in torrents:
+            _repair_rechecked.discard(h)
+            continue
+        info = torrents[h]
+        name = info.get('name', '')
+        state = info.get('state')
+        progress = info.get('progress') or 0.0
+        save_path = info.get('save_path') or ''
+        if state == 'Checking':
+            continue  # still checking, leave it in the set
+        if state == 'Paused' and progress >= 100.0:
+            if not is_library_path(save_path):
+                if dry_run:
+                    continue  # dry run: no resume, no activity, keep the hash
+                try:
+                    deluge_resume_torrent(h)
+                except Exception as e:
+                    entry = {'hash': h, 'name': name}
+                    entry['action'] = f'resume FAILED: {e}'
+                    result['errors'].append(entry)
+                    continue  # keep hash in set
+                record_activity('deluge-repair-resumed', f'Recheck of "{name}" reached 100% -- resumed')
+                result['resumed'].append({'hash': h, 'name': name})
+                _repair_rechecked.discard(h)
+            else:
+                # library path: never resume library torrents
+                continue
+        elif state == 'Paused' and progress < 100.0:
+            if not dry_run:
+                _report_once((h, 'partial'), 'deluge-error',
+                             f'Errored torrent "{name}" rechecked to {progress}% -- left paused, needs a human')
+                _repair_rechecked.discard(h)
+            # else dry_run: keep in set
+        else:
+            # any other state (Seeding, Downloading, Error) -> discard, do nothing
+            if not dry_run:
+                _repair_rechecked.discard(h)
+
     for h, info in torrents.items():
         # Deluge sets state='Error' for torrent/file errors and puts the
         # detail in 'message'. Tracker problems surface in tracker_status
@@ -6889,16 +6941,42 @@ def deluge_error_repair(dry_run=False, relink=None):
         save_path = info.get('save_path') or ''
         entry = {'hash': h, 'name': name, 'save_path': save_path,
                  'message': info.get('message'), 'label': info.get('label')}
+        # Library torrents: pause only, never recheck/resume/relink
+        if is_library_path(save_path):
+            if dry_run:
+                entry['action'] = 'would pause (library save_path; never rechecked)'
+            else:
+                try:
+                    deluge_pause_torrent(h)
+                except Exception as e:
+                    entry['action'] = f'library pause FAILED: {e}'
+                    result['errors'].append(entry)
+                    continue
+                entry['action'] = 'paused (library save_path; not rechecked or resumed)'
+            _report_once((h, 'library-error'), 'library-error',
+                         f'Errored torrent "{name}" seeds from the library ({save_path}) -- paused, not rechecked or resumed; needs a human',
+                         dry_run=dry_run)
+            result['library'].append(entry)
+            continue
         present = _deluge_path_exists(os.path.join(save_path, name)) if save_path and name else None
         if present:
-            entry['action'] = 'recheck' if not dry_run else 'would recheck'
-            if not dry_run:
+            if dry_run:
+                entry['action'] = 'would pause + recheck'
+            else:
+                try:
+                    deluge_pause_torrent(h)
+                except Exception as e:
+                    entry['action'] = f'pause FAILED, not rechecked: {e}'
+                    result['errors'].append(entry)
+                    continue
                 try:
                     deluge_force_recheck(h)
                 except Exception as e:
                     entry['action'] = f'recheck FAILED: {e}'
                     result['errors'].append(entry)
                     continue
+                _repair_rechecked.add(h)
+            entry['action'] = entry.get('action', 'paused + recheck')
             result['rechecked'].append(entry)
             continue
         if present is None:
@@ -6910,12 +6988,10 @@ def deluge_error_repair(dry_run=False, relink=None):
         if not found_local:
             entry['action'] = f'data not found in any searchable root {roots}'
             result['missing'].append(entry)
-            _report_once(
-                (h, 'missing'), 'deluge-error',
-                f'Errored torrent "{name}" — data missing from {save_path} and not found in '
-                f'{", ".join(roots) or "(no roots mounted)"} ({info.get("message") or "no message"})',
-                dry_run=dry_run,
-            )
+            _report_once((h, 'missing'), 'deluge-error',
+                         f'Errored torrent "{name}" — data missing from {save_path} and not found in '
+                         f'{", ".join(roots) or "(no roots mounted)"} ({info.get("message") or "no message"})',
+                         dry_run=dry_run)
             continue
         # Everything below crosses the container/Deluge namespace boundary:
         # found_local is this container's path, Deluge needs its own.
@@ -6958,6 +7034,7 @@ def deluge_error_repair(dry_run=False, relink=None):
     if any(counts.values()):
         log.info(f'Deluge error repair: {counts}')
     return result
+
 
 # Manual trigger for the error scan (mirrors /run-dedup). Runs inline so you
 # get the report back; dry_run=1 to look without rechecking, relink=1 to also
