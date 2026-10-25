@@ -1,3 +1,4 @@
+import glob
 import os
 import posixpath
 import re
@@ -80,6 +81,21 @@ def activity_log_trim_scheduler():
         except Exception as e:
             log.error(f'[activity-log] trim failed: {e}')
         time.sleep(86400)
+
+# ── Torrent-removal audit log ────────────────────────────────────────────────
+# Append-only JSON lines, one per torrent removed from Deluge, so a torrent
+# that vanishes can be traced to the code path that removed it. Rotated
+# weekly; the 4 newest rotated files (REMOVAL_LOG.<first-entry-timestamp>) are kept.
+REMOVAL_LOG = os.environ.get('REMOVAL_LOG', '/data/removal-audit.jsonl')
+REMOVAL_LOG_ROTATE_DAYS = 7
+REMOVAL_LOG_KEEP = 4
+REMOVAL_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+def _rotate_removal_log(now=None):
+    raise NotImplementedError('not implemented: _rotate_removal_log')
+
+def log_removal(fn_name, torrent_hash, name=None, reason=None, extra=None):
+    raise NotImplementedError('not implemented: log_removal')
 
 app = Flask(__name__)
 app.register_blueprint(share_bp)
