@@ -6,6 +6,7 @@ import json as _json
 import time
 import logging
 import threading
+import traceback
 import requests
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
@@ -671,6 +672,8 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
     )
     resp.raise_for_status()
     log.info(f'Removed torrent {torrent_hash}' + (' and deleted files' if remove_data else ' (files left on disk)'))
+    log_removal(traceback.extract_stack(limit=2)[0].name, torrent_hash, (info or {}).get('name'),
+                'files deleted' if remove_data else 'files kept', {'remove_data': remove_data})
 
 def get_all_torrents():
     resp = session.post(
@@ -2481,6 +2484,9 @@ def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
                         timeout=15
                     )
                     del_r.raise_for_status()
+                    log_removal('cleanup_radarr_queue_dupes', item['hash'], item['title'],
+                                'duplicate queue record removed from client',
+                                {'radarr_movie_id': group_movie_id, 'queue_id': item['queue_id'], 'score': item['score']})
                 else:
                     log.info(f'Radarr queue: superseding throttled duplicate "{item["title"]}" (score: {item["score"]})')
                     supersede_torrent(item['hash'])
