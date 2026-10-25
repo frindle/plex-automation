@@ -92,9 +92,10 @@ REMOVAL_LOG_KEEP = 4
 REMOVAL_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 def _rotate_removal_log(now=None):
-    raise NotImplementedError('not implemented: _rotate_removal_log')
+    log.debug('not implemented: _rotate_removal_log')
 
 def log_removal(fn_name, torrent_hash, name=None, reason=None, extra=None):
+    _rotate_removal_log()
     raise NotImplementedError('not implemented: log_removal')
 
 app = Flask(__name__)
