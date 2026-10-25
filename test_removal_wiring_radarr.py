@@ -62,8 +62,6 @@ def fake_delete(url, headers=None, params=None, timeout=None, **kw):
 requests.Session.post = fake_session_post
 requests.get = fake_get
 requests.delete = fake_delete
-aw.supersede_torrent = lambda h: None
-aw.set_torrent_label = lambda h, label: None
 
 
 def rec(qid, movie_id, dl, title, score):
