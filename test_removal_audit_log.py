@@ -6,20 +6,22 @@ Run: python3 test_removal_audit_log.py
 import glob
 import json
 import os
+import shutil
 import sys
 import tempfile
 from datetime import datetime, timedelta
 
-aw = __import__('arr-webhook')   # alias assigned only here
-
 TMP = tempfile.mkdtemp()
+LOGDIR = os.path.join(TMP, 'data')
+LOG = os.path.join(LOGDIR, 'removal-audit.jsonl')
+os.environ['REMOVAL_LOG'] = LOG            # BEFORE the import: the module reads it at import time
+aw = __import__('arr-webhook')   # alias assigned only here
 
 
 def setup():
-    """Fresh, empty log location for every test; defaults restored."""
-    d = tempfile.mkdtemp(dir=TMP)
-    aw.REMOVAL_LOG = os.path.join(d, 'removal-audit.jsonl')
-    aw.REMOVAL_LOG_MAX_BYTES = 5 * 1024 * 1024
+    """Empty log directory for every test; returns the active log path."""
+    shutil.rmtree(LOGDIR, ignore_errors=True)
+    os.makedirs(LOGDIR)
     return aw.REMOVAL_LOG
 
 
@@ -61,10 +63,11 @@ def test_appends_one_json_line_with_fields():
 
 def test_never_raises_into_callers():
     setup()
-    aw.REMOVAL_LOG = os.path.join(TMP, 'no-such-dir', 'deeper', 'x.jsonl')
+    shutil.rmtree(LOGDIR)           # parent directory missing
     r1 = aw.log_removal('f', 'H')
     assert r1 is None, r1
-    aw.REMOVAL_LOG = TMP            # a directory, not a file
+    p = setup()
+    os.makedirs(p)                  # the log path is a directory, not a file
     r2 = aw.log_removal('f', 'H', 'n', 'r', {'obj': object()})
     assert r2 is None, r2
     p = setup()
@@ -89,7 +92,8 @@ def test_recent_file_not_rotated_until_too_big():
     aw.log_removal('f', 'NEW')
     assert rotated(p) == [], rotated(p)
     assert [e['hash'] for e in lines(p)] == ['OLD', 'NEW'], lines(p)
-    aw.REMOVAL_LOG_MAX_BYTES = 10
+    with open(p, 'a') as f:                    # push the active file past 5 MiB
+        f.write(json.dumps({'ts': iso(0), 'fn': 'pad', 'hash': 'PAD', 'pad': 'x' * (6 * 1024 * 1024)}) + '\n')
     aw.log_removal('f', 'THIRD')
     assert len(rotated(p)) == 1, rotated(p)
     assert [e['hash'] for e in lines(p)] == ['THIRD'], lines(p)
