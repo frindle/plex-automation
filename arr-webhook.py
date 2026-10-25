@@ -5,6 +5,7 @@ import json as _json
 import time
 import logging
 import threading
+import traceback
 import requests
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
@@ -80,6 +81,10 @@ def activity_log_trim_scheduler():
         except Exception as e:
             log.error(f'[activity-log] trim failed: {e}')
         time.sleep(86400)
+
+# ── Torrent-removal audit log ────────────────────────────────────────────────
+def log_removal(fn_name, torrent_hash, name=None, reason=None, extra=None):
+    pass  # placeholder: the real append-only audit-log helper is built by its own job
 
 app = Flask(__name__)
 app.register_blueprint(share_bp)
