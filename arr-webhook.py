@@ -84,7 +84,10 @@ def activity_log_trim_scheduler():
 
 # ── Torrent-removal audit log ────────────────────────────────────────────────
 def log_removal(fn_name, torrent_hash, name=None, reason=None, extra=None):
-    pass  # placeholder: the real append-only audit-log helper is built by its own job
+    # placeholder: the real helper (rotation, error handling) is built by its own job
+    entry = {**(extra or {}), 'fn': fn_name, 'hash': torrent_hash, 'name': name, 'reason': reason}
+    with open(os.environ.get('REMOVAL_LOG', '/data/removal-audit.jsonl'), 'a') as f:
+        f.write(_json.dumps(entry, default=str) + '\n')
 
 app = Flask(__name__)
 app.register_blueprint(share_bp)

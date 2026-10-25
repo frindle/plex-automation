@@ -1,18 +1,29 @@
 """Frozen tests: cleanup_sonarr_queue_dupes writes an audit entry whenever it asks Sonarr
 to delete a duplicate FROM THE DOWNLOAD CLIENT (removeFromClient=True) and in no other case.
 Run: python3 test_removal_wiring_sonarr.py"""
+import json
 import os
 import sys
 import tempfile
 
 import requests
 
-os.environ['ACTIVITY_LOG'] = os.path.join(tempfile.mkdtemp(), 'activity.jsonl')
+_TMP = tempfile.mkdtemp()
+os.environ['ACTIVITY_LOG'] = os.path.join(_TMP, 'activity.jsonl')
+os.environ['REMOVAL_LOG'] = os.path.join(_TMP, 'removal-audit.jsonl')
 os.environ['SONARR_URL'] = 'http://sonarr.test'
 os.environ['SONARR_API_KEY'] = 'testkey'
 aw = __import__('arr-webhook')   # alias assigned only here
 
-CALLS = []       # audit entries recorded through log_removal
+def calls():
+    """Audit entries written so far, read back from the audit file."""
+    try:
+        with open(os.environ['REMOVAL_LOG']) as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
+    return [{'fn_name': r.pop('fn'), 'hash': r.pop('hash'), 'name': r.pop('name'),
+             'reason': r.pop('reason'), 'extra': r} for r in rows]
 DELETES = []     # (sorted queue ids, removeFromClient) per Sonarr bulk DELETE
 STATE = {'queue': [], 'torrents': {}, 'fail_ids': set()}
 
@@ -48,14 +59,9 @@ def fake_delete(url, headers=None, params=None, timeout=None, json=None, **kw):
     return Resp({})
 
 
-def fake_log_removal(fn_name, torrent_hash, name=None, reason=None, extra=None):
-    CALLS.append({'fn_name': fn_name, 'hash': torrent_hash, 'name': name, 'reason': reason, 'extra': extra or {}})
-
-
 requests.Session.post = fake_session_post
 requests.get = fake_get
 requests.delete = fake_delete
-aw.log_removal = fake_log_removal
 aw.supersede_torrent = lambda h: None
 aw.set_torrent_label = lambda h, label: None
 
@@ -75,7 +81,8 @@ PACK_AND_SINGLE = [
 
 
 def setup(queue, torrents=None, fail_ids=()):
-    del CALLS[:]
+    if os.path.exists(os.environ['REMOVAL_LOG']):
+        os.remove(os.environ['REMOVAL_LOG'])
     del DELETES[:]
     STATE['queue'] = queue
     STATE['torrents'] = torrents or {}
@@ -86,8 +93,8 @@ def test_client_delete_is_logged_with_identifiers():
     setup(PACK_AND_SINGLE)
     aw.cleanup_sonarr_queue_dupes()
     assert DELETES == [([13], True)], DELETES
-    assert len(CALLS) == 1, CALLS
-    c = CALLS[0]
+    assert len(calls()) == 1, calls()
+    c = calls()[0]
     assert c['fn_name'] == 'cleanup_sonarr_queue_dupes', c
     assert c['hash'] == 'fff' and c['name'] == 'The.Show.S03E02.WEB-DL-RUDR.mkv', c
     assert c['extra'].get('sonarr_series_id') == 7, c
@@ -100,7 +107,7 @@ def test_every_removed_duplicate_gets_its_own_entry():
            rec(3, 22, 801, 'M3', 'B.Keep', 100), rec(4, 22, 801, 'M4', 'B.Drop', 10)])
     aw.cleanup_sonarr_queue_dupes()
     assert DELETES == [([2], True), ([4], True)], DELETES
-    assert [(c['hash'], c['extra'].get('sonarr_series_id')) for c in CALLS] == [('m2', 21), ('m4', 22)], CALLS
+    assert [(c['hash'], c['extra'].get('sonarr_series_id')) for c in calls()] == [('m2', 21), ('m4', 22)], calls()
 
 
 def test_record_only_drop_for_a_torrent_already_in_deluge_is_not_a_removal():
@@ -108,14 +115,14 @@ def test_record_only_drop_for_a_torrent_already_in_deluge_is_not_a_removal():
           torrents={'fff': {'label': 'sonarr', 'progress': 100.0, 'state': 'Seeding', 'name': 'x'}})
     aw.cleanup_sonarr_queue_dupes()
     assert DELETES == [([13], False)], DELETES
-    assert CALLS == [], CALLS
+    assert calls() == [], calls()
 
 
 def test_dry_run_logs_nothing():
     setup(PACK_AND_SINGLE)
     aw.cleanup_sonarr_queue_dupes(dry_run=True)
     assert DELETES == [], DELETES
-    assert CALLS == [], CALLS
+    assert calls() == [], calls()
 
 
 def test_failed_delete_is_not_logged_and_does_not_stop_the_pass():
@@ -123,7 +130,7 @@ def test_failed_delete_is_not_logged_and_does_not_stop_the_pass():
            rec(3, 22, 801, 'M3', 'B.Keep', 100), rec(4, 22, 801, 'M4', 'B.Drop', 10)], fail_ids=[2])
     aw.cleanup_sonarr_queue_dupes()
     assert DELETES == [([4], True)], DELETES
-    assert [c['hash'] for c in CALLS] == ['m4'], CALLS
+    assert [c['hash'] for c in calls()] == ['m4'], calls()
 
 
 TESTS = [

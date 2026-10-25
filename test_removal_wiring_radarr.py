@@ -1,18 +1,29 @@
 """Frozen tests: cleanup_radarr_queue_dupes writes an audit entry whenever it asks Radarr
 to delete a duplicate FROM THE DOWNLOAD CLIENT (removeFromClient=True) and in no other case.
 Run: python3 test_removal_wiring_radarr.py"""
+import json
 import os
 import sys
 import tempfile
 
 import requests
 
-os.environ['ACTIVITY_LOG'] = os.path.join(tempfile.mkdtemp(), 'activity.jsonl')
+_TMP = tempfile.mkdtemp()
+os.environ['ACTIVITY_LOG'] = os.path.join(_TMP, 'activity.jsonl')
+os.environ['REMOVAL_LOG'] = os.path.join(_TMP, 'removal-audit.jsonl')
 os.environ['RADARR_URL'] = 'http://radarr.test'
 os.environ['RADARR_API_KEY'] = 'testkey'
 aw = __import__('arr-webhook')   # alias assigned only here
 
-CALLS = []       # audit entries recorded through log_removal
+def calls():
+    """Audit entries written so far, read back from the audit file."""
+    try:
+        with open(os.environ['REMOVAL_LOG']) as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
+    return [{'fn_name': r.pop('fn'), 'hash': r.pop('hash'), 'name': r.pop('name'),
+             'reason': r.pop('reason'), 'extra': r} for r in rows]
 DELETES = []     # (queue id, removeFromClient) per Radarr DELETE
 STATE = {'queue': [], 'torrents': {}, 'fail_ids': set()}
 
@@ -48,14 +59,9 @@ def fake_delete(url, headers=None, params=None, timeout=None, **kw):
     return Resp({})
 
 
-def fake_log_removal(fn_name, torrent_hash, name=None, reason=None, extra=None):
-    CALLS.append({'fn_name': fn_name, 'hash': torrent_hash, 'name': name, 'reason': reason, 'extra': extra or {}})
-
-
 requests.Session.post = fake_session_post
 requests.get = fake_get
 requests.delete = fake_delete
-aw.log_removal = fake_log_removal
 aw.supersede_torrent = lambda h: None
 aw.set_torrent_label = lambda h, label: None
 
@@ -66,7 +72,8 @@ def rec(qid, movie_id, dl, title, score):
 
 
 def setup(queue, torrents=None, fail_ids=()):
-    del CALLS[:]
+    if os.path.exists(os.environ['REMOVAL_LOG']):
+        os.remove(os.environ['REMOVAL_LOG'])
     del DELETES[:]
     STATE['queue'] = queue
     STATE['torrents'] = torrents or {}
@@ -77,8 +84,8 @@ def test_client_delete_is_logged_with_identifiers():
     setup([rec(7, 9, 'CCC', 'Movie.Good', 100), rec(8, 9, 'DDD', 'Movie.Worse', 20)])
     aw.cleanup_radarr_queue_dupes()
     assert DELETES == [(8, True)], DELETES
-    assert len(CALLS) == 1, CALLS
-    c = CALLS[0]
+    assert len(calls()) == 1, calls()
+    c = calls()[0]
     assert c['fn_name'] == 'cleanup_radarr_queue_dupes', c
     assert c['hash'] == 'ddd' and c['name'] == 'Movie.Worse', c
     assert c['extra'].get('radarr_movie_id') == 9 and c['extra'].get('queue_id') == 8, c
@@ -90,7 +97,7 @@ def test_every_removed_duplicate_gets_its_own_entry():
            rec(3, 5, 'M3', 'B.Keep', 100), rec(4, 5, 'M4', 'B.Drop', 10)])
     aw.cleanup_radarr_queue_dupes()
     assert DELETES == [(2, True), (4, True)], DELETES
-    assert [(c['hash'], c['extra'].get('radarr_movie_id')) for c in CALLS] == [('m2', 4), ('m4', 5)], CALLS
+    assert [(c['hash'], c['extra'].get('radarr_movie_id')) for c in calls()] == [('m2', 4), ('m4', 5)], calls()
 
 
 def test_record_only_drop_for_a_torrent_already_in_deluge_is_not_a_removal():
@@ -98,14 +105,14 @@ def test_record_only_drop_for_a_torrent_already_in_deluge_is_not_a_removal():
           torrents={'ddd': {'label': 'radarr', 'progress': 100.0, 'state': 'Seeding', 'name': 'Movie.Worse'}})
     aw.cleanup_radarr_queue_dupes()
     assert DELETES == [(8, False)], DELETES
-    assert CALLS == [], CALLS
+    assert calls() == [], calls()
 
 
 def test_dry_run_logs_nothing():
     setup([rec(7, 9, 'CCC', 'Movie.Good', 100), rec(8, 9, 'DDD', 'Movie.Worse', 20)])
     aw.cleanup_radarr_queue_dupes(dry_run=True)
     assert DELETES == [], DELETES
-    assert CALLS == [], CALLS
+    assert calls() == [], calls()
 
 
 def test_failed_delete_is_not_logged_and_does_not_stop_the_pass():
@@ -113,7 +120,7 @@ def test_failed_delete_is_not_logged_and_does_not_stop_the_pass():
            rec(3, 5, 'M3', 'B.Keep', 100), rec(4, 5, 'M4', 'B.Drop', 10)], fail_ids=[2])
     aw.cleanup_radarr_queue_dupes()
     assert DELETES == [(4, True)], DELETES
-    assert [c['hash'] for c in CALLS] == ['m4'], CALLS
+    assert [c['hash'] for c in calls()] == ['m4'], calls()
 
 
 TESTS = [
