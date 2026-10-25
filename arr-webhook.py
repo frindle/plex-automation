@@ -123,6 +123,38 @@ def log_removal(fn_name, torrent_hash, name=None, reason=None, extra=None):
     except Exception as e:
         log.warning(f'removal audit log write failed: {e}')
 
+def read_removal_log(since=None, limit=100):
+    rows = []
+    for path in sorted(glob.glob(REMOVAL_LOG + '.*')):
+        try:
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(_json.loads(line))
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+    try:
+        with open(REMOVAL_LOG, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(_json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    if since is not None:
+        rows = [r for r in rows if str(r.get('ts', '')) >= since]
+    return rows[-limit:] if limit > 0 else []
+
+
 app = Flask(__name__)
 app.register_blueprint(share_bp)
 
@@ -5818,6 +5850,16 @@ def queue_dupe_scan():
     if service in ('both', 'sonarr'):
         result['sonarr'] = cleanup_sonarr_queue_dupes(dry_run=True)
     return jsonify(result), 200
+
+@app.route('/removal-log', methods=['GET'])
+def removal_log():
+    try:
+        limit = int(request.args.get('limit', 100))
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'limit must be an integer'}), 400
+    rows = read_removal_log(request.args.get('since') or None, min(limit, 1000))
+    return jsonify({'ok': True, 'count': len(rows), 'entries': rows}), 200
+
 
 # Cross-reference Deluge completed torrents against Radarr/Sonarr state
 # to surface the "grabbed → downloaded → never imported" failures that
