@@ -2789,6 +2789,11 @@ def cleanup_sonarr_queue_dupes(series_id=None, dry_run=False):
                         timeout=15
                     )
                     del_r.raise_for_status()
+                    log_removal(
+                        'cleanup_sonarr_queue_dupes', item['hash'], item['title'],
+                        'duplicate queue record removed from client',
+                        {'sonarr_series_id': group_series_id, 'queue_ids': item['queue_ids'], 'score': item['score']}
+                    )
                 else:
                     log.info(f'Sonarr queue: superseding throttled duplicate "{item["title"]}" '
                              f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
