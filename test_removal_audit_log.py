@@ -133,5 +133,5 @@ if __name__ == '__main__':
         except Exception as e:
             failed += 1
             print(f'RESULT {t.__name__} FAIL {type(e).__name__}: {e}')
-    print(f'{len(order)} tests, {failed} failed')
+    print(f'{len(order) - failed} passed, {failed} failed')
     sys.exit(1 if failed else 0)
