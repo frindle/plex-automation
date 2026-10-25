@@ -1,3 +1,4 @@
+import glob
 import os
 import posixpath
 import re
@@ -80,6 +81,46 @@ def activity_log_trim_scheduler():
         except Exception as e:
             log.error(f'[activity-log] trim failed: {e}')
         time.sleep(86400)
+
+# ── Torrent-removal audit log ────────────────────────────────────────────────
+# Append-only JSON lines, one per torrent removed from Deluge, so a torrent
+# that vanishes can be traced to the code path that removed it. Rotated
+# weekly; the 4 newest rotated files (REMOVAL_LOG.<first-entry-timestamp>) are kept.
+REMOVAL_LOG = os.environ.get('REMOVAL_LOG', '/data/removal-audit.jsonl')
+REMOVAL_LOG_ROTATE_DAYS = 7
+REMOVAL_LOG_KEEP = 4
+REMOVAL_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+def _rotate_removal_log(now=None):
+    try:
+        if now is None:
+            now = datetime.now()
+        path = REMOVAL_LOG
+        with open(path) as f:
+            first_line = f.readline().strip()
+        if not first_line:
+            return
+        entry = _json.loads(first_line)
+        start = datetime.fromisoformat(entry['ts'])
+        size = os.path.getsize(path)
+        if (now - start) >= timedelta(days=REMOVAL_LOG_ROTATE_DAYS) or size > REMOVAL_LOG_MAX_BYTES:
+            tag = start.strftime('%Y%m%dT%H%M%S')
+            target = f'{path}.{tag}'
+            os.replace(path, target)
+        for old in sorted(glob.glob(REMOVAL_LOG + '.*'), reverse=True)[REMOVAL_LOG_KEEP:]:
+            os.remove(old)
+    except Exception:
+        log.debug('rotation failed')
+
+def log_removal(fn_name, torrent_hash, name=None, reason=None, extra=None):
+    try:
+        _rotate_removal_log()
+        path = REMOVAL_LOG
+        entry = {**(extra or {}), 'ts': datetime.now().isoformat(timespec='seconds'), 'fn': fn_name, 'hash': torrent_hash, 'name': name, 'reason': reason}
+        with open(path, 'a') as f:
+            f.write(_json.dumps(entry, default=str) + '\n')
+    except Exception as e:
+        log.warning(f'removal audit log write failed: {e}')
 
 app = Flask(__name__)
 app.register_blueprint(share_bp)
