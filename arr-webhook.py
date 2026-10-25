@@ -1,3 +1,4 @@
+import glob
 import os
 import posixpath
 import re
@@ -80,6 +81,11 @@ def activity_log_trim_scheduler():
         except Exception as e:
             log.error(f'[activity-log] trim failed: {e}')
         time.sleep(86400)
+
+# ── Torrent-removal audit log (written by log_removal in a separate job) ─────
+REMOVAL_LOG = os.environ.get('REMOVAL_LOG', '/data/removal-audit.jsonl')
+def read_removal_log(since=None, limit=100):
+    raise NotImplementedError('not implemented: read_removal_log')
 
 app = Flask(__name__)
 app.register_blueprint(share_bp)
@@ -5766,6 +5772,10 @@ def queue_dupe_scan():
     if service in ('both', 'sonarr'):
         result['sonarr'] = cleanup_sonarr_queue_dupes(dry_run=True)
     return jsonify(result), 200
+
+@app.route('/removal-log', methods=['GET'])
+def removal_log():
+    raise NotImplementedError('not implemented: removal_log')
 
 # Cross-reference Deluge completed torrents against Radarr/Sonarr state
 # to surface the "grabbed → downloaded → never imported" failures that
