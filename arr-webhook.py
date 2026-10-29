@@ -1368,6 +1368,30 @@ def _sonarr_import_pending(torrent_hash, now=None):
     return _arr_import_pending(SONARR_URL, SONARR_API_KEY, torrent_hash, now=now, who='Sonarr')
 
 
+
+def _keeper_import_confirmed(base_url, api_key, torrent_hash):
+    """Check Radarr history for a successful import of the given torrent.
+    
+    Returns True iff at least one record in /api/v3/history with this
+    downloadId has eventType == 'downloadFolderImported'.  Fail-closed:
+    any exception, HTTP error or empty hash returns False (log warning).
+    """
+    if not torrent_hash:
+        return False
+    try:
+        r = requests.get(
+            f'{base_url}/api/v3/history',
+            headers={'X-Api-Key': api_key},
+            params={'downloadId': torrent_hash.upper(), 'pageSize': 50},
+            timeout=15,
+        )
+        r.raise_for_status()
+        records = r.json().get('records') or []
+    except Exception as e:
+        log.warning(f'_keeper_import_confirmed lookup for {torrent_hash[:8]} failed ({e})')
+        return False
+    return any(rec.get('eventType') == 'downloadFolderImported' for rec in records)
+
 def dedup_via_radarr(dry_run=False):
     log.info(f'Running Radarr → Deluge dedup pass{" (DRY RUN)" if dry_run else ""}...')
     if not RADARR_API_KEY:
@@ -1456,6 +1480,10 @@ def dedup_via_radarr(dry_run=False):
                 log.warning(f'  skip movie {movie["id"]} ({movie.get("title")}): {len(matched_hashes)} torrents matched title but no keeper identified (filename mismatch + no Radarr history) — not relabeling anything')
                 continue
             log.info(f'  movie {movie["id"]} ({movie.get("title")}): keeper via {keeper_source} = {keepers[0][:12]}')
+            # Only supersede losers once the keeper has actually been imported.
+            if not _keeper_import_confirmed(RADARR_URL, RADARR_API_KEY, keepers[0]):
+                log.warning(f'dedupe: keeper not imported, deferring (movie {movie["id"]}: {keepers[0][:12]})')
+                continue
             for h in matched_hashes:
                 if h in keepers:
                     continue
@@ -2497,16 +2525,22 @@ def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
                         log.info(f'[dry-run] Radarr queue: would drop stuck queue record and supersede already-downloaded duplicate "{item["title"]}" (score: {item["score"]})')
                     else:
                         log.info(f'[dry-run] Radarr queue: would remove duplicate "{item["title"]}" (score: {item["score"]})')
+                    removed += 1
                 elif item['source'] == 'queue' and already_in_deluge:
-                    log.info(f'Radarr queue: dropping stuck queue record for already-downloaded duplicate "{item["title"]}" (score: {item["score"]}) — superseding torrent instead of removing from client')
-                    del_r = requests.delete(
-                        f'{RADARR_URL}/api/v3/queue/{item["queue_id"]}',
-                        headers={'X-Api-Key': RADARR_API_KEY},
-                        params={'removeFromClient': False, 'blocklist': False},
-                        timeout=15
-                    )
-                    del_r.raise_for_status()
-                    supersede_torrent(item['hash'])
+                    # Only drop queue record and supersede if the keeper was actually imported.
+                    if _keeper_import_confirmed(RADARR_URL, RADARR_API_KEY, best['hash']):
+                        log.info(f'Radarr queue: dropping stuck queue record for already-downloaded duplicate "{item["title"]}" (score: {item["score"]}) \u2014 superseding torrent instead of removing from client')
+                        del_r = requests.delete(
+                            f'{RADARR_URL}/api/v3/queue/{item["queue_id"]}',
+                            headers={'X-Api-Key': RADARR_API_KEY},
+                            params={'removeFromClient': False, 'blocklist': False},
+                            timeout=15
+                        )
+                        del_r.raise_for_status()
+                        supersede_torrent(item['hash'])
+                        removed += 1
+                    else:
+                        log.warning(f'dedupe: keeper not imported, deferring (movie {group_movie_id}: {best["hash"][:12]})')
                 elif item['source'] == 'queue':
                     log.info(f'Radarr queue: removing duplicate "{item["title"]}" (score: {item["score"]})')
                     del_r = requests.delete(
@@ -2519,10 +2553,15 @@ def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
                     log_removal('cleanup_radarr_queue_dupes', item['hash'], item['title'],
                                 'duplicate queue record removed from client',
                                 {'radarr_movie_id': group_movie_id, 'queue_id': item['queue_id'], 'score': item['score']})
+                    removed += 1
                 else:
-                    log.info(f'Radarr queue: superseding throttled duplicate "{item["title"]}" (score: {item["score"]})')
-                    supersede_torrent(item['hash'])
-                removed += 1
+                    # Only supersede if the keeper was actually imported.
+                    if _keeper_import_confirmed(RADARR_URL, RADARR_API_KEY, best['hash']):
+                        log.info(f'Radarr queue: superseding throttled duplicate "{item["title"]}" (score: {item["score"]})')
+                        supersede_torrent(item['hash'])
+                        removed += 1
+                    else:
+                        log.warning(f'dedupe: keeper not imported, deferring (movie {group_movie_id}: {best["hash"][:12]})')
             except Exception as e:
                 log.warning(f'Radarr queue dedupe: could not drop "{item["title"]}": {e}')
         if not dry_run:

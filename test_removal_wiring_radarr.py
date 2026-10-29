@@ -25,7 +25,7 @@ def calls():
     return [{'fn_name': r.pop('fn'), 'hash': r.pop('hash'), 'name': r.pop('name'),
              'reason': r.pop('reason'), 'extra': r} for r in rows]
 DELETES = []     # (queue id, removeFromClient) per Radarr DELETE
-STATE = {'queue': [], 'torrents': {}, 'fail_ids': set()}
+STATE = {'queue': [], 'torrents': {}, 'fail_ids': set(), 'history': {}}
 
 
 class Resp:
@@ -48,6 +48,8 @@ def fake_session_post(self, url, json=None, timeout=None, **kw):
 def fake_get(url, headers=None, params=None, timeout=None, **kw):
     if url.endswith('/api/v3/queue'):
         return Resp({'records': STATE['queue']})
+    if url.endswith('/api/v3/history'):
+        return Resp({'records': STATE['history'].get((params or {}).get('downloadId'), [])})
     return Resp({'records': []})
 
 
@@ -69,13 +71,14 @@ def rec(qid, movie_id, dl, title, score):
             'customFormatScore': score, 'size': 100, 'sizeleft': 100}
 
 
-def setup(queue, torrents=None, fail_ids=()):
+def setup(queue, torrents=None, fail_ids=(), history=None):
     if os.path.exists(os.environ['REMOVAL_LOG']):
         os.remove(os.environ['REMOVAL_LOG'])
     del DELETES[:]
     STATE['queue'] = queue
     STATE['torrents'] = torrents or {}
     STATE['fail_ids'] = set(fail_ids)
+    STATE['history'] = history or {}
 
 
 def test_client_delete_is_logged_with_identifiers():
@@ -100,7 +103,8 @@ def test_every_removed_duplicate_gets_its_own_entry():
 
 def test_record_only_drop_for_a_torrent_already_in_deluge_is_not_a_removal():
     setup([rec(7, 9, 'CCC', 'Movie.Good', 100), rec(8, 9, 'DDD', 'Movie.Worse', 20)],
-          torrents={'ddd': {'label': 'radarr', 'progress': 100.0, 'state': 'Seeding', 'name': 'Movie.Worse'}})
+          torrents={'ddd': {'label': 'radarr', 'progress': 100.0, 'state': 'Seeding', 'name': 'Movie.Worse'}},
+          history={'CCC': [{'eventType': 'downloadFolderImported', 'downloadId': 'CCC', 'movieId': 9}]})
     aw.cleanup_radarr_queue_dupes()
     assert DELETES == [(8, False)], DELETES
     assert calls() == [], calls()

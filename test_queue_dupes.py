@@ -63,6 +63,12 @@ def _grab(movie_id, score, date='2026-08-20T00:00:00Z'):
             'data': {'customFormatScore': score}}
 
 
+def _import(movie_id, download_id, date='2026-08-21T00:00:00Z'):
+    """Radarr import of the keeper: a loser may only be superseded once this exists."""
+    return {'eventType': 'downloadFolderImported', 'date': date, 'movieId': movie_id,
+            'downloadId': download_id.upper()}
+
+
 def _queued(name):
     return {'name': name, 'label': 'radarr-upgrade', 'state': 'Queued', 'progress': 0.0}
 
@@ -89,6 +95,14 @@ def run():
         deleted, labeled = _stub(aw, [], torrents, history)
         aw.cleanup_radarr_queue_dupes()
         assert deleted == [], deleted
+        # keeper 'aaa' has no import on record yet: the loser is deferred
+        assert labeled == [], labeled
+
+        # ── 1b. same, once the keeper's import is on record ─────────────
+        history = {'aaa': [_grab(42, 100), _import(42, 'aaa')], 'bbb': [_grab(42, 50)]}
+        deleted, labeled = _stub(aw, [], torrents, history)
+        aw.cleanup_radarr_queue_dupes()
+        assert deleted == [], deleted
         assert labeled == [('bbb', aw.SUPERSEDED_LABEL)], labeled
 
         # ── 2. queue-visible duplicates still work as before ─────────────
@@ -109,7 +123,7 @@ def run():
         queue = [{'id': 11, 'movieId': 77, 'downloadId': 'EEE', 'title': 'JL.Atmos',
                   'customFormatScore': 100, 'size': 100, 'sizeleft': 60}]
         torrents = {'FFF': _queued('Zack.Snyders.Justice.League.2021.2160p.DV.HDR-RUDR.mkv')}
-        deleted, labeled = _stub(aw, queue, torrents, {'fff': [_grab(77, 100)]})
+        deleted, labeled = _stub(aw, queue, torrents, {'fff': [_grab(77, 100)], 'eee': [_import(77, 'eee')]})
         aw.cleanup_radarr_queue_dupes()
         assert deleted == [], deleted
         assert labeled == [('fff', aw.SUPERSEDED_LABEL)], labeled

@@ -134,6 +134,12 @@ def _rgrab(movie_id, score, date='2026-08-20T00:00:00Z'):
             'data': {'customFormatScore': score}}
 
 
+def _rimport(movie_id, download_id, date='2026-08-21T00:00:00Z'):
+    """Radarr import of the keeper: a loser may only be superseded once this exists."""
+    return {'eventType': 'downloadFolderImported', 'date': date, 'movieId': movie_id,
+            'downloadId': download_id.upper()}
+
+
 def _sgrab(series_id, episode_id, score, date='2026-08-20T00:00:00Z'):
     return {'eventType': 'grabbed', 'date': date, 'seriesId': series_id,
             'episodeId': episode_id, 'data': {'customFormatScore': score}}
@@ -174,13 +180,23 @@ def run():
                   history={'aaa': [_rgrab(42, 100)], 'bbb': [_rgrab(42, 50)]})
         aw.handle_grab(_radarr_payload('BBB'), 'Radarr')
         assert s.deleted == [], s.deleted
+        # keeper 'aaa' has no import on record yet: the loser is deferred
+        assert s.labeled == [('bbb', 'radarr-upgrade')], s.labeled
+
+        # ── 1b. same, once the keeper's import is on record: loser superseded
+        s = _Stub(aw,
+                  torrents={'aaa': _lane('Father.Stu.2022.2160p.HDR-RUDR.mkv'),
+                            'bbb': _lane('Father.Stu.2022.2160p.WEB-DL-OTHER.mkv', label='radarr')},
+                  history={'aaa': [_rgrab(42, 100), _rimport(42, 'aaa')], 'bbb': [_rgrab(42, 50)]})
+        aw.handle_grab(_radarr_payload('BBB'), 'Radarr')
+        assert s.deleted == [], s.deleted
         assert s.labeled == [('bbb', 'radarr-upgrade'), ('bbb', aw.SUPERSEDED_LABEL)], s.labeled
 
         # ── 2. new grab is the BETTER release: the old one goes instead ───
         s = _Stub(aw,
                   torrents={'aaa': _lane('Father.Stu.2022.1080p-RUDR.mkv'),
                             'bbb': _lane('Father.Stu.2022.2160p.HDR-RUDR.mkv', label='radarr')},
-                  history={'aaa': [_rgrab(42, 50)], 'bbb': [_rgrab(42, 100)]})
+                  history={'aaa': [_rgrab(42, 50)], 'bbb': [_rgrab(42, 100), _rimport(42, 'bbb')]})
         aw.handle_grab(_radarr_payload('BBB'), 'Radarr')
         assert s.deleted == [], s.deleted
         assert s.labeled == [('bbb', 'radarr-upgrade'), ('aaa', aw.SUPERSEDED_LABEL)], s.labeled
@@ -218,7 +234,7 @@ def run():
 
         def late_history(dl):
             if dl == 'aaa':
-                return [_rgrab(42, 100)]
+                return [_rgrab(42, 100), _rimport(42, 'aaa')]
             seen.append(dl)
             return [_rgrab(42, 50)] if len(seen) > 2 else []
 
@@ -237,7 +253,7 @@ def run():
         s = _Stub(aw,
                   torrents={'aaa': _lane('Father.Stu.2022.2160p.HDR-RUDR.mkv'),
                             'bbb': _lane('Father.Stu.2022.WEB-DL-OTHER.mkv', label='radarr')},
-                  history={'aaa': [_rgrab(42, 100)], 'bbb': [_rgrab(42, 50)]},
+                  history={'aaa': [_rgrab(42, 100), _rimport(42, 'aaa')], 'bbb': [_rgrab(42, 50)]},
                   radarr_queue=[_rqrec(31, 42, 'BBB', 'Father.Stu.2022.WEB-DL-OTHER.mkv', 50)])
         aw.handle_grab(_radarr_payload('BBB'), 'Radarr')
         assert s.deleted == [31], s.deleted
@@ -264,8 +280,8 @@ def run():
                             'bbb': _lane('Father.Stu.2022.WEB-DL-OTHER.mkv', label='radarr'),
                             'ccc': _lane('Other.Film.2019.A.mkv'),
                             'ddd': _lane('Other.Film.2019.B.mkv')},
-                  history={'aaa': [_rgrab(42, 100)], 'bbb': [_rgrab(42, 50)],
-                           'ccc': [_rgrab(7, 100)], 'ddd': [_rgrab(7, 10)]})
+                  history={'aaa': [_rgrab(42, 100), _rimport(42, 'aaa')], 'bbb': [_rgrab(42, 50)],
+                           'ccc': [_rgrab(7, 100), _rimport(7, 'ccc')], 'ddd': [_rgrab(7, 10)]})
         aw.handle_grab(_radarr_payload('BBB'), 'Radarr')
         assert s.labeled == [('bbb', 'radarr-upgrade'), ('bbb', aw.SUPERSEDED_LABEL)], s.labeled
 
@@ -343,8 +359,8 @@ def run():
         s = _Stub(aw,
                   torrents={'aaa': _lane('A.2022.Good.mkv'), 'bbb': _lane('A.2022.Bad.mkv'),
                             'ccc': _lane('B.2019.Good.mkv'), 'ddd': _lane('B.2019.Bad.mkv')},
-                  history={'aaa': [_rgrab(42, 100)], 'bbb': [_rgrab(42, 50)],
-                           'ccc': [_rgrab(7, 100)], 'ddd': [_rgrab(7, 10)]})
+                  history={'aaa': [_rgrab(42, 100), _rimport(42, 'aaa')], 'bbb': [_rgrab(42, 50)],
+                           'ccc': [_rgrab(7, 100), _rimport(7, 'ccc')], 'ddd': [_rgrab(7, 10)]})
         assert aw.cleanup_radarr_queue_dupes() == 2
         assert sorted(s.labeled) == [('bbb', aw.SUPERSEDED_LABEL),
                                      ('ddd', aw.SUPERSEDED_LABEL)], s.labeled
