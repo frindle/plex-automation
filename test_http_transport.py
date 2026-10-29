@@ -2,6 +2,8 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import urllib.error
+
 import pytest
 
 import llm_advisor as la
@@ -39,7 +41,7 @@ def test_returns_message_content_and_sends_prompt_model_nothink():
 def test_http_error_raises():
     srv, url = _serve(500, {'error': 'x'}, [])
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(urllib.error.HTTPError):
             la.http_transport(url, 'm', 5)('p')
     finally:
         srv.shutdown()
@@ -48,7 +50,7 @@ def test_http_error_raises():
 def test_malformed_body_raises():
     srv, url = _serve(200, {'nope': 1}, [])
     try:
-        with pytest.raises(Exception):
+        with pytest.raises((KeyError, IndexError, TypeError)):
             la.http_transport(url, 'm', 5)('p')
     finally:
         srv.shutdown()
