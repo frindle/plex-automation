@@ -883,11 +883,15 @@ def cleanup_superseded():
     except Exception as e:
         log.error(f'Cleanup failed: {e}')
 
+PURGE_QUEUED_MAX_BATCH = 5
+
 def queued_superseded_targets(torrents):
-    """Superseded torrents sitting in Deluge's own 'Queued' state — waiting
-    behind the active-torrent limit, not transferring, not seeding, nothing
-    to lose by removing them now. (Deluge can hold a torrent here at any
-    progress %, so this checks state, not progress.) Shared by the
+    """Superseded torrents sitting in Deluge's own 'Queued' state that are safe
+    to purge. Deluge reports 0% progress for a Queued torrent even when it was
+    seeded earlier, so progress is NOT a criterion: a Queued torrent is
+    purge-eligible only if it never started (seeding_time, active_time and
+    total_uploaded all 0 and not is_finished) or its seed obligation is met
+    (seeding_time >= SEED_DAYS * 86400). Shared by the
     /purge-unstarted-superseded route and the post-import sweep."""
     return [
         {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state')}

@@ -74,8 +74,24 @@ def hashes(torrents):
     return [t['hash'] for t in aw.queued_superseded_targets(torrents)]
 
 
-def test_never_started_queued_torrent_is_purged():
-    assert hashes({'a': torrent('a')}) == ['a']
+def make_targets(n):
+    return [{'hash': f'h{i}', 'name': f'n{i}', 'progress': 0, 'state': 'Queued', 'seeding_time': 0}
+            for i in range(n)]
+
+
+def test_never_started_queued_torrent_is_purged_and_filters_hold():
+    torrents = {
+        'a': torrent('a'),
+        'p100': torrent('p100', progress=100),                       # progress is not a criterion
+        'notqueued': torrent('notqueued', state='Seeding'),
+        'otherlabel': torrent('otherlabel', label='radarr'),
+        'miss': {'label': aw.SUPERSEDED_LABEL, 'state': 'Queued', 'name': 'miss'},   # absent fields = never started
+    }
+    targets = aw.queued_superseded_targets(torrents)
+    assert [t['hash'] for t in targets] == ['a', 'p100', 'miss'], targets
+    first = targets[0]
+    assert first['name'] == 'a' and first['state'] == 'Queued' and 'progress' in first, first
+    assert first['seeding_time'] == 0, first
 
 
 def test_queued_zero_progress_but_seeded_earlier_is_not_purged():
@@ -93,48 +109,23 @@ def test_seed_window_met_is_purged_even_with_history():
         'done': torrent('done', seeding_time=aw.SEED_DAYS * DAY, active_time=99, total_uploaded=1, is_finished=True),
         'short': torrent('short', seeding_time=aw.SEED_DAYS * DAY - 1, active_time=99, total_uploaded=1),
     }
-    assert hashes(torrents) == ['done'], hashes(torrents)
+    targets = aw.queued_superseded_targets(torrents)
+    assert [t['hash'] for t in targets] == ['done'], targets
+    assert targets[0]['seeding_time'] == aw.SEED_DAYS * DAY, targets
 
 
-def test_progress_is_not_a_criterion_and_other_filters_hold():
-    torrents = {
-        'p100': torrent('p100', progress=100),                       # never started, any progress: eligible
-        'notqueued': torrent('notqueued', state='Seeding'),
-        'otherlabel': torrent('otherlabel', label='radarr'),
-        'miss': {'label': aw.SUPERSEDED_LABEL, 'state': 'Queued', 'name': 'miss'},   # fields absent = never started
-    }
-    assert hashes(torrents) == ['p100', 'miss'], hashes(torrents)
-
-
-def test_target_shape_keeps_existing_keys_and_adds_seeding_time():
-    t = aw.queued_superseded_targets({'a': torrent('a', progress=0)})[0]
-    for k in ('hash', 'name', 'progress', 'state'):
-        assert k in t, t
-    assert t['hash'] == 'a' and t['name'] == 'a' and t['state'] == 'Queued', t
-
-
-def test_batch_of_six_removes_nothing():
+def test_batch_over_five_removes_nothing_and_five_is_removed():
     setup()
-    targets = [{'hash': f'h{i}', 'name': f'n{i}', 'progress': 0, 'state': 'Queued', 'seeding_time': 0} for i in range(6)]
-    result = aw.purge_queued_superseded(targets)
+    result = aw.purge_queued_superseded(make_targets(6))
     assert tuple(result) == (0, []), result
     assert removed_hashes() == [], RPC
     assert log_rows() == [], log_rows()
-
-
-def test_batch_of_five_is_removed():
-    setup()
-    targets = [{'hash': f'h{i}', 'name': f'n{i}', 'progress': 0, 'state': 'Queued', 'seeding_time': 0} for i in range(5)]
-    removed, failed = aw.purge_queued_superseded(targets)
+    removed, failed = aw.purge_queued_superseded(make_targets(5))
     assert removed == 5 and failed == [], (removed, failed)
     assert removed_hashes() == [f'h{i}' for i in range(5)], RPC
-
-
-def test_failure_in_batch_is_reported_and_others_continue():
     setup()
     STATE['fail_hashes'] = {'h1'}
-    targets = [{'hash': f'h{i}', 'name': f'n{i}', 'progress': 0, 'state': 'Queued', 'seeding_time': 0} for i in range(3)]
-    removed, failed = aw.purge_queued_superseded(targets)
+    removed, failed = aw.purge_queued_superseded(make_targets(3))
     assert removed == 2, (removed, failed)
     assert len(failed) == 1 and failed[0]['hash'] == 'h1' and failed[0]['error'], failed
 
@@ -158,14 +149,10 @@ def test_removal_log_has_name_and_seeding_time_s():
 
 
 TESTS = [
-    test_never_started_queued_torrent_is_purged,
+    test_never_started_queued_torrent_is_purged_and_filters_hold,
     test_queued_zero_progress_but_seeded_earlier_is_not_purged,
     test_seed_window_met_is_purged_even_with_history,
-    test_progress_is_not_a_criterion_and_other_filters_hold,
-    test_target_shape_keeps_existing_keys_and_adds_seeding_time,
-    test_batch_of_six_removes_nothing,
-    test_batch_of_five_is_removed,
-    test_failure_in_batch_is_reported_and_others_continue,
+    test_batch_over_five_removes_nothing_and_five_is_removed,
     test_removal_log_has_name_and_seeding_time_s,
 ]
 
