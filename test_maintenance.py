@@ -195,9 +195,9 @@ def run():
         'b': {'label': aw.SUPERSEDED_LABEL, 'state': 'Seeding', 'name': 'b', 'progress': 100},
         'c': {'label': 'radarr', 'state': 'Queued', 'name': 'c', 'progress': 0},
         'd': {'label': aw.SUPERSEDED_LABEL, 'state': 'Queued', 'name': 'd', 'progress': 100,
-              'tracker_status': 'Announce OK'},
+              'total_uploaded': 4096, 'tracker_status': 'Announce OK'},
         'e': {'label': aw.SUPERSEDED_LABEL, 'state': 'Queued', 'name': 'e', 'progress': 100,
-              'tracker_status': 'Error: Unregistered torrent'},
+              'total_uploaded': 4096, 'tracker_status': 'Error: Unregistered torrent'},
     })
     assert [t['hash'] for t in targets] == ['a'], targets
 

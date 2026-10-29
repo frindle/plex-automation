@@ -705,14 +705,15 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
     resp.raise_for_status()
     log.info(f'Removed torrent {torrent_hash}' + (' and deleted files' if remove_data else ' (files left on disk)'))
     log_removal(traceback.extract_stack(limit=2)[0].name, torrent_hash, (info or {}).get('name'),
-                'files deleted' if remove_data else 'files kept', {'remove_data': remove_data})
+                'files deleted' if remove_data else 'files kept',
+                {'remove_data': remove_data, **({'seeding_time_s': info['seeding_time']} if (info or {}).get('seeding_time') is not None else {})})
 
 def get_all_torrents():
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrents_status',
-            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress', 'state', 'total_uploaded', 'total_seeds', 'tracker_status']],
+            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'active_time', 'is_finished', 'progress', 'state', 'total_uploaded', 'total_seeds', 'tracker_status']],
             'id': 6
         },
         timeout=10
@@ -882,33 +883,37 @@ def cleanup_superseded():
     except Exception as e:
         log.error(f'Cleanup failed: {e}')
 
+PURGE_QUEUED_MAX_BATCH = 5
+
 def queued_superseded_targets(torrents):
-    """Superseded torrents sitting in Deluge's own 'Queued' state — waiting
-    behind the active-torrent limit, not transferring, not seeding, nothing
-    to lose by removing them now. (Deluge can hold a torrent here at any
-    progress %, so this checks state, not progress.) Shared by the
+    """Superseded torrents sitting in Deluge's own 'Queued' state that are safe
+    to purge. Deluge reports 0% progress for a Queued torrent even when it was
+    seeded earlier, so progress is NOT a criterion: a Queued torrent is
+    purge-eligible only if it never started (seeding_time, active_time and
+    total_uploaded all 0 and not is_finished) or its seed obligation is met
+    (seeding_time >= SEED_DAYS * 86400). Shared by the
     /purge-unstarted-superseded route and the post-import sweep."""
+    def _never_started(info):
+        """Return True when the torrent has never started seeding."""
+        return (info.get('seeding_time') or 0) == 0 and \
+               (info.get('active_time') or 0) == 0 and \
+               (info.get('total_uploaded') or 0) == 0 and \
+               not info.get('is_finished')
     return [
-        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state')}
+        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state'), 'seeding_time': info.get('seeding_time') or 0}
         for h, info in torrents.items()
         if info.get('label') == SUPERSEDED_LABEL and info.get('state') == 'Queued'
-        # "Nothing to lose" holds only while nothing has been downloaded. A
-        # Queued torrent sitting at partial or full progress HAS taken data
-        # from the tracker and can still owe seed time, so purging it is a
-        # hit-and-run in the same way the same-group delete was. Tracker
-        # registration status is NOT a licence to delete: an unregistered
-        # torrent that hasn't met its seed window still owes the tracker
-        # (private trackers enforce minimum seed time even after dropping a
-        # superseded release). Only zero progress or a met seed obligation
-        # releases the brake.
-        and ((info.get('progress') or 0) == 0 or (info.get('seeding_time') or 0) >= SEED_DAYS * 86400)
+        and (_never_started(info) or (info.get('seeding_time') or 0) >= SEED_DAYS * 86400)
     ]
 
 def purge_queued_superseded(targets):
+    if len(targets) > PURGE_QUEUED_MAX_BATCH:
+        log.warning(f'purge: batch of {len(targets)} exceeds cap, skipping')
+        return 0, []
     removed, failed = 0, []
     for t in targets:
         try:
-            remove_torrent(t['hash'])
+            remove_torrent(t['hash'], info={'name': t.get('name'), 'seeding_time': t.get('seeding_time') or 0})
             removed += 1
         except Exception as e:
             failed.append({'hash': t['hash'], 'error': str(e)})
