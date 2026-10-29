@@ -1,5 +1,8 @@
 """llm_decide.py -- advisory local-LLM release decisions with a deterministic fallback."""
 
+import datetime
+import json
+
 KINDS = {
     'upgrade_gate': ('allow', 'throttle', 'reject'),
     'import_identity': ('match', 'mismatch', 'unsure'),
