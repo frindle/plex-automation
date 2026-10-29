@@ -705,14 +705,15 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
     resp.raise_for_status()
     log.info(f'Removed torrent {torrent_hash}' + (' and deleted files' if remove_data else ' (files left on disk)'))
     log_removal(traceback.extract_stack(limit=2)[0].name, torrent_hash, (info or {}).get('name'),
-                'files deleted' if remove_data else 'files kept', {'remove_data': remove_data})
+                'files deleted' if remove_data else 'files kept',
+                {'remove_data': remove_data, **({'seeding_time_s': info['seeding_time']} if (info or {}).get('seeding_time') is not None else {})})
 
 def get_all_torrents():
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrents_status',
-            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'progress', 'state', 'total_uploaded', 'total_seeds', 'tracker_status']],
+            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'active_time', 'is_finished', 'progress', 'state', 'total_uploaded', 'total_seeds', 'tracker_status']],
             'id': 6
         },
         timeout=10
