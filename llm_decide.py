@@ -1,3 +1,13 @@
+"""llm_decide.py -- advisory local-LLM release decisions with a deterministic fallback."""
+
+KINDS = {
+    'upgrade_gate': ('allow', 'throttle', 'reject'),
+    'import_identity': ('match', 'mismatch', 'unsure'),
+    'dupe_keeper': ('keep_first', 'keep_second', 'keep_both'),
+}
+MIN_CONFIDENCE = 0.75
+
+
 
 
 def parse_decision(kind, raw):
