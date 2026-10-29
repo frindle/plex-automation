@@ -893,27 +893,27 @@ def queued_superseded_targets(torrents):
     total_uploaded all 0 and not is_finished) or its seed obligation is met
     (seeding_time >= SEED_DAYS * 86400). Shared by the
     /purge-unstarted-superseded route and the post-import sweep."""
+    def _never_started(info):
+        """Return True when the torrent has never started seeding."""
+        return (info.get('seeding_time') or 0) == 0 and \
+               (info.get('active_time') or 0) == 0 and \
+               (info.get('total_uploaded') or 0) == 0 and \
+               not info.get('is_finished')
     return [
-        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state')}
+        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state'), 'seeding_time': info.get('seeding_time') or 0}
         for h, info in torrents.items()
         if info.get('label') == SUPERSEDED_LABEL and info.get('state') == 'Queued'
-        # "Nothing to lose" holds only while nothing has been downloaded. A
-        # Queued torrent sitting at partial or full progress HAS taken data
-        # from the tracker and can still owe seed time, so purging it is a
-        # hit-and-run in the same way the same-group delete was. Tracker
-        # registration status is NOT a licence to delete: an unregistered
-        # torrent that hasn't met its seed window still owes the tracker
-        # (private trackers enforce minimum seed time even after dropping a
-        # superseded release). Only zero progress or a met seed obligation
-        # releases the brake.
-        and ((info.get('progress') or 0) == 0 or (info.get('seeding_time') or 0) >= SEED_DAYS * 86400)
+        and (_never_started(info) or (info.get('seeding_time') or 0) >= SEED_DAYS * 86400)
     ]
 
 def purge_queued_superseded(targets):
+    if len(targets) > PURGE_QUEUED_MAX_BATCH:
+        log.warning(f'purge: batch of {len(targets)} exceeds cap, skipping')
+        return 0, []
     removed, failed = 0, []
     for t in targets:
         try:
-            remove_torrent(t['hash'])
+            remove_torrent(t['hash'], info={'name': t.get('name'), 'seeding_time': t.get('seeding_time') or 0})
             removed += 1
         except Exception as e:
             failed.append({'hash': t['hash'], 'error': str(e)})
