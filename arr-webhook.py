@@ -2360,15 +2360,10 @@ def _promote_keeper(torrent_hash, torrents):
         info = torrents.get(torrent_hash) or {}
         if not torrent_hash or not info or (info.get('progress') or 0) >= 99.0:
             return
-        # Throttled older-year upgrades stay at the bottom of the queue: only
-        # their own lane is reordered (keeper at its head), no other lane moves.
+        # Throttled older-year upgrades must stay at the bottom of their lane.
         lbl = info.get('label')
         if lbl in (RADARR_UPG_LABEL, SONARR_UPG_LABEL):
-            lane = {h: i for h, i in torrents.items()
-                    if i.get('label') == lbl and (i.get('progress') or 0) < 100}
-            reorder_deluge_queue(lane, first=torrent_hash)
-            log.info(f'skip promote, older-year upgrade lane: {torrent_hash[:8]} label={lbl} '
-                     f'kept at head of its own lane only')
+            log.info(f'skip promote, older-year upgrade lane: {torrent_hash[:8]} label={lbl}')
             return
         # The keeper is an upgrade: lead its own lane, never jump normal grabs.
         unfinished = {h: i for h, i in torrents.items() if (i.get('progress') or 0) < 100}

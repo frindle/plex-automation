@@ -1,8 +1,7 @@
 """Frozen tests: _promote_keeper (arr-webhook.py) may move a duplicate-pass keeper
-to the top of the queue only for normal grabs (same-year upgrades lead their
-own lane as before). Older-year upgrade keepers (RADARR_UPG_LABEL /
-SONARR_UPG_LABEL) are throttled by design: they only lead their own bottom
-lane -- never queue_top, and no other lane is moved.
+to the top of its lane only for normal and SAME-year upgrade labels. Older-year
+upgrade lanes (RADARR_UPG_LABEL / SONARR_UPG_LABEL) are throttled by design and
+must not be promoted.
 
 Deluge is faked at the HTTP boundary (requests.Session.post); every
 queue_top / queue_bottom call is recorded in POSTS as (method, hashes).
@@ -52,36 +51,18 @@ def promote(label, progress=50.0, h='keephash'):
     return list(POSTS)
 
 
-def promote_mixed(label):
-    """Older-year keeper plus a same-lane peer, a normal grab and a same-year upgrade."""
-    del POSTS[:]
-    torrents = {
-        'keephash': {'label': label, 'progress': 50.0, 'name': 'keeper'},
-        'otherhash': {'label': label, 'progress': 20.0, 'name': 'other'},
-        'donehash': {'label': label, 'progress': 100.0, 'name': 'done'},
-        'normhash': {'label': 'radarr', 'progress': 5.0, 'name': 'normal'},
-        'recenthash': {'label': aw.RADARR_UPG_PRIORITY_LABEL, 'progress': 5.0, 'name': 'recent'},
-    }
-    aw._promote_keeper('keephash', torrents)
-    return list(POSTS)
-
-
-def _assert_lane_head_only(label):
-    for posts in (promote(label), promote_mixed(label)):
-        assert posts == [('core.queue_bottom', ['keephash']), ('core.queue_bottom', ['otherhash'])], \
-            f'{label}: older-year keeper must lead only its own lane: {posts!r}'
-        assert not any(m == 'core.queue_top' for m, _ in posts), f'{label}: global top used: {posts!r}'
-
-
 def test_older_year_radarr_upgrade_keeper_not_promoted():
-    """Older-year: head of its own (bottom) lane only -- never queue_top, no other lane moved."""
-    _assert_lane_head_only('radarr-upgrade')
-    _assert_lane_head_only(aw.RADARR_UPG_LABEL)
+    posts = promote('radarr-upgrade')
+    assert posts == [], f'older-year radarr-upgrade keeper was reordered: {posts!r}'
+    posts = promote(aw.RADARR_UPG_LABEL)
+    assert not posts, f'RADARR_UPG_LABEL keeper was reordered: {posts!r}'
 
 
 def test_older_year_sonarr_upgrade_keeper_not_promoted():
-    _assert_lane_head_only('sonarr-upgrade')
-    _assert_lane_head_only(aw.SONARR_UPG_LABEL)
+    posts = promote('sonarr-upgrade')
+    assert posts == [], f'older-year sonarr-upgrade keeper was reordered: {posts!r}'
+    posts = promote(aw.SONARR_UPG_LABEL)
+    assert not posts, f'SONARR_UPG_LABEL keeper was reordered: {posts!r}'
 
 
 def test_same_year_upgrade_keeper_still_promoted():

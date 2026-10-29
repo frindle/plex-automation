@@ -118,14 +118,10 @@ def main():
         assert (loser, SUP) in rec['label'], 'loser stays labeled superseded'
         assert ([[loser], {'max_download_speed': -1}]) in [p for m, p in rec['rpc'] if m == 'core.set_torrent_options'], 'cap must be lifted so it can finish'
         assert not [1 for m, p in rec['rpc'] if m == 'core.queue_top' and keeper in p[0]], 'keeper must never get queue_top over normals'
-        # replay on a Deluge-like queue (ids are sorted by current position)
-        q = [keeper, loser]
-        for m, p in rec['rpc']:
-            if m in ('core.queue_top', 'core.queue_bottom'):
-                hs = sorted(p[0], key=q.index)
-                rest = [h for h in q if h not in hs]
-                q = hs + rest if m == 'core.queue_top' else rest + hs
-        assert q == [loser, keeper], 'normal stays above the keeper: %r' % q
+        # Policy (user, 2026-10-29): an older-year upgrade keeper is never
+        # promoted -- it stays at the back of the queue, throttled.
+        assert not [1 for m, p in rec['rpc'] if m in ('core.queue_top', 'core.queue_bottom') and keeper in p[0]], \
+            'older-year keeper must not be moved: %r' % rec['rpc']
 
         # ── pending-import guard ─────────────────────────────────────────
         now = datetime.datetime(2026, 10, 9, tzinfo=datetime.timezone.utc)

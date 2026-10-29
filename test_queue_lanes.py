@@ -127,11 +127,26 @@ def test_promote_keeper(aw):
         'k' * 40: {'label': aw.RADARR_UPG_LABEL, 'progress': 3.0, 'name': 'keeper'},
     }
     d = _install(aw, st)
-    d.queue = ['u1' + '0' * 38, 'k' * 40, 'n' * 40]
+    d.queue = ['u1' + '0' * 38, 'n' * 40, 'k' * 40]
     aw._promote_keeper('k' * 40, st)
-    assert d.queue[0] == 'n' * 40, 'normal stays first: %r' % d.queue
-    assert d.queue.index('k' * 40) < d.queue.index('u1' + '0' * 38), 'keeper tops the upgrade lane'
-    assert 'k' * 40 not in [h for t in d.tops() for h in t], 'keeper never gets queue_top'
+    # Policy (user, 2026-10-29): an older-year upgrade keeper is never
+    # promoted, not even within its lane -- it stays at the back, throttled.
+    assert d.queue == ['u1' + '0' * 38, 'n' * 40, 'k' * 40], 'older-year keeper not moved: %r' % d.queue
+    assert not [m for m, _ in d.rpc if m in ('core.queue_top', 'core.queue_bottom')], d.rpc
+
+    # A same-year upgrade keeper is still promoted: it leads the upgrades,
+    # but never jumps a normal grab.
+    st = {
+        'n' * 40: {'label': 'radarr', 'progress': 3.0, 'name': 'normal'},
+        'u1' + '0' * 38: {'label': aw.RADARR_UPG_LABEL, 'progress': 3.0, 'name': 'u1'},
+        'r' * 40: {'label': aw.RADARR_UPG_PRIORITY_LABEL, 'progress': 3.0, 'name': 'recent'},
+        'k' * 40: {'label': aw.RADARR_UPG_PRIORITY_LABEL, 'progress': 3.0, 'name': 'keeper'},
+    }
+    d = _install(aw, st)
+    d.queue = ['u1' + '0' * 38, 'r' * 40, 'k' * 40, 'n' * 40]
+    aw._promote_keeper('k' * 40, st)
+    assert d.queue == ['n' * 40, 'k' * 40, 'r' * 40, 'u1' + '0' * 38], 'same-year keeper leads upgrades: %r' % d.queue
+    assert 'k' * 40 not in [h for t in d.tops() for h in t], 'keeper never gets queue_top over normals'
 
 
 def test_new_radarr_grab_topped(aw):
