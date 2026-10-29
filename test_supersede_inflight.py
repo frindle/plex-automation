@@ -102,9 +102,14 @@ def main():
                   'customFormatScore': 100, 'size': 100, 'sizeleft': 99}]
         hist = {'records': [{'eventType': 'grabbed', 'date': '2026-10-06T00:00:00Z', 'movieId': 1,
                              'data': {'customFormatScore': 116}}]}
+        # the keeper's import is on record, so the loser may be superseded
+        keeper_hist = {'records': hist['records'] + [{'eventType': 'downloadFolderImported', 'date': '2026-10-07T00:00:00Z',
+                                                      'movieId': 1, 'downloadId': keeper.upper()}]}
         deleted = []
         aw.requests = type('R', (), {
-            'get': staticmethod(lambda url, **kw: _Resp({'records': queue}) if url.endswith('/queue') else _Resp(hist)),
+            'get': staticmethod(lambda url, **kw: _Resp({'records': queue}) if url.endswith('/queue')
+                                else _Resp(keeper_hist) if (kw.get('params') or {}).get('downloadId') == keeper.upper()
+                                else _Resp(hist)),
             'delete': staticmethod(lambda url, **kw: deleted.append(url) or _Resp({})),
         })()
         assert aw.cleanup_radarr_queue_dupes() == 1
