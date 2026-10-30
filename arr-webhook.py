@@ -5963,6 +5963,11 @@ def removal_log():
     return jsonify({'ok': True, 'count': len(rows), 'entries': rows}), 200
 
 
+@app.route('/llm-decisions', methods=['GET'])
+def llm_decisions():
+    raise NotImplementedError('not implemented: llm_decisions')
+
+
 # Cross-reference Deluge completed torrents against Radarr/Sonarr state
 # to surface the "grabbed → downloaded → never imported" failures that
 # the queue endpoint hides once retries expire.
