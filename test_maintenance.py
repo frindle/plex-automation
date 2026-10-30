@@ -96,8 +96,20 @@ def run():
     # The two containers disagree on paths: Deluge calls the TV library
     # /data/Media/TV Shows, this container mounts it at /media/tv. A found
     # path must be translated back before Deluge is told to move anything.
+    # Data found inside a LIBRARY root is never relinked (Sonarr upgrades
+    # delete library files a relocated torrent would be seeding from): it is
+    # reported as library-match instead, even with relink on.
+    with tempfile.TemporaryDirectory() as lib_local:
+        aw.DELUGE_PATH_MAP = [('/data/Media/TV Shows', lib_local)]
+        os.makedirs(os.path.join(lib_local, 'Some Show', 'Season 01', 'Rel.Name.2020.1080p'))
+        calls = _stub_deluge(aw, torrents, {'/data/Media/TV Shows/Some Show/Season 01/Rel.Name.2020.1080p'})
+        res = aw.deluge_error_repair(relink=True)
+        assert calls == [], calls
+        assert res['counts']['library_match'] == 1, res
+        assert res['counts']['relink_candidates'] == 0, res
+
     with tempfile.TemporaryDirectory() as tv_local:
-        deluge_tv = '/data/Media/TV Shows'
+        deluge_tv = '/data/Downloads/Complete/TV'
         aw.DELUGE_PATH_MAP = [(deluge_tv, tv_local)]
         season = os.path.join(tv_local, 'Some Show', 'Season 01')
         os.makedirs(os.path.join(season, 'Rel.Name.2020.1080p'))

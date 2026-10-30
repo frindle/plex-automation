@@ -12,6 +12,9 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 
 from media_share import share_bp, init_db as init_share_db
+import episode_retention
+import library_audit
+import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -476,6 +479,9 @@ def set_torrent_label(torrent_hash, label):
     log.info(f'Set label "{label}" on {torrent_hash}')
 
 def move_torrent_storage(torrent_hash, dest):
+    if is_library_path(dest):
+        log.warning(f'library-move-refused: {torrent_hash} -> {dest} is inside the Plex library; not moving')
+        return False
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={'method': 'core.move_storage', 'params': [[torrent_hash], dest], 'id': 5},
@@ -503,6 +509,7 @@ def move_torrent_storage(torrent_hash, dest):
                 record_activity('supersede-move-failed', f'torrent {torrent_hash} move to {dest} failed')
     except Exception as e:
         log.warning(f'Failed to verify move for {torrent_hash}: {e}')
+    return True
 
 def _torrent_has_local_data(torrent_hash):
     """True if Deluge reports data on disk for this torrent (total_done > 0).
@@ -5504,6 +5511,11 @@ def torrent_move():
             entry['result'] = 'missing hash or dest'
             results.append(entry)
             continue
+        if is_library_path(dest):
+            log.warning(f'library-move-refused: /torrent-move {h} -> {dest} is inside the Plex library')
+            entry['result'] = 'library-move-refused'
+            results.append(entry)
+            continue
         try:
             # Pause
             session.post(
@@ -7109,7 +7121,7 @@ def deluge_error_repair(dry_run=False, relink=None):
         relink = DELUGE_RELINK
     result = {'ok': True, 'dry_run': dry_run, 'relink': relink,
               'rechecked': [], 'relink_candidates': [], 'missing': [], 'errors': [],
-              'library': [], 'resumed': []}
+              'library': [], 'resumed': [], 'library_match': []}
     try:
         deluge_login()
         resp = session.post(
@@ -7236,6 +7248,13 @@ def deluge_error_repair(dry_run=False, relink=None):
         entry['found_at'] = found_local
         entry['found_at_deluge'] = found_deluge
         entry['relink_dest'] = dest
+        if is_library_path(found_deluge):
+            entry['action'] = f'library-match: data found in the library at {found_deluge}; not relinking'
+            result['library_match'].append(entry)
+            _report_once((h, 'library-match'), 'deluge-error',
+                         f'Errored torrent "{name}" -- library-match at {found_local}; not relinked, needs a human',
+                         dry_run=dry_run)
+            continue
         # Never hand Deluge a path it can't see. This re-verifies the
         # translation against Deluge's own filesystem instead of trusting
         # DELUGE_PATH_MAP blindly — a wrong map here would move_storage a
@@ -7283,6 +7302,72 @@ def run_deluge_repair():
     raw_relink = request.args.get('relink')
     relink = None if raw_relink is None else raw_relink.lower() in ('1', 'true', 'yes')
     return jsonify(deluge_error_repair(dry_run=dry_run, relink=relink)), 200
+
+
+# ── Library seed audit / episode retention (logic lives in its own modules) ──
+# Both are read-only or dry-run by default: the audit never writes to Deluge,
+# and retention only removes with EPISODE_RETENTION_APPLY=1 (via remove_torrent,
+# so the HnR and library-seed guards still apply).
+def _deluge_rpc(method, params):
+    resp = session.post(f'{DELUGE_URL}/json', json={'method': method, 'params': params, 'id': 90},
+                        timeout=30)
+    resp.raise_for_status()
+    return resp.json().get('result')
+
+
+_reported_library_audit = set()
+
+
+def library_seed_audit(dry_run=False):
+    deluge_login()
+    return library_audit.library_seed_audit(library_audit.fetch_torrents(_deluge_rpc), send_pushover,
+                                            _reported_library_audit, dry_run=dry_run)
+
+
+def _library_has_file(t):
+    """True only when every file of the torrent is verifiably hardlinked
+    (nlink > 1) as seen through DELUGE_PATH_MAP; anything unreadable -> False
+    (files are kept)."""
+    paths = episode_retention.file_paths(t)
+    if not paths:
+        return False
+    for p in paths:
+        local = _deluge_to_local(p)
+        if not local or not os.path.isfile(local) or os.stat(local).st_nlink < 2:
+            return False
+    return True
+
+
+def episode_retention_run(env=None):
+    deluge_login()
+    torrents = _deluge_rpc('core.get_torrents_status', [{}, episode_retention.FIELDS]) or {}
+    return episode_retention.episode_retention(torrents, remove_torrent, _library_has_file, env=env)
+
+
+def episode_retention_tick():
+    """6h tick: run retention and leave ONE readable INFO line, so the
+    dry-run plan can be checked from the container logs before APPLY=1."""
+    r = episode_retention_run()
+    acted = r['planned'] if r['dry_run'] else r['removed']
+    names = ', '.join(f"{e['name']}{'' if e['remove_data'] else ' (keep data)'}" for e in acted) or '-'
+    log.info(f"Episode retention {'dry-run' if r['dry_run'] else 'APPLY'}: "
+             f"{'planned' if r['dry_run'] else 'removed'} {len(acted)}/{r['limit']}, "
+             f"kept {r['kept']}, paused={r['paused']}, capped={r['capped']}, "
+             f"errors={len(r['errors'])}: {names}")
+    return r
+
+
+@app.route('/library-seed-audit', methods=['GET'])
+def library_seed_audit_route():
+    # Report only: a GET never sends Pushover; the 6h tick does.
+    return jsonify(library_seed_audit(dry_run=True)), 200
+
+
+@app.route('/episode-retention', methods=['GET'])
+def episode_retention_route():
+    # Always a dry-run report, whatever EPISODE_RETENTION_APPLY says.
+    env = {k: v for k, v in os.environ.items() if k != 'EPISODE_RETENTION_APPLY'}
+    return jsonify(episode_retention_run(env=env)), 200
 
 
 # ── Duplicate media folder scan ──────────────────────────────────────────────
@@ -7381,6 +7466,14 @@ def maintenance_scheduler():
             duplicate_folder_scan()
         except Exception as e:
             log.error(f'Duplicate folder scan failed: {e}')
+        try:
+            library_seed_audit()
+        except Exception as e:
+            log.error(f'Library seed audit failed: {e}')
+        try:
+            episode_retention_tick()
+        except Exception as e:
+            log.error(f'Episode retention failed: {e}')
         time.sleep(DELUGE_REPAIR_INTERVAL)
 
 
