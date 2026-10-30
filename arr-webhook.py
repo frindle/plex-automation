@@ -1,3 +1,4 @@
+import collections
 import glob
 import os
 import posixpath
@@ -3025,6 +3026,14 @@ def _try_radarr_manual_import(record):
             'releaseGroup': c.get('releaseGroup'),
             'downloadId': download_id,
         })
+    # LLM identity check before ManualImport
+    queue_title = record.get('title') or ''
+    matched = good[0].get('movie') or {}
+    queue_years = _year_in_title(queue_title)
+    year = matched.get('year')
+    facts = {'service': 'Radarr', 'queue_title': queue_title, 'matched_title': matched.get('title'), 'matched_year': year, 'year_matches': (year in queue_years) if (year and queue_years) else None, 'files': len(files)}
+    if _llm_advise('import_identity', facts, 'match') != 'match':
+        return False, 'LLM advisor did not confirm the match; needs manual review'
     try:
         cmd = requests.post(
             f'{RADARR_URL}/api/v3/command',
@@ -3068,6 +3077,15 @@ def _try_sonarr_manual_import(record):
             'releaseGroup': c.get('releaseGroup'),
             'downloadId': download_id,
         })
+    # LLM identity check before ManualImport
+    queue_title = record.get('title') or ''
+    matched = good[0].get('series') or {}
+    # Daily shows carry an air date (Show.2026.10.30), not the series year.
+    queue_years = _year_in_title(re.sub(r'(?<!\d)(19|20)\d{2}[.\- ]\d{2}[.\- ]\d{2}(?!\d)', ' ', queue_title))
+    year = matched.get('year')
+    facts = {'service': 'Sonarr', 'queue_title': queue_title, 'matched_title': matched.get('title'), 'matched_year': year, 'year_matches': (year in queue_years) if (year and queue_years) else None, 'files': len(files)}
+    if _llm_advise('import_identity', facts, 'match') != 'match':
+        return False, 'LLM advisor did not confirm the match; needs manual review'
     try:
         cmd = requests.post(
             f'{SONARR_URL}/api/v3/command',
@@ -3682,9 +3700,33 @@ def handle_grab(data, source):
         return
 
     # Only throttle if release is over 10GB
-    release_size = data.get('release', {}).get('size', 0)
-    size_gb = release_size / (1024 ** 3)
-    if size_gb < 10:
+    release = data.get('release') or {}
+    size_gb = (release.get('size') or 0) / (1024 ** 3)
+    title = release.get('releaseTitle') or ''
+    tags = _llm_tags(title)
+    rules_action = 'allow' if size_gb < 10 else 'throttle'
+    facts = {
+        'source': source, 'title': title, 'size_gb': round(size_gb, 2),
+        'quality': str(release.get('quality') or '') or None,
+        'indexer': release.get('indexer'),
+        'group': release.get('releaseGroup') or tags['group'],
+        'codec': tags['codec'], 'hdr': tags['hdr'],
+        'candidate_dv_web': tags['dv'] and tags['web'],
+        'seed_days': SEED_DAYS,
+    }
+    action = _llm_advise('upgrade_gate', facts, rules_action)
+    if action == 'reject':
+        log.warning(f"{source}: LLM rejected upgrade grab {download_id} ({title})")
+        time.sleep(3)
+        try:
+            deluge_login()
+            remove_torrent(download_id, remove_data=True)
+            record_activity('llm-reject', f'{source}: upgrade grab "{title}" rejected by LLM advisor')
+        except Exception as e:
+            log.error(f"{source}: reject failed: {e}")
+        return
+
+    if size_gb < 10 and action != 'throttle':
         log.info(f"{source}: upgrade grab {download_id} is {size_gb:.1f}GB, under 10GB threshold, not throttling")
         return
 
@@ -5661,7 +5703,7 @@ def plex_dupe_fix():
             f'{DELUGE_URL}/json',
             json={
                 'method': 'core.get_torrents_status',
-                'params': [{}, ['name', 'label', 'save_path', 'files', 'progress']],
+                'params': [{}, ['name', 'label', 'save_path', 'files', 'progress', 'seeding_time']],
                 'id': 91,
             },
             timeout=30,
@@ -5740,6 +5782,32 @@ def plex_dupe_fix():
         keeper = sorted_media[0]
         losers = sorted_media[1:]
         upgrade_actions = []
+        # LLM dupe-keeper advisory for 2-version groups only.
+        if len(media_list) == 2:
+            def _version_dict(m):
+                f = m.get('file') or ''
+                h, tinfo = _find_torrent_by_filepath(torrents, f)
+                secs = (tinfo or {}).get('seeding_time')
+                return {
+                    'path': _translate_plex_path(f),
+                    'size_gb': m.get('size_gb'),
+                    'res': m.get('resolution'),
+                    'hdr': _llm_tags(os.path.basename(f))['hdr'],
+                    'seeding': bool(h and tinfo),
+                    'seeded_days': round(secs / 86400, 1) if isinstance(secs, (int, float)) else None,
+                }
+            facts = {
+                'title': entry.get('title'),
+                'seed_days': SEED_DAYS,
+                'first': _version_dict(media_list[0]),
+                'second': _version_dict(media_list[1]),
+            }
+            rules_action = 'keep_first' if keeper is media_list[0] else 'keep_second'
+            if _llm_advise('dupe_keeper', facts, rules_action) == 'keep_both':
+                plan.setdefault('kept_by_llm', []).append({
+                    'plex_key': plex_key, 'title': entry.get('title'),
+                })
+                continue
         for loser in losers:
             fpath = loser.get('file') or ''
             h, tinfo = _find_torrent_by_filepath(torrents, fpath)
@@ -5965,7 +6033,40 @@ def removal_log():
 
 @app.route('/llm-decisions', methods=['GET'])
 def llm_decisions():
-    raise NotImplementedError('not implemented: llm_decisions')
+    try:
+        limit_raw = request.args.get('limit', '50')
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 50
+        if limit < 0:
+            limit = 0
+        elif limit > 1000:
+            limit = 1000
+        disagree_raw = request.args.get('disagree', '').lower()
+        disagree = disagree_raw in ('1', 'true', 'yes')
+        rows = collections.deque(maxlen=limit)  # bounded: the log grows forever
+        try:
+            with open(LLM_DECISIONS_LOG, encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = _json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    if disagree and rec.get('agree') is not False:
+                        continue
+                    rows.append(rec)
+        except OSError:
+            rows = []
+        kept = list(rows)
+        return jsonify({'ok': True, 'count': len(kept), 'entries': kept}), 200
+    except Exception:
+        return jsonify({'ok': True, 'count': 0, 'entries': []}), 200
 
 
 # Cross-reference Deluge completed torrents against Radarr/Sonarr state
