@@ -476,6 +476,9 @@ def set_torrent_label(torrent_hash, label):
     log.info(f'Set label "{label}" on {torrent_hash}')
 
 def move_torrent_storage(torrent_hash, dest):
+    if is_library_path(dest):
+        log.warning(f'library-move-refused: {torrent_hash} -> {dest} is inside the Plex library; not moving')
+        return False
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={'method': 'core.move_storage', 'params': [[torrent_hash], dest], 'id': 5},
@@ -503,6 +506,7 @@ def move_torrent_storage(torrent_hash, dest):
                 record_activity('supersede-move-failed', f'torrent {torrent_hash} move to {dest} failed')
     except Exception as e:
         log.warning(f'Failed to verify move for {torrent_hash}: {e}')
+    return True
 
 def _torrent_has_local_data(torrent_hash):
     """True if Deluge reports data on disk for this torrent (total_done > 0).
@@ -5504,6 +5508,11 @@ def torrent_move():
             entry['result'] = 'missing hash or dest'
             results.append(entry)
             continue
+        if is_library_path(dest):
+            log.warning(f'library-move-refused: /torrent-move {h} -> {dest} is inside the Plex library')
+            entry['result'] = 'library-move-refused'
+            results.append(entry)
+            continue
         try:
             # Pause
             session.post(
@@ -7109,7 +7118,7 @@ def deluge_error_repair(dry_run=False, relink=None):
         relink = DELUGE_RELINK
     result = {'ok': True, 'dry_run': dry_run, 'relink': relink,
               'rechecked': [], 'relink_candidates': [], 'missing': [], 'errors': [],
-              'library': [], 'resumed': []}
+              'library': [], 'resumed': [], 'library_match': []}
     try:
         deluge_login()
         resp = session.post(
@@ -7236,6 +7245,13 @@ def deluge_error_repair(dry_run=False, relink=None):
         entry['found_at'] = found_local
         entry['found_at_deluge'] = found_deluge
         entry['relink_dest'] = dest
+        if is_library_path(found_deluge):
+            entry['action'] = f'library-match: data found in the library at {found_deluge}; not relinking'
+            result['library_match'].append(entry)
+            _report_once((h, 'library-match'), 'deluge-error',
+                         f'Errored torrent "{name}" -- library-match at {found_local}; not relinked, needs a human',
+                         dry_run=dry_run)
+            continue
         # Never hand Deluge a path it can't see. This re-verifies the
         # translation against Deluge's own filesystem instead of trusting
         # DELUGE_PATH_MAP blindly — a wrong map here would move_storage a
