@@ -156,7 +156,7 @@ CASES = [
      lambda: (target.per_run_limit({'EPISODE_RETENTION_PER_RUN': 'x'}),
               target.per_run_limit({'EPISODE_RETENTION_PER_RUN': '-3'})), (5, 0)),
     ("constants", lambda: (target.SEED_DAYS, target.DEFAULT_PER_RUN, target.HARD_MAX_PER_RUN, target.FIELDS),
-     (21, 5, 25, ['name', 'label', 'state', 'progress', 'seeding_time', 'save_path', 'files'])),
+     (21, 5, 25, ['name', 'label', 'state', 'progress', 'seeding_time', 'save_path'])),
 ]
 
 

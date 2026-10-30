@@ -531,13 +531,15 @@ def move_torrent_storage(torrent_hash, dest):
     )
     resp.raise_for_status()
     log.info(f'Moved {torrent_hash} to {dest}')
-    
-    # Verify the move actually succeeded by checking the save_path
+    _invalidate_snapshot()
+
+    # Verify the move actually succeeded by checking the save_path (fresh,
+    # single-torrent read -- never the cached snapshot)
     status_resp = session.post(
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrents_status',
-            'params': [{}, ['save_path']],
+            'params': [{'id': [torrent_hash]}, ['save_path']],
             'id': 6,
         },
         timeout=10
@@ -752,23 +754,48 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
         timeout=30
     )
     resp.raise_for_status()
+    _invalidate_snapshot()
     log.info(f'Removed torrent {torrent_hash}' + (' and deleted files' if remove_data else ' (files left on disk)'))
     log_removal(traceback.extract_stack(limit=2)[0].name, torrent_hash, (info or {}).get('name'),
                 'files deleted' if remove_data else 'files kept',
                 {'remove_data': remove_data, **({'seeding_time_s': info['seeding_time']} if (info or {}).get('seeding_time') is not None else {})})
 
-def get_all_torrents():
+ALL_TORRENT_FIELDS = ['name', 'label', 'save_path', 'seeding_time', 'active_time', 'is_finished', 'progress', 'state', 'total_uploaded', 'total_seeds', 'tracker_status']
+DELUGE_BULK_TIMEOUT = 45   # all-torrent pulls on a ~1700-torrent client are slow; don't abandon them early
+SNAPSHOT_TTL = 90          # seconds a get_all_torrents snapshot may be reused
+_snapshot_clock = time.time
+_snapshots = {}            # frozenset(fields) -> (taken_at, {hash: status})
+_snapshots_lock = threading.Lock()
+
+def _invalidate_snapshot():
+    with _snapshots_lock:
+        _snapshots.clear()
+
+def get_all_torrents(fields=None, force=False):
+    """All-torrent status, shared across pollers for SNAPSHOT_TTL seconds. A
+    snapshot holding a superset of the requested fields serves a subset. Pass
+    force=True to bypass the cache (callers that act, then re-read to verify)."""
+    want = frozenset(fields or ALL_TORRENT_FIELDS)
+    now = _snapshot_clock()
+    if not force:
+        with _snapshots_lock:
+            for have, (taken, result) in _snapshots.items():
+                if want <= have and now - taken < SNAPSHOT_TTL:
+                    return {h: dict(t) for h, t in result.items()}
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrents_status',
-            'params': [{}, ['name', 'label', 'save_path', 'seeding_time', 'active_time', 'is_finished', 'progress', 'state', 'total_uploaded', 'total_seeds', 'tracker_status']],
+            'params': [{}, list(fields or ALL_TORRENT_FIELDS)],
             'id': 6
         },
-        timeout=10
+        timeout=DELUGE_BULK_TIMEOUT
     )
     resp.raise_for_status()
-    return resp.json().get('result', {})
+    result = resp.json().get('result', {})
+    with _snapshots_lock:
+        _snapshots[want] = (now, {h: dict(t) for h, t in result.items()})
+    return result
 
 # ── Hit-and-run protection ───────────────────────────────────────────────────
 
@@ -1454,7 +1481,7 @@ def dedup_via_radarr(dry_run=False):
     try:
         deluge_login()
         ensure_label_exists()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
         radarr_torrents = {h: i for h, i in torrents.items() if i.get('label') in ('radarr', RADARR_UPG_LABEL)}
         if not radarr_torrents:
             log.info('  no radarr-labeled torrents to check')
@@ -1784,7 +1811,7 @@ def dedup_via_sonarr(dry_run=False):
     try:
         deluge_login()
         ensure_label_exists()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
         sonarr_torrents = {h: i for h, i in torrents.items() if i.get('label') in ('sonarr', SONARR_UPG_LABEL)}
         if not sonarr_torrents:
             log.info('  no sonarr-labeled torrents to check')
@@ -2516,7 +2543,7 @@ def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
     # Fold in the throttled lane, which the queue can't see.
     try:
         deluge_login()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
     except Exception as e:
         log.warning(f'Radarr queue dedupe: Deluge unreachable, queue-only pass: {e}')
         torrents = {}
@@ -2820,7 +2847,7 @@ def cleanup_sonarr_queue_dupes(series_id=None, dry_run=False):
     # Fold in the throttled lane, which the queue can't see.
     try:
         deluge_login()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
     except Exception as e:
         log.warning(f'Sonarr queue dedupe: Deluge unreachable, queue-only pass: {e}')
         torrents = {}
@@ -3161,7 +3188,8 @@ def import_blocked_scheduler():
 # `core.force_reannounce` to trigger an immediate re-announce -- this poller
 # finds recently-added torrents stuck in an error/no-peer state and forces
 # one, rather than waiting out Deluge's own passive retry interval.
-TRACKER_STALL_INTERVAL = int(os.environ.get('TRACKER_STALL_INTERVAL', '60'))
+TRACKER_STALL_INTERVAL = int(os.environ.get('TRACKER_STALL_INTERVAL', '300'))  # 3 polls inside the 15min window
+TRACKER_STALL_STATES = ['Error', 'Downloading', 'Queued', 'Checking']  # seeding torrents are never fetched
 TRACKER_STALL_WINDOW = int(os.environ.get('TRACKER_STALL_WINDOW', '900'))  # only act within 15min of add
 TRACKER_STALL_MIN_GAP = 90  # don't re-force the same torrent more than once per this many seconds
 _last_reannounce = {}  # torrent hash -> unix timestamp of last forced reannounce
@@ -3172,10 +3200,10 @@ def check_tracker_stalls():
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrents_status',
-            'params': [{}, ['name', 'state', 'time_added', 'tracker_status', 'num_peers']],
+            'params': [{'state': TRACKER_STALL_STATES}, ['name', 'state', 'time_added', 'tracker_status', 'num_peers']],
             'id': 90,
         },
-        timeout=10,
+        timeout=DELUGE_BULK_TIMEOUT,
     )
     resp.raise_for_status()
     torrents = resp.json().get('result') or {}
@@ -3360,7 +3388,7 @@ def handle_upgrade_import(data, source):
             flip_result, flip_name = relabel_download_to_base(download_id, source)
             if flip_result == 'flipped':
                 record_activity('relabel', f'{source}: "{flip_name}" upgrade → base after import')
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
     except Exception as e:
         log.error(f'Deluge connection failed: {e}')
         return
@@ -3489,7 +3517,7 @@ def handle_upgrade_import(data, source):
     # status: the ones we just touched above are 'Moving', not 'Queued', so
     # they're correctly out of scope until they settle.
     try:
-        stale = queued_superseded_targets(get_all_torrents())
+        stale = queued_superseded_targets(get_all_torrents(force=True))
         if stale:
             removed, failed = purge_queued_superseded(stale)
             log.info(f'{source}: post-import purge removed {removed} queued superseded torrent(s)')
@@ -3908,7 +3936,7 @@ def relabel_radarr_upgrades():
     log.info('Relabeling Radarr upgrade torrents...')
     try:
         deluge_login()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
         if not torrents:
             return 0
         # Get all radarr-labeled torrents that aren't already upgrade-labeled
@@ -4024,7 +4052,7 @@ def relabel_sonarr_upgrades():
     log.info('Relabeling Sonarr upgrade torrents...')
     try:
         deluge_login()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
         if not torrents:
             return 0
         sonarr_torrents = {h: i for h, i in torrents.items() if i.get('label') == 'sonarr'}
@@ -4104,7 +4132,7 @@ def verify_and_fix_labels(services=('radarr', 'sonarr')):
     fixed = []
     try:
         deluge_login()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
         if not torrents:
             return fixed
 
@@ -4303,7 +4331,7 @@ def prioritize_normal_torrents():
     log.info('Reordering Deluge queue: normal > recent upgrades > old upgrades...')
     try:
         deluge_login()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
         if not torrents:
             return
         unfinished = {h: i for h, i in torrents.items() if (i.get('progress') or 0) < 100}
@@ -6466,7 +6494,7 @@ def missing_movies():
 def revert_superseded():
     try:
         deluge_login()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
     reverted = 0
@@ -6814,7 +6842,7 @@ def purge_unstarted_superseded():
     apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
     try:
         deluge_login()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(force=True)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
     targets = queued_superseded_targets(torrents)
@@ -7457,7 +7485,7 @@ def run_deluge_repair():
 # so the HnR and library-seed guards still apply).
 def _deluge_rpc(method, params):
     resp = session.post(f'{DELUGE_URL}/json', json={'method': method, 'params': params, 'id': 90},
-                        timeout=30)
+                        timeout=DELUGE_BULK_TIMEOUT if method == 'core.get_torrents_status' else 30)
     resp.raise_for_status()
     return resp.json().get('result')
 
@@ -7488,7 +7516,12 @@ def _library_has_file(t):
 def episode_retention_run(env=None):
     deluge_login()
     torrents = _deluge_rpc('core.get_torrents_status', [{}, episode_retention.FIELDS]) or {}
-    return episode_retention.episode_retention(torrents, remove_torrent, _library_has_file, env=env)
+    # "files" is the heavy field: fetched per hash, only for candidates that
+    # already passed the age/seed checks.
+    def fetch_files(h):
+        return (_deluge_rpc('core.get_torrent_status', [h, ['files']]) or {}).get('files')
+    return episode_retention.episode_retention(torrents, remove_torrent, _library_has_file, env=env,
+                                               fetch_files=fetch_files)
 
 
 def episode_retention_tick():
