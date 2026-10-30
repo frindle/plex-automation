@@ -32,6 +32,8 @@ def run():
             calls.append(json['method'])
             if json['method'] == 'core.get_torrents_status':
                 return _Resp({'result': {'e1': EP, 'l1': LIB}})
+            if json['method'] == 'core.get_torrent_status':
+                return _Resp({'result': {'files': EP['files']}})
             return _Resp({'result': None})
 
     aw.session = S()

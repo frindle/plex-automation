@@ -18,7 +18,7 @@ HARD_MAX_PER_RUN = 25
 MEDIA_ROOT = '/data/Media'
 VIDEO_EXT = ('.mkv', '.mp4', '.avi', '.m4v', '.ts', '.wmv')
 EPISODE_RE = re.compile(r'(?i)\bS\d{1,2}E\d{1,3}\b')
-FIELDS = ['name', 'label', 'state', 'progress', 'seeding_time', 'save_path', 'files']
+FIELDS = ['name', 'label', 'state', 'progress', 'seeding_time', 'save_path']  # "files" is fetched per candidate, see episode_retention()
 
 
 def classify(t):
@@ -63,7 +63,20 @@ def per_run_limit(env):
     return max(0, min(n, HARD_MAX_PER_RUN))
 
 
-def episode_retention(torrents, remove, library_has_file, env=None):
+def classify_light(t):
+    """classify() without the (heavy) "files" field: a Sonarr torrent whose name
+    has an episode marker is only a *candidate* 'episode'."""
+    label = (t.get('label') or '').lower()
+    if label.startswith('radarr'):
+        return 'movie'
+    if not label.startswith('sonarr'):
+        return 'other'
+    return 'episode' if EPISODE_RE.search(t.get('name') or '') else 'season-pack'
+
+
+def episode_retention(torrents, remove, library_has_file, env=None, fetch_files=None):
+    """fetch_files(hash) -> files list, used when torrents were pulled without
+    "files": it is called only for candidates that passed the age/seed checks."""
     env = os.environ if env is None else env
     apply = env.get('EPISODE_RETENTION_APPLY', '0') == '1'
     limit = per_run_limit(env)
@@ -75,7 +88,8 @@ def episode_retention(torrents, remove, library_has_file, env=None):
         return result
     for h in sorted(torrents):
         t = torrents[h] or {}
-        kind = classify(t)
+        lazy = fetch_files is not None and 'files' not in t
+        kind = classify_light(t) if lazy else classify(t)
         if kind != 'episode':
             result['kept'][kind] += 1
             continue
@@ -85,6 +99,14 @@ def episode_retention(torrents, remove, library_has_file, env=None):
         if not t.get('seeding_time') or t['seeding_time'] < SEED_DAYS * 86400:
             result['kept']['too-young'] += 1
             continue
+        if lazy:
+            try:
+                t = dict(t, files=fetch_files(h) or [])
+            except Exception:
+                t = dict(t, files=[])  # unknown -> ambiguous -> kept as a season pack
+            if classify(t) != 'episode':
+                result['kept']['season-pack'] += 1
+                continue
         if len(result['removed']) + len(result['planned']) >= limit:
             result['capped'] = True
             break
