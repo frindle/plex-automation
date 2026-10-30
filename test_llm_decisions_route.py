@@ -13,9 +13,10 @@ def _rec(i, agree):
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
+    mp = monkeypatch
     aw.app.config['PROPAGATE_EXCEPTIONS'] = True
     path = tmp_path / 'llm_decisions.jsonl'
-    monkeypatch.setattr(aw, 'LLM_DECISIONS_LOG', str(path))
+    mp.setattr(aw, 'LLM_DECISIONS_LOG', str(path))
     return aw.app.test_client(), path
 
 

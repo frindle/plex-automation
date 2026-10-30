@@ -24,21 +24,21 @@ class _Resp:
 
 
 class World:
-    def __init__(self, monkeypatch, upgrade=True, advise=None):
+    def __init__(self, mp, upgrade=True, advise=None):
         self.labeled, self.removed, self.posts, self.prioritized, self.calls = [], [], [], [], []
-        monkeypatch.delenv('LLM_DECISIONS', raising=False)
-        monkeypatch.setattr(aw, 'is_upgrade_radarr', lambda data: 'upgrade' if upgrade else None)
-        monkeypatch.setattr(aw, 'time', type('T', (), {'sleep': staticmethod(lambda s: None),
+        mp.delenv('LLM_DECISIONS', raising=False)
+        mp.setattr(aw, 'is_upgrade_radarr', lambda data: 'upgrade' if upgrade else None)
+        mp.setattr(aw, 'time', type('T', (), {'sleep': staticmethod(lambda s: None),
                                                        'time': staticmethod(lambda: 0.0)})())
-        monkeypatch.setattr(aw, 'deluge_login', lambda: None)
-        monkeypatch.setattr(aw, 'session', type('S', (), {'post': staticmethod(self.post)})())
-        monkeypatch.setattr(aw, 'ensure_label_exists_named', lambda label: None)
-        monkeypatch.setattr(aw, 'set_torrent_label', lambda h, label: self.labeled.append((h, label)))
-        monkeypatch.setattr(aw, 'dedupe_grabbed_release', lambda source, h: None)
-        monkeypatch.setattr(aw, 'prioritize_new_grab', lambda source, h: self.prioritized.append(h))
-        monkeypatch.setattr(aw, 'remove_torrent',
+        mp.setattr(aw, 'deluge_login', lambda: None)
+        mp.setattr(aw, 'session', type('S', (), {'post': staticmethod(self.post)})())
+        mp.setattr(aw, 'ensure_label_exists_named', lambda label: None)
+        mp.setattr(aw, 'set_torrent_label', lambda h, label: self.labeled.append((h, label)))
+        mp.setattr(aw, 'dedupe_grabbed_release', lambda source, h: None)
+        mp.setattr(aw, 'prioritize_new_grab', lambda source, h: self.prioritized.append(h))
+        mp.setattr(aw, 'remove_torrent',
                             lambda h, remove_data=True, info=None: self.removed.append((h, remove_data)))
-        monkeypatch.setattr(aw, 'record_activity', lambda *a, **k: None)
+        mp.setattr(aw, 'record_activity', lambda *a, **k: None)
         real = aw.llm_advisor.advise
 
         def spy(kind, facts, rules_action, **kw):
@@ -46,7 +46,7 @@ class World:
             if advise is None:
                 return real(kind, facts, rules_action, **kw)
             return advise(kind, facts, rules_action)
-        monkeypatch.setattr(aw.llm_advisor, 'advise', spy)
+        mp.setattr(aw.llm_advisor, 'advise', spy)
 
     def post(self, url, json=None, timeout=None, **kw):
         method = (json or {}).get('method')
