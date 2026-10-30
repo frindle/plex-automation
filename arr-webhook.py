@@ -7344,6 +7344,19 @@ def episode_retention_run(env=None):
     return episode_retention.episode_retention(torrents, remove_torrent, _library_has_file, env=env)
 
 
+def episode_retention_tick():
+    """6h tick: run retention and leave ONE readable INFO line, so the
+    dry-run plan can be checked from the container logs before APPLY=1."""
+    r = episode_retention_run()
+    acted = r['planned'] if r['dry_run'] else r['removed']
+    names = ', '.join(f"{e['name']}{'' if e['remove_data'] else ' (keep data)'}" for e in acted) or '-'
+    log.info(f"Episode retention {'dry-run' if r['dry_run'] else 'APPLY'}: "
+             f"{'planned' if r['dry_run'] else 'removed'} {len(acted)}/{r['limit']}, "
+             f"kept {r['kept']}, paused={r['paused']}, capped={r['capped']}, "
+             f"errors={len(r['errors'])}: {names}")
+    return r
+
+
 @app.route('/library-seed-audit', methods=['GET'])
 def library_seed_audit_route():
     # Report only: a GET never sends Pushover; the 6h tick does.
@@ -7458,7 +7471,7 @@ def maintenance_scheduler():
         except Exception as e:
             log.error(f'Library seed audit failed: {e}')
         try:
-            episode_retention_run()
+            episode_retention_tick()
         except Exception as e:
             log.error(f'Episode retention failed: {e}')
         time.sleep(DELUGE_REPAIR_INTERVAL)

@@ -54,10 +54,25 @@ def run():
         del os.environ['EPISODE_RETENTION_APPLY']
     assert set(calls) == {'core.get_torrents_status'}, calls
 
-    # the tick path (not dry-run) pushes once per torrent
+    # the tick path (not dry-run) sends one summary push, never re-announced
     aw.library_seed_audit()
     aw.library_seed_audit()
     assert len(pushed) == 1, pushed
+    assert pushed[0][0] == 'Library seed audit: 1 newly flagged', pushed
+
+    # the retention tick logs one readable INFO line with the dry-run plan
+    lines = []
+    real_info = aw.log.info
+    aw.log.info = lambda msg, *a, **k: lines.append(msg)
+    try:
+        r = aw.episode_retention_tick()
+    finally:
+        aw.log.info = real_info
+    assert r['dry_run'] is True and removed == [], (r, removed)
+    plan = [m for m in lines if m.startswith('Episode retention')]
+    assert len(plan) == 1, lines
+    assert plan[0].startswith('Episode retention dry-run: planned 1/5,'), plan
+    assert 'paused=False' in plan[0] and 'Show.S01E05.1080p (keep data)' in plan[0], plan
 
     # _library_has_file: hardlinked -> True; single link / missing -> False
     with tempfile.TemporaryDirectory() as d:

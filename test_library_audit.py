@@ -51,6 +51,28 @@ def c_message_format():
     return sent
 
 
+def c_bulk_one_summary():
+    # first tick over a big backlog: ONE push, 10 names, rest summarised
+    torrents = {'h%02d' % i: T(state='Error', name='N%02d' % i) for i in range(12)}
+    torrents['lib'] = T(save_path='/data/Media/Movies/X', label='radarr', name='Lib')
+    rep = set()
+    r, sent, _ = run(torrents, rep)
+    lines = sent[0][1].split('\n')
+    return (len(sent), sent[0][0], lines[0], lines[1], len(lines), lines[-1],
+            len(r['notified']), len(rep))
+
+
+def c_only_new_announced():
+    rep = {'h1'}
+    r, sent, _ = run({'h1': T(state='Error', name='Old'), 'h2': T(state='Error', name='New')}, rep)
+    return r['notified'], sent, sorted(rep)
+
+
+def c_none_new_no_push():
+    r, sent, _ = run({'h1': T(state='Error')}, {'h1'})
+    return r['notified'], sent
+
+
 def c_counts_and_entry():
     torrents = {
         'a': T(state='Error'),
@@ -106,11 +128,19 @@ CASES = [
      ['h']),
     ("missing fields / None label / None message don't raise",
      lambda: reasons({'label': None, 'message': None, 'save_path': None}), []),
-    ("Pushover once per torrent across runs", c_once_per_torrent,
-     (['h1', 'h2'], 2, [], [], ['h1', 'h2'], 2)),
+    ("one summary push per run, never re-announced", c_once_per_torrent,
+     (['h1', 'h2'], 1, [], [], ['h1', 'h2'], 2)),
+    ("backlog of 13: one push, 10 names, '... and 3 more'", c_bulk_one_summary,
+     (1, 'Library seed audit: 13 newly flagged', 'error 12, arr-label-in-library 1',
+      '- N00: error', 12, '... and 3 more', 13, 13)),
+    ("only newly flagged torrents are in the push", c_only_new_announced,
+     (['h2'], [('Library seed audit: 1 newly flagged', 'error 1, arr-label-in-library 0\n- New: error')],
+      ['h1', 'h2'])),
+    ("nothing new -> no push at all", c_none_new_no_push, ([], [])),
     ("dry run flags but never notifies or records", c_dry_run, (['h1'], [], set(), [])),
     ("notify title/message format", c_message_format,
-     [('Library seed audit: Show.S01', 'error, arr-label-in-library at /data/Media/TV Shows/S')]),
+     [('Library seed audit: 1 newly flagged',
+       'error 1, arr-label-in-library 1\n- Show.S01: error, arr-label-in-library')]),
     ("counts, sorted hashes, entry shape", c_counts_and_entry,
      ({'error': 2, 'arr-label-in-library': 2}, ['a', 'b', 'c'],
       {'hash': 'b', 'name': 'Rel', 'label': 'sonarr-upgrade', 'save_path': '/data/Media/TV Shows/X',
