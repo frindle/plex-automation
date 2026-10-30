@@ -37,6 +37,47 @@ def record_activity(category, summary):
     except OSError as e:
         log.debug(f'activity log write failed: {e}')
 
+# ── LLM advisor (env-gated: LLM_DECISIONS=off|shadow|enforce, default off) ──
+# llm_advisor.advise() returns rules_action untouched when off. A missing or
+# broken module must never break startup, so the import is guarded.
+try:
+    import llm_advisor
+except Exception:  # noqa: BLE001
+    llm_advisor = None
+LLM_DECISIONS_LOG = os.environ.get('LLM_DECISIONS_LOG', '/data/llm_decisions.jsonl')
+
+
+def _llm_record(category, info):
+    """record= callback for advise(): the /digest page needs a string summary."""
+    info = info if isinstance(info, dict) else {}
+    record_activity(category, f"{info.get('kind')} ({info.get('mode')}): "
+                              f"rules={info.get('rules_action')} llm={info.get('llm_action')}")
+
+
+def _llm_advise(kind, facts, rules_action):
+    """Ask the advisor; a missing module, an exception or a non-string answer returns rules_action."""
+    if llm_advisor is None:
+        return rules_action
+    try:
+        action = llm_advisor.advise(kind, facts, rules_action, record=_llm_record)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'[llm] advise({kind}) failed: {e}')
+        return rules_action
+    return action if isinstance(action, str) else rules_action
+
+
+def _llm_tags(name):
+    """Release-name markers for advisor facts: codec, hdr, dv, web, group (no API calls)."""
+    n = '.' + re.sub(r'[\s_\-\[\]()]+', '.', (name or '').lower()) + '.'
+    dv = any(t in n for t in ('.dv.', '.dovi.', '.dolby.vision.'))
+    codec = next((c for c in ('x265', 'hevc', 'h265', 'h.265', 'av1', 'x264', 'h264', 'h.264', 'avc')
+                  if '.' + c + '.' in n), None)
+    m = re.search(r'-([A-Za-z0-9]+)(?:\.[A-Za-z0-9]{2,4})?$', (name or '').strip())
+    return {'codec': codec, 'dv': dv,
+            'hdr': dv or any(t in n for t in ('.hdr.', '.hdr10.', '.hdr10+.')),
+            'web': any(t in n for t in ('.web.', '.webdl.', '.webrip.')),
+            'group': m.group(1) if m else None}
+
 ACTIVITY_LOG_RETENTION_DAYS = int(os.environ.get('ACTIVITY_LOG_RETENTION_DAYS', '7'))
 
 def trim_activity_log(retention_days=ACTIVITY_LOG_RETENTION_DAYS):
