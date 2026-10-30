@@ -7,4 +7,7 @@ COPY monthly_upgrade.py .
 COPY media_share.py .
 COPY llm_decide.py .
 COPY llm_advisor.py .
+COPY library_audit.py .
+COPY episode_retention.py .
+COPY speed_cap.py .
 CMD ["python", "-u", "arr-webhook.py"]

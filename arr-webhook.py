@@ -12,6 +12,9 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 
 from media_share import share_bp, init_db as init_share_db
+import episode_retention
+import library_audit
+import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -7301,6 +7304,59 @@ def run_deluge_repair():
     return jsonify(deluge_error_repair(dry_run=dry_run, relink=relink)), 200
 
 
+# ── Library seed audit / episode retention (logic lives in its own modules) ──
+# Both are read-only or dry-run by default: the audit never writes to Deluge,
+# and retention only removes with EPISODE_RETENTION_APPLY=1 (via remove_torrent,
+# so the HnR and library-seed guards still apply).
+def _deluge_rpc(method, params):
+    resp = session.post(f'{DELUGE_URL}/json', json={'method': method, 'params': params, 'id': 90},
+                        timeout=30)
+    resp.raise_for_status()
+    return resp.json().get('result')
+
+
+_reported_library_audit = set()
+
+
+def library_seed_audit(dry_run=False):
+    deluge_login()
+    return library_audit.library_seed_audit(library_audit.fetch_torrents(_deluge_rpc), send_pushover,
+                                            _reported_library_audit, dry_run=dry_run)
+
+
+def _library_has_file(t):
+    """True only when every file of the torrent is verifiably hardlinked
+    (nlink > 1) as seen through DELUGE_PATH_MAP; anything unreadable -> False
+    (files are kept)."""
+    paths = episode_retention.file_paths(t)
+    if not paths:
+        return False
+    for p in paths:
+        local = _deluge_to_local(p)
+        if not local or not os.path.isfile(local) or os.stat(local).st_nlink < 2:
+            return False
+    return True
+
+
+def episode_retention_run(env=None):
+    deluge_login()
+    torrents = _deluge_rpc('core.get_torrents_status', [{}, episode_retention.FIELDS]) or {}
+    return episode_retention.episode_retention(torrents, remove_torrent, _library_has_file, env=env)
+
+
+@app.route('/library-seed-audit', methods=['GET'])
+def library_seed_audit_route():
+    # Report only: a GET never sends Pushover; the 6h tick does.
+    return jsonify(library_seed_audit(dry_run=True)), 200
+
+
+@app.route('/episode-retention', methods=['GET'])
+def episode_retention_route():
+    # Always a dry-run report, whatever EPISODE_RETENTION_APPLY says.
+    env = {k: v for k, v in os.environ.items() if k != 'EPISODE_RETENTION_APPLY'}
+    return jsonify(episode_retention_run(env=env)), 200
+
+
 # ── Duplicate media folder scan ──────────────────────────────────────────────
 # When a new torrent lands for content that already has a library folder, the
 # import can end up beside the existing folder instead of replacing it,
@@ -7397,6 +7453,14 @@ def maintenance_scheduler():
             duplicate_folder_scan()
         except Exception as e:
             log.error(f'Duplicate folder scan failed: {e}')
+        try:
+            library_seed_audit()
+        except Exception as e:
+            log.error(f'Library seed audit failed: {e}')
+        try:
+            episode_retention_run()
+        except Exception as e:
+            log.error(f'Episode retention failed: {e}')
         time.sleep(DELUGE_REPAIR_INTERVAL)
 
 
