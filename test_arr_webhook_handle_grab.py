@@ -63,10 +63,10 @@ def test_blank_or_missing_label_gets_sonarr_before_priority(monkeypatch):
     for status in ({'label': ''}, {'label': None}, {'progress': 0.0}):
         w = World(monkeypatch, dict(status))
         aw.handle_grab(_grab(), 'Sonarr')
-        assert w.labels == [('abc123', 'sonarr')], status
+        assert w.labels == [('abc123', 'sonarr')]
         kinds = [e[0] for e in w.events]
-        assert kinds.index('label') < kinds.index('prioritize'), status
-        assert ('ensure', 'sonarr') in w.events[:kinds.index('label')], status
+        assert kinds.index('label') < kinds.index('prioritize')
+        assert ('ensure', 'sonarr') in w.events[:kinds.index('label')]
 
 
 def test_unregistered_torrent_is_not_labeled_and_never_raises(monkeypatch):
@@ -80,7 +80,7 @@ def test_non_empty_label_is_never_overridden(monkeypatch):
     for existing in ('sonarr', 'sonarr-upgrade', 'tv-custom'):
         w = World(monkeypatch, {'label': existing})
         aw.handle_grab(_grab(), 'Sonarr')
-        assert w.labels == [], existing
+        assert w.labels == []
         assert w.status['label'] == existing
 
 
