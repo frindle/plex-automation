@@ -7,8 +7,9 @@ aw = __import__('arr-webhook')
 @pytest.fixture
 def client(monkeypatch):
     aw.app.config['PROPAGATE_EXCEPTIONS'] = True
+    mp = monkeypatch
     calls = []
-    monkeypatch.setattr(aw, 'deluge_login', lambda: calls.append(('login', None)))
+    mp.setattr(aw, 'deluge_login', lambda: calls.append(('login', None)))
     box = {'result': {'h1': {'name': 'a', 'label': 'sonarr', 'state': 'Seeding', 'progress': 100.0,
                              'seeding_time': 0, 'save_path': '/data/Downloads/Complete'}}}
 
@@ -16,7 +17,7 @@ def client(monkeypatch):
         calls.append((method, params))
         return box['result']
 
-    monkeypatch.setattr(aw, '_deluge_rpc', rpc)
+    mp.setattr(aw, '_deluge_rpc', rpc)
     return aw.app.test_client(), calls, box
 
 
