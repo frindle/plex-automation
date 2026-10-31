@@ -3706,6 +3706,34 @@ def prioritize_new_grab(source, download_id):
         log.error(f"{source}: failed to prioritize new grab {download_id}: {e}")
 
 
+
+def label_blank_sonarr_grab(download_id):
+    """Label a Sonarr grab that has an empty or missing Deluge label as
+    'sonarr'. Polls get_torrent_status until the torrent appears, then sets
+    the label only if it is blank/missing/whitespace. Never raises."""
+    try:
+        deluge_login()
+        for attempt in range(max(1, GRAB_PRIORITIZE_TRIES)):
+            status = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.get_torrent_status', 'params': [download_id, ['label']], 'id': 93},
+                timeout=10,
+            ).json().get('result') or {}
+            if status:
+                break
+            if attempt + 1 < GRAB_PRIORITIZE_TRIES:
+                time.sleep(GRAB_PRIORITIZE_DELAY)
+        else:
+            log.warning(f'Sonarr: grab {download_id} never registered in Deluge, not labeling')
+            return
+        lbl = status.get('label')
+        if not lbl or not str(lbl).strip():
+            ensure_label_exists_named('sonarr')
+            set_torrent_label(download_id, 'sonarr')
+    except Exception as e:
+        log.error(f'Sonarr: failed to label blank grab {download_id}: {e}')
+
+
 def handle_grab(data, source):
     """
     Fires when Sonarr/Radarr sends a grab to Deluge.
@@ -3716,6 +3744,10 @@ def handle_grab(data, source):
     if not download_id:
         log.warning(f"{source}: On Grab but no downloadId, skipping")
         return
+
+    # Label blank/missing Sonarr categories before any upgrade logic
+    if source == 'Sonarr':
+        label_blank_sonarr_grab(download_id)
 
     # Check if this is an upgrade via API since isUpgrade is not in Grab payload
     if source == 'Sonarr':
