@@ -72,3 +72,8 @@ def test_library_seed_lazy_fetch_files_path():
     assert [h for h, _ in calls] == ["a"], r
     assert calls[0][1] is False
     assert r["kept"]["season-pack"] == 2, r
+
+
+def test_module_docstring_mentions_library_seed():
+    doc = E.__doc__ or ""
+    assert "library-seed" in doc and "/data/Media" in doc and "Sonarr" in doc, doc
