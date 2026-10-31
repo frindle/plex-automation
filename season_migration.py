@@ -142,8 +142,8 @@ def migrate_op(rpc, torrent_hash, t, seeding_dir=SEEDING_DIR, run=subprocess.run
             return False
 
         # 6) Force recheck and resume
-        rpc('core.force_recheck', [torrent_hash])
-        rpc('core.resume_torrent', [torrent_hash])
+        rpc('core.force_recheck', [[torrent_hash]])
+        rpc('core.resume_torrent', [[torrent_hash]])
         return True
 
     return op
