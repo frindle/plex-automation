@@ -7546,7 +7546,9 @@ def library_seed_audit_route():
 
 @app.route('/torrent-breakdown', methods=['GET'])
 def torrent_breakdown_route():
-    raise NotImplementedError('not implemented: torrent_breakdown_route')
+    deluge_login()
+    torrents = _deluge_rpc('core.get_torrents_status', [{}, torrent_breakdown.FIELDS]) or {}
+    return jsonify(torrent_breakdown.breakdown(torrents)), 200
 
 
 @app.route('/episode-retention', methods=['GET'])
