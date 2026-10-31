@@ -1,6 +1,8 @@
 """Episode torrent retention: keep seeding season packs, drop single-episode
-Sonarr torrents once they have seeded SEED_DAYS. Movies are never touched;
-anything ambiguous counts as a season pack.
+Sonarr or exactly `library-seed` torrents once they have seeded SEED_DAYS.
+Single-episode torrents labeled `library-seed` under /data/Media keep their
+files (entry removed only). Movies are never touched; anything ambiguous
+counts as a season pack.
 
 Data is deleted only when every file is outside /data/Media AND the library
 already holds the episode (library_has_file); otherwise the torrent entry is
@@ -25,7 +27,8 @@ def classify(t):
     label = (t.get('label') or '').lower()
     if label.startswith('radarr'):
         return 'movie'
-    if not label.startswith('sonarr'):
+    tracked = label.startswith('sonarr') or label == 'library-seed'
+    if not tracked:
         return 'other'
     videos = [f.get('path') or '' for f in (t.get('files') or [])
               if (f.get('path') or '').lower().endswith(VIDEO_EXT)]
@@ -64,12 +67,13 @@ def per_run_limit(env):
 
 
 def classify_light(t):
-    """classify() without the (heavy) "files" field: a Sonarr torrent whose name
-    has an episode marker is only a *candidate* 'episode'."""
+    """classify() without the (heavy) "files" field: a Sonarr or library-seed
+    torrent whose name has an episode marker is only a *candidate* 'episode'."""
     label = (t.get('label') or '').lower()
     if label.startswith('radarr'):
         return 'movie'
-    if not label.startswith('sonarr'):
+    tracked = label.startswith('sonarr') or label == 'library-seed'
+    if not tracked:
         return 'other'
     return 'episode' if EPISODE_RE.search(t.get('name') or '') else 'season-pack'
 
