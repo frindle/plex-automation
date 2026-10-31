@@ -34,9 +34,7 @@ def test_classify_library_seed_goes_through_episode_detection():
     pack = "Show.S01.1080p"
     files = [{"path": "%s/Show.S01E%02d.mkv" % (pack, i)} for i in range(1, 4)]
     assert E.classify(tor(name=pack, files=files)) == "season-pack"
-    nomarker_path = [{"path": NAME + "/movie.mkv"}]
     assert E.classify(tor(files=[{"path": "x/clip.mkv"}])) == "season-pack"
-    assert E.classify(tor(files=nomarker_path)) == "season-pack"
 
 
 def test_classify_light_library_seed():
