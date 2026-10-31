@@ -14,6 +14,7 @@ from flask import Flask, request, jsonify
 
 from media_share import share_bp, init_db as init_share_db
 import episode_retention
+import torrent_breakdown
 import library_audit
 import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
 
@@ -7541,6 +7542,13 @@ def episode_retention_tick():
 def library_seed_audit_route():
     # Report only: a GET never sends Pushover; the 6h tick does.
     return jsonify(library_seed_audit(dry_run=True)), 200
+
+
+@app.route('/torrent-breakdown', methods=['GET'])
+def torrent_breakdown_route():
+    deluge_login()
+    torrents = _deluge_rpc('core.get_torrents_status', [{}, torrent_breakdown.FIELDS]) or {}
+    return jsonify(torrent_breakdown.breakdown(torrents)), 200
 
 
 @app.route('/episode-retention', methods=['GET'])
