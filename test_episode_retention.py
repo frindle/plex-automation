@@ -109,7 +109,7 @@ CASES = [
      lambda: removed({'m': EP(label='radarr-upgrade', name='Film.S01E01')}), []),
     ("ambiguous: no files list -> season pack, kept", lambda: removed({'x': EP(files=[])}), []),
     ("ambiguous: two video files -> kept",
-     lambda: removed({'x': EP(files=[{'path': 'a/Show.S01E05.mkv'}, {'path': 'a/sample.mkv'}])}), []),
+     lambda: removed({'x': EP(files=[{'path': 'a/Show.S01E05.mkv'}, {'path': 'a/Show.S01E06.mkv'}])}), []),
     ("ambiguous: episode name but file lacks SxxEyy -> kept",
      lambda: removed({'x': EP(files=[{'path': 'a/show-105.mkv'}])}), []),
     ("ambiguous: season name, one episode file -> kept",
