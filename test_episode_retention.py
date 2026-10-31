@@ -50,7 +50,7 @@ def removed(torrents, **kw):
 
 def c_kept_counts():
     r, calls = run({'a': PACK(), 'b': EP(label='radarr', name='Film.2020.S01E01'), 'c': EP(label=''),
-                    'd': EP(label='library-seed'), 'e': EP(progress=99.5), 'f': EP(days=3), 'g': EP()})
+                    'd': EP(label='library-seeds'), 'e': EP(progress=99.5), 'f': EP(days=3), 'g': EP()})
     return r['kept'], calls, [e['hash'] for e in r['removed']]
 
 
@@ -119,8 +119,8 @@ CASES = [
      [('e', True)]),
     ("sonarr-upgrade-recent label counts as sonarr",
      lambda: removed({'e': EP(label='Sonarr-Upgrade-Recent')}), [('e', True)]),
-    ("unlabelled / library-seed never touched",
-     lambda: removed({'a': EP(label=''), 'b': EP(label='library-seed'), 'c': EP(label=None)}), []),
+    ("unlabelled / non-sonarr labels never touched",
+     lambda: removed({'a': EP(label=''), 'b': EP(label='library-seeds'), 'c': EP(label=None)}), []),
     ("incomplete episode kept", lambda: removed({'e': EP(progress=99.9)}), []),
     ("missing progress / seeding_time -> kept",
      lambda: removed({'a': EP(progress=None), 'b': dict(EP(), seeding_time=None)}), []),
