@@ -30,8 +30,19 @@ def classify(t):
     tracked = label.startswith('sonarr') or label == 'library-seed'
     if not tracked:
         return 'other'
-    videos = [f.get('path') or '' for f in (t.get('files') or [])
-              if (f.get('path') or '').lower().endswith(VIDEO_EXT)]
+    videos = []
+    for f in (t.get('files') or []):
+        fp = f.get('path') or ''
+        if not fp.lower().endswith(VIDEO_EXT):
+            continue
+        parts = fp.split('/')
+        # Skip if any directory component (all but last) equals 'sample' case-insensitive
+        if any(p.lower() == 'sample' for p in parts[:-1]):
+            continue
+        # Skip if basename starts with 'sample' (case-insensitive)
+        if parts[-1].lower().startswith('sample'):
+            continue
+        videos.append(fp)
     if len(videos) == 1 and EPISODE_RE.search(t.get('name') or '') and EPISODE_RE.search(videos[0]):
         return 'episode'
     return 'season-pack'
