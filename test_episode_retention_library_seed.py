@@ -76,4 +76,4 @@ def test_library_seed_lazy_fetch_files_path():
 
 def test_module_docstring_mentions_library_seed():
     doc = E.__doc__ or ""
-    assert "library-seed" in doc and "/data/Media" in doc and "Sonarr" in doc, doc
+    assert doc.count("library-seed") >= 2 and "/data/Media" in doc and "Sonarr" in doc, doc
