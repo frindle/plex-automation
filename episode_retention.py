@@ -22,6 +22,8 @@ VIDEO_EXT = ('.mkv', '.mp4', '.avi', '.m4v', '.ts', '.wmv')
 EPISODE_RE = re.compile(r'(?i)\bS\d{1,2}E\d{1,3}\b')
 FIELDS = ['name', 'label', 'state', 'progress', 'seeding_time', 'save_path']  # "files" is fetched per candidate, see episode_retention()
 
+DEFERRED = 'deferred'
+
 
 def classify(t):
     label = (t.get('label') or '').lower()
@@ -96,7 +98,7 @@ def episode_retention(torrents, remove, library_has_file, env=None, fetch_files=
     apply = env.get('EPISODE_RETENTION_APPLY', '0') == '1'
     limit = per_run_limit(env)
     result = {'dry_run': not apply, 'limit': limit, 'paused': False, 'capped': False,
-              'removed': [], 'planned': [], 'errors': [],
+              'removed': [], 'planned': [], 'deferred': [], 'errors': [],
               'kept': {'season-pack': 0, 'movie': 0, 'other': 0, 'incomplete': 0, 'too-young': 0}}
     if any((t or {}).get('state') == 'Error' for t in torrents.values()):
         result['paused'] = True
@@ -130,9 +132,12 @@ def episode_retention(torrents, remove, library_has_file, env=None, fetch_files=
             result['planned'].append(entry)
             continue
         try:
-            remove(h, entry['remove_data'])
+            ret = remove(h, entry['remove_data'])
         except Exception as e:
             result['errors'].append({'hash': h, 'error': str(e)})
             break
-        result['removed'].append(entry)
+        if ret == DEFERRED:
+            result['deferred'].append(entry)
+        else:
+            result['removed'].append(entry)
     return result
