@@ -141,7 +141,7 @@ def test_remove_library_seed_info_none():
     assert removes == [['H', False]]
     assert acts() == ['library-guard']
     get_cs = called('core.get_torrent_status')
-    assert get_cs == [['H', ['tracker_status', 'seeding_time', 'save_path']]]
+    assert len(get_cs) == 1 and get_cs[0][0] == 'H' and {'seeding_time', 'save_path', 'progress', 'total_uploaded', 'is_finished'} <= set(get_cs[0][1]), get_cs
 
 def test_remove_library_seed_caller_info_no_save_path():
     """remove_torrent library-seed, caller passes info without save_path."""
@@ -190,18 +190,16 @@ def test_remove_downloads_low_seed_time():
                  'tracker_status': 'Error: Unregistered torrent'}})
     aw.remove_torrent('H')
     removes = called('core.remove_torrent')
-    assert removes == [['H', False]]
-    assert acts() == ['hnr-guard']
+    assert removes == []
+    assert acts() == ['seed-floor']
 
 def test_remove_library_seed_remove_data_false():
     """remove_torrent with remove_data=False on a library path."""
-    setup({'H': {'save_path': '/data/Media/Movies/X (2020)'}})
+    setup({'H': {'save_path': '/data/Media/Movies/X (2020)', 'seeding_time': 60*86400}})
     aw.remove_torrent('H', remove_data=False)
     removes = called('core.remove_torrent')
     assert removes == [['H', False]]
     assert acts() == []
-    get_cs = called('core.get_torrent_status')
-    assert get_cs == []
     get_ts = called('core.get_torrents_status')
     assert get_ts == []
 

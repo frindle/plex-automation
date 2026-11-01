@@ -78,12 +78,11 @@ def test_logs_removal_with_caller_name_hash_and_reason():
     assert isinstance(c['reason'], str) and c['reason'], c
 
 
-def test_seed_obligation_downgrade_is_logged_as_files_kept():
-    setup({'save_path': DOWNLOADS, 'seeding_time': 3600})
-    cleanup_probe('HASH2')
-    assert len(calls()) == 1, calls()
-    assert calls()[0]['extra'].get('remove_data') is False, calls()[0]
-    assert calls()[0]['hash'] == 'HASH2', calls()[0]
+def test_seed_floor_deferral_removes_and_logs_nothing():
+    setup({'save_path': DOWNLOADS, 'seeding_time': 3600, 'progress': 100, 'total_uploaded': 5, 'is_finished': True})
+    assert cleanup_probe('HASH2') == aw.DEFERRED
+    assert [m for m, p in RPC if m == 'core.remove_torrent'] == [], RPC
+    assert calls() == [], calls()
 
 
 def test_name_comes_from_caller_supplied_info():
@@ -97,12 +96,13 @@ def test_name_comes_from_caller_supplied_info():
     assert calls()[0]['name'] is None, calls()[0]
 
 
-def test_remove_data_false_is_logged_without_status_fetch():
-    setup()
-    cleanup_probe('HASH5', remove_data=False)
-    assert [m for m, p in RPC if m == 'core.get_torrent_status'] == [], RPC
+def test_remove_data_false_still_checks_seed_time_and_logs_name():
+    setup({'name': 'Show.S01E01', 'seeding_time': OLD_ENOUGH})
+    assert cleanup_probe('HASH5', remove_data=False) is True
+    assert [m for m, p in RPC if m == 'core.get_torrent_status'] != [], RPC
     assert len(calls()) == 1, calls()
     assert calls()[0]['hash'] == 'HASH5' and calls()[0]['extra'].get('remove_data') is False, calls()[0]
+    assert calls()[0]['name'] == 'Show.S01E01', calls()[0]
 
 
 def test_failed_removal_is_not_logged():
@@ -118,9 +118,9 @@ def test_failed_removal_is_not_logged():
 
 TESTS = [
     test_logs_removal_with_caller_name_hash_and_reason,
-    test_seed_obligation_downgrade_is_logged_as_files_kept,
+    test_seed_floor_deferral_removes_and_logs_nothing,
     test_name_comes_from_caller_supplied_info,
-    test_remove_data_false_is_logged_without_status_fetch,
+    test_remove_data_false_still_checks_seed_time_and_logs_name,
     test_failed_removal_is_not_logged,
 ]
 

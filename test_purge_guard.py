@@ -37,7 +37,8 @@ def fake_post(self, url, json=None, timeout=None, **kw):
     if method == 'core.remove_torrent' and params[0] in STATE['fail_hashes']:
         raise requests.ConnectionError('deluge down')
     if method == 'core.get_torrent_status':
-        return Resp({'result': {'save_path': '/data/Downloads/Complete', 'seeding_time': 0}})
+        return Resp({'result': {'save_path': '/data/Downloads/Complete', 'seeding_time': 0, 'progress': 0,
+                                'total_uploaded': 0, 'is_finished': False}})
     return Resp({'result': None})
 
 

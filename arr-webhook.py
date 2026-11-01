@@ -717,14 +717,33 @@ def supersede_torrent(torrent_hash):
                         f'torrent {torrent_hash} superseded with no local data — '
                         f'not moved (orphan avoided; reaped by cleanup)')
 
+DEFERRED = 'deferred'
 def remove_torrent(torrent_hash, remove_data=True, info=None):
+    # Pre-fetch: get status when we lack key fields, even for remove_data=False.
+    _i = info or {}
+    if (info is not None or not remove_data):
+        _missing_fields = [k for k in ('progress', 'total_uploaded', 'is_finished') if k not in _i]
+        if (not _i.get('seeding_time') or _i.get('seeding_time', 0) < SEED_DAYS * 86400) and _missing_fields:
+            try:
+                resp = session.post(
+                    f'{DELUGE_URL}/json',
+                    json={'method': 'core.get_torrent_status',
+                          'params': [torrent_hash, ['name', 'tracker_status', 'seeding_time', 'save_path', 'progress', 'total_uploaded', 'is_finished']], 'id': 9},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                fetched = resp.json().get('result') or {}
+                info = {**fetched, **_i}  # caller values win
+            except Exception as e:
+                log.warning(f'{torrent_hash}: status fetch failed ({e}); keeping provided info'); info = _i  # noqa: E702
+
     if remove_data:
         if info is None:
             try:
                 resp = session.post(
                     f'{DELUGE_URL}/json',
                     json={'method': 'core.get_torrent_status',
-                          'params': [torrent_hash, ['tracker_status', 'seeding_time', 'save_path']], 'id': 8},
+                          'params': [torrent_hash, ['name', 'tracker_status', 'seeding_time', 'save_path', 'progress', 'total_uploaded', 'is_finished']], 'id': 8},
                     timeout=10,
                 )
                 resp.raise_for_status()
@@ -737,18 +756,26 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
                 sp = _torrent_save_path(torrent_hash)
                 if sp is not None:
                     info = {**info, 'save_path': sp}
+    # Seed floor: no removal path may drop entry before SEED_DAYS days.
+    st = info.get('seeding_time')
+    never = (st == 0 and info.get('total_uploaded', 0) == 0
+             and info.get('is_finished') is False
+             and 'progress' in info and info.get('progress', 100) < 100)
+    if st is None or (st < SEED_DAYS * 86400 and not never):
+        name = (info or {}).get('name')
+        days = round(st / 86400, 1) if st is not None else None
+        log.warning(f'Seed floor {torrent_hash} ({name}): seeded {days}d < {SEED_DAYS}d (or unknown) - removal deferred')
+        record_activity('seed-floor', f'torrent {torrent_hash} ({name}) deferred - {days}d < {SEED_DAYS}d')
+        return DEFERRED
+
+    if remove_data:
         # Library-seed guard: before HnR check, block data-delete for library paths.
         if is_library_path(info.get('save_path')):
             save_path = info['save_path']
             log.warning(f'Library-seed guard {torrent_hash}: seed obligation skipped (library {save_path}) — keeping files')
             record_activity('library-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (library save_path {save_path})')
             remove_data = False
-        else:
-            seeding_time = info.get('seeding_time') or 0
-            if seeding_time < SEED_DAYS * 86400:
-                log.warning(f'HnR guard {torrent_hash}: seed obligation unmet (seeded {seeding_time}s < {SEED_DAYS}d) — removing entry only, keeping files')
-                record_activity('hnr-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (seed obligation unmet: seeded {seeding_time}s < {SEED_DAYS * 86400}s)')
-                remove_data = False
+
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={'method': 'core.remove_torrent', 'params': [torrent_hash, remove_data], 'id': 7},
@@ -759,7 +786,8 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
     log.info(f'Removed torrent {torrent_hash}' + (' and deleted files' if remove_data else ' (files left on disk)'))
     log_removal(traceback.extract_stack(limit=2)[0].name, torrent_hash, (info or {}).get('name'),
                 'files deleted' if remove_data else 'files kept',
-                {'remove_data': remove_data, **({'seeding_time_s': info['seeding_time']} if (info or {}).get('seeding_time') is not None else {})})
+                {'remove_data': remove_data, 'seeding_days': round(info['seeding_time'] / 86400, 1) if (info or {}).get('seeding_time') is not None else None, **({'seeding_time_s': info['seeding_time']} if (info or {}).get('seeding_time') is not None else {})})
+    return True
 
 ALL_TORRENT_FIELDS = ['name', 'label', 'save_path', 'seeding_time', 'active_time', 'is_finished', 'progress', 'state', 'total_uploaded', 'total_seeds', 'tracker_status']
 DELUGE_BULK_TIMEOUT = 45   # all-torrent pulls on a ~1700-torrent client are slow; don't abandon them early
@@ -936,8 +964,9 @@ def cleanup_superseded():
                 continue
             if info.get('seeding_time', 0) >= threshold_seconds:
                 log.info(f'Cleanup: removing {info.get("name")} (seeded {info["seeding_time"]/86400:.1f} days)')
-                remove_torrent(torrent_hash)
-                removed += 1
+                r = remove_torrent(torrent_hash)
+                if r != DEFERRED:
+                    removed += 1
                 continue
             # Orphan reaper: a superseded torrent stuck at 0% with no data on
             # disk never accrues seeding_time, so the seed-window gate above can
@@ -950,7 +979,9 @@ def cleanup_superseded():
                     and not _torrent_has_local_data(torrent_hash):
                 log.info(f'Cleanup: removing 0% superseded orphan {info.get("name")} '
                          f'(no local data — would never meet the seed window)')
-                remove_torrent(torrent_hash, remove_data=False)
+                r = remove_torrent(torrent_hash, remove_data=False)
+                if r == DEFERRED:
+                    continue
                 record_activity('cleanup',
                                 f'Removed superseded orphan "{info.get("name")}" (no data on disk)')
                 removed += 1
@@ -990,8 +1021,9 @@ def purge_queued_superseded(targets):
     removed, failed = 0, []
     for t in targets:
         try:
-            remove_torrent(t['hash'], info={'name': t.get('name'), 'seeding_time': t.get('seeding_time') or 0})
-            removed += 1
+            r = remove_torrent(t['hash'], info={'name': t.get('name'), 'seeding_time': t.get('seeding_time') or 0})
+            if r != DEFERRED:
+                removed += 1
         except Exception as e:
             failed.append({'hash': t['hash'], 'error': str(e)})
     return removed, failed
@@ -2128,8 +2160,10 @@ def cleanup_unpacked_torrents():
             age = now - state[h].get('first_seen_rar_at', now)
             if age >= threshold:
                 log.info(f'[unpack] removing rar-torrent aged {age/86400:.1f}d: {state[h].get("name")}')
+                r = remove_torrent(h)
+                if r == DEFERRED:
+                    continue
                 record_activity('cleanup', f'Removed rar-torrent "{state[h].get("name")}" (aged {age/86400:.1f}d past the {SEED_DAYS}-day window)')
-                remove_torrent(h)
                 state.pop(h, None)
                 removed += 1
         _save_unpack_state(state)
@@ -2271,7 +2305,9 @@ def cleanup_stalled_seeds(dry_run=False):
                 'swarm_seeds': swarm_seeds,
             })
             if not dry_run:
-                remove_torrent(h, remove_data=False)
+                r = remove_torrent(h, remove_data=False)
+                if r == DEFERRED:
+                    continue
                 state.pop(h, None)
             removed += 1
         if not dry_run:
@@ -4266,10 +4302,10 @@ def purge_stalled_upgrade_torrents(label=RADARR_UPG_LABEL):
                 else:
                     log.info(f'Skipping in-progress upgrade: {i.get("name")} ({total_done/1024/1024:.1f}MB downloaded)')
         if to_remove:
-            for _h in to_remove:
-                remove_torrent(_h, remove_data=False)
-            log.info(f'Purged {len(to_remove)} stalled upgrade torrents')
-            record_activity('cleanup', f'Purged {len(to_remove)} stalled {label} torrent(s) (< 5MB downloaded, not queued)')
+            purged = [_h for _h in to_remove if remove_torrent(_h, remove_data=False) != DEFERRED]
+            log.info(f'Purged {len(purged)} stalled upgrade torrents')
+            if purged:
+                record_activity('cleanup', f'Purged {len(purged)} stalled {label} torrent(s) (< 5MB downloaded, not queued)')
         else:
             log.info('No stalled upgrade torrents to purge')
     except Exception as e:
@@ -4736,6 +4772,7 @@ def purge_non_radarr():
             keep_healthy.append(h)
 
     removed = 0
+    deferred = 0
     errors = []
     if apply_:
         # Remove with data. Batch in chunks so we don't hammer Deluge.
@@ -4745,11 +4782,14 @@ def purge_non_radarr():
             chunk = hashes[i:i + BATCH]
             for h in chunk:
                 try:
-                    remove_torrent(h)
-                    removed += 1
+                    r = remove_torrent(h)
+                    if r == DEFERRED:
+                        deferred += 1
+                    else:
+                        removed += 1
                 except Exception as e:
                     errors.append({'hash': h, 'error': str(e)})
-        log.info(f'purge-non-radarr: removed {removed}, {len(errors)} errors')
+        log.info(f'purge-non-radarr: removed {removed}, {deferred} deferred, {len(errors)} errors')
 
     return jsonify({
         'ok': True,
@@ -4758,6 +4798,7 @@ def purge_non_radarr():
         'purge_count': len(to_purge),
         'keep_count': len(keep_healthy),
         'removed': removed,
+        'deferred': deferred,
         'error_count': len(errors),
         'purge_sample': to_purge[:20],  # first 20 for preview; full list too big to dump
         'purge_total_gb': round(sum(t['size_gb'] for t in to_purge), 2),
@@ -6856,7 +6897,10 @@ def torrent_purge():
         result['note'] = 'dry-run — pass ?apply=1 to remove torrent + files'
         return jsonify({'ok': True, 'apply': False, 'target': result}), 200
     try:
-        remove_torrent(torrent_hash)
+        r = remove_torrent(torrent_hash)
+        if r == DEFERRED:
+            result['result'] = f'deferred: seed floor ({SEED_DAYS}d) not met, torrent kept'
+            return jsonify({'ok': True, 'apply': True, 'deferred': True, 'target': result}), 200
         record_activity('cleanup', f'Manually purged "{info.get("name")}" via /torrent-purge (label: {info.get("label")})')
         result['result'] = 'removed torrent + files'
     except Exception as e:
