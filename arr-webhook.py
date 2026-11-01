@@ -2581,9 +2581,11 @@ def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
     try:
         deluge_login()
         torrents = get_all_torrents(force=True)
+        deluge_ok = True
     except Exception as e:
         log.warning(f'Radarr queue dedupe: Deluge unreachable, queue-only pass: {e}')
         torrents = {}
+        deluge_ok = False
     for h, info in torrents.items():
         if info.get('label') != RADARR_UPG_LABEL:
             continue
@@ -2649,6 +2651,9 @@ def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
                     else:
                         log.info(f'[dry-run] Radarr queue: would remove duplicate "{item["title"]}" (score: {item["score"]})')
                     removed += 1
+                elif not deluge_ok and item['source'] == 'queue':
+                    log.warning(f'Radarr queue: seeding state unknown, deferring "{item["title"]}" (score: {item["score"]})')
+                    continue
                 elif item['source'] == 'queue' and already_in_deluge:
                     # Only drop queue record and supersede if the keeper was actually imported.
                     if _keeper_import_confirmed(RADARR_URL, RADARR_API_KEY, best['hash']):
@@ -2885,9 +2890,11 @@ def cleanup_sonarr_queue_dupes(series_id=None, dry_run=False):
     try:
         deluge_login()
         torrents = get_all_torrents(force=True)
+        deluge_ok = True
     except Exception as e:
         log.warning(f'Sonarr queue dedupe: Deluge unreachable, queue-only pass: {e}')
         torrents = {}
+        deluge_ok = False
     for h, info in torrents.items():
         if info.get('label') != SONARR_UPG_LABEL:
             continue
@@ -2960,6 +2967,9 @@ def cleanup_sonarr_queue_dupes(series_id=None, dry_run=False):
                     else:
                         log.info(f'[dry-run] Sonarr queue: would remove duplicate "{item["title"]}" '
                                  f'({eps} ep(s), score: {item["score"]}) — covered by "{keeper["title"]}"')
+                elif not deluge_ok and item["source"] == "queue":
+                    log.warning(f"Sonarr queue: seeding state unknown, deferring \"{item['title']}\" ({eps} ep(s), score: {item['score']})")
+                    continue
                 elif item['source'] == 'queue' and already_in_deluge:
                     log.info(f'Sonarr queue: dropping stuck queue record for already-downloaded duplicate "{item["title"]}" '
                              f'({eps} ep(s), score: {item["score"]}) — superseding torrent instead of removing from client')
