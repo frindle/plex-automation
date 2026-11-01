@@ -15,8 +15,17 @@ def deluge_login():
     s.post(f'{DELUGE_URL}/json', json={'method':'auth.login','params':[DELUGE_PASSWORD],'id':1})
 
 def get_torrents():
-    r = s.post(f'{DELUGE_URL}/json', json={'method':'core.get_torrents_status','params':[{},['name','label','total_done']],'id':2})
+    r = s.post(f'{DELUGE_URL}/json', json={'method':'core.get_torrents_status','params':[{},['name','label','total_done','seeding_time','total_uploaded','is_finished','progress']],'id':2})
     return r.json().get('result', {})
+
+def is_never_seeded(info):
+    for key in ('seeding_time', 'total_uploaded', 'is_finished', 'progress'):
+        if key not in info:
+            return False
+    return (info['seeding_time'] == 0
+            and info['total_uploaded'] == 0
+            and info['is_finished'] is False
+            and info['progress'] < 100)
 
 # Step 1: Purge stalled upgrades
 print('Step 1: Purging stalled radarr-upgrade torrents...')
@@ -26,8 +35,11 @@ to_remove = []
 removed = 0
 for h,i in torrents.items():
     if i.get('label') == RADARR_UPG_LABEL and i.get('total_done', 0) < 5*1024*1024:
-        print(f'  Purging: {i["name"]} ({i["total_done"]/1024/1024:.1f}MB)')
-        to_remove.append(h)
+        if is_never_seeded(i):
+            print(f'  Purging: {i["name"]} ({i["total_done"]/1024/1024:.1f}MB)')
+            to_remove.append(h)
+        else:
+            print(f'  Skipping (seed floor): {i["name"]} ({i["total_done"]/1024/1024:.1f}MB)')
     elif i.get('label') == RADARR_UPG_LABEL:
         print(f'  Skipping in-progress: {i["name"]} ({i["total_done"]/1024/1024:.1f}MB)')
 if to_remove:
