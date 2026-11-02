@@ -156,5 +156,84 @@ def test_radarr_lane_movie_ids_maps_both_lane_labels(monkeypatch):
     monkeypatch.setattr(target, 'deluge_login', lambda: None)
     monkeypatch.setattr(target, 'get_all_torrents', lambda force=False: torrents)
     ids = {'aaa': 11, 'bbb': 22, 'ccc': 33, 'ddd': None}
-    monkeypatch.setattr(target, '_radarr_grab_identity', lambda h: (ids[h], 0))
+    monkeypatch.setattr(target, '_radarr_grab_identity', lambda h, strict=False: (ids[h], 0))
     assert target.radarr_lane_movie_ids() == {11, 22}
+
+
+def test_radarr_lane_movie_ids_fails_closed_on_history_error(monkeypatch):
+    import pytest
+    torrents = {'aaa': {'label': target.RADARR_UPG_LABEL}}
+    monkeypatch.setattr(target, 'deluge_login', lambda: None)
+    monkeypatch.setattr(target, 'get_all_torrents', lambda force=False: torrents)
+    monkeypatch.setattr(target, 'RADARR_API_KEY', 'k')
+
+    def boom(*a, **kw):
+        raise RuntimeError('radarr down')
+    monkeypatch.setattr(target.requests, 'get', boom)
+    with pytest.raises(RuntimeError):
+        target.radarr_lane_movie_ids()
+
+
+def _sonarr_bulk_setup(monkeypatch, lane_ids, series_ids=(1, 2, 3, 4)):
+    posted = []
+    saved = []
+
+    class Resp:
+        def __init__(self, payload):
+            self._p = payload
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return self._p
+
+    monkeypatch.setattr(target.requests, 'get',
+                        lambda url, **kw: Resp([{'id': i, 'monitored': True, 'year': 2020} for i in series_ids]))
+    monkeypatch.setattr(target.requests, 'post', lambda url, **kw: (posted.append(kw['json']), Resp({'id': 7}))[1])
+    monkeypatch.setattr(target, '_load_upgrade_state', lambda: {})
+    monkeypatch.setattr(target, '_save_upgrade_state', lambda st: saved.append(st))
+    monkeypatch.setattr(target, 'UPGRADE_BATCH_SIZE', 10)
+    if isinstance(lane_ids, Exception):
+        def boom():
+            raise lane_ids
+        monkeypatch.setattr(target, 'sonarr_lane_series_ids', boom)
+    else:
+        monkeypatch.setattr(target, 'sonarr_lane_series_ids', lambda: set(lane_ids))
+    return posted, saved
+
+
+def test_sonarr_bulk_search_skips_series_already_in_lane(monkeypatch):
+    posted, saved = _sonarr_bulk_setup(monkeypatch, {2, 3})
+    target.sonarr_bulk_search()
+    assert sorted(p['seriesId'] for p in posted) == [1, 4]
+    assert saved
+
+
+def test_sonarr_bulk_search_fails_closed_when_lane_unreadable(monkeypatch):
+    posted, saved = _sonarr_bulk_setup(monkeypatch, RuntimeError('deluge down'))
+    target.sonarr_bulk_search()
+    assert posted == []
+    assert saved == []
+
+
+def test_sonarr_lane_series_ids_maps_both_labels_and_fails_closed(monkeypatch):
+    import pytest
+    torrents = {
+        'aaa': {'label': target.SONARR_UPG_LABEL},
+        'bbb': {'label': target.SONARR_UPG_PRIORITY_LABEL},
+        'ccc': {'label': 'sonarr'},
+    }
+    monkeypatch.setattr(target, 'deluge_login', lambda: None)
+    monkeypatch.setattr(target, 'get_all_torrents', lambda force=False: torrents)
+    ids = {'aaa': 11, 'bbb': 22, 'ccc': 33}
+    monkeypatch.setattr(target, '_sonarr_grab_identity',
+                        lambda h, strict=False: (ids[h], frozenset({1}), 0))
+    assert target.sonarr_lane_series_ids() == {11, 22}
+
+    monkeypatch.setattr(target, 'SONARR_API_KEY', 'k')
+    monkeypatch.undo()
+    monkeypatch.setattr(target, 'deluge_login', lambda: None)
+    monkeypatch.setattr(target, 'get_all_torrents', lambda force=False: torrents)
+    monkeypatch.setattr(target, 'SONARR_API_KEY', 'k')
+    monkeypatch.setattr(target.requests, 'get', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('x')))
+    with pytest.raises(RuntimeError):
+        target.sonarr_lane_series_ids()

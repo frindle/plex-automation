@@ -2371,7 +2371,7 @@ def _serialized(fn):
     return wrapper
 
 
-def _radarr_grab_identity(download_id):
+def _radarr_grab_identity(download_id, strict=False):
     """(movieId, customFormatScore) for a torrent hash, from Radarr's grab
     history. Returns (None, 0) when Radarr has no grab on record.
 
@@ -2391,6 +2391,8 @@ def _radarr_grab_identity(download_id):
         records = r.json().get('records') or []
     except Exception as e:
         log.warning(f'Radarr queue dedupe: history lookup for {download_id[:8]} failed: {e}')
+        if strict:
+            raise
         return None, 0
     grabs = [rec for rec in records if rec.get('eventType') == 'grabbed']
     if not grabs:
@@ -2710,7 +2712,7 @@ def cleanup_radarr_queue_dupes(movie_id=None, dry_run=False):
     return report_list if dry_run else removed
 
 
-def _sonarr_grab_identity(download_id):
+def _sonarr_grab_identity(download_id, strict=False):
     """(seriesId, frozenset(episodeIds), customFormatScore) for a torrent
     hash, from Sonarr's grab history. Returns (None, frozenset(), 0) when
     Sonarr has no grab on record.
@@ -2737,6 +2739,8 @@ def _sonarr_grab_identity(download_id):
         records = r.json().get('records') or []
     except Exception as e:
         log.warning(f'Sonarr queue dedupe: history lookup for {download_id[:8]} failed: {e}')
+        if strict:
+            raise
         return None, frozenset(), 0
     grabs = [rec for rec in records if rec.get('eventType') == 'grabbed']
     if not grabs:
@@ -3955,14 +3959,16 @@ class _NoSearch(Exception):
 
 def radarr_lane_movie_ids():
     """Radarr movieIds that already have a torrent in the throttled upgrade
-    lane (either lane label). Raises if Deluge cannot be read."""
+    lane (either lane label). Raises if Deluge or Radarr history cannot be
+    read: a swallowed lookup failure would silently drop a lane movie from the
+    set and let the search re-grab it."""
     deluge_login()
     torrents = get_all_torrents(force=True)
     lane_labels = {RADARR_UPG_LABEL, RADARR_UPG_PRIORITY_LABEL}
     ids = set()
     for torrent_hash, info in torrents.items():
         if info.get('label') in lane_labels:
-            movie_id, _ = _radarr_grab_identity(torrent_hash)
+            movie_id, _ = _radarr_grab_identity(torrent_hash, strict=True)
             if movie_id:
                 ids.add(movie_id)
     return ids
@@ -4109,6 +4115,23 @@ def relabel_radarr_upgrades():
         log.error(f'Radarr upgrade relabeling failed: {e}')
         return 0
 
+def sonarr_lane_series_ids():
+    """Sonarr seriesIds that already have a torrent in the throttled upgrade
+    lane (either lane label). The relabel hides those torrents from Sonarr's
+    queue, so SeriesSearch would re-grab them. Raises if Deluge or Sonarr
+    history cannot be read (fail closed)."""
+    deluge_login()
+    torrents = get_all_torrents(force=True)
+    lane_labels = {SONARR_UPG_LABEL, SONARR_UPG_PRIORITY_LABEL}
+    ids = set()
+    for torrent_hash, info in torrents.items():
+        if info.get('label') in lane_labels:
+            series_id, _, _ = _sonarr_grab_identity(torrent_hash, strict=True)
+            if series_id:
+                ids.add(series_id)
+    return ids
+
+
 def sonarr_bulk_search():
     """Sonarr counterpart of radarr_bulk_search: a bounded yearly-upgrade pass.
 
@@ -4139,6 +4162,17 @@ def sonarr_bulk_search():
         series_ids = [s['id'] for s in ordered]
         indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(series_ids))
         batch = [series_ids[i] for i in indices]
+        try:
+            in_lane = sonarr_lane_series_ids()
+        except Exception as e:
+            log.error(f'Sonarr bulk search: cannot read upgrade lane ({e}); '
+                      f'skipping this pass without advancing the cursor')
+            return
+        skipped = [sid for sid in batch if sid in in_lane]
+        if skipped:
+            log.info(f'Sonarr bulk search: skipping {len(skipped)} series already '
+                     f'downloading in the upgrade lane')
+            batch = [sid for sid in batch if sid not in in_lane]
         log.info(f'Sonarr bulk search: {len(batch)} of {len(series_ids)} series this pass '
                  f'(cursor -> {next_cursor})')
         for series_id in batch:
