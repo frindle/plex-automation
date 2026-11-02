@@ -3949,6 +3949,25 @@ def ensure_label_exists_named(label):
         log.info(f"Created label: {label}")
 
 
+class _NoSearch(Exception):
+    pass
+
+
+def radarr_lane_movie_ids():
+    """Radarr movieIds that already have a torrent in the throttled upgrade
+    lane (either lane label). Raises if Deluge cannot be read."""
+    deluge_login()
+    torrents = get_all_torrents(force=True)
+    lane_labels = {RADARR_UPG_LABEL, RADARR_UPG_PRIORITY_LABEL}
+    ids = set()
+    for torrent_hash, info in torrents.items():
+        if info.get('label') in lane_labels:
+            movie_id, _ = _radarr_grab_identity(torrent_hash)
+            if movie_id:
+                ids.add(movie_id)
+    return ids
+
+
 def radarr_bulk_search():
     """Trigger a bounded yearly-upgrade pass over monitored Radarr movies.
 
@@ -3979,9 +3998,28 @@ def radarr_bulk_search():
         movie_ids = [m['id'] for m in ordered]
         indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(movie_ids))
         batch = [movie_ids[i] for i in indices]
+        # A movie whose upgrade is already in the throttled lane is invisible
+        # to Radarr's own queue check (the relabel hides it), so searching it
+        # makes Radarr re-grab the SAME release -- a fresh tracker snatch of a
+        # torrent we already hold, with no extra seed time. Skip those.
+        try:
+            in_lane = radarr_lane_movie_ids()
+        except Exception as e:
+            # Fail closed: without the lane view a search would re-snatch.
+            log.error(f'Radarr bulk search: cannot read upgrade lane ({e}); '
+                      f'skipping this pass without advancing the cursor')
+            return
+        skipped = [mid for mid in batch if mid in in_lane]
+        if skipped:
+            log.info(f'Radarr bulk search: skipping {len(skipped)} movie(s) already '
+                     f'downloading in the upgrade lane')
+            batch = [mid for mid in batch if mid not in in_lane]
         log.info(f'Radarr bulk search: {len(batch)} of {len(movie_ids)} movies this pass '
                  f'(cursor -> {next_cursor})')
         try:
+            if not batch:
+                log.info('Radarr bulk search: nothing left to search after lane filter')
+                raise _NoSearch()
             r = requests.post(
                 f'{RADARR_URL}/api/v3/command',
                 headers={'X-Api-Key': RADARR_API_KEY},
@@ -3990,6 +4028,8 @@ def radarr_bulk_search():
             )
             r.raise_for_status()
             log.info(f'Radarr bulk search pass ({len(batch)} movies) queued: id {r.json().get("id")}')
+        except _NoSearch:
+            pass
         except Exception as e:
             log.error(f'Radarr bulk search pass failed: {e}')
         state['radarr'] = {'cursor': next_cursor, 'last_run': datetime.now(timezone.utc).isoformat()}

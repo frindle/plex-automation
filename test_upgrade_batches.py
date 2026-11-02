@@ -89,3 +89,72 @@ def test_run_monthly_upgrade_invalid_service(monkeypatch):
     assert r.status_code == 400
     body = r.get_json()
     assert body['ok'] is False and 'error' in body
+
+
+def _bulk_search_setup(monkeypatch, lane_ids, movie_ids=(1, 2, 3, 4)):
+    posted = []
+    saved = []
+
+    class Resp:
+        def __init__(self, payload):
+            self._p = payload
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return self._p
+
+    def fake_get(url, **kw):
+        return Resp([{'id': i, 'monitored': True, 'year': 2020} for i in movie_ids])
+
+    def fake_post(url, **kw):
+        posted.append(kw['json'])
+        return Resp({'id': 7})
+
+    monkeypatch.setattr(target.requests, 'get', fake_get)
+    monkeypatch.setattr(target.requests, 'post', fake_post)
+    monkeypatch.setattr(target, '_load_upgrade_state', lambda: {})
+    monkeypatch.setattr(target, '_save_upgrade_state', lambda st: saved.append(st))
+    monkeypatch.setattr(target, 'UPGRADE_BATCH_SIZE', 10)
+    if isinstance(lane_ids, Exception):
+        def boom():
+            raise lane_ids
+        monkeypatch.setattr(target, 'radarr_lane_movie_ids', boom)
+    else:
+        monkeypatch.setattr(target, 'radarr_lane_movie_ids', lambda: set(lane_ids))
+    return posted, saved
+
+
+def test_radarr_bulk_search_skips_movies_already_in_lane(monkeypatch):
+    posted, saved = _bulk_search_setup(monkeypatch, {2, 3})
+    target.radarr_bulk_search()
+    assert len(posted) == 1
+    assert sorted(posted[0]['movieIds']) == [1, 4]
+    assert saved  # cursor still advances
+
+
+def test_radarr_bulk_search_all_in_lane_posts_nothing(monkeypatch):
+    posted, saved = _bulk_search_setup(monkeypatch, {1, 2, 3, 4})
+    target.radarr_bulk_search()
+    assert posted == []
+    assert saved
+
+
+def test_radarr_bulk_search_fails_closed_when_lane_unreadable(monkeypatch):
+    posted, saved = _bulk_search_setup(monkeypatch, RuntimeError('deluge down'))
+    target.radarr_bulk_search()
+    assert posted == []
+    assert saved == []  # cursor not advanced, retried next pass
+
+
+def test_radarr_lane_movie_ids_maps_both_lane_labels(monkeypatch):
+    torrents = {
+        'aaa': {'label': target.RADARR_UPG_LABEL},
+        'bbb': {'label': target.RADARR_UPG_PRIORITY_LABEL},
+        'ccc': {'label': 'radarr'},
+        'ddd': {'label': target.RADARR_UPG_LABEL},
+    }
+    monkeypatch.setattr(target, 'deluge_login', lambda: None)
+    monkeypatch.setattr(target, 'get_all_torrents', lambda force=False: torrents)
+    ids = {'aaa': 11, 'bbb': 22, 'ccc': 33, 'ddd': None}
+    monkeypatch.setattr(target, '_radarr_grab_identity', lambda h: (ids[h], 0))
+    assert target.radarr_lane_movie_ids() == {11, 22}
