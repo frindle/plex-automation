@@ -754,8 +754,8 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
             except Exception as e:
                 log.warning(f'{torrent_hash}: status fetch failed ({e}); assuming still registered — keeping files'); info = {}  # noqa: E702
         else:
-            # Caller passed info without save_path — fetch it.
-            if 'save_path' not in info:
+            # Caller passed info without a save_path (missing or None) — fetch it.
+            if not info.get('save_path'):
                 sp = _torrent_save_path(torrent_hash)
                 if sp is not None:
                     info = {**info, 'save_path': sp}
@@ -774,8 +774,13 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
         return DEFERRED
 
     if remove_data:
-        # Library-seed guard: block data-delete for library paths.
-        if is_library_path(info.get('save_path')):
+        # Library-seed guard: block data-delete for library paths. An unknown save_path could be a library
+        # path, so it keeps the files too.
+        if not isinstance(info.get('save_path'), str) or not info.get('save_path'):
+            log.warning(f'Library-seed guard {torrent_hash}: save_path unknown — keeping files')
+            record_activity('library-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (save_path unknown)')
+            remove_data = False
+        elif is_library_path(info.get('save_path')):
             save_path = info['save_path']
             log.warning(f'Library-seed guard {torrent_hash}: seed obligation skipped (library {save_path}) — keeping files')
             record_activity('library-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (library save_path {save_path})')
@@ -1004,7 +1009,9 @@ def queued_superseded_targets(torrents):
     seeded earlier, so progress is NOT a criterion: a Queued torrent is
     purge-eligible only if it never started (seeding_time, active_time and
     total_uploaded all 0 and not is_finished) or its seed obligation is met
-    (seeding_time >= SEED_DAYS * 86400). Shared by the
+    (seeding_time >= SEED_DAYS * 86400). A target's seeding_time stays None
+    when the snapshot did not carry it, so remove_torrent fetches the real
+    value before its seed floor decides. Shared by the
     /purge-unstarted-superseded route and the post-import sweep."""
     def _never_started(info):
         """Return True when the torrent has never started seeding."""
@@ -1013,7 +1020,7 @@ def queued_superseded_targets(torrents):
                (info.get('total_uploaded') or 0) == 0 and \
                not info.get('is_finished')
     return [
-        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state'), 'seeding_time': info.get('seeding_time') or 0}
+        {'hash': h, 'name': info.get('name'), 'progress': info.get('progress'), 'state': info.get('state'), 'seeding_time': info.get('seeding_time')}
         for h, info in torrents.items()
         if info.get('label') == SUPERSEDED_LABEL and info.get('state') == 'Queued'
         and (_never_started(info) or (info.get('seeding_time') or 0) >= SEED_DAYS * 86400)
@@ -1026,7 +1033,7 @@ def purge_queued_superseded(targets):
     removed, failed = 0, []
     for t in targets:
         try:
-            r = remove_torrent(t['hash'], info={'name': t.get('name'), 'seeding_time': t.get('seeding_time') or 0})
+            r = remove_torrent(t['hash'], info={'name': t.get('name'), 'seeding_time': t.get('seeding_time')})  # None: Deluge's value is used
             if r != DEFERRED:
                 removed += 1
         except Exception as e:

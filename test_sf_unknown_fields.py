@@ -1,5 +1,7 @@
 """remove_torrent's seed floor with missing or None status fields: a field nobody knows is never read as 0, a
-missing seed time is fetched, and a None from the caller does not hide the value Deluge reports.
+missing seed time is fetched, and a None from the caller does not hide the value Deluge reports. An unknown
+save_path keeps the files (it could be a library path), and a queued-superseded target never turns an unknown
+seed time into 0.
 Run: python3 test_sf_unknown_fields.py"""
 import json
 import os
@@ -17,7 +19,7 @@ aw = __import__('arr-webhook')
 
 DAY = 86400
 RPC = []
-STATE = {'one': {}, 'fail': False}
+STATE = {'one': {}, 'fail': False, 'paths': {}}
 
 
 class Resp:
@@ -41,6 +43,8 @@ def fake_post(self, url, json=None, timeout=None, **kw):
         if STATE['fail']:
             raise requests.ConnectionError('deluge down')
         return Resp({'result': dict(STATE['one'].get(params[0], {}))})
+    if method == 'core.get_torrents_status':  # _torrent_save_path's probe
+        return Resp({'result': {h: {'save_path': STATE['paths'][h]} for h in params[0]['id'] if h in STATE['paths']}})
     return Resp({'result': None})
 
 
@@ -54,6 +58,7 @@ def setup():
     del RPC[:]
     STATE['one'] = {}
     STATE['fail'] = False
+    STATE['paths'] = {}
     aw._snapshots.clear()
 
 
@@ -139,12 +144,67 @@ def test_deferral_message_says_unknown():
     assert '5.0d' in summaries()[-1], summaries()
 
 
+def removals():
+    return [tuple(p) for m, p in RPC if m == 'core.remove_torrent']
+
+
+def guard_notes():
+    return [r['summary'] for r in _rows('ACTIVITY_LOG') if r['category'] == 'library-guard']
+
+
+def test_unknown_save_path_keeps_files():
+    # Seeded long enough and data-delete asked, but nobody knows where the files are: they could be in the
+    # library, so the entry goes and the files stay.
+    for hsh, info in (('H7', full(30 * DAY, save_path=None)), ('H8', {k: v for k, v in full(30 * DAY).items() if k != 'save_path'})):
+        setup()
+        STATE['fail'] = True
+        assert aw.remove_torrent(hsh, remove_data=True, info=info) is True
+        assert removals() == [(hsh, False)], RPC
+        assert guard_notes() and 'save_path unknown' in guard_notes()[-1], guard_notes()
+
+
+def test_save_path_probe_fills_a_none():
+    # A None save_path from the caller is looked up: a download path found that way still deletes its files,
+    # a library path found that way keeps them.
+    for path, want in (('/data/Downloads/Complete', True), ('/data/Media/Movies/X (2020)', False)):
+        setup()
+        STATE['fail'] = True
+        STATE['paths']['H9'] = path
+        assert aw.remove_torrent('H9', remove_data=True, info=full(30 * DAY, save_path=None)) is True
+        assert removals() == [('H9', want)], (path, RPC)
+
+
+def test_purge_does_not_read_unknown_seed_time_as_zero():
+    # A queued superseded target whose seed time the snapshot did not carry: Deluge says it seeded 3 days, so
+    # the purge defers it (read as 0, the never-seeded exemption would have deleted it).
+    setup()
+    STATE['one']['HA'] = full(3 * DAY, progress=0.0, total_uploaded=0, is_finished=False)
+    removed, failed = aw.purge_queued_superseded([{'hash': 'HA', 'name': 'Queued.Show', 'seeding_time': None}])
+    assert (removed, failed) == (0, []) and removals() == [], RPC
+
+
+def test_queued_target_keeps_unknown_seed_time_unknown():
+    # Selection still treats absent fields as never started (test_purge_guard, test_maintenance); the target
+    # carries None, not 0, so remove_torrent asks Deluge instead of taking the never-seeded exemption on a guess.
+    base = {'label': aw.SUPERSEDED_LABEL, 'state': 'Queued', 'seeding_time': 0, 'active_time': 0, 'total_uploaded': 0,
+            'is_finished': False, 'progress': 0.0, 'name': 'n'}
+    absent = {k: v for k, v in base.items() if k != 'seeding_time'}
+    torrents = {'never': dict(base), 'absent': absent, 'none': dict(base, seeding_time=None),
+                'done': dict(base, seeding_time=30 * DAY, total_uploaded=9, is_finished=True)}
+    got = {t['hash']: t['seeding_time'] for t in aw.queued_superseded_targets(torrents)}
+    assert got == {'never': 0, 'absent': None, 'none': None, 'done': 30 * DAY}, got
+
+
 TESTS = [
     test_missing_seed_time_is_fetched,
     test_missing_upload_count_is_not_never_seeded,
     test_none_progress_defers_without_crashing,
     test_caller_none_does_not_hide_deluge_value,
     test_deferral_message_says_unknown,
+    test_unknown_save_path_keeps_files,
+    test_save_path_probe_fills_a_none,
+    test_purge_does_not_read_unknown_seed_time_as_zero,
+    test_queued_target_keeps_unknown_seed_time_unknown,
 ]
 
 if __name__ == '__main__':
