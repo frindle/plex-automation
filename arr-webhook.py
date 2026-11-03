@@ -2266,9 +2266,11 @@ def cleanup_stalled_seeds(dry_run=False):
     -1/missing), the swarm size is unknown and the torrent is NOT removed —
     missing data means "don't know", never "safe to remove".
 
-    This only unseeds (remove_data=False) -- Deluge stops tracking/seeding
-    the torrent but the file(s) on disk are left completely untouched. For
-    library-seed torrents the file is the live media, so it must survive.
+    Files are deleted only when every file is verifiably imported (hardlinked,
+    nlink > 1) and none sits under the media tree -- the library keeps its own
+    link, so only the duplicate download copy goes. Anything else (library-seed
+    torrents, where the file IS the live media; unreadable or un-imported
+    files) is only unseeded and the file(s) on disk are left untouched.
 
     dry_run=True reports what WOULD be removed without removing anything
     and without touching the persisted state file (so a preview run
@@ -2304,7 +2306,7 @@ def cleanup_stalled_seeds(dry_run=False):
                 log.info(f'[seed-tracking] skipping stalled candidate (swarm seeds unknown/low, '
                          f'safety gate): {info.get("name")} (total_seeds={swarm_seeds})')
                 continue
-            action = 'WOULD unseed' if dry_run else 'unseeding (files kept on disk)'
+            action = 'WOULD unseed' if dry_run else 'unseeding'
             log.info(f'[seed-tracking] {action} stalled seed: {info.get("name")} '
                      f'(+{gained/1e6:.1f}MB uploaded since last week\'s check, '
                      f'{swarm_seeds} other swarm seeds)')
@@ -2317,7 +2319,11 @@ def cleanup_stalled_seeds(dry_run=False):
                 'swarm_seeds': swarm_seeds,
             })
             if not dry_run:
-                r = remove_torrent(h, remove_data=False)
+                # Delete the files only when every one is verifiably imported (hardlinked into the library)
+                # and none sits under the media tree; otherwise unseed and keep them.
+                files = (_deluge_rpc('core.get_torrent_status', [h, ['files']]) or {}).get('files')
+                drop = episode_retention.remove_data_for(dict(info, files=files), _library_has_file)
+                r = remove_torrent(h, remove_data=drop)
                 if r == DEFERRED:
                     continue
                 state.pop(h, None)
@@ -2330,7 +2336,7 @@ def cleanup_stalled_seeds(dry_run=False):
         log.info(f'Stalled-seed review complete{" (DRY RUN)" if dry_run else ""}: '
                  f'{"would remove" if dry_run else "removed"} {removed}')
         if removed and not dry_run:
-            record_activity('cleanup', f'Unseeded {removed} stalled torrent(s), files left on disk (≥{STALL_SEED_MIN_DAYS}d seeded, negligible upload since last week, >{STALL_MIN_SWARM_SEEDS} other swarm seeds)')
+            record_activity('cleanup', f'Unseeded {removed} stalled torrent(s), imported download copies deleted (≥{STALL_SEED_MIN_DAYS}d seeded, negligible upload since last week, >{STALL_MIN_SWARM_SEEDS} other swarm seeds)')
     except Exception as e:
         log.error(f'Stalled-seed review failed: {e}')
     return candidates
@@ -4398,7 +4404,9 @@ def purge_stalled_upgrade_torrents(label=RADARR_UPG_LABEL):
                 else:
                     log.info(f'Skipping in-progress upgrade: {i.get("name")} ({total_done/1024/1024:.1f}MB downloaded)')
         if to_remove:
-            purged = [_h for _h in to_remove if remove_torrent(_h, remove_data=False) != DEFERRED]
+            # < 5MB partials were never imported: drop their data too (remove_torrent's library guard
+            # still keeps anything under a library path or with an unknown save_path).
+            purged = [_h for _h in to_remove if remove_torrent(_h, remove_data=True) != DEFERRED]
             log.info(f'Purged {len(purged)} stalled upgrade torrents')
             if purged:
                 record_activity('cleanup', f'Purged {len(purged)} stalled {label} torrent(s) (< 5MB downloaded, not queued)')

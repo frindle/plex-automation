@@ -70,7 +70,7 @@ def test_purge_removes_genuinely_stalled_downloading_torrent(monkeypatch):
     }
     removed, activity = _setup(monkeypatch, torrents)
     target.purge_stalled_upgrade_torrents(LABEL)
-    assert removed == [('h2', False)]
+    assert removed == [('h2', True)], 'a <5MB partial was never imported: its data goes too'
     assert activity == [('cleanup', 'Purged 1 stalled radarr-upgrade torrent(s) (< 5MB downloaded, not queued)')]
 
 
@@ -103,5 +103,5 @@ def test_purge_mixed_batch_only_removes_the_genuine_stall(monkeypatch):
     }
     removed, activity = _setup(monkeypatch, torrents)
     target.purge_stalled_upgrade_torrents(LABEL)
-    assert removed == [('stalled1', False)]
+    assert removed == [('stalled1', True)]
     assert activity == [('cleanup', 'Purged 1 stalled radarr-upgrade torrent(s) (< 5MB downloaded, not queued)')]
