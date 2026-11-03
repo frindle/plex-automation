@@ -717,13 +717,16 @@ def supersede_torrent(torrent_hash):
                         f'torrent {torrent_hash} superseded with no local data — '
                         f'not moved (orphan avoided; reaped by cleanup)')
 
+# remove_torrent result: the seed floor blocked the removal, retry later
 DEFERRED = 'deferred'
 def remove_torrent(torrent_hash, remove_data=True, info=None):
-    # Pre-fetch: get status when we lack key fields, even for remove_data=False.
-    _i = info or {}
-    if (info is not None or not remove_data):
-        _missing_fields = [k for k in ('progress', 'total_uploaded', 'is_finished') if k not in _i]
-        if (not _i.get('seeding_time') or _i.get('seeding_time', 0) < SEED_DAYS * 86400) and _missing_fields:
+    # Pre-fetch: know the seed time before deciding anything, even for remove_data=False.
+    # A field the caller left out or passed as None is unknown and is taken from Deluge.
+    _i = {k: v for k, v in (info or {}).items() if v is not None}
+    if info is not None or not remove_data:
+        st0 = _i.get('seeding_time')
+        if st0 is None or (st0 < SEED_DAYS * 86400
+                           and any(k not in _i for k in ('progress', 'total_uploaded', 'is_finished'))):
             try:
                 resp = session.post(
                     f'{DELUGE_URL}/json',
@@ -735,7 +738,7 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
                 fetched = resp.json().get('result') or {}
                 info = {**fetched, **_i}  # caller values win
             except Exception as e:
-                log.warning(f'{torrent_hash}: status fetch failed ({e}); keeping provided info'); info = _i  # noqa: E702
+                log.warning(f'{torrent_hash}: status fetch failed ({e}); keeping provided info'); info = info or {}  # noqa: E702
 
     if remove_data:
         if info is None:
@@ -756,20 +759,22 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
                 sp = _torrent_save_path(torrent_hash)
                 if sp is not None:
                     info = {**info, 'save_path': sp}
-    # Seed floor: no removal path may drop entry before SEED_DAYS days.
+    # Seed floor: no removal path may drop the entry before SEED_DAYS days of seeding.
+    # Unknown seed time defers. Only a provably never-seeded partial download is exempt:
+    # every field must be known, so a missing upload count or progress is not "never".
     st = info.get('seeding_time')
-    never = (st == 0 and info.get('total_uploaded', 0) == 0
-             and info.get('is_finished') is False
-             and 'progress' in info and info.get('progress', 100) < 100)
+    progress = info.get('progress')
+    never = (st == 0 and info.get('total_uploaded') == 0 and info.get('is_finished') is False
+             and isinstance(progress, (int, float)) and progress < 100)
     if st is None or (st < SEED_DAYS * 86400 and not never):
-        name = (info or {}).get('name')
-        days = round(st / 86400, 1) if st is not None else None
-        log.warning(f'Seed floor {torrent_hash} ({name}): seeded {days}d < {SEED_DAYS}d (or unknown) - removal deferred')
-        record_activity('seed-floor', f'torrent {torrent_hash} ({name}) deferred - {days}d < {SEED_DAYS}d')
+        name = info.get('name')
+        days = 'unknown' if st is None else f'{round(st / 86400, 1)}d'
+        log.warning(f'Seed floor {torrent_hash} ({name}): seeded {days} < {SEED_DAYS}d - removal deferred')
+        record_activity('seed-floor', f'torrent {torrent_hash} ({name}) deferred - seeded {days} < {SEED_DAYS}d')
         return DEFERRED
 
     if remove_data:
-        # Library-seed guard: before HnR check, block data-delete for library paths.
+        # Library-seed guard: block data-delete for library paths.
         if is_library_path(info.get('save_path')):
             save_path = info['save_path']
             log.warning(f'Library-seed guard {torrent_hash}: seed obligation skipped (library {save_path}) — keeping files')
@@ -784,9 +789,9 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
     resp.raise_for_status()
     _invalidate_snapshot()
     log.info(f'Removed torrent {torrent_hash}' + (' and deleted files' if remove_data else ' (files left on disk)'))
-    log_removal(traceback.extract_stack(limit=2)[0].name, torrent_hash, (info or {}).get('name'),
+    log_removal(traceback.extract_stack(limit=2)[0].name, torrent_hash, info.get('name'),
                 'files deleted' if remove_data else 'files kept',
-                {'remove_data': remove_data, 'seeding_days': round(info['seeding_time'] / 86400, 1) if (info or {}).get('seeding_time') is not None else None, **({'seeding_time_s': info['seeding_time']} if (info or {}).get('seeding_time') is not None else {})})
+                {'remove_data': remove_data, 'seeding_days': round(st / 86400, 1), 'seeding_time_s': st})
     return True
 
 ALL_TORRENT_FIELDS = ['name', 'label', 'save_path', 'seeding_time', 'active_time', 'is_finished', 'progress', 'state', 'total_uploaded', 'total_seeds', 'tracker_status']
