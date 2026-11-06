@@ -7576,7 +7576,7 @@ def _restore_moved_files(dry_run, lookback_days, only_hashes, untracked_only):
         resp = session.post(
             f'{DELUGE_URL}/json',
             json={'method': 'core.get_torrents_status',
-                  'params': [{}, ['name', 'save_path', 'state', 'label']], 'id': 65},
+                  'params': [{}, ['name', 'save_path', 'state', 'label', 'progress']], 'id': 65},
             timeout=30,
         )
         resp.raise_for_status()
@@ -7682,6 +7682,14 @@ def _restore_moved_files(dry_run, lookback_days, only_hashes, untracked_only):
                     _repair_rechecked.add(h)
                 except Exception as e:
                     result['errors'].append({'hash': h, 'name': name, 'error': f'pause/recheck failed: {e}'})
+            elif info.get('state') in ('Queued', 'Paused', 'Downloading') and (info.get('progress') or 0) < 100:
+                # Deluge already wrote these files off (0% after a rejected
+                # fastresume). Without a recheck it would re-download every
+                # piece over the restored hardlink. Recheck keeps the state.
+                try:
+                    deluge_force_recheck(h)
+                except Exception as e:
+                    result['errors'].append({'hash': h, 'name': name, 'error': f'recheck failed: {e}'})
             record_activity('deluge-restore', f'Restored {n_restored} moved file(s) into "{name}" by hardlink from the library')
 
     result['counts'] = {k: len(v) for k, v in result.items() if isinstance(v, list)}

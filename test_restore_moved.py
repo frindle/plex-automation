@@ -163,6 +163,23 @@ def test_error_torrent_paused_and_rechecked(monkeypatch, tmp_path):
     assert H in aw._repair_rechecked
 
 
+def test_written_off_queued_torrent_rechecked_not_paused(monkeypatch, tmp_path):
+    w = World(monkeypatch, tmp_path, state='Queued')
+    w.torrents[H]['progress'] = 0.0
+    r = aw.restore_moved_files()
+    assert len(r['restored']) == 1 and w.dst.exists()
+    assert [c[0] for c in w.writes()] == ['core.force_recheck']
+    assert aw._repair_rechecked == set()
+
+
+def test_complete_seeding_torrent_not_rechecked(monkeypatch, tmp_path):
+    w = World(monkeypatch, tmp_path, state='Seeding')
+    w.torrents[H]['progress'] = 100.0
+    r = aw.restore_moved_files()
+    assert len(r['restored']) == 1
+    assert w.writes() == []
+
+
 def test_error_repair_does_not_double_pause(monkeypatch, tmp_path):
     w = World(monkeypatch, tmp_path, state='Error')
     r = aw.deluge_error_repair()
