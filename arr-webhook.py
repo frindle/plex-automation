@@ -3094,6 +3094,48 @@ def _ib_seen_recently(download_id, ttl_hours=24):
     _ib_seen[download_id] = now
     return False
 
+# IndexerFlags enum values; Radarr and Sonarr differ (Radarr/Radarr and Sonarr/Sonarr
+# src/NzbDrone.Core/Parser/Model/IndexerFlags.cs)
+_RADARR_INDEXER_FLAGS = {
+    'g_freeleech': 1, 'g_halfleech': 2, 'g_doubleupload': 4, 'ptp_golden': 8, 'ptp_approved': 16,
+    'g_internal': 32, 'ahd_internal': 64, 'g_scene': 128, 'g_freeleech75': 256, 'g_freeleech25': 512,
+    'ahd_userrelease': 1024, 'nuked': 2048,
+}
+_SONARR_INDEXER_FLAGS = {
+    'freeleech': 1, 'halfleech': 2, 'doubleupload': 4, 'internal': 8, 'scene': 16,
+    'freeleech75': 32, 'freeleech25': 64, 'nuked': 128, 'subtitles': 256,
+}
+
+def _manual_import_flags(candidate, base_url, api_key, download_id, flag_map):
+    """indexerFlags for a ManualImport file: the candidate's own, else the grab history's. 0 on any error."""
+    try:
+        own = candidate.get('indexerFlags')
+        if isinstance(own, int) and not isinstance(own, bool) and own:
+            return own
+        r = requests.get(
+            f'{base_url}/api/v3/history',
+            headers={'X-Api-Key': api_key},
+            params={'downloadId': download_id, 'eventType': 1, 'pageSize': 10, 'sortKey': 'date', 'sortDirection': 'descending'},
+            timeout=20,
+        )
+        r.raise_for_status()
+        records = (r.json() or {}).get('records') or []
+        if not records:
+            return 0
+        newest = max(records, key=lambda x: x.get('date') or '')
+        raw = str((newest.get('data') or {}).get('indexerFlags') or '').strip()
+        flags = 0
+        for tok in raw.split(','):
+            tok = tok.strip().lower()
+            if tok.isdigit():
+                flags |= int(tok)
+            elif tok:
+                flags |= flag_map.get(tok, 0)
+        return flags
+    except Exception as e:
+        log.info(f'indexerFlags lookup failed for {download_id}: {e}')
+        return 0
+
 def _try_radarr_manual_import(record):
     download_id = record.get('downloadId') or ''
     movie_id = record.get('movieId')
@@ -3121,6 +3163,7 @@ def _try_radarr_manual_import(record):
             'quality': c.get('quality'),
             'languages': c.get('languages'),
             'releaseGroup': c.get('releaseGroup'),
+            'indexerFlags': _manual_import_flags(c, RADARR_URL, RADARR_API_KEY, download_id, _RADARR_INDEXER_FLAGS),
             'downloadId': download_id,
         })
     # LLM identity check before ManualImport
@@ -3172,6 +3215,7 @@ def _try_sonarr_manual_import(record):
             'quality': c.get('quality'),
             'languages': c.get('languages'),
             'releaseGroup': c.get('releaseGroup'),
+            'indexerFlags': _manual_import_flags(c, SONARR_URL, SONARR_API_KEY, download_id, _SONARR_INDEXER_FLAGS),
             'downloadId': download_id,
         })
     # LLM identity check before ManualImport
