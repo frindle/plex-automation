@@ -86,7 +86,7 @@ def test_sonarr_command_has_downloadClientId():
     """Test 3: Sonarr command carries downloadClientId."""
     setup({'abc123def': {'name': 'Show.S01E01', 'label': 'sonarr', 'save_path': '/data/Downloads/Complete/sonarr', 'progress': 100.0}})
     r = aw._auto_rescue('sonarr')
-    assert CMDS == [{'name': 'DownloadedEpisodesScan', 'path': '/data/Downloads/Complete/sonarr/Show.S01E01', 'importMode': 'auto', 'downloadClientId': 'ABC123DEF'}]
+    assert CMDS == [{'name': 'DownloadedEpisodesScan', 'path': '/data/Downloads/Complete/sonarr/Show.S01E01', 'importMode': 'copy', 'downloadClientId': 'ABC123DEF'}]
     assert acts() == ['import-rescue']
     assert saved()['attempts']['abc123def'] == 1
 
@@ -95,7 +95,7 @@ def test_radarr_command_has_downloadClientId():
     """Test 4: Radarr command carries downloadClientId."""
     setup({'fed987': {'name': 'Movie.2020.1080p', 'label': 'radarr', 'save_path': '/data/Downloads/Complete/radarr', 'progress': 100.0}})
     r = aw._auto_rescue('radarr')
-    assert CMDS == [{'name': 'DownloadedMoviesScan', 'path': '/data/Downloads/Complete/radarr/Movie.2020.1080p', 'importMode': 'auto', 'downloadClientId': 'FED987'}]
+    assert CMDS == [{'name': 'DownloadedMoviesScan', 'path': '/data/Downloads/Complete/radarr/Movie.2020.1080p', 'importMode': 'copy', 'downloadClientId': 'FED987'}]
 
 
 def test_cap_give_up_once_persistence():

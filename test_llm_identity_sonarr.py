@@ -21,6 +21,7 @@ class World:
     def __init__(self, mp, advise=None, queue_title='Some.Show.S01E02.1080p.WEB.x264-GRP', year=2010,
                  candidates=None):
         self.commands, self.pushes, self.calls = [], [], []
+        self.payloads = []
         self.queue = [{'id': 1, 'downloadId': 'HASH1', 'seriesId': 42, 'episodeId': 5, 'title': queue_title,
                        'trackedDownloadState': 'importBlocked',
                        'statusMessages': [{'messages': ['Manual Import required']}]}]
@@ -53,6 +54,7 @@ class World:
 
     def post(self, url, headers=None, json=None, timeout=None, **kw):
         self.commands.append((json or {}).get('name'))
+        self.payloads.append(json or {})
         return _Resp({'id': 1})
 
 
@@ -63,6 +65,7 @@ def test_off_mode_asks_with_match_and_still_imports(monkeypatch):
     assert callable(w.calls[0][3].get('record'))
     assert w.commands == ['ManualImport']
     assert w.pushes == []
+    assert [p.get('importMode') for p in w.payloads] == ['copy']
 
 
 def test_facts_carry_titles_and_year_matches(monkeypatch):

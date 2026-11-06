@@ -27,6 +27,9 @@ services:
       # library-seeding torrents seed the media files themselves, so a relink
       # can move real library data.
       DELUGE_RELINK: "0"
+      # Hardlink files an *arr moved out of a live torrent back into it.
+      RESTORE_MOVED_FILES: "1"
+      RELINK_DATA_ROOT: "/srv/data"
       SEED_DAYS: "21"
       # Stale-seed unseed pass (weekly): torrent seeded >= this long AND
       # negligible upload since last week's check AND swarm already has
@@ -66,6 +69,10 @@ services:
       # via the filesystem fallback when the Plex API rejects the delete.
       - "/mnt/user/data/Media/TV Shows:/media/tv"
       - "/mnt/user/data/Media/Music:/media/music:ro"
+      # Whole share in ONE mount so restore_moved_files can hardlink library
+      # files back into torrent folders (hardlinks cannot cross mount points).
+      # Paths /data/X map to RELINK_DATA_ROOT/X.
+      - "/mnt/user/data:/srv/data"
 
 networks:
   br0:

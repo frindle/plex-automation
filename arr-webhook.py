@@ -207,6 +207,7 @@ app.register_blueprint(share_bp)
 _DESTRUCTIVE_GET_GUARD_PATHS = {
     '/torrent-purge', '/purge-unstarted-superseded', '/complete-orphans',
     '/incomplete-orphans', '/run-stalled-seeds', '/auto-rescue', '/run-deluge-repair',
+    '/run-restore-moved',
 }
 
 @app.before_request
@@ -217,7 +218,7 @@ def _require_post_for_mutations():
         return
     apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
     dry_run = request.args.get('dry_run', '').lower() in ('1', 'true', 'yes')
-    mutating = apply or (request.path in ('/auto-rescue', '/run-deluge-repair') and not dry_run)
+    mutating = apply or (request.path in ('/auto-rescue', '/run-deluge-repair', '/run-restore-moved') and not dry_run)
     if mutating:
         return jsonify({'ok': False, 'error': 'mutation requires POST'}), 405
 
@@ -3134,7 +3135,7 @@ def _try_radarr_manual_import(record):
         cmd = requests.post(
             f'{RADARR_URL}/api/v3/command',
             headers={'X-Api-Key': RADARR_API_KEY, 'Content-Type': 'application/json'},
-            json={'name': 'ManualImport', 'files': files, 'importMode': 'auto'},
+            json={'name': 'ManualImport', 'files': files, 'importMode': 'copy'},
             timeout=20,
         )
         cmd.raise_for_status()
@@ -3186,7 +3187,7 @@ def _try_sonarr_manual_import(record):
         cmd = requests.post(
             f'{SONARR_URL}/api/v3/command',
             headers={'X-Api-Key': SONARR_API_KEY, 'Content-Type': 'application/json'},
-            json={'name': 'ManualImport', 'files': files, 'importMode': 'auto'},
+            json={'name': 'ManualImport', 'files': files, 'importMode': 'copy'},
             timeout=20,
         )
         cmd.raise_for_status()
@@ -3932,7 +3933,7 @@ def handle_grab(data, source):
                     requests.post(
                         f'{url}/api/v3/command',
                         headers={'X-Api-Key': key},
-                        json={'name': scan_cmd, 'path': save_path, 'downloadClientId': download_id},
+                        json={'name': scan_cmd, 'path': save_path, 'importMode': 'copy', 'downloadClientId': download_id},
                         timeout=15,
                     )
                     log.info(f"{source}: fired {scan_cmd} on {save_path}")
@@ -5304,7 +5305,8 @@ def _auto_rescue(service, dry_run=False):
             cr = requests.post(
                 f'{url}/api/v3/command',
                 headers={'X-Api-Key': key, 'Content-Type': 'application/json'},
-                json={'name': scan_cmd, 'path': scan_path, 'importMode': 'auto', 'downloadClientId': h.upper()},
+                # 'copy', never 'auto': Auto MOVES the file out of the torrent folder when the *arr has no tracked download for it.
+                json={'name': scan_cmd, 'path': scan_path, 'importMode': 'copy', 'downloadClientId': h.upper()},
                 timeout=20,
             )
             cr.raise_for_status()
@@ -7471,6 +7473,232 @@ def _report_once(key, category, summary, dry_run=False):
 
 _repair_rechecked = set()  # hashes this process paused + rechecked, awaiting resume decision
 
+# ── Restore files an *arr moved out of a live torrent ───────────────────────
+# Sonarr/Radarr imports run with importMode 'copy' now, but older untracked
+# imports (Auto mode MOVES when the *arr has no tracked download) pulled files
+# out of torrent folders. The *arr history event downloadFolderImported
+# (eventType 3) records droppedPath (torrent file) and importedPath (library),
+# so we hardlink the library file back. Needs ONE mount over the whole share
+# (RELINK_DATA_ROOT) because hardlinks cannot cross mount points (EXDEV).
+RELINK_DATA_ROOT = os.environ.get('RELINK_DATA_ROOT', '/srv/data')
+RESTORE_MOVED_FILES = os.environ.get('RESTORE_MOVED_FILES', '1').lower() not in ('0', 'false', 'no', 'off')
+RESTORE_MOVED_INTERVAL = int(os.environ.get('RESTORE_MOVED_INTERVAL', '900'))
+_restore_present = set()  # droppedPaths confirmed on disk this process; never re-stat'ed
+_restore_warned = False
+_restore_lock = threading.Lock()
+
+
+def _relink_path(p):
+    """Map an *arr/Deluge '/data/X' path under RELINK_DATA_ROOT; None if not mappable."""
+    if not isinstance(p, str) or not p.startswith('/data/'):
+        return None
+    rel = posixpath.normpath(p[len('/data/'):])
+    if rel in ('.', '') or rel == '..' or rel.startswith('../'):
+        return None
+    return os.path.join(RELINK_DATA_ROOT, rel)
+
+
+def _fetch_import_events(label, url, key, cutoff, untracked_only):
+    """downloadFolderImported events newer than cutoff whose droppedPath is in /data/Downloads/."""
+    out, page = [], 1
+    while page <= 200:
+        r = requests.get(
+            f'{url}/api/v3/history',
+            headers={'X-Api-Key': key},
+            params={'eventType': 3, 'pageSize': 1000, 'page': page,
+                    'sortKey': 'date', 'sortDirection': 'descending'},
+            timeout=60,
+        )
+        r.raise_for_status()
+        body = r.json() or {}
+        records = body.get('records') or []
+        if not records:
+            break
+        older = False
+        for rec in records:
+            try:
+                when = datetime.fromisoformat(str(rec.get('date')).replace('Z', '+00:00'))
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+            except ValueError:
+                when = None
+            if when is not None and when < cutoff:
+                older = True
+                continue
+            data = rec.get('data') or {}
+            dropped, imported = data.get('droppedPath'), data.get('importedPath')
+            if not (isinstance(dropped, str) and dropped.startswith('/data/Downloads/') and imported):
+                continue
+            if untracked_only and rec.get('downloadId'):
+                continue
+            out.append({'dropped': dropped, 'imported': imported, 'source': label})
+        if older or page * 1000 >= (body.get('totalRecords') or 0):
+            break
+        page += 1
+    return out
+
+
+def restore_moved_files(dry_run=False, lookback_days=7, only_hashes=None, untracked_only=True):
+    """Hardlink library files back into live torrents they were moved out of.
+    Never copies, deletes, overwrites or renames. Disk I/O is limited to paths
+    owned by a live torrent, so idle array disks are not spun up for nothing."""
+    global _restore_warned
+    if not RESTORE_MOVED_FILES:
+        return {'ok': True, 'disabled': 'RESTORE_MOVED_FILES is off'}
+    if not os.path.isdir(RELINK_DATA_ROOT):
+        if not _restore_warned:
+            _restore_warned = True
+            log.warning(f'restore_moved_files disabled: RELINK_DATA_ROOT {RELINK_DATA_ROOT} is not a directory '
+                        f'(mount /mnt/user/data there)')
+        return {'ok': True, 'disabled': f'RELINK_DATA_ROOT {RELINK_DATA_ROOT} is not a directory'}
+    with _restore_lock:
+        return _restore_moved_files(dry_run, lookback_days, only_hashes, untracked_only)
+
+
+def _restore_moved_files(dry_run, lookback_days, only_hashes, untracked_only):
+    result = {'ok': True, 'dry_run': dry_run, 'restored': [], 'would_restore': [],
+              'size_mismatch': [], 'source_missing': [], 'errors': []}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    events = []
+    for label, url, key in (('sonarr', SONARR_URL, SONARR_API_KEY), ('radarr', RADARR_URL, RADARR_API_KEY)):
+        if not key:
+            continue
+        try:
+            events += _fetch_import_events(label, url, key, cutoff, untracked_only)
+        except Exception as e:
+            log.error(f'restore_moved_files: {label} history fetch failed: {e}')
+            result['errors'].append({'source': label, 'error': f'history fetch failed: {e}'})
+    if not events:
+        result['counts'] = {k: len(v) for k, v in result.items() if isinstance(v, list)}
+        return result
+    try:
+        deluge_login()
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.get_torrents_status',
+                  'params': [{}, ['name', 'save_path', 'state', 'label']], 'id': 65},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        torrents = resp.json().get('result') or {}
+    except Exception as e:
+        log.error(f'restore_moved_files: Deluge fetch failed: {e}')
+        result['ok'] = False
+        result['errors'].append({'error': f'deluge fetch failed: {e}'})
+        return result
+
+    roots = []  # (root, hash, info) for live torrents we may touch
+    for h, info in torrents.items():
+        if only_hashes is not None and h not in only_hashes:
+            continue
+        sp, nm = info.get('save_path') or '', info.get('name') or ''
+        if not sp or not nm or is_library_path(sp):
+            continue
+        roots.append((posixpath.normpath(sp + '/' + nm), h, info))
+
+    # Group droppedPaths by owning torrent: pure string matching, no disk I/O.
+    owned, seen = {}, set()
+    for ev in events:
+        d = ev['dropped']
+        if d in seen or d in _restore_present:
+            continue
+        seen.add(d)
+        best = None
+        for root, h, _info in roots:
+            if (d == root or d.startswith(root + '/')) and (best is None or len(root) > len(best[0])):
+                best = (root, h)
+        if best:
+            owned.setdefault(best[1], []).append(ev)
+
+    for h, evs in owned.items():
+        info = torrents[h]
+        name = info.get('name') or ''
+        missing = []
+        for ev in evs:
+            dst = _relink_path(ev['dropped'])
+            if dst is None:
+                continue
+            try:
+                if os.path.exists(dst):
+                    _restore_present.add(ev['dropped'])
+                    continue
+            except OSError as e:
+                result['errors'].append({'hash': h, 'dropped': ev['dropped'], 'error': str(e)})
+                continue
+            missing.append((ev, dst))
+        if not missing:
+            continue
+        try:
+            fr = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.get_torrent_status', 'params': [h, ['files']], 'id': 66},
+                timeout=30,
+            )
+            fr.raise_for_status()
+            files = (fr.json().get('result') or {}).get('files') or []
+        except Exception as e:
+            result['errors'].append({'hash': h, 'name': name, 'error': f'file list failed: {e}'})
+            continue
+        sizes = {posixpath.normpath((info.get('save_path') or '') + '/' + f.get('path', '')): f.get('size')
+                 for f in files}
+        n_restored = 0
+        for ev, dst in missing:
+            want = sizes.get(posixpath.normpath(ev['dropped']))
+            src = _relink_path(ev['imported'])
+            entry = {'hash': h, 'name': name, 'dropped': ev['dropped'], 'imported': ev['imported']}
+            if want is None or src is None:
+                continue
+            try:
+                have = os.stat(src).st_size
+            except FileNotFoundError:
+                result['source_missing'].append(entry)
+                continue
+            except OSError as e:
+                result['errors'].append({**entry, 'error': str(e)})
+                continue
+            if have != want:
+                result['size_mismatch'].append({**entry, 'have': have, 'want': want})
+                continue
+            if dry_run:
+                result['would_restore'].append(entry)
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                os.link(src, dst)
+            except FileExistsError:
+                _restore_present.add(ev['dropped'])
+                continue
+            except OSError as e:
+                result['errors'].append({**entry, 'error': str(e)})
+                continue
+            _restore_present.add(ev['dropped'])
+            result['restored'].append(entry)
+            n_restored += 1
+        if n_restored:
+            if info.get('state') == 'Error':
+                try:
+                    deluge_pause_torrent(h)
+                    deluge_force_recheck(h)
+                    _repair_rechecked.add(h)
+                except Exception as e:
+                    result['errors'].append({'hash': h, 'name': name, 'error': f'pause/recheck failed: {e}'})
+            record_activity('deluge-restore', f'Restored {n_restored} moved file(s) into "{name}" by hardlink from the library')
+
+    result['counts'] = {k: len(v) for k, v in result.items() if isinstance(v, list)}
+    if any(result['counts'].values()):
+        log.info(f'restore_moved_files: {result["counts"]}')
+    return result
+
+
+def restore_moved_scheduler():
+    while True:
+        try:
+            restore_moved_files()
+        except Exception as e:
+            log.error(f'restore_moved_scheduler error: {e}')
+        time.sleep(RESTORE_MOVED_INTERVAL)
+
+
 def deluge_error_repair(dry_run=False, relink=None):
     """Scan Deluge for errored torrents and self-heal what's safe to heal."""
     if relink is None:
@@ -7535,12 +7763,22 @@ def deluge_error_repair(dry_run=False, relink=None):
             if not dry_run:
                 _repair_rechecked.discard(h)
 
+    # Hardlink back files an *arr moved out of errored torrents, so the
+    # present/recheck branch below sees them. Runs after the resume pass:
+    # hashes it just paused + rechecked must not be examined with stale state.
+    error_hashes = {h for h, i in torrents.items() if i.get('state') == 'Error'}
+    if error_hashes:
+        result['restore'] = restore_moved_files(dry_run=dry_run, lookback_days=90,
+                                                only_hashes=error_hashes, untracked_only=False)
+
     for h, info in torrents.items():
         # Deluge sets state='Error' for torrent/file errors and puts the
         # detail in 'message'. Tracker problems surface in tracker_status
         # instead, so they don't land here.
         if info.get('state') != 'Error':
             continue
+        if h in _repair_rechecked:
+            continue  # restore_moved_files just paused + rechecked it
         name = info.get('name') or ''
         save_path = info.get('save_path') or ''
         entry = {'hash': h, 'name': name, 'save_path': save_path,
@@ -7658,6 +7896,16 @@ def run_deluge_repair():
     raw_relink = request.args.get('relink')
     relink = None if raw_relink is None else raw_relink.lower() in ('1', 'true', 'yes')
     return jsonify(deluge_error_repair(dry_run=dry_run, relink=relink)), 200
+
+
+@app.route('/run-restore-moved', methods=['POST', 'GET'])
+def run_restore_moved():
+    dry_run = request.args.get('dry_run', '').lower() in ('1', 'true', 'yes')
+    try:
+        days = int(request.args.get('lookback_days', '7'))
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'lookback_days must be an integer'}), 400
+    return jsonify(restore_moved_files(dry_run=dry_run, lookback_days=days)), 200
 
 
 # ── Library seed audit / episode retention (logic lives in its own modules) ──
@@ -7907,4 +8155,6 @@ if __name__ == '__main__':
     t9.start()
     t10 = threading.Thread(target=queue_dupe_cleanup_scheduler, daemon=True)
     t10.start()
+    t11 = threading.Thread(target=restore_moved_scheduler, daemon=True)
+    t11.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
