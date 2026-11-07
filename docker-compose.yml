@@ -31,6 +31,9 @@ services:
       RESTORE_MOVED_FILES: "1"
       RELINK_DATA_ROOT: "/srv/data"
       SEED_DAYS: "21"
+      # Drop single-episode torrents after SEED_DAYS (data deleted only if
+      # outside /data/Media and the library has the episode). 0 = dry-run.
+      EPISODE_RETENTION_APPLY: "1"
       # Stale-seed unseed pass (weekly): torrent seeded >= this long AND
       # negligible upload since last week's check AND swarm already has
       # STALL_MIN_SWARM_SEEDS+ other seeders -> unseed it (files stay,
