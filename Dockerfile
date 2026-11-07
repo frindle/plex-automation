@@ -8,6 +8,7 @@ COPY media_share.py .
 COPY llm_decide.py .
 COPY llm_advisor.py .
 COPY library_audit.py .
+COPY downloads_audit.py .
 COPY episode_retention.py .
 COPY torrent_breakdown.py .
 COPY speed_cap.py .

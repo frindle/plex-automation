@@ -16,6 +16,7 @@ from media_share import share_bp, init_db as init_share_db
 import episode_retention
 import torrent_breakdown
 import library_audit
+import downloads_audit
 import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -7980,6 +7981,44 @@ def library_seed_audit(dry_run=False):
                                             _reported_library_audit, dry_run=dry_run)
 
 
+DOWNLOADS_AUDIT_STATE = os.environ.get('DOWNLOADS_AUDIT_STATE', '/data/downloads_audit_reported.json')
+DOWNLOADS_AUDIT_INTERVAL = int(os.environ.get('DOWNLOADS_AUDIT_INTERVAL', '86400'))  # daily
+DOWNLOADS_AUDIT_TIMEOUT = 180  # one all-torrent pull WITH files
+_downloads_audit_last = [0.0]
+
+
+def downloads_audit_run(dry_run=False):
+    """Report-only (downloads_audit never deletes, moves or relabels). A dry
+    run neither notifies nor touches the reported-state file."""
+    deluge_login()
+    resp = session.post(f'{DELUGE_URL}/json',
+                        json={'method': 'core.get_torrents_status', 'params': [{}, downloads_audit.FIELDS], 'id': 91},
+                        timeout=DOWNLOADS_AUDIT_TIMEOUT)
+    resp.raise_for_status()
+    torrents = resp.json().get('result') or {}
+    reported = downloads_audit.load_reported(DOWNLOADS_AUDIT_STATE)
+    r = downloads_audit.audit(torrents, _deluge_to_local(downloads_audit.DOWNLOADS_ROOT), _deluge_to_local,
+                              send_pushover, reported, time.time(), dry_run=dry_run)
+    if not dry_run:
+        downloads_audit.save_reported(DOWNLOADS_AUDIT_STATE, reported)
+    return r
+
+
+def downloads_audit_tick(now=None):
+    """Runs on the 6h maintenance tick but only once per DOWNLOADS_AUDIT_INTERVAL:
+    the Downloads walk is the costly part."""
+    now = time.time() if now is None else now
+    if now - _downloads_audit_last[0] < DOWNLOADS_AUDIT_INTERVAL:
+        return None
+    r = downloads_audit_run()
+    _downloads_audit_last[0] = now
+    c = r['counts']
+    log.info(f"Downloads audit: orphan files {c['orphan_files']} ({c['orphan_bytes'] / 1e9:.1f} GB), "
+             f"single-link {c['single_link_torrents']} torrents ({c['single_link_bytes'] / 1e9:.1f} GB), "
+             f"unlabeled {c['unlabeled']}, newly notified {len(r['notified'])}")
+    return r
+
+
 def _library_has_file(t):
     """True only when every file of the torrent is verifiably hardlinked
     (nlink > 1) as seen through DELUGE_PATH_MAP; anything unreadable -> False
@@ -8022,6 +8061,12 @@ def episode_retention_tick():
 def library_seed_audit_route():
     # Report only: a GET never sends Pushover; the 6h tick does.
     return jsonify(library_seed_audit(dry_run=True)), 200
+
+
+@app.route('/downloads-audit', methods=['GET'])
+def downloads_audit_route():
+    # Report only: a GET never sends Pushover or records anything; the daily tick does.
+    return jsonify(downloads_audit_run(dry_run=True)), 200
 
 
 @app.route('/torrent-breakdown', methods=['GET'])
@@ -8142,6 +8187,10 @@ def maintenance_scheduler():
             episode_retention_tick()
         except Exception as e:
             log.error(f'Episode retention failed: {e}')
+        try:
+            downloads_audit_tick()
+        except Exception as e:
+            log.error(f'Downloads audit failed: {e}')
         time.sleep(DELUGE_REPAIR_INTERVAL)
 
 
