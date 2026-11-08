@@ -45,6 +45,19 @@ def is_main_video(rel_path):
     return not (base.startswith('sample') or stem.endswith(EXTRAS_SUFFIX))
 
 
+def is_sample(rel_path):
+    """A sample file: anything inside a Sample(s) folder, or a video named
+    sample* / *-sample / *.sample."""
+    parts = (rel_path or '').split('/')
+    if any(p.lower() in ('sample', 'samples') for p in parts[:-1]):
+        return True
+    base = parts[-1].lower()
+    if not base.endswith(VIDEO_EXT):
+        return False
+    stem = base.rsplit('.', 1)[0]
+    return base.startswith('sample') or stem.endswith(('-sample', '.sample', '_sample'))
+
+
 def is_subtitle(rel_path):
     return (rel_path or '').lower().endswith(SUB_EXT)
 

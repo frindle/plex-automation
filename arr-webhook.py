@@ -719,6 +719,70 @@ def supersede_torrent(torrent_hash):
                         f'torrent {torrent_hash} superseded with no local data — '
                         f'not moved (orphan avoided; reaped by cleanup)')
 
+# Samples only matter while a torrent seeds. When a removal keeps the files,
+# the torrent's sample files are deleted right after the entry is gone.
+SAMPLE_MAX_BYTES = 2 * 1024 ** 3  # a "sample" bigger than this is not deleted
+
+
+def _sample_files_to_delete(torrent_hash):
+    """Local paths of this torrent's sample files, read BEFORE a keep-data
+    removal. [] on any doubt: lookup failure, no real main video (the
+    "sample" might be the release), or another torrent with the same name and
+    save_path (a cross-seed still using the files)."""
+    try:
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.get_torrent_status',
+                  'params': [torrent_hash, ['name', 'save_path', 'files']], 'id': 10},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        st = resp.json().get('result') or {}
+    except Exception as e:
+        log.warning(f'{torrent_hash}: sample lookup failed ({e}); samples kept')
+        return []
+    save_path, files = st.get('save_path'), st.get('files')
+    if not isinstance(save_path, str) or not save_path or not isinstance(files, list):
+        return []
+    rels = [f.get('path') or '' for f in files if isinstance(f, dict)]
+    samples = [r for r in rels if episode_retention.is_sample(r)]
+    if not samples or not any(episode_retention.is_main_video(r) for r in rels):
+        return []
+    try:
+        others = get_all_torrents(['name', 'save_path'])
+    except Exception as e:
+        log.warning(f'{torrent_hash}: cross-seed check failed ({e}); samples kept')
+        return []
+    sp = posixpath.normpath(save_path)
+    if any(h != torrent_hash and t.get('name') == st.get('name')
+           and posixpath.normpath(t.get('save_path') or '/') == sp for h, t in (others or {}).items()):
+        return []
+    out = []
+    for r in samples:
+        local = _deluge_to_local(posixpath.normpath(posixpath.join(save_path, r)))
+        try:
+            if local and os.path.isfile(local) and os.path.getsize(local) <= SAMPLE_MAX_BYTES:
+                out.append(local)
+        except OSError:
+            continue
+    return out
+
+
+def _delete_samples(paths, torrent_hash):
+    for p in paths:
+        try:
+            os.remove(p)
+            log.info(f'{torrent_hash}: deleted sample {p}')
+        except OSError as e:
+            log.warning(f'{torrent_hash}: could not delete sample {p} ({e})')
+    for d in sorted({os.path.dirname(p) for p in paths}, reverse=True):
+        if os.path.basename(d).lower() in ('sample', 'samples'):
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+
+
 # remove_torrent result: the seed floor blocked the removal, retry later
 DEFERRED = 'deferred'
 def remove_torrent(torrent_hash, remove_data=True, info=None):
@@ -788,6 +852,7 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
             record_activity('library-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (library save_path {save_path})')
             remove_data = False
 
+    samples = [] if remove_data else _sample_files_to_delete(torrent_hash)
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={'method': 'core.remove_torrent', 'params': [torrent_hash, remove_data], 'id': 7},
@@ -795,6 +860,15 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
     )
     resp.raise_for_status()
     _invalidate_snapshot()
+    if samples:
+        try:
+            body = resp.json() or {}
+        except Exception:
+            body = {}
+        if body.get('error') is None and body.get('result') is not False:
+            _delete_samples(samples, torrent_hash)
+        else:
+            log.warning(f'{torrent_hash}: Deluge did not confirm the removal; samples kept')
     log.info(f'Removed torrent {torrent_hash}' + (' and deleted files' if remove_data else ' (files left on disk)'))
     log_removal(traceback.extract_stack(limit=2)[0].name, torrent_hash, info.get('name'),
                 'files deleted' if remove_data else 'files kept',
