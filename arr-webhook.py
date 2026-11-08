@@ -2321,10 +2321,10 @@ def cleanup_stalled_seeds(dry_run=False):
                 'swarm_seeds': swarm_seeds,
             })
             if not dry_run:
-                # Delete the files only when every one is verifiably imported (hardlinked into the library)
+                # Delete the files only when every video is verifiably in the library (hardlinked or copy-imported)
                 # and none sits under the media tree; otherwise unseed and keep them.
                 files = (_deluge_rpc('core.get_torrent_status', [h, ['files']]) or {}).get('files')
-                drop = episode_retention.remove_data_for(dict(info, files=files), _library_has_file)
+                drop = episode_retention.remove_data_for(dict(info, files=files, hash=h), _library_has_file)
                 r = remove_torrent(h, remove_data=drop)
                 if r == DEFERRED:
                     continue
@@ -8019,18 +8019,114 @@ def downloads_audit_tick(now=None):
     return r
 
 
+ARR_EXTRAS_TTL = 3600
+_arr_extras_cache = {}  # who -> (fetched_at, set of extensions the *arr imports as extra files)
+
+
+def _arr_imported_paths(torrent_hash):
+    """{droppedPath: (importedPath, who)} from Radarr + Sonarr
+    downloadFolderImported history for this torrent. None on ANY lookup
+    error (callers keep the files)."""
+    if not torrent_hash:
+        return None
+    out = {}
+    for who, url, key in (('Radarr', RADARR_URL, RADARR_API_KEY), ('Sonarr', SONARR_URL, SONARR_API_KEY)):
+        if not key:
+            continue
+        try:
+            r = requests.get(
+                f'{url}/api/v3/history',
+                headers={'X-Api-Key': key},
+                params={'downloadId': torrent_hash.upper(), 'pageSize': 1000},
+                timeout=15,
+            )
+            r.raise_for_status()
+            records = (r.json() or {}).get('records') or []
+        except Exception as e:
+            log.warning(f'{who} import-history lookup for {torrent_hash[:8]} failed ({e}); keeping files')
+            return None
+        for rec in records:
+            if rec.get('eventType') != 'downloadFolderImported':
+                continue
+            data = rec.get('data') or {}
+            dropped, imported = data.get('droppedPath'), data.get('importedPath')
+            if isinstance(dropped, str) and isinstance(imported, str) and dropped and imported:
+                out[posixpath.normpath(dropped)] = (imported, who)
+    return out
+
+
+def _arr_extra_exts(who):
+    """Extensions the *arr copies alongside an import (Import Extra Files).
+    Empty set when off or on any error, so subtitles are then kept."""
+    now = time.time()
+    hit = _arr_extras_cache.get(who)
+    if hit and now - hit[0] < ARR_EXTRAS_TTL:
+        return hit[1]
+    url, key = (RADARR_URL, RADARR_API_KEY) if who == 'Radarr' else (SONARR_URL, SONARR_API_KEY)
+    exts = set()
+    try:
+        r = requests.get(f'{url}/api/v3/config/mediamanagement', headers={'X-Api-Key': key}, timeout=15)
+        r.raise_for_status()
+        cfg = r.json() or {}
+        if cfg.get('importExtraFiles'):
+            exts = {'.' + e.strip().lstrip('.').lower()
+                    for e in str(cfg.get('extraFileExtensions') or '').split(',') if e.strip()}
+    except Exception as e:
+        log.warning(f'{who} mediamanagement lookup failed ({e}); treating extra files as not imported')
+        return set()
+    _arr_extras_cache[who] = (now, exts)
+    return exts
+
+
 def _library_has_file(t):
-    """True only when every file of the torrent is verifiably hardlinked
-    (nlink > 1) as seen through DELUGE_PATH_MAP; anything unreadable -> False
-    (files are kept)."""
-    paths = episode_retention.file_paths(t)
-    if not paths:
+    """True only when the library verifiably holds every video of the torrent,
+    so deleting the torrent's data loses nothing. Each main video must be
+    either hardlinked (nlink > 1) or copy-imported: a downloadFolderImported
+    history record for this torrent's hash whose droppedPath is that file and
+    whose importedPath (under /data/Media) exists on disk. Samples, bonus
+    features and .nfo/.txt/images are disposable; subtitles count only when
+    hardlinked or the importing *arr copies that extension as an extra file.
+    At least one main video is required. Anything unreadable, unmapped or any
+    failed lookup -> False (files are kept)."""
+    save_path = t.get('save_path') or ''
+    files = t.get('files') or []
+    if not files:
         return False
-    for p in paths:
+    imported = None  # fetched lazily: only when some main video is a single-link copy
+    importers = set()
+    pending_subs = []
+    have_main = False
+    for f in files:
+        rel = f.get('path') or ''
+        p = posixpath.normpath(posixpath.join(save_path, rel))
         local = _deluge_to_local(p)
-        if not local or not os.path.isfile(local) or os.stat(local).st_nlink < 2:
+        if not local or not os.path.isfile(local):
             return False
-    return True
+        if os.stat(local).st_nlink >= 2:
+            have_main = have_main or episode_retention.is_main_video(rel)
+            continue
+        if episode_retention.is_main_video(rel):
+            if imported is None:
+                imported = _arr_imported_paths(t.get('hash'))
+                if imported is None:
+                    return False
+            hit = imported.get(p)
+            if not hit or not episode_retention.under_media(hit[0]):
+                return False
+            dst = _deluge_to_local(hit[0])
+            if not dst or not os.path.isfile(dst):
+                return False
+            importers.add(hit[1])
+            have_main = True
+        elif episode_retention.is_subtitle(rel):
+            pending_subs.append(rel)
+    if pending_subs:
+        if not importers:
+            return False
+        exts = set().union(*(_arr_extra_exts(w) for w in importers))
+        if any(posixpath.splitext(r)[1].lower() not in exts for r in pending_subs):
+            return False
+    return have_main
 
 
 def episode_retention_run(env=None):

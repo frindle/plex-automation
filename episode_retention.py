@@ -24,6 +24,30 @@ FIELDS = ['name', 'label', 'state', 'progress', 'seeding_time', 'save_path']  # 
 
 DEFERRED = 'deferred'
 
+# Files an *arr never imports: samples and bonus material. Deleting them with
+# the torrent loses nothing the library holds.
+EXTRAS_DIRS = {'sample', 'samples', 'extras', 'featurettes', 'behind the scenes', 'deleted scenes',
+               'interviews', 'scenes', 'shorts', 'trailers', 'bonus', 'other'}
+EXTRAS_SUFFIX = ('-sample', '-featurette', '-trailer', '-behindthescenes', '-deleted', '-interview',
+                 '-scene', '-short', '-other')
+SUB_EXT = ('.srt', '.ass', '.ssa', '.sub', '.idx', '.sup', '.vtt')
+
+
+def is_main_video(rel_path):
+    """A video file the *arr would import (not a sample or bonus feature)."""
+    parts = (rel_path or '').split('/')
+    base = parts[-1].lower()
+    if not base.endswith(VIDEO_EXT):
+        return False
+    if any(p.lower() in EXTRAS_DIRS for p in parts[:-1]):
+        return False
+    stem = base.rsplit('.', 1)[0]
+    return not (base.startswith('sample') or stem.endswith(EXTRAS_SUFFIX))
+
+
+def is_subtitle(rel_path):
+    return (rel_path or '').lower().endswith(SUB_EXT)
+
 
 def classify(t):
     label = (t.get('label') or '').lower()
@@ -127,7 +151,8 @@ def episode_retention(torrents, remove, library_has_file, env=None, fetch_files=
         if len(result['removed']) + len(result['planned']) >= limit:
             result['capped'] = True
             break
-        entry = {'hash': h, 'name': t.get('name', ''), 'remove_data': remove_data_for(t, library_has_file)}
+        entry = {'hash': h, 'name': t.get('name', ''),
+                 'remove_data': remove_data_for(dict(t, hash=h), library_has_file)}
         if not apply:
             result['planned'].append(entry)
             continue
