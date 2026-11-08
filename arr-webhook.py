@@ -14,6 +14,7 @@ from flask import Flask, request, jsonify
 
 from media_share import share_bp, init_db as init_share_db
 import episode_retention
+import rar_extract
 import torrent_breakdown
 import library_audit
 import downloads_audit
@@ -208,7 +209,7 @@ app.register_blueprint(share_bp)
 _DESTRUCTIVE_GET_GUARD_PATHS = {
     '/torrent-purge', '/purge-unstarted-superseded', '/complete-orphans',
     '/incomplete-orphans', '/run-stalled-seeds', '/auto-rescue', '/run-deluge-repair',
-    '/run-restore-moved',
+    '/run-restore-moved', '/rar-library-scan',
 }
 
 @app.before_request
@@ -720,15 +721,18 @@ def supersede_torrent(torrent_hash):
                         f'not moved (orphan avoided; reaped by cleanup)')
 
 # Samples only matter while a torrent seeds. When a removal keeps the files,
-# the torrent's sample files are deleted right after the entry is gone.
+# the torrent's sample files are deleted right after the entry is gone, and
+# RAR sets in the library are queued for unpacking (Plex can't play .rar).
 SAMPLE_MAX_BYTES = 2 * 1024 ** 3  # a "sample" bigger than this is not deleted
 
 
-def _sample_files_to_delete(torrent_hash):
-    """Local paths of this torrent's sample files, read BEFORE a keep-data
-    removal. [] on any doubt: lookup failure, no real main video (the
-    "sample" might be the release), or another torrent with the same name and
-    save_path (a cross-seed still using the files)."""
+def _keep_data_cleanup_plan(torrent_hash):
+    """Read BEFORE a keep-data removal: (sample paths to delete, library RAR
+    sets to unpack), as local paths. ([], []) on any doubt: lookup failure,
+    or another torrent with the same name and save_path (a cross-seed still
+    using the files). Samples also need a real main video in the torrent (the
+    "sample" might be the release); RAR sets only count under the library,
+    where nothing else would ever unpack them."""
     try:
         resp = session.post(
             f'{DELUGE_URL}/json',
@@ -739,24 +743,28 @@ def _sample_files_to_delete(torrent_hash):
         resp.raise_for_status()
         st = resp.json().get('result') or {}
     except Exception as e:
-        log.warning(f'{torrent_hash}: sample lookup failed ({e}); samples kept')
-        return []
+        log.warning(f'{torrent_hash}: cleanup lookup failed ({e}); samples/rars left alone')
+        return [], []
     save_path, files = st.get('save_path'), st.get('files')
     if not isinstance(save_path, str) or not save_path or not isinstance(files, list):
-        return []
+        return [], []
     rels = [f.get('path') or '' for f in files if isinstance(f, dict)]
     samples = [r for r in rels if episode_retention.is_sample(r)]
-    if not samples or not any(episode_retention.is_main_video(r) for r in rels):
-        return []
+    if not any(episode_retention.is_main_video(r) for r in rels):
+        samples = []
+    deluge_paths = [posixpath.normpath(posixpath.join(save_path, r)) for r in rels]
+    rsets = rar_extract.rar_sets(deluge_paths) if is_library_path(save_path) else []
+    if not samples and not rsets:
+        return [], []
     try:
         others = get_all_torrents(['name', 'save_path'])
     except Exception as e:
-        log.warning(f'{torrent_hash}: cross-seed check failed ({e}); samples kept')
-        return []
+        log.warning(f'{torrent_hash}: cross-seed check failed ({e}); samples/rars left alone')
+        return [], []
     sp = posixpath.normpath(save_path)
     if any(h != torrent_hash and t.get('name') == st.get('name')
            and posixpath.normpath(t.get('save_path') or '/') == sp for h, t in (others or {}).items()):
-        return []
+        return [], []
     out = []
     for r in samples:
         local = _deluge_to_local(posixpath.normpath(posixpath.join(save_path, r)))
@@ -765,7 +773,10 @@ def _sample_files_to_delete(torrent_hash):
                 out.append(local)
         except OSError:
             continue
-    return out
+    local_sets = [{'first': _deluge_to_local(rs['first']),
+                   'volumes': [_deluge_to_local(v) for v in rs['volumes']],
+                   'extras': [_deluge_to_local(v) for v in rs['extras']]} for rs in rsets]
+    return out, local_sets
 
 
 def _delete_samples(paths, torrent_hash):
@@ -781,6 +792,138 @@ def _delete_samples(paths, torrent_hash):
                 os.rmdir(d)
             except OSError:
                 pass
+
+
+# ── Library RAR sets: unpack once nothing seeds them ────────────────────────
+RAR_QUEUE_PATH = os.environ.get('RAR_QUEUE_PATH', '/data/rar_extract_queue.json')
+RAR_EXTRACT_INTERVAL = int(os.environ.get('RAR_EXTRACT_INTERVAL', '900'))
+RAR_EXTRACT_ENABLED = os.environ.get('RAR_EXTRACT_ENABLED', '1').lower() not in ('0', 'false', 'no', 'off')
+RAR_MIN_TORRENTS = int(os.environ.get('RAR_MIN_TORRENTS', '50'))  # fewer from Deluge = glitch, do nothing
+_rar_queue_lock = threading.Lock()  # short: load/modify/save of the queue file
+_rar_run_lock = threading.Lock()    # long: one extraction pass at a time
+
+
+def _queue_rar_sets(rsets, source):
+    try:
+        with _rar_queue_lock:
+            q = rar_extract.load_queue(RAR_QUEUE_PATH)
+            added = sum(1 for rs in rsets if rar_extract.enqueue(q, rs, source, time.time()))
+            if added:
+                rar_extract.save_queue(RAR_QUEUE_PATH, q)
+        if added:
+            log.info(f'[rar] queued {added} library RAR set(s) from {source} for unpacking')
+        return added
+    except Exception as e:
+        log.warning(f'[rar] could not queue RAR sets from {source}: {e}')
+        return 0
+
+
+def _library_local_roots():
+    return [local for deluge, local in DELUGE_PATH_MAP
+            if episode_retention.under_media(deluge) and os.path.isdir(local) and os.access(local, os.W_OK)]
+
+
+def _owned_local_paths():
+    """Every file a live torrent owns, as local paths. Raises on any doubt so
+    callers do nothing rather than unpack (and delete) a seeding set."""
+    ts = _deluge_rpc('core.get_torrents_status', [{}, ['save_path', 'files']]) or {}
+    if len(ts) < RAR_MIN_TORRENTS or any(not isinstance(t.get('files'), list) for t in ts.values()):
+        raise RuntimeError(f'Deluge returned {len(ts)} torrents or incomplete file lists')
+    return {posixpath.normpath(_deluge_to_local(posixpath.join(t.get('save_path') or '', f.get('path') or '')))
+            for t in ts.values() for f in t['files']}
+
+
+def scan_library_rar_sets():
+    """Library RAR sets that no live torrent owns."""
+    deluge_login()
+    owned = _owned_local_paths()
+    out = []
+    for root in _library_local_roots():
+        for d, dirs, files in os.walk(root):
+            dirs[:] = [x for x in dirs if not x.startswith('.')]
+            for rs in rar_extract.rar_sets([os.path.join(d, n) for n in files]):
+                if not any(posixpath.normpath(v) in owned for v in rs['volumes']):
+                    out.append(rs)
+    return out
+
+
+def _rescan_arr_for(local_path):
+    """Ask the owning *arr to rescan the series/movie folder holding local_path."""
+    deluge_path = _local_to_deluge(local_path)
+    for who, url, key, ep, cmd, idk in (('Sonarr', SONARR_URL, SONARR_API_KEY, 'series', 'RescanSeries', 'seriesId'),
+                                        ('Radarr', RADARR_URL, RADARR_API_KEY, 'movie', 'RescanMovie', 'movieId')):
+        if not key:
+            continue
+        try:
+            r = requests.get(f'{url}/api/v3/{ep}', headers={'X-Api-Key': key}, timeout=60)
+            r.raise_for_status()
+            for item in r.json() or []:
+                root = (item.get('path') or '').rstrip('/')
+                if root and (deluge_path == root or deluge_path.startswith(root + '/')):
+                    requests.post(f'{url}/api/v3/command', headers={'X-Api-Key': key},
+                                  json={'name': cmd, idk: item['id']}, timeout=30).raise_for_status()
+                    return f'{who} {cmd} {item.get("title")}'
+        except Exception as e:
+            log.warning(f'[rar] {who} rescan lookup for {local_path} failed: {e}')
+    return None
+
+
+def process_rar_queue():
+    """Unpack queued library RAR sets one by one. Sets a live torrent owns
+    again are skipped; failures are retried up to MAX_ATTEMPTS, then parked
+    as 'failed' for a human (GET /rar-extract-queue)."""
+    if not _rar_run_lock.acquire(blocking=False):
+        return {'ok': False, 'error': 'already running'}
+    done, failed = [], []
+    try:
+        with _rar_queue_lock:
+            pending = [e for e in rar_extract.load_queue(RAR_QUEUE_PATH) if e.get('status') != 'failed']
+        if not pending:
+            return {'ok': True, 'done': [], 'failed': []}
+        deluge_login()
+        owned = _owned_local_paths()
+        for e in pending:
+            if any(posixpath.normpath(v) in owned for v in e.get('volumes') or []):
+                log.info(f'[rar] {e["first"]} is owned by a live torrent again; skipped')
+                continue
+            res = rar_extract.extract(e)
+            with _rar_queue_lock:
+                q = rar_extract.load_queue(RAR_QUEUE_PATH)
+                cur = next((x for x in q if x.get('first') == e['first']), None)
+                if res['ok']:
+                    q = [x for x in q if x.get('first') != e['first']]
+                elif cur is not None:
+                    cur['attempts'] = cur.get('attempts', 0) + 1
+                    cur['error'] = res['error']
+                    if cur['attempts'] >= rar_extract.MAX_ATTEMPTS:
+                        cur['status'] = 'failed'
+                rar_extract.save_queue(RAR_QUEUE_PATH, q)
+            if res['ok']:
+                rescan = _rescan_arr_for(e['first'])
+                log.info(f'[rar] unpacked {e["first"]} -> {len(res["files"])} file(s); rescan: {rescan}')
+                record_activity('rar-extract', f'Unpacked {os.path.basename(e["first"])} '
+                                               f'({len(res["files"])} file(s)); {rescan or "no *arr rescan"}')
+                done.append({'first': e['first'], 'files': res['files'], 'rescan': rescan})
+            else:
+                log.warning(f'[rar] unpack of {e["first"]} failed: {res["error"]}')
+                if cur is not None and cur.get('status') == 'failed':
+                    record_activity('rar-extract', f'Gave up unpacking {e["first"]}: {res["error"]}')
+                failed.append({'first': e['first'], 'error': res['error']})
+        return {'ok': True, 'done': done, 'failed': failed}
+    except Exception as e:
+        log.warning(f'[rar] queue pass aborted: {e}')
+        return {'ok': False, 'error': str(e), 'done': done, 'failed': failed}
+    finally:
+        _rar_run_lock.release()
+
+
+def rar_extract_scheduler():
+    if not RAR_EXTRACT_ENABLED:
+        log.info('Library RAR unpacking disabled (RAR_EXTRACT_ENABLED=0)')
+        return
+    while True:
+        time.sleep(RAR_EXTRACT_INTERVAL)
+        process_rar_queue()
 
 
 # remove_torrent result: the seed floor blocked the removal, retry later
@@ -852,7 +995,7 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
             record_activity('library-guard', f'torrent {torrent_hash} data-delete downgraded to keep-data (library save_path {save_path})')
             remove_data = False
 
-    samples = [] if remove_data else _sample_files_to_delete(torrent_hash)
+    samples, rsets = ([], []) if remove_data else _keep_data_cleanup_plan(torrent_hash)
     resp = session.post(
         f'{DELUGE_URL}/json',
         json={'method': 'core.remove_torrent', 'params': [torrent_hash, remove_data], 'id': 7},
@@ -860,15 +1003,18 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
     )
     resp.raise_for_status()
     _invalidate_snapshot()
-    if samples:
+    if samples or rsets:
         try:
             body = resp.json() or {}
         except Exception:
             body = {}
         if body.get('error') is None and body.get('result') is not False:
-            _delete_samples(samples, torrent_hash)
+            if samples:
+                _delete_samples(samples, torrent_hash)
+            if rsets:
+                _queue_rar_sets(rsets, torrent_hash)
         else:
-            log.warning(f'{torrent_hash}: Deluge did not confirm the removal; samples kept')
+            log.warning(f'{torrent_hash}: Deluge did not confirm the removal; samples/rars left alone')
     log.info(f'Removed torrent {torrent_hash}' + (' and deleted files' if remove_data else ' (files left on disk)'))
     log_removal(traceback.extract_stack(limit=2)[0].name, torrent_hash, info.get('name'),
                 'files deleted' if remove_data else 'files kept',
@@ -8233,6 +8379,41 @@ def library_seed_audit_route():
     return jsonify(library_seed_audit(dry_run=True)), 200
 
 
+@app.route('/rar-library-scan', methods=['GET', 'POST'])
+def rar_library_scan_route():
+    """Library RAR sets no torrent owns. Dry run lists them; POST ?apply=1 queues them."""
+    apply = request.method == 'POST' and request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    try:
+        sets = scan_library_rar_sets()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 503
+    rows = []
+    for rs in sets:
+        try:
+            size = sum(os.path.getsize(v) for v in rs['volumes'])
+        except OSError:
+            size = None
+        rows.append({'first': rs['first'], 'volumes': len(rs['volumes']), 'size': size})
+    queued = _queue_rar_sets(sets, 'library-scan') if apply else 0
+    total = sum(r['size'] or 0 for r in rows)
+    return jsonify({'ok': True, 'dry_run': not apply, 'count': len(rows), 'bytes': total,
+                    'queued': queued, 'sets': rows}), 200
+
+
+@app.route('/rar-extract-queue', methods=['GET'])
+def rar_extract_queue_route():
+    with _rar_queue_lock:
+        q = rar_extract.load_queue(RAR_QUEUE_PATH)
+    return jsonify({'ok': True, 'count': len(q), 'queue': [
+        {k: e.get(k) for k in ('first', 'source', 'added', 'attempts', 'status', 'error')} for e in q]}), 200
+
+
+@app.route('/run-rar-extract', methods=['POST'])
+def run_rar_extract_route():
+    threading.Thread(target=process_rar_queue, daemon=True).start()
+    return jsonify({'ok': True, 'started': True}), 202
+
+
 @app.route('/downloads-audit', methods=['GET'])
 def downloads_audit_route():
     # Report only: a GET never sends Pushover or records anything; the daily tick does.
@@ -8428,4 +8609,6 @@ if __name__ == '__main__':
     t10.start()
     t11 = threading.Thread(target=restore_moved_scheduler, daemon=True)
     t11.start()
+    t12 = threading.Thread(target=rar_extract_scheduler, daemon=True)
+    t12.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
