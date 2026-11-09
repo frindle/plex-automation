@@ -874,13 +874,37 @@ _EP_RE = re.compile(r'(?i)(?:^|[^a-z0-9])S(\d{1,2})((?:[ ._-]?E\d{1,3})+)(?![0-9
 _EP_RANGE_RE = re.compile(r'-(\d{2,3})(?![0-9])(?!p)', re.I)
 
 
+_NX_RE = re.compile(r'(?i)(?:^|[^a-z0-9])(\d{1,2})x(\d{2,3})(?![0-9])')
+
+
+_NX_MORE_RE = re.compile(r'(?i)(?:x(\d{2,3})|-(?:\d{1,2}x)?(\d{2,3}))(?![0-9])(?!p)')
+
+
+def _nx_episodes(base):
+    """[(season, episode), ...] from an NxNN name (scene DVD rips: show.3x01.title.avi)."""
+    m = _NX_RE.search(base)
+    if not m:
+        return []
+    season, eps, pos = int(m.group(1)), [int(m.group(2))], m.end()
+    while True:
+        n = _NX_MORE_RE.match(base, pos)
+        if not n:
+            break
+        if n.group(1):
+            eps.append(int(n.group(1)))
+        elif int(n.group(2)) > eps[-1]:
+            eps += list(range(eps[-1] + 1, int(n.group(2)) + 1))
+        pos = n.end()
+    return [(season, e) for e in eps]
+
 def _episodes_in_name(name):
     """[(season, episode), ...] from an SxxEyy file name: SxxEyyEzz, SxxEyy-Ezz
-    and SxxEyy-zz (a range) included. [] if none."""
+    and SxxEyy-zz (a range) included. Falls back to NxNN names (3x01, 3x01x02,
+    3x01-02, 3x01-3x02). [] if none."""
     base = os.path.basename(name or '')
     m = _EP_RE.search(base)
     if not m:
-        return []
+        return _nx_episodes(base)
     season = int(m.group(1))
     eps = [int(e) for e in re.findall(r'(?i)E(\d{1,3})', m.group(2))]
     rng = _EP_RANGE_RE.match(base, m.end())
@@ -920,7 +944,7 @@ def rar_set_action(rset, cache=None, contents=None):
     delete: the owning Sonarr series has a file for every episode in the set,
             or the owning Radarr movie has a file.
     unpack: the set holds a video the *arr has no file for.
-    skip:   a firm no (no video inside, no SxxEyy in a name, an episode Sonarr
+    skip:   a firm no (no video inside, no SxxEyy/NxNN in a name, an episode Sonarr
             doesn't list, no owning *arr item). Parked for a human; nothing touched.
     error:  lsar or an *arr API failed; retried like a failed unpack."""
     cache = {} if cache is None else cache
@@ -942,7 +966,7 @@ def rar_set_action(rset, cache=None, contents=None):
         for v in videos:
             eps = _episodes_in_name(v)
             if not eps:
-                return {'action': 'skip', 'reason': f'no SxxEyy in {os.path.basename(v)}', 'arr': title}
+                return {'action': 'skip', 'reason': f'no SxxEyy/NxNN in {os.path.basename(v)}', 'arr': title}
             want.update(eps)
         try:
             r = requests.get(f'{SONARR_URL}/api/v3/episode', params={'seriesId': series['id']},

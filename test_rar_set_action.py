@@ -75,7 +75,16 @@ def test_episodes_in_name():
     assert e('Show.S02E01-720p.mkv') == [(2, 1)]
     assert e('show.s10e100.mkv') == [(10, 100)]
     assert e('Show.2019.10.01.mkv') == []
-    assert e('Show 1x05.mkv') == []
+    assert e('Show 1x05.mkv') == [(1, 5)]
+    assert e('ncis.3x01.kill_ari_part_1.dvdrip_xvid-fov.avi') == [(3, 1)]
+    assert e('Show.3x01x02.avi') == [(3, 1), (3, 2)]
+    assert e('Show.3x01-03.avi') == [(3, 1), (3, 2), (3, 3)]
+    assert e('Show.3x01-3x02.avi') == [(3, 1), (3, 2)]
+    assert e('Show.3x01-720p.avi') == [(3, 1)]
+    assert e('ncis.3x09.frame-up.dvdrip_xvid-fov.avi') == [(3, 9)]
+    assert e('Movie.1920x1080.mkv') == []
+    assert e('Show.S01E01.10bit.x264.mkv') == [(1, 1)]
+    assert e('Show.2x5.mkv') == []
 
 
 def test_torrent_has_rar():
@@ -212,3 +221,9 @@ if __name__ == '__main__':
         if n.startswith('test_') and callable(f):
             f()
             print('ok', n)
+
+
+def test_sonarr_nxnn_name_deletes():
+    aw.requests = _requests({(3, 1): True})
+    d = aw.rar_set_action(_set(TV), {}, _ls('ncis.3x01.kill_ari_part_1.dvdrip_xvid-fov.avi'))
+    assert d['action'] == 'delete', d
