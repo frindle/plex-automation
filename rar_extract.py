@@ -17,6 +17,7 @@ import shutil
 import subprocess
 
 UNAR = os.environ.get('UNAR_BIN', 'unar')
+LSAR = os.environ.get('LSAR_BIN', 'lsar')
 EXTRACT_TIMEOUT = int(os.environ.get('RAR_EXTRACT_TIMEOUT', '3600'))
 MAX_ATTEMPTS = 3
 
@@ -62,6 +63,57 @@ def rar_sets(paths):
             continue
         out.append({'first': g['first'], 'volumes': sorted(g['vols']), 'extras': sfv.get((d, stem), [])})
     return out
+
+
+def has_rar_volumes(paths):
+    """True if any path names a RAR volume (.rar, .partNN.rar, .rNN, .sNN)."""
+    for p in paths:
+        base = os.path.basename(p or '')
+        if _PART.match(base) or _OLD_RAR.match(base) or _OLD_VOL.match(base):
+            return True
+    return False
+
+
+def list_contents(first, run=subprocess.run):
+    """Inner file names of a RAR set (directories left out), via lsar -j.
+    -> {'ok': True, 'files': [...]} or {'ok': False, 'error': str}"""
+    try:
+        r = run([LSAR, '-j', first], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {'ok': False, 'error': f'lsar failed: {str(e)[:200]}'}
+    if r.returncode != 0:
+        return {'ok': False, 'error': f'lsar exit {r.returncode}: {(r.stderr or r.stdout or "").strip()[:300]}'}
+    try:
+        entries = json.loads(r.stdout).get('lsarContents')
+    except (ValueError, AttributeError):
+        return {'ok': False, 'error': 'lsar output not JSON'}
+    if not isinstance(entries, list):
+        return {'ok': False, 'error': 'lsar output has no lsarContents'}
+    files = [e['XADFileName'] for e in entries
+             if isinstance(e, dict) and isinstance(e.get('XADFileName'), str) and not e.get('XADIsDirectory')]
+    return {'ok': True, 'files': files}
+
+
+def delete_set(rset, remove=os.remove):
+    """Delete a set's volumes and .sfv files, first volume last.
+    -> {'ok': bool, 'removed': [...], 'error': str}
+    Stops at the first failure; the files already removed are listed."""
+    removed = []
+    first = rset.get('first')
+    # The first volume goes last, so a retry after a partial failure can
+    # still list the set's contents.
+    order = [v for v in rset.get('volumes') or [] if v != first] + list(rset.get('extras') or [])
+    if first:
+        order.append(first)
+    for v in order:
+        try:
+            remove(v)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            return {'ok': False, 'removed': removed, 'error': f'could not delete {v}: {e}'}
+        removed.append(v)
+    return {'ok': True, 'removed': removed}
 
 
 def _walk_files(root):

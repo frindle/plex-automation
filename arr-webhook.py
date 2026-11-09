@@ -868,25 +868,146 @@ def _rescan_arr_for(local_path):
     return None
 
 
+_EP_RE = re.compile(r'(?i)(?:^|[^a-z0-9])S(\d{1,2})((?:[ ._-]?E\d{1,3})+)(?![0-9])')
+
+
+_EP_RANGE_RE = re.compile(r'-(\d{2,3})(?![0-9])(?!p)', re.I)
+
+
+def _episodes_in_name(name):
+    """[(season, episode), ...] from an SxxEyy file name: SxxEyyEzz, SxxEyy-Ezz
+    and SxxEyy-zz (a range) included. [] if none."""
+    base = os.path.basename(name or '')
+    m = _EP_RE.search(base)
+    if not m:
+        return []
+    season = int(m.group(1))
+    eps = [int(e) for e in re.findall(r'(?i)E(\d{1,3})', m.group(2))]
+    rng = _EP_RANGE_RE.match(base, m.end())
+    if rng and int(rng.group(1)) > eps[-1]:
+        eps += list(range(eps[-1] + 1, int(rng.group(1)) + 1))
+    elif len(eps) == 2 and eps[1] > eps[0] + 1 and re.search(r'(?i)-E\d', m.group(2)):
+        eps = list(range(eps[0], eps[1] + 1))
+    return [(season, e) for e in eps]
+
+
+def _arr_items(kind, cache):
+    """Sonarr series ('series') or Radarr movies ('movie'), fetched once per pass. Raises on API errors."""
+    if kind not in cache:
+        url, key = (SONARR_URL, SONARR_API_KEY) if kind == 'series' else (RADARR_URL, RADARR_API_KEY)
+        if not key:
+            cache[kind] = []
+        else:
+            r = requests.get(f'{url}/api/v3/{kind}', headers={'X-Api-Key': key}, timeout=60)
+            r.raise_for_status()
+            cache[kind] = r.json() or []
+    return cache[kind]
+
+
+def _owning_item(items, deluge_path):
+    """The *arr item whose folder holds deluge_path (deepest match), or None."""
+    best, best_len = None, -1
+    for item in items or []:
+        root = (item.get('path') or '').rstrip('/')
+        if root and (deluge_path == root or deluge_path.startswith(root + '/')) and len(root) > best_len:
+            best, best_len = item, len(root)
+    return best
+
+
+def rar_set_action(rset, cache=None, contents=None):
+    """Unpack or delete one library RAR set (Penn, 2026-11-07).
+    -> {'action': 'unpack'|'delete'|'skip'|'error', 'reason': str, 'arr': title}
+    delete: the owning Sonarr series has a file for every episode in the set,
+            or the owning Radarr movie has a file.
+    unpack: the set holds a video the *arr has no file for.
+    skip:   a firm no (no video inside, no SxxEyy in a name, an episode Sonarr
+            doesn't list, no owning *arr item). Parked for a human; nothing touched.
+    error:  lsar or an *arr API failed; retried like a failed unpack."""
+    cache = {} if cache is None else cache
+    lst = (contents or rar_extract.list_contents)(rset['first'])
+    if not lst.get('ok'):
+        return {'action': 'error', 'reason': lst.get('error') or 'lsar failed'}
+    videos = [f for f in lst.get('files') or [] if episode_retention.is_main_video(f)]
+    if not videos:
+        return {'action': 'skip', 'reason': 'no video inside'}
+    dp = _local_to_deluge(rset['first'])
+    try:
+        series = _owning_item(_arr_items('series', cache), dp)
+        movie = None if series else _owning_item(_arr_items('movie', cache), dp)
+    except Exception as e:
+        return {'action': 'error', 'reason': f'*arr lookup failed: {str(e)[:200]}'}
+    if series:
+        title = series.get('title')
+        want = set()
+        for v in videos:
+            eps = _episodes_in_name(v)
+            if not eps:
+                return {'action': 'skip', 'reason': f'no SxxEyy in {os.path.basename(v)}', 'arr': title}
+            want.update(eps)
+        try:
+            r = requests.get(f'{SONARR_URL}/api/v3/episode', params={'seriesId': series['id']},
+                             headers={'X-Api-Key': SONARR_API_KEY}, timeout=60)
+            r.raise_for_status()
+            have = {(e.get('seasonNumber'), e.get('episodeNumber')): bool(e.get('hasFile')) for e in r.json() or []}
+        except Exception as e:
+            return {'action': 'error', 'reason': f'Sonarr episode lookup failed: {str(e)[:200]}', 'arr': title}
+        unknown = sorted(want - set(have))
+        if unknown:
+            s0, e0 = unknown[0]
+            return {'action': 'skip', 'arr': title,
+                    'reason': f'{len(unknown)} episode(s) not in Sonarr (first S{s0:02d}E{e0:02d})'}
+        missing = [k for k in want if not have[k]]
+        if missing:
+            return {'action': 'unpack', 'arr': title,
+                    'reason': f'Sonarr is missing {len(missing)} of {len(want)} episode(s)'}
+        return {'action': 'delete', 'arr': title, 'reason': f'Sonarr has all {len(want)} episode(s)'}
+    if movie:
+        if movie.get('hasFile'):
+            return {'action': 'delete', 'arr': movie.get('title'), 'reason': 'Radarr has the movie'}
+        return {'action': 'unpack', 'arr': movie.get('title'), 'reason': 'Radarr has no file'}
+    return {'action': 'skip', 'reason': 'no Sonarr/Radarr item owns this folder'}
+
+
 def process_rar_queue():
-    """Unpack queued library RAR sets one by one. Sets a live torrent owns
-    again are skipped; failures are retried up to MAX_ATTEMPTS, then parked
-    as 'failed' for a human (GET /rar-extract-queue)."""
+    """Unpack or delete queued library RAR sets one by one (rar_set_action
+    decides, fresh, per set). Sets a live torrent owns again are left for
+    later; firm no's are parked as 'skipped'; failures are retried up to
+    MAX_ATTEMPTS, then parked as 'failed' for a human (GET /rar-extract-queue)."""
     if not _rar_run_lock.acquire(blocking=False):
         return {'ok': False, 'error': 'already running'}
-    done, failed = [], []
+    done, failed, skipped = [], [], []
     try:
         with _rar_queue_lock:
-            pending = [e for e in rar_extract.load_queue(RAR_QUEUE_PATH) if e.get('status') != 'failed']
+            pending = [e for e in rar_extract.load_queue(RAR_QUEUE_PATH)
+                       if e.get('status') not in ('failed', 'skipped')]
         if not pending:
-            return {'ok': True, 'done': [], 'failed': []}
+            return {'ok': True, 'done': [], 'failed': [], 'skipped': []}
         deluge_login()
         owned = _owned_local_paths()
+        cache = {}
         for e in pending:
             if any(posixpath.normpath(v) in owned for v in e.get('volumes') or []):
                 log.info(f'[rar] {e["first"]} is owned by a live torrent again; skipped')
                 continue
-            res = rar_extract.extract(e)
+            dec = rar_set_action(e, cache)
+            act = dec['action']
+            if act == 'skip':
+                with _rar_queue_lock:
+                    q = rar_extract.load_queue(RAR_QUEUE_PATH)
+                    for x in q:
+                        if x.get('first') == e['first']:
+                            x['status'], x['error'] = 'skipped', dec['reason']
+                    rar_extract.save_queue(RAR_QUEUE_PATH, q)
+                log.info(f'[rar] left {e["first"]} alone: {dec["reason"]}')
+                record_activity('rar-extract', f'Left {os.path.basename(e["first"])} alone: {dec["reason"]}')
+                skipped.append({'first': e['first'], 'reason': dec['reason']})
+                continue
+            if act == 'delete':
+                res = rar_extract.delete_set(e)
+            elif act == 'unpack':
+                res = rar_extract.extract(e)
+            else:
+                res = {'ok': False, 'error': dec['reason']}
             with _rar_queue_lock:
                 q = rar_extract.load_queue(RAR_QUEUE_PATH)
                 cur = next((x for x in q if x.get('first') == e['first']), None)
@@ -898,21 +1019,28 @@ def process_rar_queue():
                     if cur['attempts'] >= rar_extract.MAX_ATTEMPTS:
                         cur['status'] = 'failed'
                 rar_extract.save_queue(RAR_QUEUE_PATH, q)
-            if res['ok']:
+            if res['ok'] and act == 'delete':
+                log.info(f'[rar] deleted {e["first"]} ({len(res["removed"])} file(s)): {dec["reason"]}')
+                record_activity('rar-delete', f'Deleted RAR set {os.path.basename(e["first"])} '
+                                              f'({len(res["removed"])} file(s)); {dec["reason"]}')
+                done.append({'first': e['first'], 'action': 'delete', 'removed': len(res['removed']),
+                             'reason': dec['reason']})
+            elif res['ok']:
                 rescan = _rescan_arr_for(e['first'])
                 log.info(f'[rar] unpacked {e["first"]} -> {len(res["files"])} file(s); rescan: {rescan}')
                 record_activity('rar-extract', f'Unpacked {os.path.basename(e["first"])} '
                                                f'({len(res["files"])} file(s)); {rescan or "no *arr rescan"}')
-                done.append({'first': e['first'], 'files': res['files'], 'rescan': rescan})
+                done.append({'first': e['first'], 'action': 'unpack', 'files': res['files'], 'rescan': rescan})
             else:
-                log.warning(f'[rar] unpack of {e["first"]} failed: {res["error"]}')
+                verb = {'delete': 'delete', 'unpack': 'unpack'}.get(act, 'check')
+                log.warning(f'[rar] {verb} of {e["first"]} failed: {res["error"]}')
                 if cur is not None and cur.get('status') == 'failed':
-                    record_activity('rar-extract', f'Gave up unpacking {e["first"]}: {res["error"]}')
+                    record_activity('rar-extract', f'Gave up on {e["first"]} ({verb}): {res["error"]}')
                 failed.append({'first': e['first'], 'error': res['error']})
-        return {'ok': True, 'done': done, 'failed': failed}
+        return {'ok': True, 'done': done, 'failed': failed, 'skipped': skipped}
     except Exception as e:
         log.warning(f'[rar] queue pass aborted: {e}')
-        return {'ok': False, 'error': str(e), 'done': done, 'failed': failed}
+        return {'ok': False, 'error': str(e), 'done': done, 'failed': failed, 'skipped': skipped}
     finally:
         _rar_run_lock.release()
 
@@ -2346,42 +2474,34 @@ def _save_unpack_state(state):
     except Exception as e:
         log.warning(f'[unpack] failed to persist state: {e}')
 
-def _torrent_has_rar(save_path, torrent_name):
-    """Best-effort: check whether the torrent folder contains a rar set.
-    Different Deluge setups mount paths differently; assume the container
-    has visibility into /data (standard on Unraid)."""
-    try:
-        base = os.path.join(save_path, torrent_name)
-        if os.path.isdir(base):
-            for entry in os.listdir(base):
-                low = entry.lower()
-                if low.endswith('.rar') or re.match(r'.*\.r\d\d$', low):
-                    return True
-        # Some torrents are single-file at save_path with .rar
-        if os.path.isdir(save_path):
-            for entry in os.listdir(save_path):
-                low = entry.lower()
-                if torrent_name.lower() in low and (low.endswith('.rar') or re.match(r'.*\.r\d\d$', low)):
-                    return True
-    except Exception:
-        pass
-    return False
+def _torrent_has_rar(files):
+    """A RAR release: the torrent's own file list (Deluge-relative paths) has
+    RAR volumes and no playable main video. Uses the file list, not the disk,
+    so it works for every save_path (library seeds included) whatever the
+    container mounts. A torrent with a real .mkv/.mp4 plus a subs .rar is a
+    plain-video release, not a RAR one."""
+    rels = [f.get('path') or '' for f in files or [] if isinstance(f, dict)]
+    if not rar_extract.has_rar_volumes(rels):
+        return False
+    return not any(episode_retention.is_main_video(r) for r in rels)
 
 def cleanup_unpacked_torrents():
     log.info('Running unpacked-torrent removal pass...')
     try:
         deluge_login()
-        torrents = get_all_torrents()
+        torrents = get_all_torrents(['name', 'label', 'save_path', 'files'])
         state = _load_unpack_state()
         now = time.time()
         removed = 0
-        # First: mark newly discovered rar-torrents
+        # First: mark newly discovered rar-torrents (any save_path, library
+        # seeds and movies included; the library guard in remove_torrent
+        # keeps their files and queues the RAR sets for unpack-or-delete)
         for h, info in torrents.items():
             if h in state:
                 continue
             if info.get('label') == SUPERSEDED_LABEL:
                 continue
-            if _torrent_has_rar(info.get('save_path', ''), info.get('name', '')):
+            if _torrent_has_rar(info.get('files')):
                 state[h] = {'first_seen_rar_at': now, 'name': info.get('name', '')}
                 log.info(f'[unpack] marking rar-torrent (aging out in {SEED_DAYS}d): {info.get("name")}')
         # Then: remove those that have aged out
@@ -8381,23 +8501,33 @@ def library_seed_audit_route():
 
 @app.route('/rar-library-scan', methods=['GET', 'POST'])
 def rar_library_scan_route():
-    """Library RAR sets no torrent owns. Dry run lists them; POST ?apply=1 queues them."""
+    """Library RAR sets no torrent owns, each with what would happen to it
+    (unpack / delete / skip, see rar_set_action). The dry run only lists;
+    POST ?apply=1 queues the unpack and delete sets (the worker decides again
+    right before acting). Skip and error sets are listed, never queued."""
     apply = request.method == 'POST' and request.args.get('apply', '').lower() in ('1', 'true', 'yes')
     try:
         sets = scan_library_rar_sets()
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 503
-    rows = []
+    rows, act_sets, cache = [], [], {}
     for rs in sets:
         try:
             size = sum(os.path.getsize(v) for v in rs['volumes'])
         except OSError:
             size = None
-        rows.append({'first': rs['first'], 'volumes': len(rs['volumes']), 'size': size})
-    queued = _queue_rar_sets(sets, 'library-scan') if apply else 0
+        dec = rar_set_action(rs, cache)
+        if dec['action'] in ('unpack', 'delete'):
+            act_sets.append(rs)
+        rows.append({'first': rs['first'], 'volumes': len(rs['volumes']), 'size': size,
+                     'action': dec['action'], 'reason': dec.get('reason'), 'arr': dec.get('arr')})
+    queued = _queue_rar_sets(act_sets, 'library-scan') if apply else 0
     total = sum(r['size'] or 0 for r in rows)
+    counts = {}
+    for r in rows:
+        counts[r['action']] = counts.get(r['action'], 0) + 1
     return jsonify({'ok': True, 'dry_run': not apply, 'count': len(rows), 'bytes': total,
-                    'queued': queued, 'sets': rows}), 200
+                    'actions': counts, 'queued': queued, 'sets': rows}), 200
 
 
 @app.route('/rar-extract-queue', methods=['GET'])
