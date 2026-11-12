@@ -1175,11 +1175,24 @@ def evict_library_rar_pack(torrent_hash, dry_run=True, info=None, cache=None, co
     set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
     res['steps'].append('labeled superseded')
     if not move_torrent_storage(torrent_hash, SEEDING_DIR):
+        # Put the old label back so cleanup_superseded never reaps a torrent
+        # that is still sitting in the library.
+        try:
+            set_torrent_label(torrent_hash, info.get('label') or '')
+        except Exception as e:
+            log.warning(f'rar-pack-evict: label revert failed for {torrent_hash}: {e}')
         res['ok'] = False
-        res['error'] = 'move refused'
+        res['error'] = 'move refused; label restored'
         return res
     res['steps'].append(f'moved to {SEEDING_DIR}')
-    sp = _torrent_save_path(torrent_hash)
+    # Deluge's move_storage is async: save_path only changes once the move
+    # completes, so poll instead of reading it once.
+    sp = None
+    for _ in range(RAR_PACK_SETTLE_POLLS):
+        sp = _torrent_save_path(torrent_hash)
+        if sp and posixpath.normpath(sp) == posixpath.normpath(SEEDING_DIR):
+            break
+        sleep(5)
     if not sp or posixpath.normpath(sp) != posixpath.normpath(SEEDING_DIR):
         res['ok'] = False
         res['error'] = f'torrent save_path is {sp!r} after the move'

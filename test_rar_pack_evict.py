@@ -178,6 +178,32 @@ def test_extracted_file_missing_blocks_move():
     assert not any(c[0] in ('label', 'move') for c in calls), calls
 
 
+def test_failed_move_restores_label():
+    d = tempfile.mkdtemp()
+    f = os.path.join(d, 'Show.S01E02.mkv')
+    open(f, 'wb').write(b'x')
+    calls = _wire(extracted=[f])
+    aw.move_torrent_storage = lambda h, dst: calls.append(('move', h, dst)) and False
+    r = aw.evict_library_rar_pack('h', dry_run=False, info=INFO, contents=_ls(INNER), stat=_stat(1, 1),
+                                  sleep=lambda s: None)
+    assert not r['ok']
+    labels = [c for c in calls if c[0] == 'label']
+    assert labels == [('label', 'h', 'superseded'), ('label', 'h', INFO.get('label') or '')], labels
+    assert not any(c[0] == 'recheck' for c in calls), calls
+
+
+def test_save_path_polled_until_move_lands():
+    d = tempfile.mkdtemp()
+    f = os.path.join(d, 'Show.S01E02.mkv')
+    open(f, 'wb').write(b'x')
+    _wire(extracted=[f])
+    seen = iter([INFO['save_path'], INFO['save_path'], aw.SEEDING_DIR])
+    aw._torrent_save_path = lambda h: next(seen)
+    r = aw.evict_library_rar_pack('h', dry_run=False, info=INFO, contents=_ls(INNER), stat=_stat(1, 1),
+                                  sleep=lambda s: None)
+    assert r['ok'], r
+
+
 def test_route_allowlisted():
     assert '/rar-pack-scan' in aw._DESTRUCTIVE_GET_GUARD_PATHS
 
