@@ -2,6 +2,7 @@
 episodes (volumes kept), then label superseded and move to SEEDING_DIR.
 Run: python test_rar_pack_evict.py"""
 import importlib.util
+import json
 import os
 import tempfile
 import types
@@ -88,8 +89,13 @@ def test_keep_volumes_leaves_volumes_and_extracts_only_requested():
         open(p, 'wb').write(b'x' * 10)
     seen = []
 
+    listing = json.dumps({'lsarContents': [{'XADFileName': 'E01.mkv', 'XADIndex': 0},
+                                           {'XADFileName': 'E02.mkv', 'XADIndex': 1}]})
+
     def run(cmd, **k):
         seen.append(cmd)
+        if '-j' in cmd:
+            return types.SimpleNamespace(returncode=0, stdout=listing, stderr='')
         out = cmd[cmd.index('-output-directory') + 1]
         open(os.path.join(out, 'E02.mkv'), 'wb').write(b'video')
         return types.SimpleNamespace(returncode=0, stdout='', stderr='')
@@ -98,7 +104,8 @@ def test_keep_volumes_leaves_volumes_and_extracts_only_requested():
     r = real(rs, run=run, keep_volumes=True, only=['E02.mkv'])
     assert r['ok'], r
     assert all(os.path.isfile(p) for p in vols + [sfv]), 'volumes must stay'
-    assert seen[0][-1] == 'E02.mkv' and seen[0][-2] == vols[0]
+    unar = [c for c in seen if '-j' not in c][0]
+    assert '-indexes' in unar and unar[-1] == '1' and unar[-2] == vols[0], unar
     assert os.path.isfile(os.path.join(d, 'E02.mkv'))
     assert not real(rs, run=run, keep_volumes=True)['ok'], 'keep_volumes needs a file list'
     os.remove(os.path.join(d, 'E02.mkv'))

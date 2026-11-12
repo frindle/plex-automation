@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import tempfile
+import types
 
 import rar_extract as rx
 
@@ -149,6 +150,36 @@ def test_queue_roundtrip():
         assert rx.load_queue(p) == []
         rx.save_queue(p, [{'first': 'a'}])
         assert rx.load_queue(p) == [{'first': 'a'}]
+
+
+def test_extract_only_uses_indexes_for_glob_names():
+    """unar treats file arguments as wildcards; names with [ ] go by lsar index."""
+    d = tempfile.mkdtemp()
+    first = os.path.join(d, 'pack.rar')
+    open(first, 'wb').write(b'x' * 10)
+    name = '[Grp] Show S01E02 [1080p].mkv'
+    listing = json.dumps({'lsarContents': [{'XADFileName': 'Show S01E01.mkv', 'XADIndex': 0},
+                                           {'XADFileName': name, 'XADIndex': 4}]})
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append(cmd)
+        if '-j' in cmd:
+            return _R(0, listing)
+        out = cmd[cmd.index('-output-directory') + 1]
+        open(os.path.join(out, name), 'wb').write(b'video')
+        return _R(0, '')
+    r = rx.extract({'first': first, 'volumes': [first]}, run=run, keep_volumes=True, only=[name],
+                   disk_usage=lambda p: types.SimpleNamespace(free=10**12))
+    assert r['ok'], r
+    unar = seen[-1]
+    assert '-indexes' in unar and unar[-1] == '4' and name not in unar, unar
+    assert os.path.isfile(os.path.join(d, name))
+    seen.clear()
+    r = rx.extract({'first': first, 'volumes': [first]}, run=run, keep_volumes=True, only=['missing.mkv'],
+                   disk_usage=lambda p: types.SimpleNamespace(free=10**12))
+    assert not r['ok'] and 'not in the archive' in r['error'], r
+    assert all('-j' in c for c in seen), 'no unar call when a name is missing'
 
 
 if __name__ == '__main__':
