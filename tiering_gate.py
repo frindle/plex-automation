@@ -2,21 +2,23 @@
 
 Given file paths the mover wants to push to the glacier disk (written in
 Deluge's namespace, e.g. /data/Media/TV Shows/Show/S01/ep.mkv), decide per
-path:
-  free     no Deluge torrent owns the file
-  release  every owning torrent has met the seeding rule: remove the torrent
-           from Deluge, keep its data, then the file may move
-  wait     an owning torrent is still inside the seeding rule (or unfinished,
-           or its state is unknown): leave the file, try again another night
+path (no side effects):
+  free   no Deluge torrent owns the file
+  pause  every owning torrent is complete (progress 100) with a known, healthy
+         state: the mover pauses them around the move and resumes them after.
+         The /mnt/user path is unchanged by a disk-to-disk move, so a resumed
+         torrent keeps seeding with no recheck. Nothing is ever removed.
+  wait   an owning torrent is incomplete, erroring, checking/moving, or its
+         state is unknown: leave the file, try again another night
 
-The seeding rule is the one remove_torrent() enforces (the same floor the RAR
-sets and episode retention rely on): SEED_DAYS of seeding, torrent complete.
-Pure logic here; arr-webhook.py supplies the Deluge data and does the removal.
+Pure logic here; arr-webhook.py supplies the Deluge data and does the pausing.
 """
 import posixpath
 
-FREE, RELEASE, WAIT = 'free', 'release', 'wait'
-FIELDS = ['name', 'save_path', 'seeding_time', 'progress', 'state']
+FREE, PAUSE, WAIT = 'free', 'pause', 'wait'
+FIELDS = ['name', 'save_path', 'progress', 'state']
+OK_STATES = {'seeding', 'paused', 'stopped', 'queued'}
+PAUSED_STATES = {'paused', 'stopped'}
 
 
 def content_roots(torrents):
@@ -43,21 +45,25 @@ def owners(path, roots):
         p = posixpath.dirname(p) or '/'
 
 
-def seed_state(t, seed_days):
-    """(ok, reason). ok only when complete and seeded >= seed_days; unknown -> not ok."""
+def torrent_ok(t):
+    """(ok, reason). ok only when complete and in a known, healthy state."""
     t = t or {}
-    st = t.get('seeding_time')
-    if not isinstance(st, (int, float)):
-        return False, 'seed time unknown'
     prog = t.get('progress')
     if not isinstance(prog, (int, float)) or prog < 100:
         return False, 'torrent not complete'
-    if st < seed_days * 86400:
-        return False, f'seeded {round(st / 86400, 1)}d of {seed_days}d'
-    return True, 'seed rule met'
+    st = t.get('state')
+    if not isinstance(st, str) or st.lower() not in OK_STATES:
+        return False, f'torrent state {st if isinstance(st, str) and st else "unknown"}'
+    return True, 'complete'
 
 
-def classify_paths(paths, torrents, seed_days):
+def is_paused(t):
+    """True when the torrent is already paused/stopped (by someone else)."""
+    st = (t or {}).get('state')
+    return isinstance(st, str) and st.lower() in PAUSED_STATES
+
+
+def classify_paths(paths, torrents):
     """-> [{'path', 'status', 'reason', 'hashes'}] in input order."""
     roots = content_roots(torrents)
     out = []
@@ -66,42 +72,28 @@ def classify_paths(paths, torrents, seed_days):
         if not hs:
             out.append({'path': path, 'status': FREE, 'reason': 'no torrent', 'hashes': []})
             continue
-        states = [(h,) + seed_state(torrents[h], seed_days) for h in hs]
+        states = [(h,) + torrent_ok(torrents[h]) for h in hs]
         blockers = [f'{h[:8]} {why}' for h, ok, why in states if not ok]
         if blockers:
             out.append({'path': path, 'status': WAIT, 'reason': '; '.join(blockers), 'hashes': hs})
         else:
-            out.append({'path': path, 'status': RELEASE, 'reason': 'seed rule met', 'hashes': hs})
+            out.append({'path': path, 'status': PAUSE, 'reason': 'complete, pause around move', 'hashes': hs})
     return out
 
 
-def apply_releases(rows, torrents, remove, deferred):
-    """Remove each released torrent once, keeping data. `remove(hash, info)` is
-    remove_torrent(h, False, info), which re-checks the seed floor itself and
-    returns `deferred` when it refuses. Any failure turns every path that
-    torrent owns into 'wait'. Mutates and returns rows."""
-    done, failed = set(), {}
-    for row in rows:
-        if row['status'] != RELEASE:
-            continue
-        for h in row['hashes']:
-            if h in done or h in failed:
+def pause_plan(rows, torrents):
+    """-> (to_pause, already_paused, blockers). Hashes owning the rows, split into
+    ones we may pause (running) and ones someone else already paused (left alone).
+    blockers lists every row that is 'wait' (the caller refuses to pause then)."""
+    to_pause, already, blockers = [], [], []
+    for r in rows:
+        if r['status'] == WAIT:
+            blockers.append(r)
+        for h in r['hashes']:
+            if h in to_pause or h in already:
                 continue
-            try:
-                ret = remove(h, torrents.get(h) or {})
-            except Exception as e:  # one bad torrent must not stop the batch
-                failed[h] = f'removal error: {e}'
-                continue
-            if ret == deferred or ret is False:
-                failed[h] = 'removal deferred by seed floor'
-            else:
-                done.add(h)
-    for row in rows:
-        bad = [h for h in row['hashes'] if h in failed]
-        if row['status'] == RELEASE and bad:
-            row['status'] = WAIT
-            row['reason'] = f'{bad[0][:8]} {failed[bad[0]]}'
-    return rows
+            (already if is_paused(torrents.get(h)) else to_pause).append(h)
+    return to_pause, already, blockers
 
 
 def to_tsv(rows):

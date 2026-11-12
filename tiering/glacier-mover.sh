@@ -33,6 +33,7 @@ FOLDER_DEPTH="${FOLDER_DEPTH:-4}"                 # path parts (below /mnt/diskN
 TIERING_API="${TIERING_API:-http://10.0.0.4:9876}"        # plex-automation container
 API_TIMEOUT="${API_TIMEOUT:-120}"
 NO_TORRENT_CHECK="${NO_TORRENT_CHECK:-0}"         # 1 = skip the Deluge gate (not for normal use)
+PAUSE_SETTLE_SEC="${PAUSE_SETTLE_SEC:-3}"         # wait after pausing so Deluge closes its file handles
 RSYNC_FLAGS="${RSYNC_FLAGS:--aHAXS}"              # -a keeps perms/times/owner; -A ACLs; -X xattrs; -H hardlinks
 LOG_DIR="${LOG_DIR:-$ROOT/var/log/tiering}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/glacier.log}"
@@ -86,10 +87,25 @@ files_match() {
 # any_open FILE... -> exit 0 when any is open right now
 any_open() { local p; for p in "$@"; do is_open "$p" && return 0; done; return 1; }
 
-# gate_call APPLY(0|1): stdin = Deluge-namespace paths, stdout = status<TAB>reason<TAB>path
+# gate_call: stdin = Deluge-namespace paths, stdout = status<TAB>reason<TAB>path (free/pause/wait).
+# No side effects: pausing is a separate call per unit.
 gate_call() {
   curl -sS -f --max-time "$API_TIMEOUT" -X POST -H 'Content-Type: text/plain' --data-binary @- \
-    "$TIERING_API/tiering/torrent-gate?format=tsv&apply=$1"
+    "$TIERING_API/tiering/torrent-gate?format=tsv"
+}
+
+# pause_call: stdin = one unit's Deluge-namespace paths. stdout = `paused<TAB>hash` (ours,
+# resume it later) or `foreign<TAB>hash` (already paused by someone else, leave alone).
+# Non-zero exit = could not pause (treat the unit as wait).
+pause_call() {
+  curl -sS -f --max-time "$API_TIMEOUT" -X POST -H 'Content-Type: text/plain' --data-binary @- \
+    "$TIERING_API/tiering/torrent-pause"
+}
+
+# resume_call: stdin = hashes this run paused. Non-zero exit = could not resume.
+resume_call() {
+  curl -sS -f --max-time "$API_TIMEOUT" -X POST -H 'Content-Type: text/plain' --data-binary @- \
+    "$TIERING_API/tiering/torrent-resume"
 }
 
 # --- helpers ---------------------------------------------------------------
@@ -294,7 +310,8 @@ move_unit() {
 
 CH_AT=(); CH_SZ=(); CH_DK=(); CH_PATHS=()
 ROOM_LEFT=0; CAP_LEFT=0; MISFITS=0; STOP=0
-N_MOVED=0; B_MOVED=0; N_FAILED=0; N_SKIPPED=0; N_RELEASED=0; N_UNITS=0
+N_MOVED=0; B_MOVED=0; N_FAILED=0; N_SKIPPED=0; N_PAUSED=0; N_UNITS=0
+PAUSED_HASHES=()   # hashes this run paused and has not resumed yet (the exit trap resumes them)
 
 note_skip() { # reason path...
   local r="$1" p; shift
@@ -308,6 +325,29 @@ gate_path() { # host path -> Deluge-namespace path (/mnt/diskN/data/x -> /data/x
   printf '%s' "$p"
 }
 
+# pause_unit PATH... -> 0 paused (PAUSED_HASHES set), 1 pause failed/no answer (nothing left paused)
+pause_unit() {
+  local resp st h hs=() p
+  PAUSED_HASHES=()
+  resp="$(for p in "$@"; do gate_path "$p"; printf '\n'; done | pause_call 2>&1)" || return 1
+  while IFS="$TAB" read -r st h; do
+    [ "$st" = paused ] && [ -n "$h" ] && hs+=("$h")
+  done <<<"$resp"
+  PAUSED_HASHES=("${hs[@]}")
+  return 0
+}
+
+# resume_unit: resume what pause_unit paused; keep the hashes for the exit trap if that fails
+resume_unit() {
+  [ "${#PAUSED_HASHES[@]}" -eq 0 ] && return 0
+  if printf '%s\n' "${PAUSED_HASHES[@]}" | resume_call >/dev/null 2>&1; then
+    PAUSED_HASHES=()
+  else
+    log "WARN  could not resume ${#PAUSED_HASHES[@]} torrent(s) (the server resumes them after its pause limit): ${PAUSED_HASHES[*]}"
+  fi
+  return 0
+}
+
 process_chunk() {
   local i j n=${#CH_AT[@]} p unitstat reason line st rs path
   [ "$n" -eq 0 ] && return 0
@@ -316,7 +356,7 @@ process_chunk() {
     local resp
     resp="$(for i in "${!CH_AT[@]}"; do
               while IFS= read -r p; do gate_path "$p"; printf '\n'; done <<<"${CH_PATHS[$i]}"
-            done | gate_call "$APPLY" 2>&1)" || resp=""
+            done | gate_call 2>&1)" || resp=""
     while IFS="$TAB" read -r st rs path; do
       [ -n "$path" ] && G["$path"]="$st$TAB$rs"
     done <<<"$resp"
@@ -329,7 +369,7 @@ process_chunk() {
         line="${G[$(gate_path "$p")]:-wait${TAB}no answer from the torrent gate}"
         st="${line%%"$TAB"*}"; rs="${line#*"$TAB"}"
         if [ "$st" = wait ]; then unitstat=wait; reason="$rs"; break; fi
-        [ "$st" = release ] && unitstat=release
+        [ "$st" = pause ] && unitstat=pause
       done
     fi
     if [ "$unitstat" = wait ]; then
@@ -337,18 +377,29 @@ process_chunk() {
       note_skip "torrent: $reason" "${paths[@]}"; echo "torrent still seeding" >>"$TMP/reject"
       continue
     fi
-    [ "$unitstat" = release ] && N_RELEASED=$((N_RELEASED + 1))
+    [ "$unitstat" = pause ] && N_PAUSED=$((N_PAUSED + 1))
     if [ "$APPLY" != 1 ]; then
       for p in "${paths[@]}"; do
         printf '%s\t%s\t%s\n' "${CH_DK[$i]}" "${CH_SZ[$i]}" "${p#"$MNT/${CH_DK[$i]}/"}" >>"$TMP/plan"
       done
-      log "WOULD MOVE  ${CH_DK[$i]} -> $GLACIER  $(hr "${CH_SZ[$i]}")  ${#paths[@]} file(s)  ${paths[0]}$([ "$unitstat" = release ] && echo '  [torrent: release]')"
+      log "WOULD MOVE  ${CH_DK[$i]} -> $GLACIER  $(hr "${CH_SZ[$i]}")  ${#paths[@]} file(s)  ${paths[0]}$([ "$unitstat" = pause ] && echo '  [torrent: pause]')"
       N_MOVED=$((N_MOVED + ${#paths[@]})); B_MOVED=$((B_MOVED + CH_SZ[i]))
       continue
     fi
     SKIP_REASON=""; FAIL_REASON=""
+    if [ "$unitstat" = pause ]; then
+      if ! pause_unit "${paths[@]}"; then
+        ROOM_LEFT=$((ROOM_LEFT + CH_SZ[i])); CAP_LEFT=$((CAP_LEFT + CH_SZ[i]))
+        N_PAUSED=$((N_PAUSED - 1))
+        note_skip "torrent: could not pause (no answer or refused)" "${paths[@]}"; echo "torrent still seeding" >>"$TMP/reject"
+        continue
+      fi
+      [ "${#PAUSED_HASHES[@]}" -gt 0 ] && [ "$PAUSE_SETTLE_SEC" != 0 ] && sleep "$PAUSE_SETTLE_SEC"
+    fi
     move_unit "${CH_DK[$i]}" "${CH_AT[$i]}" "${paths[@]}"
-    case $? in
+    local mrc=$?
+    resume_unit
+    case $mrc in
       0) N_MOVED=$((N_MOVED + ${#paths[@]})); B_MOVED=$((B_MOVED + CH_SZ[i]))
          for p in "${paths[@]}"; do
            printf '%s\t%s\t%s\n' "${CH_DK[$i]}" "${CH_SZ[$i]}" "${p#"$MNT/${CH_DK[$i]}/"}" >>"$TMP/plan"
@@ -423,7 +474,7 @@ report() {
   else
     log "nothing to move"
   fi
-  log "totals: moved=$N_MOVED ($(hr "$B_MOVED")) failed=$N_FAILED skipped=$N_SKIPPED torrents-released=$N_RELEASED"
+  log "totals: moved=$N_MOVED ($(hr "$B_MOVED")) failed=$N_FAILED skipped=$N_SKIPPED torrents-paused=$N_PAUSED"
   if [ -s "$TMP/skipped-groups" ]; then
     local g; g="$(wc -l <"$TMP/skipped-groups")"
     log "skipped $g hardlink group(s), e.g.: $(head -3 "$TMP/skipped-groups" | tr '\t' ' ' | tr '\n' ';')"
@@ -434,7 +485,7 @@ report() {
     [ "$APPLY" = 1 ] || subj="Glacier dry run: would move $N_MOVED, skipped $N_SKIPPED"
     if [ -x "$NOTIFY_CMD" ]; then
       "$NOTIFY_CMD" -e "Glacier tiering" -s "$subj" \
-        -d "$(hr "$B_MOVED") to $GLACIER; torrents released $N_RELEASED. Log: $LOG_FILE" -i "$imp" >/dev/null 2>&1
+        -d "$(hr "$B_MOVED") to $GLACIER; torrents paused and resumed $N_PAUSED. Log: $LOG_FILE" -i "$imp" >/dev/null 2>&1
     else
       log "notify script not found at $NOTIFY_CMD"
     fi
@@ -454,7 +505,9 @@ main() {
   preflight || return 2
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then log "ABORT: another glacier run holds the lock"; return 2; fi
-  TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+  TMP="$(mktemp -d)"
+  trap 'resume_unit; rm -rf "$TMP"' EXIT
+  trap 'exit 130' INT; trap 'exit 143' TERM
   : >"$TMP/plan"
   local total used target
   read -r total used <<<"$(fs_stats "$GLACIER")"

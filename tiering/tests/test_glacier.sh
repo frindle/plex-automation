@@ -26,7 +26,9 @@ gate_call() { cat >/dev/null; : >"$R/gate.flag.$1"; }          # default: gate a
 EOF
   # default gate: every path is free
   cat >>"$R/ovr.sh" <<'EOF'
-gate_call() { local f="$R/gate.calls"; echo "apply=$1" >>"$f"; while IFS= read -r p; do echo "$p" >>"$R/gate.paths"; printf 'free\tno torrent\t%s\n' "$p"; done; }
+gate_call() { echo gate >>"$R/gate.calls"; while IFS= read -r p; do echo "$p" >>"$R/gate.paths"; printf 'free\tno torrent\t%s\n' "$p"; done; }
+pause_call() { local n=0 p; while IFS= read -r p; do [ -n "$p" ] || continue; echo "$p" >>"$R/pause.paths"; n=$((n+1)); printf 'paused\th%s\n' "$(basename "$p")"; done; echo pause >>"$R/pause.calls"; }
+resume_call() { while IFS= read -r h; do echo "$h" >>"$R/resume.hashes"; done; echo resume >>"$R/resume.calls"; }
 EOF
   : >"$R/notify.log"
   printf '#!/bin/sh\necho "$@" >>"%s/notify.log"\n' "$R" >"$R/bin/notify"; chmod +x "$R/bin/notify"
@@ -41,7 +43,7 @@ mkf() {
 
 run() { # [extra extras] ; env: EXTRA_OVR (code), flags in $FLAGS
   env SCRIPT="$SCRIPT" ROOT="$R" CAP="$CAP" R="$R" M="$M" LOG_FILE="$R/glacier.log" LOG_DIR="$R" LOCK_FILE="$R/lock" \
-      NOTIFY_CMD="$R/bin/notify" MIN_AGE_DAYS="${MIN_AGE_DAYS:-0}" ${ENVX:-} \
+      NOTIFY_CMD="$R/bin/notify" MIN_AGE_DAYS="${MIN_AGE_DAYS:-0}" PAUSE_SETTLE_SEC=0 ${ENVX:-} \
       bash -c 'source "$SCRIPT"; source "$R/ovr.sh"; eval "$EXTRA_OVR"; main "$@"' harness "$@" 2>&1
 }
 EXTRA_OVR=""; export EXTRA_OVR
@@ -285,14 +287,16 @@ echo "$out" | grep -q 'per-disk  disk3 -> disk1: 1 file(s)' && ok || bad "per-di
 echo "$out" | grep -q 'top folders by bytes' && ok || bad "top folders heading"
 echo "$out" | grep -q 'data/Media/Show' && ok || bad "top folders lists a folder"
 check "dry run sent no notification" test ! -s "$R/notify.log"
-grep -q 'apply=0' "$R/gate.calls" && ok || bad "dry run asks the gate with apply=0"
+grep -q gate "$R/gate.calls" && ok || bad "dry run still classifies through the gate"
+check "dry run makes no pause call" test ! -e "$R/pause.calls"
+check "dry run makes no resume call" test ! -e "$R/resume.calls"
 out="$(run --apply)"
 check "apply moved a" onglacier data/Media/Show/S01/a.mkv
 check "apply moved b" onglacier data/Media/Movie/b.mkv
 check "apply gone from source" test ! -e "$M/disk2/data/Media/Show/S01/a.mkv"
 eq "one notification" "$(wc -l <"$R/notify.log")" 1
 grep -q 'moved 2, failed 0, skipped 0' "$R/notify.log" && ok || bad "notify subject counts: $(cat "$R/notify.log")"
-grep -q 'apply=1' "$R/gate.calls" && ok || bad "apply asks the gate with apply=1"
+check "free files are never paused" test ! -e "$R/pause.calls"
 
 setup top_20_folders
 for i in $(seq 1 25); do mkf disk2 "data/Media/Show$i/S01/e.mkv" $((100 + i)) 100; done
@@ -321,21 +325,119 @@ eq "dest untouched" "$(md5sum <"$M/disk1/data/Media/a.mkv")" "$before"
 check "source kept" src disk2 data/Media/a.mkv
 echo "$out" | grep -q 'destination already exists' && ok || bad "logged skip"
 
+GATE_PAUSE_OVR='gate_call() { echo gate >>"$R/gate.calls"; while IFS= read -r p; do echo "$p" >>"$R/gate.paths"; case "$p" in
+  */pz/*) printf "pause\tcomplete\t%s\n" "$p";; */seed/*) printf "wait\ttorrent not complete\t%s\n" "$p";; *) printf "free\tno torrent\t%s\n" "$p";; esac; done; }'
+
 setup torrent_gate
 mkf disk2 data/Media/free/a.mkv 1000 100
-mkf disk2 data/Media/rel/b.mkv 1000 99
+mkf disk2 data/Media/pz/b.mkv 1000 99
 mkf disk2 data/Media/seed/c.mkv 1000 98
-EXTRA_OVR='gate_call() { echo "apply=$1" >>"$R/gate.calls"; while IFS= read -r p; do echo "$p" >>"$R/gate.paths"; case "$p" in
-  */rel/*) printf "release\tseed rule met\t%s\n" "$p";; */seed/*) printf "wait\tseeded 3d of 21d\t%s\n" "$p";; *) printf "free\tno torrent\t%s\n" "$p";; esac; done; }'
+EXTRA_OVR="$GATE_PAUSE_OVR"
 out="$(run --apply)"
 EXTRA_OVR=""; export EXTRA_OVR
 check "free file moved" onglacier data/Media/free/a.mkv
-check "released file moved" onglacier data/Media/rel/b.mkv
-check "seeding file waits" src disk2 data/Media/seed/c.mkv
-check "seeding file not on glacier" gone data/Media/seed/c.mkv
+check "paused-owner file moved" onglacier data/Media/pz/b.mkv
+check "incomplete torrent waits" src disk2 data/Media/seed/c.mkv
+check "incomplete torrent not on glacier" gone data/Media/seed/c.mkv
 grep -qx '/data/Media/seed/c.mkv' "$R/gate.paths" && ok || bad "gate gets Deluge-namespace paths: $(cat "$R/gate.paths")"
-echo "$out" | grep -q 'torrents-released=1' && ok || bad "counts released torrent"
+eq "one pause call (only the pause unit)" "$(wc -l <"$R/pause.calls")" 1
+grep -qx '/data/Media/pz/b.mkv' "$R/pause.paths" && ok || bad "pause gets the unit's Deluge paths"
+eq "resumed exactly what it paused" "$(cat "$R/resume.hashes")" "hb.mkv"
+echo "$out" | grep -q 'torrents-paused=1' && ok || bad "counts paused torrent"
 echo "$out" | grep -q 'skipped=1' && ok || bad "counts the waiting file as skipped"
+
+setup pause_order_pause_before_move_resume_after
+mkf disk2 data/Media/pz/b.mkv 1000 99
+EXTRA_OVR="$GATE_PAUSE_OVR"'
+pause_call() { cat >/dev/null; echo "pause src_exists=$([ -f "$M/disk2/data/Media/pz/b.mkv" ] && echo 1 || echo 0)" >>"$R/order"; printf "paused\thX\n"; }
+resume_call() { cat >/dev/null; echo "resume src_exists=$([ -f "$M/disk2/data/Media/pz/b.mkv" ] && echo 1 || echo 0) dst=$([ -f "$M/disk1/data/Media/pz/b.mkv" ] && echo 1 || echo 0)" >>"$R/order"; }'
+run --apply >/dev/null
+EXTRA_OVR=""; export EXTRA_OVR
+eq "pause before the move, resume after it" "$(tr '\n' '|' <"$R/order")" "pause src_exists=1|resume src_exists=0 dst=1|"
+
+setup pause_foreign_hash_not_resumed
+mkf disk2 data/Media/pz/b.mkv 1000 99
+EXTRA_OVR="$GATE_PAUSE_OVR"'
+pause_call() { cat >/dev/null; printf "foreign\thUSER\n"; }
+resume_call() { cat >"$R/resumed.body"; echo r >>"$R/resume.calls"; }'
+run --apply >/dev/null
+EXTRA_OVR=""; export EXTRA_OVR
+check "file still moves when the owner was paused by the user" onglacier data/Media/pz/b.mkv
+check "foreign-paused torrent is never resumed" test ! -e "$R/resume.calls"
+
+setup pause_resume_on_move_failure
+mkf disk2 data/Media/pz/b.mkv 1000 99
+EXTRA_OVR="$GATE_PAUSE_OVR"'
+files_match() { return 1; }'
+run --apply >/dev/null; rc=$?
+EXTRA_OVR=""; export EXTRA_OVR
+eq "failure exit code" "$rc" 1
+check "source kept" src disk2 data/Media/pz/b.mkv
+eq "resumed after a failed move" "$(cat "$R/resume.hashes")" "hb.mkv"
+
+setup pause_resume_on_skip_open_file
+mkf disk2 data/Media/pz/b.mkv 1000 99
+# opened only after the pause (planning check passes, the pre-copy re-check sees the handle)
+EXTRA_OVR="$GATE_PAUSE_OVR"'
+is_open() { [ -e "$R/pause.calls" ]; }'
+out="$(run --apply)"
+EXTRA_OVR=""; export EXTRA_OVR
+check "file opened after pause is not moved" src disk2 data/Media/pz/b.mkv
+echo "$out" | grep -q 're-checked before copy' && ok || bad "open check re-run after pause: $out"
+eq "resumed after a skipped unit" "$(cat "$R/resume.hashes")" "hb.mkv"
+
+setup pause_resume_on_skip_destination_exists
+mkf disk2 data/Media/pz/b.mkv 1000 99
+mkf disk1 data/Media/pz/b.mkv 500 5
+EXTRA_OVR="$GATE_PAUSE_OVR"
+run --apply >/dev/null
+EXTRA_OVR=""; export EXTRA_OVR
+check "destination clash keeps source" src disk2 data/Media/pz/b.mkv
+eq "resumed after destination-exists skip" "$(cat "$R/resume.hashes" 2>/dev/null)" "hb.mkv"
+
+setup pause_call_failure_means_wait
+mkf disk2 data/Media/pz/b.mkv 1000 99
+EXTRA_OVR="$GATE_PAUSE_OVR"'
+pause_call() { cat >/dev/null; return 22; }'
+out="$(run --apply)"; rc=$?
+EXTRA_OVR=""; export EXTRA_OVR
+eq "exit 0 (a wait is not a failure)" "$rc" 0
+check "unit left in place" src disk2 data/Media/pz/b.mkv
+check "nothing on glacier" gone data/Media/pz/b.mkv
+check "no resume when nothing was paused" test ! -e "$R/resume.calls"
+echo "$out" | grep -q 'could not pause' && ok || bad "logs the pause failure: $out"
+echo "$out" | grep -q 'skipped=1' && ok || bad "counts it as skipped"
+
+setup dry_run_reports_pause_and_never_calls_pause
+mkf disk2 data/Media/pz/b.mkv 1000 99
+EXTRA_OVR="$GATE_PAUSE_OVR"
+out="$(run)"
+EXTRA_OVR=""; export EXTRA_OVR
+echo "$out" | grep -q 'WOULD MOVE.*\[torrent: pause\]' && ok || bad "dry run line shows [torrent: pause]: $out"
+check "dry run: no pause call" test ! -e "$R/pause.calls"
+check "dry run: no resume call" test ! -e "$R/resume.calls"
+check "dry run: file stays" src disk2 data/Media/pz/b.mkv
+
+setup pause_resumed_by_exit_trap_on_term
+mkf disk2 data/Media/pz/b.mkv 1000 99
+EXTRA_OVR="$GATE_PAUSE_OVR"'
+rsync() { kill -TERM $$; sleep 2; }'
+run --apply >/dev/null
+EXTRA_OVR=""; export EXTRA_OVR
+eq "trap resumed the paused torrent after SIGTERM" "$(cat "$R/resume.hashes" 2>/dev/null)" "hb.mkv"
+check "source kept" src disk2 data/Media/pz/b.mkv
+
+setup pause_resume_failure_is_retried_by_trap
+mkf disk2 data/Media/pz/b.mkv 1000 99
+EXTRA_OVR="$GATE_PAUSE_OVR"'
+resume_call() { cat >/dev/null; echo try >>"$R/resume.tries"; return 22; }'
+out="$(run --apply)"
+EXTRA_OVR=""; export EXTRA_OVR
+eq "resume tried per unit and again by the exit trap" "$(wc -l <"$R/resume.tries")" 2
+echo "$out" | grep -q 'could not resume' && ok || bad "warns when resume fails"
+
+setup mover_never_removes_torrents
+for w in torrent-remove remove_torrent apply=1 'torrent-gate?[^"]*apply'; do grep -q "^[^#]*$w" "$SCRIPT" && bad "script mentions $w" || ok; done
 
 setup torrent_gate_unreachable_fails_safe
 mkf disk2 data/Media/a.mkv 1000 100
@@ -348,7 +450,7 @@ check "nothing on glacier" gone data/Media/a.mkv
 setup torrent_gate_group_waits_if_any_member_waits
 mkf disk2 data/Media/rel/a.mkv 1000 100
 ln "$M/disk2/data/Media/rel/a.mkv" "$M/disk2/data/Media/seed-link.mkv"
-EXTRA_OVR='gate_call() { while IFS= read -r p; do case "$p" in *seed-link*) printf "wait\tseeded 1d\t%s\n" "$p";; *) printf "release\tok\t%s\n" "$p";; esac; done; }'
+EXTRA_OVR='gate_call() { while IFS= read -r p; do case "$p" in *seed-link*) printf "wait\tnot complete\t%s\n" "$p";; *) printf "pause\tok\t%s\n" "$p";; esac; done; }'
 run --apply >/dev/null
 EXTRA_OVR=""; export EXTRA_OVR
 check "group not split (a)" src disk2 data/Media/rel/a.mkv

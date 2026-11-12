@@ -8575,42 +8575,191 @@ def downloads_audit_route():
     return jsonify(downloads_audit_run(dry_run=True)), 200
 
 
-@app.route('/tiering/torrent-gate', methods=['POST'])
-def tiering_torrent_gate_route():
-    """Glacier mover gate. Body: newline-separated paths (Deluge namespace) or
-    {"paths": [...]}. Each path comes back free / release / wait (see tiering_gate).
-    Without ?apply=1 nothing is touched. With it, each torrent that has met the
-    seeding rule is removed from Deluge with its data kept. ?format=tsv returns
-    status<TAB>reason<TAB>path lines for the bash mover. Any Deluge trouble
-    answers 503 so the mover treats every file as 'wait'."""
-    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+TIERING_PAUSE_STATE_PATH = os.environ.get('TIERING_PAUSE_STATE_PATH', '/data/tiering_paused.json')
+# A torrent the glacier mover paused is resumed by the next gate/pause/resume call once
+# it has been paused this long (the mover crashed or lost the network mid-move).
+TIERING_PAUSE_MAX_MIN = int(os.environ.get('TIERING_PAUSE_MAX_MIN', '360'))
+_tiering_ledger_lock = threading.RLock()
+
+
+def _tiering_ledger_load():
+    try:
+        with open(TIERING_PAUSE_STATE_PATH) as f:
+            d = _json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _tiering_ledger_save(d):
+    tmp = TIERING_PAUSE_STATE_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        _json.dump(d, f)
+    os.replace(tmp, TIERING_PAUSE_STATE_PATH)
+
+
+def _tiering_resume_stale(now=None):
+    """Resume ledger entries older than TIERING_PAUSE_MAX_MIN. Never raises."""
+    now = time.time() if now is None else now
+    with _tiering_ledger_lock:
+        led = _tiering_ledger_load()
+        stale = [h for h, ts in led.items() if not isinstance(ts, (int, float)) or now - ts > TIERING_PAUSE_MAX_MIN * 60]
+        for h in stale:
+            try:
+                deluge_resume_torrent(h)
+                led.pop(h, None)
+                log.warning(f'[tiering] auto-resumed stale paused torrent {h[:8]}')
+            except Exception as e:
+                log.warning(f'[tiering] stale resume of {h[:8]} failed: {e}')
+        if stale:
+            try:
+                _tiering_ledger_save(led)
+            except Exception as e:
+                log.warning(f'[tiering] ledger save failed: {e}')
+
+
+def _tiering_paths_from_request():
+    """(paths, error_response). Body: newline-separated paths or {"paths": [...]}."""
     body = (request.get_data(as_text=True) or '').strip()
     if body.startswith('{'):
         try:
             paths = _json.loads(body).get('paths', [])
         except Exception as e:
-            return jsonify({'ok': False, 'error': f'JSON parse: {e}'}), 400
+            return None, (jsonify({'ok': False, 'error': f'JSON parse: {e}'}), 400)
     else:
         paths = [ln for ln in body.split('\n') if ln.strip()]
     paths = [p for p in paths if isinstance(p, str) and p.startswith('/')]
     if not paths:
-        return jsonify({'ok': False, 'error': 'no absolute paths in body'}), 400
+        return None, (jsonify({'ok': False, 'error': 'no absolute paths in body'}), 400)
+    return paths, None
+
+
+def _tiering_torrents():
+    """(torrents, error_response) after resuming stale ledger pauses."""
     try:
         deluge_login()
+        _tiering_resume_stale()
         torrents = _deluge_rpc('core.get_torrents_status', [{}, tiering_gate.FIELDS])
     except Exception as e:
-        return jsonify({'ok': False, 'error': f'deluge unavailable: {e}'}), 503
+        return None, (jsonify({'ok': False, 'error': f'deluge unavailable: {e}'}), 503)
     if not isinstance(torrents, dict):
-        return jsonify({'ok': False, 'error': 'deluge returned no torrent list'}), 503
-    rows = tiering_gate.classify_paths(paths, torrents, SEED_DAYS)
-    if apply:
-        tiering_gate.apply_releases(rows, torrents, lambda h, info: remove_torrent(h, False, info), DEFERRED)
+        return None, (jsonify({'ok': False, 'error': 'deluge returned no torrent list'}), 503)
+    return torrents, None
+
+
+@app.route('/tiering/torrent-gate', methods=['POST'])
+def tiering_torrent_gate_route():
+    """Glacier mover gate, classification only (no side effects besides resuming
+    stale pauses). Body: newline-separated paths (Deluge namespace) or
+    {"paths": [...]}. Each path comes back free / pause / wait (see tiering_gate).
+    ?format=tsv returns status<TAB>reason<TAB>path lines for the bash mover. Any
+    Deluge trouble answers 503 so the mover treats every file as 'wait'.
+    Torrents are never removed from here."""
+    paths, err = _tiering_paths_from_request()
+    if err:
+        return err
+    torrents, err = _tiering_torrents()
+    if err:
+        return err
+    rows = tiering_gate.classify_paths(paths, torrents)
     if request.args.get('format') == 'tsv':
         return app.response_class(tiering_gate.to_tsv(rows), mimetype='text/plain'), 200
     counts = {}
     for r in rows:
         counts[r['status']] = counts.get(r['status'], 0) + 1
-    return jsonify({'ok': True, 'dry_run': not apply, 'counts': counts, 'paths': rows}), 200
+    return jsonify({'ok': True, 'counts': counts, 'paths': rows}), 200
+
+
+@app.route('/tiering/torrent-pause', methods=['POST'])
+def tiering_torrent_pause_route():
+    """Pause the torrents owning one unit's files, right before the mover copies it.
+    Body as /tiering/torrent-gate (the unit's Deluge-namespace paths). Re-classifies
+    first: any 'wait' path -> 409 and nothing is paused. A torrent someone else
+    already paused is left alone (reported as foreign, never resumed by us). Each
+    torrent we pause is written to the ledger (TIERING_PAUSE_STATE_PATH) so a
+    crashed mover cannot strand it paused: stale entries (TIERING_PAUSE_MAX_MIN)
+    are resumed by the next call. If any pause fails, those already paused by
+    this call are resumed and the answer is 503. Plain-text answer, one line per
+    torrent: `paused<TAB>hash` (ours, resume it) or `foreign<TAB>hash`."""
+    paths, err = _tiering_paths_from_request()
+    if err:
+        return err
+    torrents, err = _tiering_torrents()
+    if err:
+        return err
+    rows = tiering_gate.classify_paths(paths, torrents)
+    to_pause, already, blockers = tiering_gate.pause_plan(rows, torrents)
+    if blockers:
+        return jsonify({'ok': False, 'error': 'not pausable: ' + blockers[0]['reason']}), 409
+    done = []
+    with _tiering_ledger_lock:
+        led = _tiering_ledger_load()
+        # ours from an earlier call that is still inside the limit and still paused
+        mine = [h for h in already if h in led]
+        foreign = [h for h in already if h not in led]
+        try:
+            for h in to_pause:
+                deluge_pause_torrent(h)
+                led[h] = time.time()
+                done.append(h)
+                _tiering_ledger_save(led)
+        except Exception as e:
+            for h in done:
+                try:
+                    deluge_resume_torrent(h)
+                    led.pop(h, None)
+                except Exception as e2:
+                    log.warning(f'[tiering] rollback resume of {h[:8]} failed: {e2}')
+            try:
+                _tiering_ledger_save(led)
+            except Exception:
+                pass
+            return jsonify({'ok': False, 'error': f'pause failed: {e}'}), 503
+    lines = ''.join(f'paused\t{h}\n' for h in done + mine) + ''.join(f'foreign\t{h}\n' for h in foreign)
+    return app.response_class(lines, mimetype='text/plain'), 200
+
+
+@app.route('/tiering/torrent-resume', methods=['POST'])
+def tiering_torrent_resume_route():
+    """Resume torrents the pause endpoint paused. Body: newline-separated hashes
+    or {"hashes": [...]}. Only hashes in the ledger are resumed (a torrent the
+    gate did not pause is never touched); resumed entries leave the ledger. A
+    failed resume keeps its entry and answers 503 (stale auto-resume retries)."""
+    body = (request.get_data(as_text=True) or '').strip()
+    if body.startswith('{'):
+        try:
+            hashes = _json.loads(body).get('hashes', [])
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'JSON parse: {e}'}), 400
+    else:
+        hashes = [ln.strip() for ln in body.split('\n') if ln.strip()]
+    hashes = [h for h in hashes if isinstance(h, str) and h]
+    if not hashes:
+        return jsonify({'ok': False, 'error': 'no hashes in body'}), 400
+    try:
+        deluge_login()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'deluge unavailable: {e}'}), 503
+    out, failed = [], False
+    with _tiering_ledger_lock:
+        led = _tiering_ledger_load()
+        for h in hashes:
+            if h not in led:
+                out.append(f'ignored\t{h}')
+                continue
+            try:
+                deluge_resume_torrent(h)
+                led.pop(h, None)
+                out.append(f'resumed\t{h}')
+            except Exception as e:
+                failed = True
+                out.append(f'failed\t{h}')
+                log.warning(f'[tiering] resume of {h[:8]} failed: {e}')
+        try:
+            _tiering_ledger_save(led)
+        except Exception as e:
+            log.warning(f'[tiering] ledger save failed: {e}')
+    return app.response_class('\n'.join(out) + '\n', mimetype='text/plain'), (503 if failed else 200)
 
 
 @app.route('/torrent-breakdown', methods=['GET'])

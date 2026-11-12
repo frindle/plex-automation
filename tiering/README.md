@@ -24,13 +24,15 @@ Stops when disk1 reaches `TARGET_PCT` (98), or at `NIGHTLY_CAP_BYTES` (1.5 TB), 
 Ranked by atime (`stat` only, file contents are never read for ranking). Today the disks are mounted `noatime`, so atime is roughly the date each file was added; the script warns and still works. After access times are turned on (`relatime,nodiratime`), ranking becomes real last-opened. `REQUIRE_ATIME=1` makes it abort on `noatime` instead.
 
 ## Torrents
-Before moving, paths are sent (Deluge namespace, `/data/Media/...`) to `POST $TIERING_API/tiering/torrent-gate` on the plex-automation container:
-- no torrent: moves;
-- torrent has met the seeding rule (`SEED_DAYS`, same floor `remove_torrent` enforces for the RAR sets): in apply mode the torrent is removed from Deluge with its data kept, then the file moves. Dry runs only report it;
-- not met, unfinished, or unknown: the file is skipped and retried another night;
-- API unreachable: everything is skipped (fail safe).
+Torrents are paused around each move and never removed. The path the torrent sees (`/mnt/user/...`) does not change when a file goes disk to disk, and `rsync -a` keeps size and mtime, so a resumed torrent keeps seeding with no recheck.
 
-Rebuild/redeploy the plex-automation container so the new endpoint exists (`tiering_gate.py` is in the Dockerfile). `TIERING_API` defaults to `http://10.0.0.4:9876`; on Unraid the host often cannot reach a br0 container IP, so set it to a reachable address. The tracker's own minimum seed time is not read by this repo: set `SEED_DAYS` in the container to the longest tracker minimum if it is above 21.
+1. Classification, once per chunk: `POST $TIERING_API/tiering/torrent-gate` (no side effects). `free` = no torrent owns the file. `pause` = every owning torrent is complete (progress 100) in a known healthy state. `wait` = an owner is incomplete, erroring, checking or unknown: the unit is skipped and retried another night. API unreachable or no answer: also `wait` (fail safe). There is no seed-time rule; the weekly stalled-seed cleanup stays the only thing that unseeds.
+2. Per unit, right around the move (not per chunk): `POST /tiering/torrent-pause` with the unit's paths pauses the owners and returns the hashes it paused. The mover waits `PAUSE_SETTLE_SEC` (3) for Deluge to close the files, re-runs the open-file check inside `move_unit`, moves, then `POST /tiering/torrent-resume` with those hashes. Resume happens on every outcome (moved, skipped, failed). If the pause call fails, the unit is treated as `wait`.
+3. A torrent already paused by someone else is not paused and not resumed (the file still moves). The resume endpoint only resumes hashes the gate paused.
+4. Crash safety: the server keeps a ledger of paused hashes + time (`TIERING_PAUSE_STATE_PATH`, default `/data/tiering_paused.json`). Every gate/pause/resume call first resumes entries older than `TIERING_PAUSE_MAX_MIN` (default 360). The mover also resumes its own paused hashes from an EXIT/INT/TERM trap. If a user pauses a torrent by hand after the gate paused it, the stale auto-resume can resume it.
+5. Dry run never calls pause/resume; it prints `WOULD MOVE ... [torrent: pause]`.
+
+Rebuild/redeploy the plex-automation container so the new endpoints exist (`tiering_gate.py` is in the Dockerfile). `TIERING_API` defaults to `http://10.0.0.4:9876`; on Unraid the host often cannot reach a br0 container IP, so set it to a reachable address. Keep `/data` persistent so the ledger survives a container restart.
 
 ## Install (User Scripts plugin)
 1. Copy `glacier-mover.sh` to `/boot/config/plugins/user.scripts/scripts/glacier-mover/script`:
@@ -44,7 +46,7 @@ Rebuild/redeploy the plex-automation container so the new endpoint exists (`tier
 4. When happy, change the script body to run `--apply` (or the wrapper: `exec bash .../glacier-mover.sh --apply`).
 5. Set `LOG_DIR=/mnt/cache/appdata/tiering` to keep the log across reboots (default is `/var/log/tiering`, which is RAM). One Unraid notification per run with moved/failed/skipped counts.
 
-Settings via env vars (defaults in the script header): `MEDIA_ROOTS GLACIER SRC_DISKS TARGET_PCT NIGHTLY_CAP_BYTES MIN_AGE_DAYS EXCLUDE_NAMES EXCLUDE_CONTAINS MAIN_EXT SIDE_EXT TIERING_API NOTIFY_ON_DRY LOG_DIR`.
+Settings via env vars (defaults in the script header): `MEDIA_ROOTS GLACIER SRC_DISKS TARGET_PCT NIGHTLY_CAP_BYTES MIN_AGE_DAYS EXCLUDE_NAMES EXCLUDE_CONTAINS MAIN_EXT SIDE_EXT TIERING_API PAUSE_SETTLE_SEC NOTIFY_ON_DRY LOG_DIR`.
 
 The run aborts if the array is stopped, the mover is running, a parity check/rebuild is running, or another glacier run holds the lock.
 
