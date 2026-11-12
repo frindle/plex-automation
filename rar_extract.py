@@ -123,9 +123,14 @@ def _walk_files(root):
             yield os.path.join(d, n)
 
 
-def extract(rset, run=subprocess.run, disk_usage=shutil.disk_usage):
+def extract(rset, run=subprocess.run, disk_usage=shutil.disk_usage, keep_volumes=False, only=None):
     """Extract one set in place. -> {'ok': bool, 'files': [...], 'error': str}
-    Volumes are deleted only after every extracted file is moved into place."""
+    Volumes are deleted only after every extracted file is moved into place.
+    keep_volumes=True (a torrent still seeds the set): `only` must list the
+    inner file names to extract, and the volumes and .sfv are never deleted.
+    Default behaviour (keep_volumes=False) is unchanged."""
+    if keep_volumes and not only:
+        return {'ok': False, 'error': 'keep_volumes needs the inner files to extract'}
     first = rset['first']
     d = os.path.dirname(first)
     vols = rset['volumes']
@@ -141,7 +146,7 @@ def extract(rset, run=subprocess.run, disk_usage=shutil.disk_usage):
     shutil.rmtree(tmp, ignore_errors=True)
     try:
         os.makedirs(tmp)
-        r = run([UNAR, '-q', '-no-directory', '-force-overwrite', '-output-directory', tmp, first],
+        r = run([UNAR, '-q', '-no-directory', '-force-overwrite', '-output-directory', tmp, first] + list(only or []),
                 capture_output=True, text=True, timeout=EXTRACT_TIMEOUT)
         if r.returncode != 0:
             return {'ok': False, 'error': f'unar exit {r.returncode}: {(r.stderr or r.stdout or "").strip()[:300]}'}
@@ -161,11 +166,12 @@ def extract(rset, run=subprocess.run, disk_usage=shutil.disk_usage):
         return {'ok': False, 'error': str(e)[:300]}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    for v in vols + list(rset.get('extras') or []):
-        try:
-            os.remove(v)
-        except OSError:
-            pass
+    if not keep_volumes:
+        for v in vols + list(rset.get('extras') or []):
+            try:
+                os.remove(v)
+            except OSError:
+                pass
     return {'ok': True, 'files': [dest for _, dest in moves]}
 
 

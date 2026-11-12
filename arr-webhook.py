@@ -210,7 +210,7 @@ app.register_blueprint(share_bp)
 _DESTRUCTIVE_GET_GUARD_PATHS = {
     '/torrent-purge', '/purge-unstarted-superseded', '/complete-orphans',
     '/incomplete-orphans', '/run-stalled-seeds', '/auto-rescue', '/run-deluge-repair',
-    '/run-restore-moved', '/rar-library-scan',
+    '/run-restore-moved', '/rar-library-scan', '/rar-pack-scan',
 }
 
 @app.before_request
@@ -991,6 +991,212 @@ def rar_set_action(rset, cache=None, contents=None):
             return {'action': 'delete', 'arr': movie.get('title'), 'reason': 'Radarr has the movie'}
         return {'action': 'unpack', 'arr': movie.get('title'), 'reason': 'Radarr has no file'}
     return {'action': 'skip', 'reason': 'no Sonarr/Radarr item owns this folder'}
+
+
+# ── Season-pack RAR torrents seeding from the library: extract + evict ─────
+RAR_PACK_SETTLE_POLLS = int(os.environ.get('RAR_PACK_SETTLE_POLLS', '60'))
+
+
+def _same_filesystem(path_a, path_b, stat=os.stat):
+    """True when both local paths exist on one filesystem (same st_dev), so a
+    move_storage between them is a rename, never a copy of ~100 GB."""
+    try:
+        return stat(path_a).st_dev == stat(path_b).st_dev
+    except (OSError, ValueError):
+        return False
+
+
+def _torrent_pack_info(torrent_hash):
+    """name/label/save_path/files for one torrent, or None."""
+    try:
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.get_torrent_status',
+                  'params': [torrent_hash, ['name', 'label', 'save_path', 'files']], 'id': 11},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        st = resp.json().get('result') or {}
+        return st if isinstance(st, dict) and st.get('save_path') else None
+    except Exception as e:
+        log.warning(f'{torrent_hash}: rar-pack lookup failed ({e})')
+        return None
+
+
+def plan_rar_pack(torrent_hash, info, cache=None, contents=None, stat=os.stat):
+    """Plan the eviction of one library torrent. Pure reads (lsar, *arr GETs, stat).
+    -> {'hash', 'name', 'action': 'evict'|'refuse', 'reason', 'same_filesystem',
+        'episodes': n, 'extract': [{'set': rset, 'files': [inner names], 'episodes': [(s, e)]}]}
+    Refuses unless the save_path is in the library, the file list holds RAR
+    volumes, the sets hold more than one distinct episode, the owning Sonarr
+    series lists every episode, and nothing needed is ambiguous."""
+    cache = {} if cache is None else cache
+    save_path = info.get('save_path') or ''
+    out = {'hash': torrent_hash, 'name': info.get('name'), 'action': 'refuse', 'reason': '',
+           'same_filesystem': None, 'episodes': 0, 'extract': []}
+    if not is_library_path(save_path):
+        out['reason'] = 'save_path is not in the Plex library'
+        return out
+    rels = [f.get('path') or '' for f in info.get('files') or [] if isinstance(f, dict)]
+    if not rar_extract.has_rar_volumes(rels):
+        out['reason'] = 'no RAR volumes in the torrent'
+        return out
+    if (info.get('label') or '') == SUPERSEDED_LABEL:
+        out['reason'] = 'already labeled superseded'
+        return out
+    rsets = rar_extract.rar_sets([posixpath.normpath(posixpath.join(save_path, r)) for r in rels])
+    if not rsets:
+        out['reason'] = 'RAR volumes form no complete set'
+        return out
+    local_sets = [{'first': _deluge_to_local(rs['first']),
+                   'volumes': [_deluge_to_local(v) for v in rs['volumes']],
+                   'extras': [_deluge_to_local(v) for v in rs['extras']]} for rs in rsets]
+    if not all(rs['first'] and all(rs['volumes']) for rs in local_sets):
+        out['reason'] = 'a RAR path has no local mount'
+        return out
+    seeding_local = _deluge_to_local(SEEDING_DIR)
+    out['same_filesystem'] = bool(seeding_local) and _same_filesystem(
+        os.path.dirname(local_sets[0]['first']), seeding_local, stat)
+    try:
+        series = _owning_item(_arr_items('series', cache), posixpath.normpath(save_path))
+    except Exception as e:
+        out['reason'] = f'*arr lookup failed: {str(e)[:200]}'
+        return out
+    if not series:
+        out['reason'] = 'no Sonarr series owns this folder'
+        return out
+    try:
+        r = requests.get(f'{SONARR_URL}/api/v3/episode', params={'seriesId': series['id']},
+                         headers={'X-Api-Key': SONARR_API_KEY}, timeout=60)
+        r.raise_for_status()
+        have = {(e.get('seasonNumber'), e.get('episodeNumber')): bool(e.get('hasFile')) for e in r.json() or []}
+    except Exception as e:
+        out['reason'] = f'Sonarr episode lookup failed: {str(e)[:200]}'
+        return out
+    all_eps = set()
+    for rs in local_sets:
+        lst = (contents or rar_extract.list_contents)(rs['first'])
+        if not lst.get('ok'):
+            out['reason'] = lst.get('error') or 'lsar failed'
+            return out
+        names = []
+        for v in (f for f in lst.get('files') or [] if episode_retention.is_main_video(f)):
+            eps = _episodes_in_name(v)
+            if not eps:
+                out['reason'] = f'no SxxEyy/NxNN in {os.path.basename(v)}'
+                return out
+            all_eps.update(eps)
+            unknown = [k for k in eps if k not in have]
+            if unknown:
+                out['reason'] = f'episode S{unknown[0][0]:02d}E{unknown[0][1]:02d} not in Sonarr'
+                return out
+            if not all(have[k] for k in eps):
+                names.append((v, eps))
+        if names:
+            out['extract'].append({'set': rs, 'files': [n for n, _ in names],
+                                   'episodes': sorted({k for _, eps in names for k in eps})})
+    out['episodes'] = len(all_eps)
+    if len(all_eps) < 2:
+        out['reason'] = 'not a season pack (fewer than two episodes inside)'
+        return out
+    out['action'] = 'evict'
+    n = sum(len(x['files']) for x in out['extract'])
+    out['reason'] = (f'extract {n} missing file(s) then evict to {SEEDING_DIR}' if n
+                     else f'Sonarr has every episode; evict to {SEEDING_DIR}')
+    return out
+
+
+def _wait_rar_pack_settled(torrent_hash, sleep=time.sleep, poll_seconds=10):
+    """After move + recheck: True once the torrent is out of Checking/Moving
+    with no Error and 100% progress. Same polling idea as season_migration."""
+    for _ in range(RAR_PACK_SETTLE_POLLS):
+        try:
+            resp = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.get_torrent_status',
+                      'params': [torrent_hash, ['state', 'progress']], 'id': 12},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            st = resp.json().get('result') or {}
+        except Exception:
+            st = {}
+        state = st.get('state')
+        if state == 'Error':
+            return False
+        if state and state not in ('Checking', 'Moving') and (st.get('progress') or 0) >= 100:
+            return True
+        sleep(poll_seconds)
+    return False
+
+
+def evict_library_rar_pack(torrent_hash, dry_run=True, info=None, cache=None, contents=None,
+                           stat=os.stat, sleep=time.sleep):
+    """Extract the episodes Sonarr lacks from a library season-pack RAR torrent
+    (volumes kept), then label it superseded and move it to SEEDING_DIR so the
+    volumes seed from Just4Seeding while the extracted episodes stay in the
+    library. Refuses unless the move is a same-filesystem rename. HnR/seed-floor
+    guards, supersede_torrent and remove_torrent are not involved; the torrent
+    is reaped by cleanup_superseded after SEED_DAYS. Dry run changes nothing.
+    -> {'ok': bool, 'dry_run': bool, 'plan': {...}, 'steps': [...], 'error': str}"""
+    if info is None:
+        info = _torrent_pack_info(torrent_hash)
+    if not info:
+        return {'ok': False, 'dry_run': dry_run, 'error': 'torrent not found'}
+    plan = plan_rar_pack(torrent_hash, info, cache, contents, stat)
+    res = {'ok': plan['action'] == 'evict', 'dry_run': dry_run, 'plan': plan, 'steps': []}
+    if plan['action'] != 'evict':
+        res['error'] = plan['reason']
+        return res
+    if dry_run:
+        return res
+    if not plan['same_filesystem']:
+        res['ok'] = False
+        res['error'] = (f'{SEEDING_DIR} is not on the same filesystem as the library; '
+                        'refusing (a move would copy the whole pack)')
+        return res
+    extracted = []
+    for item in plan['extract']:
+        ex = rar_extract.extract(item['set'], keep_volumes=True, only=item['files'])
+        if not ex.get('ok'):
+            res['ok'] = False
+            res['error'] = f'extract failed: {ex.get("error")}'
+            return res
+        extracted += ex['files']
+        res['steps'].append(f'extracted {len(ex["files"])} file(s)')
+    first_local = plan['extract'][0]['set']['first'] if plan['extract'] else _deluge_to_local(
+        posixpath.join(info['save_path'], info.get('name') or ''))
+    note = _rescan_arr_for(first_local)
+    res['steps'].append(f'rescan: {note}')
+    if not all(os.path.isfile(p) for p in extracted):
+        res['ok'] = False
+        res['error'] = 'an extracted episode is missing from the library; torrent not moved'
+        return res
+    set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
+    res['steps'].append('labeled superseded')
+    if not move_torrent_storage(torrent_hash, SEEDING_DIR):
+        res['ok'] = False
+        res['error'] = 'move refused'
+        return res
+    res['steps'].append(f'moved to {SEEDING_DIR}')
+    sp = _torrent_save_path(torrent_hash)
+    if not sp or posixpath.normpath(sp) != posixpath.normpath(SEEDING_DIR):
+        res['ok'] = False
+        res['error'] = f'torrent save_path is {sp!r} after the move'
+        return res
+    if not all(os.path.isfile(p) for p in extracted):
+        res['ok'] = False
+        res['error'] = 'an extracted episode vanished from the library after the move'
+        return res
+    deluge_force_recheck(torrent_hash)
+    if not _wait_rar_pack_settled(torrent_hash, sleep=sleep):
+        res['ok'] = False
+        res['error'] = 'torrent did not recheck to 100% after the move'
+        return res
+    res['steps'].append('recheck ok')
+    res['steps'].append(f'rescan: {_rescan_arr_for(first_local)}')
+    record_activity('rar-pack-evict', f'{plan["name"]}: {len(extracted)} episode file(s) extracted, torrent moved to {SEEDING_DIR}')
+    return res
 
 
 def process_rar_queue():
@@ -8553,6 +8759,48 @@ def rar_library_scan_route():
         counts[r['action']] = counts.get(r['action'], 0) + 1
     return jsonify({'ok': True, 'dry_run': not apply, 'count': len(rows), 'bytes': total,
                     'actions': counts, 'queued': queued, 'sets': rows}), 200
+
+
+@app.route('/rar-pack-scan', methods=['GET', 'POST'])
+def rar_pack_scan_route():
+    """Library torrents holding RAR season packs, each with the episodes that
+    would be extracted, whether SEEDING_DIR shares a filesystem with it, and
+    the planned action. The dry run only lists. POST ?hash=<h>&apply=1 evicts
+    that one torrent (see evict_library_rar_pack)."""
+    apply = request.method == 'POST' and request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    h = (request.args.get('hash') or '').strip().lower()
+    if apply:
+        if not h:
+            return jsonify({'ok': False, 'error': 'apply needs ?hash=<torrent hash>'}), 400
+        res = evict_library_rar_pack(h, dry_run=False)
+        return jsonify(_rar_pack_json(res)), (200 if res.get('ok') else 409)
+    try:
+        deluge_login()
+        torrents = get_all_torrents(['name', 'label', 'save_path', 'files'], force=True)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 503
+    cache, rows = {}, []
+    for th, t in sorted((torrents or {}).items()):
+        if h and th != h:
+            continue
+        if not is_library_path(t.get('save_path')):
+            continue
+        rels = [f.get('path') or '' for f in t.get('files') or [] if isinstance(f, dict)]
+        if not rar_extract.has_rar_volumes(rels):
+            continue
+        rows.append(_rar_pack_json(evict_library_rar_pack(th, dry_run=True, info=t, cache=cache))['plan'])
+    return jsonify({'ok': True, 'dry_run': True, 'count': len(rows),
+                    'evictable': sum(1 for r in rows if r['action'] == 'evict'), 'torrents': rows}), 200
+
+
+def _rar_pack_json(res):
+    out = dict(res)
+    plan = dict(res.get('plan') or {})
+    plan['extract'] = [{'first': x['set']['first'], 'files': x['files'],
+                        'episodes': [f'S{s:02d}E{e:02d}' for s, e in x['episodes']]}
+                       for x in plan.get('extract') or []]
+    out['plan'] = plan
+    return out
 
 
 @app.route('/rar-extract-queue', methods=['GET'])
