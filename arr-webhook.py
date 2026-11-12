@@ -16,6 +16,7 @@ from media_share import share_bp, init_db as init_share_db
 import episode_retention
 import rar_extract
 import torrent_breakdown
+import tiering_gate
 import library_audit
 import downloads_audit
 import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
@@ -8572,6 +8573,44 @@ def run_rar_extract_route():
 def downloads_audit_route():
     # Report only: a GET never sends Pushover or records anything; the daily tick does.
     return jsonify(downloads_audit_run(dry_run=True)), 200
+
+
+@app.route('/tiering/torrent-gate', methods=['POST'])
+def tiering_torrent_gate_route():
+    """Glacier mover gate. Body: newline-separated paths (Deluge namespace) or
+    {"paths": [...]}. Each path comes back free / release / wait (see tiering_gate).
+    Without ?apply=1 nothing is touched. With it, each torrent that has met the
+    seeding rule is removed from Deluge with its data kept. ?format=tsv returns
+    status<TAB>reason<TAB>path lines for the bash mover. Any Deluge trouble
+    answers 503 so the mover treats every file as 'wait'."""
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    body = (request.get_data(as_text=True) or '').strip()
+    if body.startswith('{'):
+        try:
+            paths = _json.loads(body).get('paths', [])
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'JSON parse: {e}'}), 400
+    else:
+        paths = [ln for ln in body.split('\n') if ln.strip()]
+    paths = [p for p in paths if isinstance(p, str) and p.startswith('/')]
+    if not paths:
+        return jsonify({'ok': False, 'error': 'no absolute paths in body'}), 400
+    try:
+        deluge_login()
+        torrents = _deluge_rpc('core.get_torrents_status', [{}, tiering_gate.FIELDS])
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'deluge unavailable: {e}'}), 503
+    if not isinstance(torrents, dict):
+        return jsonify({'ok': False, 'error': 'deluge returned no torrent list'}), 503
+    rows = tiering_gate.classify_paths(paths, torrents, SEED_DAYS)
+    if apply:
+        tiering_gate.apply_releases(rows, torrents, lambda h, info: remove_torrent(h, False, info), DEFERRED)
+    if request.args.get('format') == 'tsv':
+        return app.response_class(tiering_gate.to_tsv(rows), mimetype='text/plain'), 200
+    counts = {}
+    for r in rows:
+        counts[r['status']] = counts.get(r['status'], 0) + 1
+    return jsonify({'ok': True, 'dry_run': not apply, 'counts': counts, 'paths': rows}), 200
 
 
 @app.route('/torrent-breakdown', methods=['GET'])
