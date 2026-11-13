@@ -510,3 +510,7 @@ def spend_summary(path, month):
     except OSError:
         pass
     return out
+
+
+def paid_cap_reached(env, path, month):
+    raise NotImplementedError('not implemented: paid_cap_reached')
