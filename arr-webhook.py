@@ -1494,7 +1494,15 @@ def torrent_is_unregistered(info):
     fail-safe direction is 'keep seeding', because the cost of being wrong is
     a hit-and-run on the tracker and the cost of being right late is disk."""
     status = (info.get('tracker_status') or '').lower()
+    if UNREGISTERED_ACCOUNT_RE.search(status):
+        return False
     return any(marker in status for marker in UNREGISTERED_MARKERS)
+
+
+# Account-level errors use the same words ("Unregistered passkey", "User not registered", "IP not
+# registered"). They hit every torrent on that tracker and say nothing about the torrent, so they
+# never count as dead (fail-safe: keep seeding).
+UNREGISTERED_ACCOUNT_RE = re.compile(r'\b(passkey|torrent_pass|authkey|user|account|ip|device|client)\b')
 
 
 def should_supersede_candidate(info):
@@ -9232,7 +9240,13 @@ _unregistered_last = [0.0]
 _unregistered_report = {'ts': None, 'apply': False, 'rows': []}   # newest sweep, shown on /digest
 _unregistered_reported = set()   # (hash, outcome) already written to the activity log, so a refusal is not repeated hourly
 SWEEP_TORRENT_FIELDS = ['name', 'label', 'save_path', 'seeding_time', 'is_finished', 'progress', 'state',
-                        'total_uploaded', 'tracker_status', 'time_added']
+                        'total_uploaded', 'tracker_status', 'time_added', 'tracker_host']
+# Blast-radius limits for apply. When most of one tracker's torrents say "unregistered" at once, that is a
+# tracker or account problem, not dead torrents: list them and change nothing. And at most
+# UNREGISTERED_MAX_PER_PASS removals per hourly pass; the rest wait for the next pass.
+UNREGISTERED_MASS_MIN = 5
+UNREGISTERED_MASS_SHARE = 0.8
+UNREGISTERED_MAX_PER_PASS = 25
 
 
 def _arr_queue_by_hash():
@@ -9282,6 +9296,18 @@ def unregistered_sweep(apply=None, now=None):
     torrents = get_all_torrents(SWEEP_TORRENT_FIELDS, force=True)
     dead = {h: i for h, i in torrents.items() if torrent_is_unregistered(i)}
     rows = []
+    host_of = lambda i: (i.get('tracker_host') or '').lower()   # noqa: E731
+    per_host = collections.Counter(host_of(i) for i in torrents.values())
+    dead_per_host = collections.Counter(host_of(i) for i in dead.values())
+    mass = {host for host, n in dead_per_host.items()
+            if n >= UNREGISTERED_MASS_MIN and n / per_host[host] >= UNREGISTERED_MASS_SHARE}
+    for host in mass:
+        if (host, 'mass') not in _unregistered_reported:
+            _unregistered_reported.add((host, 'mass'))
+            log.warning(f'[unregistered] {dead_per_host[host]} of {per_host[host]} torrents on {host or "?"} say unregistered; left alone')
+            record_activity('unregistered', f'{dead_per_host[host]} of {per_host[host]} torrents on {host or "one tracker"} '
+                            'say unregistered at once: looks like a tracker or account problem, nothing removed')
+    applied = 0
     if dead:
         queue, failed = _arr_queue_by_hash()
         for h, info in sorted(dead.items(), key=lambda kv: kv[1].get('time_added') or 0):
@@ -9291,15 +9317,25 @@ def unregistered_sweep(apply=None, now=None):
             row = {'hash': h, 'name': info.get('name') or h, 'state': info.get('state'),
                    'age_days': round((now - added) / 86400, 1) if isinstance(added, (int, float)) else None,
                    'arr': owner, 'in_queue': bool(q), 'tracker_status': info.get('tracker_status')}
-            if q:
+            skip = None
+            if host_of(info) in mass:
+                skip = row['would'] = (f'skip: {dead_per_host[host_of(info)]} of {per_host[host_of(info)]} torrents on this '
+                                       'tracker say it (tracker or account problem)')
+            elif q:
                 row['would'] = f'blocklist {owner} queue item(s), then remove torrent'
             elif owner in failed:
-                row['would'] = f'skip: {owner} queue unreadable'
+                skip = row['would'] = f'skip: {owner} queue unreadable'
             else:
                 row['would'] = 'remove torrent only (library copy stays)'
             row['outcome'] = 'dry-run'
-            if apply and not (not q and owner in failed):
-                row['outcome'] = _unregistered_apply_one(h, info, q, owner)
+            if apply:
+                if skip:
+                    row['outcome'] = skip
+                elif applied >= UNREGISTERED_MAX_PER_PASS:
+                    row['outcome'] = f'waiting: {UNREGISTERED_MAX_PER_PASS} per pass, next pass takes it'
+                else:
+                    applied += 1
+                    row['outcome'] = _unregistered_apply_one(h, info, q, owner)
             rows.append(row)
     _unregistered_report.update(ts=datetime.now().isoformat(timespec='seconds'), apply=bool(apply), rows=rows)
     log.info(f'[unregistered] sweep: {len(rows)} dead torrent(s), {"apply" if apply else "dry run"}')

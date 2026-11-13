@@ -171,7 +171,7 @@ def test_arr_unreachable_leaves_its_torrents_alone(world):
     w.sonarr_down = True
     rows = aw.unregistered_sweep(apply=True, now=NOW)
     assert w.deletes == [] and w.removed() == []
-    assert rows[0]['outcome'] == 'dry-run' and 'unreadable' in rows[0]['would']
+    assert rows[0]['outcome'] == rows[0]['would'] == 'skip: Sonarr queue unreadable'
 
 
 def test_tick_runs_at_most_once_an_hour(world, monkeypatch):
@@ -187,3 +187,32 @@ def test_default_is_dry_run(world):
     assert aw.UNREGISTERED_APPLY is False
     aw.unregistered_sweep(now=NOW)
     assert w.deletes == [] and w.removed() == []
+
+
+def test_account_errors_never_count_as_dead():
+    for s in ('Unregistered passkey', 'Error: User not registered', 'IP not registered with this tracker',
+              'Unregistered device', 'Error: unregistered torrent_pass', 'Account not registered'):
+        assert not aw.torrent_is_unregistered({'tracker_status': s}), s
+    assert aw.torrent_is_unregistered({'tracker_status': 'Unregistered torrent'})
+
+
+def test_most_of_one_tracker_dead_at_once_changes_nothing(world):
+    ts = {('%02d' % i) * 20: tor(f'Show.S01E{i:02d}', 'Unregistered torrent', tracker_host='tracker.one.test')
+          for i in range(6)}
+    ts[A] = tor('Other.Healthy', 'Announce OK', tracker_host='tracker.one.test')
+    ts[B] = tor('Elsewhere.Dead', 'Unregistered torrent', tracker_host='tracker.two.test')
+    w = world(ts)
+    rows = aw.unregistered_sweep(apply=True, now=NOW)
+    mass_rows = [r for r in rows if r['hash'] != B]
+    assert len(mass_rows) == 6 and all(r['outcome'].startswith('skip: 6 of 7') for r in mass_rows)
+    assert w.removed() == [(B, True)] or w.removed() == [(B, False)]   # the other tracker's one still goes
+    assert w.deletes == []
+
+
+def test_at_most_25_removals_per_pass(world, monkeypatch):
+    ts = {('%02x' % i) * 20: tor(f'Movie.{i}', 'Unregistered torrent', label='radarr', tracker_host=f't{i}.test')
+          for i in range(30)}
+    w = world(ts, imported=set(ts))
+    rows = aw.unregistered_sweep(apply=True, now=NOW)
+    assert len(w.removed()) == aw.UNREGISTERED_MAX_PER_PASS
+    assert sum(r['outcome'].startswith('waiting') for r in rows) == 30 - aw.UNREGISTERED_MAX_PER_PASS
