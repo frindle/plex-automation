@@ -18,6 +18,12 @@ jobs:
       - run: python -m py_compile arr-webhook.py monthly_upgrade.py media_share.py
       - run: ruff check arr-webhook.py monthly_upgrade.py media_share.py
 
+  shell-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash backup/tests/test_plex_db_r2.sh
+
   docker-build:
     runs-on: ubuntu-latest
     needs: lint
