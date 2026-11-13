@@ -37,6 +37,21 @@ Background schedulers (run inside the same process):
 4. Point Sonarr/Radarr's webhook connections (Settings → Connect) at `http://<container-ip>:9876/webhook/sonarr` and `/webhook/radarr`, enabling the **On Grab** and **On Import** (upgrade) triggers.
 5. If using the media share portal, point a Cloudflare Tunnel + Access application at `http://<container-ip>:9876/share` and restrict ingress so the container is only reachable through the tunnel.
 
+## LLM decisions
+
+Advisory decisions for upgrade grabs, import identity and duplicate keepers (`llm_decide.py`, `llm_advisor.py`). `LLM_DECISIONS=off` (default) never calls a model; `shadow` logs what the chain would do next to what the rules did; `enforce` lets a confident answer (>= 0.75) override the rules. Hard rules always win. Set values in `.env`; compose passes them through with empty defaults.
+
+Layers, each skipped when its env is unset:
+
+1. Local Darkbloom: `DARKBLOOM_BASE_URL` + `DARKBLOOM_API_KEY` (OpenAI-compatible). Model is `LLM_LOCAL_MODEL`, else the first id from `/v1/models` (cached 10 min). `LLM_DECIDE_URL`/`LLM_DECIDE_MODEL`/`LLM_DECIDE_KEY` still work when `DARKBLOOM_BASE_URL` is unset. Optional hold check: `LLM_LOCAL_HOLD_URL` + `LLM_LOCAL_HOLD_TOKEN`; the local layer is skipped only when the response is 200 with top-level `hold: true` (errors fail open).
+2. Paid Darkbloom: `DARKBLOOM_CLOUD_API_KEY`, `DARKBLOOM_CLOUD_MODEL` (default `qwen3.5-27b-claude-opus-8bit`).
+3. Claude: `ANTHROPIC_API_KEY`, `LLM_CLAUDE_MODEL` (default `claude-sonnet-5-5`), structured output via the `anthropic` SDK.
+4. Rules: an exhausted chain returns nothing and the rules action stands.
+
+Waiting for local: when the local layer is unavailable (down, timeout, bad output, hold) the decision is pending for `LLM_LOCAL_WAIT_MIN` minutes (default 15) before any paid layer is used. Pending state is kept in `LLM_PENDING_PATH` (`/data/llm_pending.json`, keyed by kind + hash of the facts) so a restart keeps the clock; entries drop on resolve or after 24 h. While pending: import identity answers `unsure` (enforce) and dupe keeper `keep_both`; shadow keeps the rules action. An upgrade grab applies the rules action at once and a background thread retries local about every 60 s, then escalates; a late `reject` removes the torrent and a late `throttle` labels it (enforce only). A restart drops pending grabs and the rules action stands. A valid but low-confidence open-model answer goes to Claude immediately.
+
+Logging: each row in `LLM_DECISIONS_LOG` carries `layer`, `model`, `latency_ms`, `pending_min`, and for paid calls `paid_calls` (token usage and provider request id). Keys and headers are never logged. Each escalation to a paid layer adds an activity line (`llm-escalation`). `GET /llm-decisions` reads the log; `GET /llm-spend?month=YYYY-MM` sums calls and tokens per paid layer (tokens only, no prices).
+
 ## Deployment
 
 Runs on Unraid at `/mnt/user/appdata/plex-automation`, on the `br0` macvlan network (external) at a static IP. `.env` lives only on the server and is gitignored — never commit real secrets.

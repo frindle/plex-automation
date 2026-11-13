@@ -49,6 +49,28 @@ def fake_post(self, url, json=None, timeout=None, **kw):
 
 requests.Session.post = fake_post
 
+GETS = []
+ARR = {'imported': set(), 'fail': set()}  # (service, HASH) pairs imported; services whose lookup fails
+
+
+def fake_get(url, headers=None, params=None, timeout=None, **kw):
+    """Fake Sonarr/Radarr /api/v3/history?downloadId=..."""
+    svc = 'radarr' if url.startswith(aw.RADARR_URL) else 'sonarr'
+    GETS.append((svc, url, dict(params or {})))
+    if svc in ARR['fail']:
+        raise requests.ConnectionError('arr down')
+    did = (params or {}).get('downloadId')
+    recs = [{'eventType': 'downloadFolderImported', 'downloadId': did}] if (svc, did) in ARR['imported'] else []
+    return Resp({'records': recs})
+
+
+requests.get = fake_get
+_KEYS = (aw.SONARR_API_KEY, aw.RADARR_API_KEY)
+
+
+def arr_keys(on=True):
+    aw.SONARR_API_KEY, aw.RADARR_API_KEY = ('k', 'k') if on else ('', '')
+
 
 def setup():
     for k in ('REMOVAL_LOG', 'ACTIVITY_LOG', 'UNPACK_STATE_PATH', 'SEED_STATE_PATH'):
@@ -59,6 +81,10 @@ def setup():
     STATE['one'] = {}
     STATE['fail'] = False
     aw._snapshots.clear()
+    del GETS[:]
+    ARR['imported'] = set()
+    ARR['fail'] = set()
+    aw.SONARR_API_KEY, aw.RADARR_API_KEY = _KEYS
 
 
 def _rows(key):
@@ -118,12 +144,72 @@ def test_unpacked_deferred():
               open(os.environ['UNPACK_STATE_PATH'], 'w'))
     STATE['all'] = {'a': {'name': 'A', 'save_path': '/nonexistent'}, 'b': {'name': 'B', 'save_path': '/nonexistent'}}
     STATE['one'] = {'a': young(), 'b': full(30 * DAY)}
+    arr_keys()
+    ARR['imported'] = {('sonarr', 'A'), ('sonarr', 'B')}
     aw.cleanup_unpacked_torrents()
     assert removed_hashes() == ['b'], RPC
     state = read_json('UNPACK_STATE_PATH')
     assert 'a' in state and 'b' not in state, state
     assert not any('"A"' in s for s in summaries()), summaries()
     assert any('Removed 1 unpacked' in s for s in summaries()), summaries()
+
+
+def _aged(h, save_path='/data/Downloads/Complete'):
+    json.dump({h: {'first_seen_rar_at': 0, 'name': h.upper()}}, open(os.environ['UNPACK_STATE_PATH'], 'w'))
+    STATE['all'] = {h: {'name': h.upper(), 'save_path': save_path}}
+    STATE['one'] = {h: full(30 * DAY, save_path=save_path)}
+
+
+def test_unpacked_waits_for_import():
+    setup()
+    _aged('c')
+    arr_keys()
+    aw.cleanup_unpacked_torrents()
+    assert removed_hashes() == [], RPC
+    state = read_json('UNPACK_STATE_PATH')
+    assert 'c' in state and state['c'].get('import_wait'), state
+    kept = [s for s in summaries() if 'never imported' in s]
+    assert len(kept) == 1, summaries()
+    assert {g[0] for g in GETS} == {'sonarr', 'radarr'}, GETS
+    assert all(g[2].get('downloadId') == 'C' and g[2].get('eventType') == 3 for g in GETS), GETS
+    aw.cleanup_unpacked_torrents()  # second pass: still kept, not announced again
+    assert removed_hashes() == [], RPC
+    assert len([s for s in summaries() if 'never imported' in s]) == 1, summaries()
+    ARR['imported'] = {('radarr', 'C')}  # imported later: now it goes
+    aw.cleanup_unpacked_torrents()
+    assert removed_hashes() == ['c'], RPC
+    assert 'c' not in read_json('UNPACK_STATE_PATH')
+
+
+def test_unpacked_lookup_failure_keeps():
+    setup()
+    _aged('d')
+    arr_keys()
+    ARR['fail'] = {'sonarr'}
+    aw.cleanup_unpacked_torrents()  # Sonarr down, Radarr has no import: unknown, keep
+    assert removed_hashes() == [], RPC
+    ARR['imported'] = {('radarr', 'D')}  # Sonarr still down, Radarr imported it: go
+    aw.cleanup_unpacked_torrents()
+    assert removed_hashes() == ['d'], RPC
+
+
+def test_unpacked_no_arr_configured_keeps():
+    setup()
+    _aged('e')
+    arr_keys(False)
+    aw.cleanup_unpacked_torrents()
+    assert removed_hashes() == [] and GETS == [], (RPC, GETS)
+    assert 'e' in read_json('UNPACK_STATE_PATH')
+
+
+def test_unpacked_library_seed_skips_import_check():
+    setup()
+    _aged('f', save_path='/data/Media/TV Shows/Some Show')
+    arr_keys()
+    aw.cleanup_unpacked_torrents()
+    assert removed_hashes() == ['f'], RPC
+    assert GETS == [], GETS
+    assert [p for m, p in RPC if m == 'core.remove_torrent'] == [['f', False]], RPC
 
 
 def test_stalled_deferred():
@@ -142,6 +228,10 @@ def test_stalled_deferred():
 
 TESTS = [
     test_unpacked_deferred,
+    test_unpacked_waits_for_import,
+    test_unpacked_lookup_failure_keeps,
+    test_unpacked_no_arr_configured_keeps,
+    test_unpacked_library_seed_skips_import_check,
     test_stalled_deferred,
 ]
 

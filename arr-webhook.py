@@ -55,20 +55,60 @@ LLM_DECISIONS_LOG = os.environ.get('LLM_DECISIONS_LOG', '/data/llm_decisions.jso
 def _llm_record(category, info):
     """record= callback for advise(): the /digest page needs a string summary."""
     info = info if isinstance(info, dict) else {}
+    if category == 'llm-escalation':
+        record_activity(category, f"{info.get('kind')} ({info.get('mode')}): escalated to {info.get('layer')} "
+                                  f"({info.get('reason')})")
+        return
     record_activity(category, f"{info.get('kind')} ({info.get('mode')}): "
                               f"rules={info.get('rules_action')} llm={info.get('llm_action')}")
 
 
-def _llm_advise(kind, facts, rules_action):
-    """Ask the advisor; a missing module, an exception or a non-string answer returns rules_action."""
+def _llm_advise(kind, facts, rules_action, info=None):
+    """Ask the advisor; a missing module, an exception or a non-string answer returns rules_action.
+    `info` (dict) receives pending/layer/pending_min when the caller cares about a pending decision."""
     if llm_advisor is None:
         return rules_action
     try:
-        action = llm_advisor.advise(kind, facts, rules_action, record=_llm_record)
+        action = llm_advisor.advise(kind, facts, rules_action, record=_llm_record, info=info)
     except Exception as e:  # noqa: BLE001
         log.warning(f'[llm] advise({kind}) failed: {e}')
         return rules_action
     return action if isinstance(action, str) else rules_action
+
+
+LLM_LATE_POLL_S = 60.0
+
+
+def _late_gate(source, download_id, title, facts, rules_action, upgrade_label, poll_s=None):
+    """Upgrade-gate decision that was pending when the grab arrived. The rules action was applied already; this
+    thread retries the chain until it answers, then applies a late reject/throttle (enforce) or just logs (shadow).
+    A restart drops the thread; startup clears the pending entries and the rules action stands."""
+    poll = LLM_LATE_POLL_S if poll_s is None else poll_s
+    try:
+        for _ in range(int(24 * 3600 / max(poll, 1)) + 1):
+            time.sleep(poll)
+            info = {}
+            action = _llm_advise('upgrade_gate', facts, rules_action, info)
+            if info.get('pending'):
+                continue
+            mode = (os.environ.get('LLM_DECISIONS', 'off') or '').strip().lower()
+            if mode != 'enforce' or action == rules_action:
+                return
+            if action == 'reject':
+                log.warning(f"{source}: late LLM reject of upgrade grab {download_id} ({title})")
+                deluge_login()
+                remove_torrent(download_id, remove_data=True)
+                record_activity('llm-reject-late', f'{source}: upgrade grab "{title}" rejected late by LLM advisor')
+            elif action == 'throttle' and rules_action == 'allow':
+                deluge_login()
+                ensure_label_exists_named(upgrade_label)
+                set_torrent_label(download_id, upgrade_label)
+                session.post(f'{DELUGE_URL}/json',
+                             json={'method': 'core.queue_bottom', 'params': [[download_id]], 'id': 11}, timeout=10)
+                record_activity('llm-throttle-late', f'{source}: upgrade grab "{title}" throttled late by LLM advisor')
+            return
+    except Exception as e:  # noqa: BLE001
+        log.error(f"{source}: late LLM gate failed: {e}")
 
 
 def _llm_tags(name):
@@ -210,7 +250,7 @@ app.register_blueprint(share_bp)
 _DESTRUCTIVE_GET_GUARD_PATHS = {
     '/torrent-purge', '/purge-unstarted-superseded', '/complete-orphans',
     '/incomplete-orphans', '/run-stalled-seeds', '/auto-rescue', '/run-deluge-repair',
-    '/run-restore-moved', '/rar-library-scan',
+    '/run-restore-moved', '/rar-library-scan', '/rar-pack-scan',
 }
 
 @app.before_request
@@ -993,6 +1033,225 @@ def rar_set_action(rset, cache=None, contents=None):
     return {'action': 'skip', 'reason': 'no Sonarr/Radarr item owns this folder'}
 
 
+# ── Season-pack RAR torrents seeding from the library: extract + evict ─────
+RAR_PACK_SETTLE_POLLS = int(os.environ.get('RAR_PACK_SETTLE_POLLS', '60'))
+
+
+def _same_filesystem(path_a, path_b, stat=os.stat):
+    """True when both local paths exist on one filesystem (same st_dev), so a
+    move_storage between them is a rename, never a copy of ~100 GB."""
+    try:
+        return stat(path_a).st_dev == stat(path_b).st_dev
+    except (OSError, ValueError):
+        return False
+
+
+def _torrent_pack_info(torrent_hash):
+    """name/label/save_path/files for one torrent, or None."""
+    try:
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.get_torrent_status',
+                  'params': [torrent_hash, ['name', 'label', 'save_path', 'files']], 'id': 11},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        st = resp.json().get('result') or {}
+        return st if isinstance(st, dict) and st.get('save_path') else None
+    except Exception as e:
+        log.warning(f'{torrent_hash}: rar-pack lookup failed ({e})')
+        return None
+
+
+def plan_rar_pack(torrent_hash, info, cache=None, contents=None, stat=os.stat):
+    """Plan the eviction of one library torrent. Pure reads (lsar, *arr GETs, stat).
+    -> {'hash', 'name', 'action': 'evict'|'refuse', 'reason', 'same_filesystem',
+        'episodes': n, 'extract': [{'set': rset, 'files': [inner names], 'episodes': [(s, e)]}]}
+    Refuses unless the save_path is in the library, the file list holds RAR
+    volumes, the sets hold more than one distinct episode, the owning Sonarr
+    series lists every episode, and nothing needed is ambiguous."""
+    cache = {} if cache is None else cache
+    save_path = info.get('save_path') or ''
+    out = {'hash': torrent_hash, 'name': info.get('name'), 'action': 'refuse', 'reason': '',
+           'same_filesystem': None, 'episodes': 0, 'extract': []}
+    if not is_library_path(save_path):
+        out['reason'] = 'save_path is not in the Plex library'
+        return out
+    rels = [f.get('path') or '' for f in info.get('files') or [] if isinstance(f, dict)]
+    if not rar_extract.has_rar_volumes(rels):
+        out['reason'] = 'no RAR volumes in the torrent'
+        return out
+    if (info.get('label') or '') == SUPERSEDED_LABEL:
+        out['reason'] = 'already labeled superseded'
+        return out
+    rsets = rar_extract.rar_sets([posixpath.normpath(posixpath.join(save_path, r)) for r in rels])
+    if not rsets:
+        out['reason'] = 'RAR volumes form no complete set'
+        return out
+    local_sets = [{'first': _deluge_to_local(rs['first']),
+                   'volumes': [_deluge_to_local(v) for v in rs['volumes']],
+                   'extras': [_deluge_to_local(v) for v in rs['extras']]} for rs in rsets]
+    if not all(rs['first'] and all(rs['volumes']) for rs in local_sets):
+        out['reason'] = 'a RAR path has no local mount'
+        return out
+    seeding_local = _deluge_to_local(SEEDING_DIR)
+    out['same_filesystem'] = bool(seeding_local) and _same_filesystem(
+        os.path.dirname(local_sets[0]['first']), seeding_local, stat)
+    try:
+        series = _owning_item(_arr_items('series', cache), posixpath.normpath(save_path))
+    except Exception as e:
+        out['reason'] = f'*arr lookup failed: {str(e)[:200]}'
+        return out
+    if not series:
+        out['reason'] = 'no Sonarr series owns this folder'
+        return out
+    try:
+        r = requests.get(f'{SONARR_URL}/api/v3/episode', params={'seriesId': series['id']},
+                         headers={'X-Api-Key': SONARR_API_KEY}, timeout=60)
+        r.raise_for_status()
+        have = {(e.get('seasonNumber'), e.get('episodeNumber')): bool(e.get('hasFile')) for e in r.json() or []}
+    except Exception as e:
+        out['reason'] = f'Sonarr episode lookup failed: {str(e)[:200]}'
+        return out
+    all_eps = set()
+    for rs in local_sets:
+        lst = (contents or rar_extract.list_contents)(rs['first'])
+        if not lst.get('ok'):
+            out['reason'] = lst.get('error') or 'lsar failed'
+            return out
+        names = []
+        for v in (f for f in lst.get('files') or [] if episode_retention.is_main_video(f)):
+            eps = _episodes_in_name(v)
+            if not eps:
+                out['reason'] = f'no SxxEyy/NxNN in {os.path.basename(v)}'
+                return out
+            all_eps.update(eps)
+            unknown = [k for k in eps if k not in have]
+            if unknown:
+                out['reason'] = f'episode S{unknown[0][0]:02d}E{unknown[0][1]:02d} not in Sonarr'
+                return out
+            if not all(have[k] for k in eps):
+                names.append((v, eps))
+        if names:
+            out['extract'].append({'set': rs, 'files': [n for n, _ in names],
+                                   'episodes': sorted({k for _, eps in names for k in eps})})
+    out['episodes'] = len(all_eps)
+    if len(all_eps) < 2:
+        out['reason'] = 'not a season pack (fewer than two episodes inside)'
+        return out
+    out['action'] = 'evict'
+    n = sum(len(x['files']) for x in out['extract'])
+    out['reason'] = (f'extract {n} missing file(s) then evict to {SEEDING_DIR}' if n
+                     else f'Sonarr has every episode; evict to {SEEDING_DIR}')
+    return out
+
+
+def _wait_rar_pack_settled(torrent_hash, sleep=time.sleep, poll_seconds=10):
+    """After move + recheck: True once the torrent is out of Checking/Moving
+    with no Error and 100% progress. Same polling idea as season_migration."""
+    for _ in range(RAR_PACK_SETTLE_POLLS):
+        try:
+            resp = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.get_torrent_status',
+                      'params': [torrent_hash, ['state', 'progress']], 'id': 12},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            st = resp.json().get('result') or {}
+        except Exception:
+            st = {}
+        state = st.get('state')
+        if state == 'Error':
+            return False
+        if state and state not in ('Checking', 'Moving') and (st.get('progress') or 0) >= 100:
+            return True
+        sleep(poll_seconds)
+    return False
+
+
+def evict_library_rar_pack(torrent_hash, dry_run=True, info=None, cache=None, contents=None,
+                           stat=os.stat, sleep=time.sleep):
+    """Extract the episodes Sonarr lacks from a library season-pack RAR torrent
+    (volumes kept), then label it superseded and move it to SEEDING_DIR so the
+    volumes seed from Just4Seeding while the extracted episodes stay in the
+    library. Refuses unless the move is a same-filesystem rename. HnR/seed-floor
+    guards, supersede_torrent and remove_torrent are not involved; the torrent
+    is reaped by cleanup_superseded after SEED_DAYS. Dry run changes nothing.
+    -> {'ok': bool, 'dry_run': bool, 'plan': {...}, 'steps': [...], 'error': str}"""
+    if info is None:
+        info = _torrent_pack_info(torrent_hash)
+    if not info:
+        return {'ok': False, 'dry_run': dry_run, 'error': 'torrent not found'}
+    plan = plan_rar_pack(torrent_hash, info, cache, contents, stat)
+    res = {'ok': plan['action'] == 'evict', 'dry_run': dry_run, 'plan': plan, 'steps': []}
+    if plan['action'] != 'evict':
+        res['error'] = plan['reason']
+        return res
+    if dry_run:
+        return res
+    if not plan['same_filesystem']:
+        res['ok'] = False
+        res['error'] = (f'{SEEDING_DIR} is not on the same filesystem as the library; '
+                        'refusing (a move would copy the whole pack)')
+        return res
+    extracted = []
+    for item in plan['extract']:
+        ex = rar_extract.extract(item['set'], keep_volumes=True, only=item['files'])
+        if not ex.get('ok'):
+            res['ok'] = False
+            res['error'] = f'extract failed: {ex.get("error")}'
+            return res
+        extracted += ex['files']
+        res['steps'].append(f'extracted {len(ex["files"])} file(s)')
+    first_local = plan['extract'][0]['set']['first'] if plan['extract'] else _deluge_to_local(
+        posixpath.join(info['save_path'], info.get('name') or ''))
+    note = _rescan_arr_for(first_local)
+    res['steps'].append(f'rescan: {note}')
+    if not all(os.path.isfile(p) for p in extracted):
+        res['ok'] = False
+        res['error'] = 'an extracted episode is missing from the library; torrent not moved'
+        return res
+    set_torrent_label(torrent_hash, SUPERSEDED_LABEL)
+    res['steps'].append('labeled superseded')
+    if not move_torrent_storage(torrent_hash, SEEDING_DIR):
+        # Put the old label back so cleanup_superseded never reaps a torrent
+        # that is still sitting in the library.
+        try:
+            set_torrent_label(torrent_hash, info.get('label') or '')
+        except Exception as e:
+            log.warning(f'rar-pack-evict: label revert failed for {torrent_hash}: {e}')
+        res['ok'] = False
+        res['error'] = 'move refused; label restored'
+        return res
+    res['steps'].append(f'moved to {SEEDING_DIR}')
+    # Deluge's move_storage is async: save_path only changes once the move
+    # completes, so poll instead of reading it once.
+    sp = None
+    for _ in range(RAR_PACK_SETTLE_POLLS):
+        sp = _torrent_save_path(torrent_hash)
+        if sp and posixpath.normpath(sp) == posixpath.normpath(SEEDING_DIR):
+            break
+        sleep(5)
+    if not sp or posixpath.normpath(sp) != posixpath.normpath(SEEDING_DIR):
+        res['ok'] = False
+        res['error'] = f'torrent save_path is {sp!r} after the move'
+        return res
+    if not all(os.path.isfile(p) for p in extracted):
+        res['ok'] = False
+        res['error'] = 'an extracted episode vanished from the library after the move'
+        return res
+    deluge_force_recheck(torrent_hash)
+    if not _wait_rar_pack_settled(torrent_hash, sleep=sleep):
+        res['ok'] = False
+        res['error'] = 'torrent did not recheck to 100% after the move'
+        return res
+    res['steps'].append('recheck ok')
+    res['steps'].append(f'rescan: {_rescan_arr_for(first_local)}')
+    record_activity('rar-pack-evict', f'{plan["name"]}: {len(extracted)} episode file(s) extracted, torrent moved to {SEEDING_DIR}')
+    return res
+
+
 def process_rar_queue():
     """Unpack or delete queued library RAR sets one by one (rar_set_action
     decides, fresh, per set). Sets a live torrent owns again are left for
@@ -1222,7 +1481,10 @@ UNREGISTERED_MARKERS = (
     'not registered',
     'torrent not found',
     'infohash not found',
+    'info hash not found',
+    'hash not found',
     'torrent does not exist',
+    'torrent deleted',
 )
 
 
@@ -1232,7 +1494,15 @@ def torrent_is_unregistered(info):
     fail-safe direction is 'keep seeding', because the cost of being wrong is
     a hit-and-run on the tracker and the cost of being right late is disk."""
     status = (info.get('tracker_status') or '').lower()
+    if UNREGISTERED_ACCOUNT_RE.search(status):
+        return False
     return any(marker in status for marker in UNREGISTERED_MARKERS)
+
+
+# Account-level errors use the same words ("Unregistered passkey", "User not registered", "IP not
+# registered"). They hit every torrent on that tracker and say nothing about the torrent, so they
+# never count as dead (fail-safe: keep seeding).
+UNREGISTERED_ACCOUNT_RE = re.compile(r'\b(passkey|torrent_pass|authkey|user|account|ip|device|client)\b')
 
 
 def should_supersede_candidate(info):
@@ -2479,11 +2749,38 @@ def dedup_via_sonarr(dry_run=False):
 # .mkv into Media, so the torrent's disk-space cost is pure archive. After
 # SEED_DAYS have passed since unpack we remove the torrent + its rar files.
 #
-# We identify "unpacked" torrents by: the torrent's save_path contains .rar
-# files AND Radarr/Sonarr has an imported file that references this download.
+# We identify "unpacked" torrents by: the torrent's file list has RAR volumes
+# and no main video. Removal also waits until Sonarr or Radarr has imported the
+# download (a DownloadFolderImported event for its hash), so a RAR release that
+# was never unpacked and imported (Unpackerr down) is kept, not deleted. Library
+# seeds skip that wait: their files are kept by the library guard anyway.
 # Track state in a sidecar JSON so we know the "unpacked at" timestamp.
 
 _UNPACK_STATE_PATH = os.environ.get('UNPACK_STATE_PATH', '/data/unpacked_torrents.json')
+
+
+def _arr_imported(torrent_hash):
+    """True when Sonarr or Radarr has imported this download, False when every
+    configured *arr answered and neither has, None when none is configured or a
+    lookup failed. Callers keep the torrent unless this is True."""
+    answered, failed = False, False
+    for who, url, key in (('Sonarr', SONARR_URL, SONARR_API_KEY), ('Radarr', RADARR_URL, RADARR_API_KEY)):
+        if not key:
+            continue
+        try:
+            r = requests.get(f'{url}/api/v3/history', headers={'X-Api-Key': key},
+                             params={'downloadId': torrent_hash.upper(), 'eventType': 3, 'pageSize': 10},
+                             timeout=15)
+            r.raise_for_status()
+            records = r.json().get('records') or []
+        except Exception as e:
+            log.warning(f'[unpack] {who} import check for {torrent_hash[:8]} failed ({type(e).__name__}); keeping it')
+            failed = True
+            continue
+        if any(rec.get('eventType') == 'downloadFolderImported' for rec in records):
+            return True
+        answered = True
+    return None if failed or not answered else False
 
 def _load_unpack_state():
     try:
@@ -2538,6 +2835,12 @@ def cleanup_unpacked_torrents():
                 continue
             age = now - state[h].get('first_seen_rar_at', now)
             if age >= threshold:
+                if not is_library_path(torrents[h].get('save_path')) and _arr_imported(h) is not True:
+                    if not state[h].get('import_wait'):
+                        state[h]['import_wait'] = now
+                        log.info(f'[unpack] keeping rar-torrent aged {age/86400:.1f}d: no Sonarr/Radarr import yet: {state[h].get("name")}')
+                        record_activity('cleanup', f'Kept rar-torrent "{state[h].get("name")}": past the {SEED_DAYS}-day window but Sonarr/Radarr never imported it (is Unpackerr running?)')
+                    continue
                 log.info(f'[unpack] removing rar-torrent aged {age/86400:.1f}d: {state[h].get("name")}')
                 r = remove_torrent(h)
                 if r == DEFERRED:
@@ -4254,7 +4557,13 @@ def handle_grab(data, source):
         'candidate_dv_web': tags['dv'] and tags['web'],
         'seed_days': SEED_DAYS,
     }
-    action = _llm_advise('upgrade_gate', facts, rules_action)
+    llm_info = {}
+    action = _llm_advise('upgrade_gate', facts, rules_action, llm_info)
+    if llm_info.get('pending'):
+        action = rules_action
+        up_label = SONARR_UPG_LABEL if source == 'Sonarr' else RADARR_UPG_LABEL
+        threading.Thread(target=_late_gate, args=(source, download_id, title, facts, rules_action, up_label),
+                         daemon=True, name='llm-late-gate').start()
     if action == 'reject':
         log.warning(f"{source}: LLM rejected upgrade grab {download_id} ({title})")
         time.sleep(3)
@@ -5094,7 +5403,8 @@ def digest():
     entries = _digest_entries(None if show_all else since)
     entries.reverse()  # newest first
     if request.args.get('format') == 'json':
-        return jsonify({'ok': True, 'since': since, 'count': len(entries), 'entries': entries})
+        return jsonify({'ok': True, 'since': since, 'count': len(entries), 'entries': entries,
+                        'unregistered': _unregistered_report})
 
     counts = {}
     for e in entries:
@@ -5127,6 +5437,7 @@ a {{ color:#78dce8; }}
 · <a href="/digest?all=1">show everything</a></div>
 <form method="post" action="/digest/reviewed"><button type="submit">Mark all reviewed</button></form>
 <table>{rows or "<tr><td>Nothing to review 🎉</td></tr>"}</table>
+{_digest_unregistered_html()}
 </body></html>'''
 
 @app.route('/digest/reviewed', methods=['POST'])
@@ -6685,6 +6996,18 @@ def llm_decisions():
         return jsonify({'ok': True, 'count': len(kept), 'entries': kept}), 200
     except Exception:
         return jsonify({'ok': True, 'count': 0, 'entries': []}), 200
+
+
+@app.route('/llm-spend', methods=['GET'])
+def llm_spend():
+    month = request.args.get('month') or datetime.now().strftime('%Y-%m')
+    if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', month):
+        return jsonify({'ok': False, 'error': 'month must be YYYY-MM'}), 400
+    try:
+        layers = llm_advisor.spend_summary(LLM_DECISIONS_LOG, month)
+    except Exception:
+        layers = {}
+    return jsonify({'ok': True, 'month': month, 'layers': layers}), 200
 
 
 # Cross-reference Deluge completed torrents against Radarr/Sonarr state
@@ -8555,6 +8878,48 @@ def rar_library_scan_route():
                     'actions': counts, 'queued': queued, 'sets': rows}), 200
 
 
+@app.route('/rar-pack-scan', methods=['GET', 'POST'])
+def rar_pack_scan_route():
+    """Library torrents holding RAR season packs, each with the episodes that
+    would be extracted, whether SEEDING_DIR shares a filesystem with it, and
+    the planned action. The dry run only lists. POST ?hash=<h>&apply=1 evicts
+    that one torrent (see evict_library_rar_pack)."""
+    apply = request.method == 'POST' and request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    h = (request.args.get('hash') or '').strip().lower()
+    if apply:
+        if not h:
+            return jsonify({'ok': False, 'error': 'apply needs ?hash=<torrent hash>'}), 400
+        res = evict_library_rar_pack(h, dry_run=False)
+        return jsonify(_rar_pack_json(res)), (200 if res.get('ok') else 409)
+    try:
+        deluge_login()
+        torrents = get_all_torrents(['name', 'label', 'save_path', 'files'], force=True)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 503
+    cache, rows = {}, []
+    for th, t in sorted((torrents or {}).items()):
+        if h and th != h:
+            continue
+        if not is_library_path(t.get('save_path')):
+            continue
+        rels = [f.get('path') or '' for f in t.get('files') or [] if isinstance(f, dict)]
+        if not rar_extract.has_rar_volumes(rels):
+            continue
+        rows.append(_rar_pack_json(evict_library_rar_pack(th, dry_run=True, info=t, cache=cache))['plan'])
+    return jsonify({'ok': True, 'dry_run': True, 'count': len(rows),
+                    'evictable': sum(1 for r in rows if r['action'] == 'evict'), 'torrents': rows}), 200
+
+
+def _rar_pack_json(res):
+    out = dict(res)
+    plan = dict(res.get('plan') or {})
+    plan['extract'] = [{'first': x['set']['first'], 'files': x['files'],
+                        'episodes': [f'S{s:02d}E{e:02d}' for s, e in x['episodes']]}
+                       for x in plan.get('extract') or []]
+    out['plan'] = plan
+    return out
+
+
 @app.route('/rar-extract-queue', methods=['GET'])
 def rar_extract_queue_route():
     with _rar_queue_lock:
@@ -8858,6 +9223,175 @@ def duplicate_folders():
     }), 200
 
 
+# ── Unregistered (dead) torrent sweep ────────────────────────────────────────
+# Torrents whose tracker says it dropped them (UNREGISTERED_MARKERS, the one list
+# of phrases) can never seed or download again. Default is a DRY RUN: the findings
+# show on /digest and nothing changes. With UNREGISTERED_APPLY=1:
+#   - still in a Sonarr/Radarr queue (not imported): drop the queue item with
+#     blocklist so the arr searches again; removeFromClient=False, the Deluge side
+#     always goes through remove_torrent below;
+#   - then remove_torrent(), so its guards (SEED_DAYS floor, library-seed guard)
+#     still apply; a refusal is listed on /digest;
+#   - already imported: remove_torrent() only, the library copy stays.
+# Healthy torrents and other tracker errors (timeouts, unreachable, DNS) are left alone.
+UNREGISTERED_APPLY = os.environ.get('UNREGISTERED_APPLY', '').lower() in ('1', 'true', 'yes')
+UNREGISTERED_SWEEP_INTERVAL = 3600   # at most once an hour
+_unregistered_last = [0.0]
+_unregistered_report = {'ts': None, 'apply': False, 'rows': []}   # newest sweep, shown on /digest
+_unregistered_reported = set()   # (hash, outcome) already written to the activity log, so a refusal is not repeated hourly
+SWEEP_TORRENT_FIELDS = ['name', 'label', 'save_path', 'seeding_time', 'is_finished', 'progress', 'state',
+                        'total_uploaded', 'tracker_status', 'time_added', 'tracker_host']
+# Blast-radius limits for apply. When most of one tracker's torrents say "unregistered" at once, that is a
+# tracker or account problem, not dead torrents: list them and change nothing. And at most
+# UNREGISTERED_MAX_PER_PASS removals per hourly pass; the rest wait for the next pass.
+UNREGISTERED_MASS_MIN = 5
+UNREGISTERED_MASS_SHARE = 0.8
+UNREGISTERED_MAX_PER_PASS = 25
+
+
+def _arr_queue_by_hash():
+    """({hash: {'who', 'ids'}}, {who that could not be read}) from the Sonarr and Radarr queues."""
+    out, failed = {}, set()
+    for who, url, key, size in (('Sonarr', SONARR_URL, SONARR_API_KEY, 1000), ('Radarr', RADARR_URL, RADARR_API_KEY, 500)):
+        if not key:
+            continue
+        try:
+            r = requests.get(f'{url}/api/v3/queue', headers={'X-Api-Key': key},
+                             params={'pageSize': size}, timeout=15)
+            r.raise_for_status()
+            for item in r.json().get('records') or []:
+                h = (item.get('downloadId') or '').lower()
+                if h and item.get('id') is not None:
+                    out.setdefault(h, {'who': who, 'ids': []})['ids'].append(item['id'])
+        except Exception as e:
+            log.warning(f'[unregistered] {who} queue read failed ({type(e).__name__}); its torrents are left alone')
+            failed.add(who)
+    return out, failed
+
+
+def _arr_blocklist_queue_items(who, ids):
+    """Drop queue items with blocklist so the arr searches again; never touches the client."""
+    base, key = (SONARR_URL, SONARR_API_KEY) if who == 'Sonarr' else (RADARR_URL, RADARR_API_KEY)
+    params = {'removeFromClient': False, 'blocklist': True}
+    if who == 'Sonarr':
+        r = requests.delete(f'{base}/api/v3/queue/bulk', headers={'X-Api-Key': key}, params=params,
+                            json={'ids': list(ids)}, timeout=15)
+        r.raise_for_status()
+    else:
+        for qid in ids:
+            r = requests.delete(f'{base}/api/v3/queue/{qid}', headers={'X-Api-Key': key}, params=params, timeout=15)
+            r.raise_for_status()
+
+
+def _label_owner(label):
+    lab = (label or '').lower()
+    return 'Sonarr' if lab.startswith('sonarr') else 'Radarr' if lab.startswith('radarr') else None
+
+
+def unregistered_sweep(apply=None, now=None):
+    """One pass. Returns the report rows (also kept for /digest). apply=None follows UNREGISTERED_APPLY."""
+    apply = UNREGISTERED_APPLY if apply is None else apply
+    now = time.time() if now is None else now
+    deluge_login()
+    torrents = get_all_torrents(SWEEP_TORRENT_FIELDS, force=True)
+    dead = {h: i for h, i in torrents.items() if torrent_is_unregistered(i)}
+    rows = []
+    host_of = lambda i: (i.get('tracker_host') or '').lower()   # noqa: E731
+    per_host = collections.Counter(host_of(i) for i in torrents.values())
+    dead_per_host = collections.Counter(host_of(i) for i in dead.values())
+    mass = {host for host, n in dead_per_host.items()
+            if n >= UNREGISTERED_MASS_MIN and n / per_host[host] >= UNREGISTERED_MASS_SHARE}
+    for host in mass:
+        if (host, 'mass') not in _unregistered_reported:
+            _unregistered_reported.add((host, 'mass'))
+            log.warning(f'[unregistered] {dead_per_host[host]} of {per_host[host]} torrents on {host or "?"} say unregistered; left alone')
+            record_activity('unregistered', f'{dead_per_host[host]} of {per_host[host]} torrents on {host or "one tracker"} '
+                            'say unregistered at once: looks like a tracker or account problem, nothing removed')
+    applied = 0
+    if dead:
+        queue, failed = _arr_queue_by_hash()
+        for h, info in sorted(dead.items(), key=lambda kv: kv[1].get('time_added') or 0):
+            q = queue.get(h.lower())
+            owner = q['who'] if q else _label_owner(info.get('label'))
+            added = info.get('time_added')
+            row = {'hash': h, 'name': info.get('name') or h, 'state': info.get('state'),
+                   'age_days': round((now - added) / 86400, 1) if isinstance(added, (int, float)) else None,
+                   'arr': owner, 'in_queue': bool(q), 'tracker_status': info.get('tracker_status')}
+            skip = None
+            if host_of(info) in mass:
+                skip = row['would'] = (f'skip: {dead_per_host[host_of(info)]} of {per_host[host_of(info)]} torrents on this '
+                                       'tracker say it (tracker or account problem)')
+            elif q:
+                row['would'] = f'blocklist {owner} queue item(s), then remove torrent'
+            elif owner in failed:
+                skip = row['would'] = f'skip: {owner} queue unreadable'
+            else:
+                row['would'] = 'remove torrent only (library copy stays)'
+            row['outcome'] = 'dry-run'
+            if apply:
+                if skip:
+                    row['outcome'] = skip
+                elif applied >= UNREGISTERED_MAX_PER_PASS:
+                    row['outcome'] = f'waiting: {UNREGISTERED_MAX_PER_PASS} per pass, next pass takes it'
+                else:
+                    applied += 1
+                    row['outcome'] = _unregistered_apply_one(h, info, q, owner)
+            rows.append(row)
+    _unregistered_report.update(ts=datetime.now().isoformat(timespec='seconds'), apply=bool(apply), rows=rows)
+    log.info(f'[unregistered] sweep: {len(rows)} dead torrent(s), {"apply" if apply else "dry run"}')
+    return rows
+
+
+def _unregistered_apply_one(h, info, q, owner):
+    name = info.get('name') or h
+    try:
+        if q:
+            _arr_blocklist_queue_items(owner, q['ids'])
+            log.info(f'[unregistered] {owner}: blocklisted queue item(s) {q["ids"]} for "{name}"')
+            record_activity('unregistered', f'Blocklisted "{name}" in the {owner} queue (tracker dropped it); {owner} will search again')
+        # Same guards as every other removal: SEED_DAYS floor, library-seed guard. Imported or unknown
+        # ownership keeps the files unless an import is confirmed; a queue item's download is dead, so its files go.
+        keep = not q and _arr_imported(h) is not True
+        r = remove_torrent(h, remove_data=not keep, info=info)
+    except Exception as e:
+        log.error(f'[unregistered] {name}: {type(e).__name__}: {e}')
+        return f'error: {type(e).__name__}'
+    if r == DEFERRED:
+        if (h, 'refused') not in _unregistered_reported:
+            _unregistered_reported.add((h, 'refused'))
+            record_activity('unregistered', f'Kept dead torrent "{name}": the {SEED_DAYS}-day seed floor refused the removal')
+        return f'refused by seed floor ({SEED_DAYS}d)'
+    log.info(f'[unregistered] removed "{name}"' + (' (files kept)' if keep else ''))
+    record_activity('unregistered', f'Removed dead torrent "{name}" (tracker dropped it)' + (' - files kept' if keep else ''))
+    _unregistered_reported.discard((h, 'refused'))
+    return 'removed (files kept)' if keep else 'removed'
+
+
+def unregistered_sweep_tick(now=None):
+    """Runs on the maintenance tick but at most once per UNREGISTERED_SWEEP_INTERVAL."""
+    now = time.time() if now is None else now
+    if now - _unregistered_last[0] < UNREGISTERED_SWEEP_INTERVAL:
+        return None
+    _unregistered_last[0] = now
+    return unregistered_sweep(now=now)
+
+
+def _digest_unregistered_html():
+    rep = _unregistered_report
+    if not rep['ts']:
+        return ''
+    head = ('applied' if rep['apply'] else 'dry run, nothing changed') + f" - {rep['ts']}"
+    esc = lambda v: str('' if v is None else v).replace('&', '&amp;').replace('<', '&lt;')   # noqa: E731
+    body = ''.join(
+        f"<tr><td>{esc(r['name'])}</td><td>{esc(r['age_days'])}d</td><td>{esc(r['state'])}</td>"
+        f"<td>{esc(r['arr'] or '-')}</td><td>{esc(r['outcome'] if rep['apply'] else r['would'])}</td></tr>"
+        for r in rep['rows'])
+    return (f"<h2>Dead torrents (tracker dropped them): {len(rep['rows'])}</h2><div class='sub'>{head}</div>"
+            f"<table><tr><td><b>name</b></td><td><b>age</b></td><td><b>state</b></td><td><b>arr</b></td>"
+            f"<td><b>{'result' if rep['apply'] else 'apply would'}</b></td></tr>"
+            f"{body or '<tr><td>none</td></tr>'}</table>")
+
+
 def maintenance_scheduler():
     """Every 6 hours: heal errored torrents, then look for duplicate library
     folders. Shares one thread because the dupe scan is scandir-only (sizes
@@ -8884,6 +9418,10 @@ def maintenance_scheduler():
             downloads_audit_tick()
         except Exception as e:
             log.error(f'Downloads audit failed: {e}')
+        try:
+            unregistered_sweep_tick()
+        except Exception as e:
+            log.error(f'Unregistered sweep failed: {e}')
         time.sleep(DELUGE_REPAIR_INTERVAL)
 
 
@@ -8925,6 +9463,15 @@ def _is_recent_year(year, now=None):
 
 
 if __name__ == '__main__':
+    # Late-gate threads do not survive a restart: forget pending upgrade grabs, the rules action stands.
+    if llm_advisor is not None:
+        try:
+            dropped = llm_advisor.drop_pending('upgrade_gate')
+            if dropped:
+                log.info(f'[llm] dropped {dropped} pending upgrade_gate decision(s) at startup; rules action stands')
+                record_activity('llm-pending-dropped', f'{dropped} pending upgrade_gate decision(s) dropped at restart')
+        except Exception as e:  # noqa: BLE001
+            log.debug(f'[llm] pending cleanup failed: {e}')
     port = int(os.environ.get('PORT', 9876))
     log.info(f'Starting arr-webhook listener on port {port}')
     log.info(f'Superseded torrents will be auto-removed after {SEED_DAYS} days of seeding')

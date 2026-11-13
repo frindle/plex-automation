@@ -74,9 +74,9 @@ def has_rar_volumes(paths):
     return False
 
 
-def list_contents(first, run=subprocess.run):
-    """Inner file names of a RAR set (directories left out), via lsar -j.
-    -> {'ok': True, 'files': [...]} or {'ok': False, 'error': str}"""
+def _lsar_entries(first, run):
+    """File entries (directories left out) of a RAR set via lsar -j.
+    -> {'ok': True, 'entries': [dict, ...]} or {'ok': False, 'error': str}"""
     try:
         r = run([LSAR, '-j', first], capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.SubprocessError) as e:
@@ -89,9 +89,36 @@ def list_contents(first, run=subprocess.run):
         return {'ok': False, 'error': 'lsar output not JSON'}
     if not isinstance(entries, list):
         return {'ok': False, 'error': 'lsar output has no lsarContents'}
-    files = [e['XADFileName'] for e in entries
+    files = [e for e in entries
              if isinstance(e, dict) and isinstance(e.get('XADFileName'), str) and not e.get('XADIsDirectory')]
-    return {'ok': True, 'files': files}
+    return {'ok': True, 'entries': files}
+
+
+def list_contents(first, run=subprocess.run):
+    """Inner file names of a RAR set (directories left out), via lsar -j.
+    -> {'ok': True, 'files': [...]} or {'ok': False, 'error': str}"""
+    lst = _lsar_entries(first, run)
+    if not lst['ok']:
+        return lst
+    return {'ok': True, 'files': [e['XADFileName'] for e in lst['entries']]}
+
+
+def _indexes_for(first, names, run):
+    """lsar indexes of the inner files `names`. unar reads file arguments as
+    wildcard patterns, so a name with [ ] * ? would not match itself; asking by
+    index (unar -indexes) extracts exactly these files.
+    -> {'ok': True, 'indexes': [str, ...]} or {'ok': False, 'error': str}"""
+    lst = _lsar_entries(first, run)
+    if not lst['ok']:
+        return lst
+    by_name = {}
+    for e in lst['entries']:
+        if isinstance(e.get('XADIndex'), int):
+            by_name.setdefault(e['XADFileName'], e['XADIndex'])
+    missing = [n for n in names if n not in by_name]
+    if missing:
+        return {'ok': False, 'error': f'not in the archive: {missing[0][:200]}'}
+    return {'ok': True, 'indexes': [str(by_name[n]) for n in names]}
 
 
 def delete_set(rset, remove=os.remove):
@@ -123,9 +150,14 @@ def _walk_files(root):
             yield os.path.join(d, n)
 
 
-def extract(rset, run=subprocess.run, disk_usage=shutil.disk_usage):
+def extract(rset, run=subprocess.run, disk_usage=shutil.disk_usage, keep_volumes=False, only=None):
     """Extract one set in place. -> {'ok': bool, 'files': [...], 'error': str}
-    Volumes are deleted only after every extracted file is moved into place."""
+    Volumes are deleted only after every extracted file is moved into place.
+    keep_volumes=True (a torrent still seeds the set): `only` must list the
+    inner file names to extract, and the volumes and .sfv are never deleted.
+    Default behaviour (keep_volumes=False) is unchanged."""
+    if keep_volumes and not only:
+        return {'ok': False, 'error': 'keep_volumes needs the inner files to extract'}
     first = rset['first']
     d = os.path.dirname(first)
     vols = rset['volumes']
@@ -137,11 +169,18 @@ def extract(rset, run=subprocess.run, disk_usage=shutil.disk_usage):
             return {'ok': False, 'error': f'not enough free space ({need / 1e9:.1f} GB needed)'}
     except OSError as e:
         return {'ok': False, 'error': f'stat failed: {e}'}
+    pick = []
+    if only:
+        ix = _indexes_for(first, list(only), run)
+        if not ix['ok']:
+            return {'ok': False, 'error': ix['error']}
+        pick = ['-indexes']
     tmp = os.path.join(d, '.unrar-' + os.path.basename(first))
     shutil.rmtree(tmp, ignore_errors=True)
     try:
         os.makedirs(tmp)
-        r = run([UNAR, '-q', '-no-directory', '-force-overwrite', '-output-directory', tmp, first],
+        r = run([UNAR, '-q', '-no-directory', '-force-overwrite'] + pick + ['-output-directory', tmp, first]
+                + (ix['indexes'] if only else []),
                 capture_output=True, text=True, timeout=EXTRACT_TIMEOUT)
         if r.returncode != 0:
             return {'ok': False, 'error': f'unar exit {r.returncode}: {(r.stderr or r.stdout or "").strip()[:300]}'}
@@ -161,11 +200,12 @@ def extract(rset, run=subprocess.run, disk_usage=shutil.disk_usage):
         return {'ok': False, 'error': str(e)[:300]}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    for v in vols + list(rset.get('extras') or []):
-        try:
-            os.remove(v)
-        except OSError:
-            pass
+    if not keep_volumes:
+        for v in vols + list(rset.get('extras') or []):
+            try:
+                os.remove(v)
+            except OSError:
+                pass
     return {'ok': True, 'files': [dest for _, dest in moves]}
 
 
