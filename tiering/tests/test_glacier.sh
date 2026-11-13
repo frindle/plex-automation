@@ -466,6 +466,32 @@ check "still moves (ranking by date added)" onglacier data/Media/a.mkv
 out="$(REQUIRE_ATIME=1 PROC_MOUNTS="$R/mounts" run --apply)"; rc=$?
 eq "REQUIRE_ATIME=1 aborts" "$rc" 2
 
+setup parity_check_dry_run_goes_ahead_apply_stops
+mkf disk2 data/Media/a.mkv 1000 100
+printf '#!/bin/sh\necho mdResync=123456\n' >"$R/bin/mdcmd"; chmod +x "$R/bin/mdcmd"
+out="$(MDCMD="$R/bin/mdcmd" run)"; rc=$?
+eq "dry run exit 0 during parity" "$rc" 0
+echo "$out" | grep -q 'WARN: a parity check' && ok || bad "dry run warns about parity: $out"
+echo "$out" | grep -q 'WOULD MOVE' && ok || bad "dry run still plans: $out"
+out="$(MDCMD="$R/bin/mdcmd" run --apply)"; rc=$?
+eq "apply aborts during parity" "$rc" 2
+check "apply moved nothing" gone data/Media/a.mkv
+printf '#!/bin/sh\necho mdResync=0\n' >"$R/bin/mdcmd"
+out="$(MDCMD="$R/bin/mdcmd" run --apply)"; rc=$?
+eq "apply runs when no parity check" "$rc" 0
+check "moved once parity is done" onglacier data/Media/a.mkv
+
+setup log_dir_made_before_first_log_line
+mkf disk2 data/Media/a.mkv 1000 100
+echo "/dev/md2 $M/disk2 xfs rw,noatime 0 0" >"$R/mounts"
+out="$(PROC_MOUNTS="$R/mounts" ENVX="LOG_DIR=$R/newlogs LOG_FILE=$R/newlogs/g.log" run)"
+echo "$out" | grep -q 'No such file' && bad "log write failed: $out" || ok
+grep -q 'WARN.*noatime' "$R/newlogs/g.log" 2>/dev/null && ok || bad "preflight WARN reached the log file"
+
+setup ere_escape_leaves_slashes_alone
+out="$(bash -c 'source "$1"; ere_escape "/mnt/disk2.x"' _ "$SCRIPT")"
+eq "escaped path" "$out" '/mnt/disk2\.x'
+
 setup dry_run_prints_roots
 mkf disk2 data/Media/a.mkv 1000 100
 out="$(run)"

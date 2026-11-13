@@ -111,10 +111,11 @@ resume_call() {
 
 # --- helpers ---------------------------------------------------------------
 
-ere_escape() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'; }
+ere_escape() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g'; }  # no \/ : GNU grep 3.8+ warns on it
 
 preflight() {
   local d
+  mkdir -p "$LOG_DIR" "$(dirname "$LOCK_FILE")" 2>/dev/null
   for d in $GLACIER $SRC_DISKS; do
     if [ ! -d "$MNT/$d" ]; then log "ABORT: $MNT/$d is not a directory (array stopped?)"; return 2; fi
     if [ -z "$ROOT" ] && ! mountpoint -q "$MNT/$d" 2>/dev/null; then
@@ -133,9 +134,10 @@ preflight() {
     log "ABORT: the mover is running"; return 2
   fi
   if command -v "$MDCMD" >/dev/null 2>&1 && "$MDCMD" status 2>/dev/null | grep -Eq '^mdResync=[1-9]'; then
-    log "ABORT: a parity check or rebuild is running"; return 2
+    # A dry run only lists files (metadata reads), so it may run; a live move waits.
+    if [ "$APPLY" = 1 ]; then log "ABORT: a parity check or rebuild is running"; return 2; fi
+    log "WARN: a parity check or rebuild is running: the dry run goes ahead (a live run would stop here)"
   fi
-  mkdir -p "$LOG_DIR" "$(dirname "$LOCK_FILE")" 2>/dev/null
   return 0
 }
 
