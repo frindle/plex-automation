@@ -9284,8 +9284,8 @@ def _arr_blocklist_queue_items(who, ids):
 
 
 def _label_owner(label):
-    l = (label or '').lower()
-    return 'Sonarr' if l.startswith('sonarr') else 'Radarr' if l.startswith('radarr') else None
+    lab = (label or '').lower()
+    return 'Sonarr' if lab.startswith('sonarr') else 'Radarr' if lab.startswith('radarr') else None
 
 
 def unregistered_sweep(apply=None, now=None):
