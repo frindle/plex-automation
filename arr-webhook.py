@@ -1481,7 +1481,10 @@ UNREGISTERED_MARKERS = (
     'not registered',
     'torrent not found',
     'infohash not found',
+    'info hash not found',
+    'hash not found',
     'torrent does not exist',
+    'torrent deleted',
 )
 
 
@@ -5392,7 +5395,8 @@ def digest():
     entries = _digest_entries(None if show_all else since)
     entries.reverse()  # newest first
     if request.args.get('format') == 'json':
-        return jsonify({'ok': True, 'since': since, 'count': len(entries), 'entries': entries})
+        return jsonify({'ok': True, 'since': since, 'count': len(entries), 'entries': entries,
+                        'unregistered': _unregistered_report})
 
     counts = {}
     for e in entries:
@@ -5425,6 +5429,7 @@ a {{ color:#78dce8; }}
 · <a href="/digest?all=1">show everything</a></div>
 <form method="post" action="/digest/reviewed"><button type="submit">Mark all reviewed</button></form>
 <table>{rows or "<tr><td>Nothing to review 🎉</td></tr>"}</table>
+{_digest_unregistered_html()}
 </body></html>'''
 
 @app.route('/digest/reviewed', methods=['POST'])
@@ -9210,6 +9215,147 @@ def duplicate_folders():
     }), 200
 
 
+# ── Unregistered (dead) torrent sweep ────────────────────────────────────────
+# Torrents whose tracker says it dropped them (UNREGISTERED_MARKERS, the one list
+# of phrases) can never seed or download again. Default is a DRY RUN: the findings
+# show on /digest and nothing changes. With UNREGISTERED_APPLY=1:
+#   - still in a Sonarr/Radarr queue (not imported): drop the queue item with
+#     blocklist so the arr searches again; removeFromClient=False, the Deluge side
+#     always goes through remove_torrent below;
+#   - then remove_torrent(), so its guards (SEED_DAYS floor, library-seed guard)
+#     still apply; a refusal is listed on /digest;
+#   - already imported: remove_torrent() only, the library copy stays.
+# Healthy torrents and other tracker errors (timeouts, unreachable, DNS) are left alone.
+UNREGISTERED_APPLY = os.environ.get('UNREGISTERED_APPLY', '').lower() in ('1', 'true', 'yes')
+UNREGISTERED_SWEEP_INTERVAL = 3600   # at most once an hour
+_unregistered_last = [0.0]
+_unregistered_report = {'ts': None, 'apply': False, 'rows': []}   # newest sweep, shown on /digest
+_unregistered_reported = set()   # (hash, outcome) already written to the activity log, so a refusal is not repeated hourly
+SWEEP_TORRENT_FIELDS = ['name', 'label', 'save_path', 'seeding_time', 'is_finished', 'progress', 'state',
+                        'total_uploaded', 'tracker_status', 'time_added']
+
+
+def _arr_queue_by_hash():
+    """({hash: {'who', 'ids'}}, {who that could not be read}) from the Sonarr and Radarr queues."""
+    out, failed = {}, set()
+    for who, url, key, size in (('Sonarr', SONARR_URL, SONARR_API_KEY, 1000), ('Radarr', RADARR_URL, RADARR_API_KEY, 500)):
+        if not key:
+            continue
+        try:
+            r = requests.get(f'{url}/api/v3/queue', headers={'X-Api-Key': key},
+                             params={'pageSize': size}, timeout=15)
+            r.raise_for_status()
+            for item in r.json().get('records') or []:
+                h = (item.get('downloadId') or '').lower()
+                if h and item.get('id') is not None:
+                    out.setdefault(h, {'who': who, 'ids': []})['ids'].append(item['id'])
+        except Exception as e:
+            log.warning(f'[unregistered] {who} queue read failed ({type(e).__name__}); its torrents are left alone')
+            failed.add(who)
+    return out, failed
+
+
+def _arr_blocklist_queue_items(who, ids):
+    """Drop queue items with blocklist so the arr searches again; never touches the client."""
+    base, key = (SONARR_URL, SONARR_API_KEY) if who == 'Sonarr' else (RADARR_URL, RADARR_API_KEY)
+    params = {'removeFromClient': False, 'blocklist': True}
+    if who == 'Sonarr':
+        r = requests.delete(f'{base}/api/v3/queue/bulk', headers={'X-Api-Key': key}, params=params,
+                            json={'ids': list(ids)}, timeout=15)
+        r.raise_for_status()
+    else:
+        for qid in ids:
+            r = requests.delete(f'{base}/api/v3/queue/{qid}', headers={'X-Api-Key': key}, params=params, timeout=15)
+            r.raise_for_status()
+
+
+def _label_owner(label):
+    l = (label or '').lower()
+    return 'Sonarr' if l.startswith('sonarr') else 'Radarr' if l.startswith('radarr') else None
+
+
+def unregistered_sweep(apply=None, now=None):
+    """One pass. Returns the report rows (also kept for /digest). apply=None follows UNREGISTERED_APPLY."""
+    apply = UNREGISTERED_APPLY if apply is None else apply
+    now = time.time() if now is None else now
+    deluge_login()
+    torrents = get_all_torrents(SWEEP_TORRENT_FIELDS, force=True)
+    dead = {h: i for h, i in torrents.items() if torrent_is_unregistered(i)}
+    rows = []
+    if dead:
+        queue, failed = _arr_queue_by_hash()
+        for h, info in sorted(dead.items(), key=lambda kv: kv[1].get('time_added') or 0):
+            q = queue.get(h.lower())
+            owner = q['who'] if q else _label_owner(info.get('label'))
+            added = info.get('time_added')
+            row = {'hash': h, 'name': info.get('name') or h, 'state': info.get('state'),
+                   'age_days': round((now - added) / 86400, 1) if isinstance(added, (int, float)) else None,
+                   'arr': owner, 'in_queue': bool(q), 'tracker_status': info.get('tracker_status')}
+            if q:
+                row['would'] = f'blocklist {owner} queue item(s), then remove torrent'
+            elif owner in failed:
+                row['would'] = f'skip: {owner} queue unreadable'
+            else:
+                row['would'] = 'remove torrent only (library copy stays)'
+            row['outcome'] = 'dry-run'
+            if apply and not (not q and owner in failed):
+                row['outcome'] = _unregistered_apply_one(h, info, q, owner)
+            rows.append(row)
+    _unregistered_report.update(ts=datetime.now().isoformat(timespec='seconds'), apply=bool(apply), rows=rows)
+    log.info(f'[unregistered] sweep: {len(rows)} dead torrent(s), {"apply" if apply else "dry run"}')
+    return rows
+
+
+def _unregistered_apply_one(h, info, q, owner):
+    name = info.get('name') or h
+    try:
+        if q:
+            _arr_blocklist_queue_items(owner, q['ids'])
+            log.info(f'[unregistered] {owner}: blocklisted queue item(s) {q["ids"]} for "{name}"')
+            record_activity('unregistered', f'Blocklisted "{name}" in the {owner} queue (tracker dropped it); {owner} will search again')
+        # Same guards as every other removal: SEED_DAYS floor, library-seed guard. Imported or unknown
+        # ownership keeps the files unless an import is confirmed; a queue item's download is dead, so its files go.
+        keep = not q and _arr_imported(h) is not True
+        r = remove_torrent(h, remove_data=not keep, info=info)
+    except Exception as e:
+        log.error(f'[unregistered] {name}: {type(e).__name__}: {e}')
+        return f'error: {type(e).__name__}'
+    if r == DEFERRED:
+        if (h, 'refused') not in _unregistered_reported:
+            _unregistered_reported.add((h, 'refused'))
+            record_activity('unregistered', f'Kept dead torrent "{name}": the {SEED_DAYS}-day seed floor refused the removal')
+        return f'refused by seed floor ({SEED_DAYS}d)'
+    log.info(f'[unregistered] removed "{name}"' + (' (files kept)' if keep else ''))
+    record_activity('unregistered', f'Removed dead torrent "{name}" (tracker dropped it)' + (' - files kept' if keep else ''))
+    _unregistered_reported.discard((h, 'refused'))
+    return 'removed (files kept)' if keep else 'removed'
+
+
+def unregistered_sweep_tick(now=None):
+    """Runs on the maintenance tick but at most once per UNREGISTERED_SWEEP_INTERVAL."""
+    now = time.time() if now is None else now
+    if now - _unregistered_last[0] < UNREGISTERED_SWEEP_INTERVAL:
+        return None
+    _unregistered_last[0] = now
+    return unregistered_sweep(now=now)
+
+
+def _digest_unregistered_html():
+    rep = _unregistered_report
+    if not rep['ts']:
+        return ''
+    head = ('applied' if rep['apply'] else 'dry run, nothing changed') + f" - {rep['ts']}"
+    esc = lambda v: str('' if v is None else v).replace('&', '&amp;').replace('<', '&lt;')   # noqa: E731
+    body = ''.join(
+        f"<tr><td>{esc(r['name'])}</td><td>{esc(r['age_days'])}d</td><td>{esc(r['state'])}</td>"
+        f"<td>{esc(r['arr'] or '-')}</td><td>{esc(r['outcome'] if rep['apply'] else r['would'])}</td></tr>"
+        for r in rep['rows'])
+    return (f"<h2>Dead torrents (tracker dropped them): {len(rep['rows'])}</h2><div class='sub'>{head}</div>"
+            f"<table><tr><td><b>name</b></td><td><b>age</b></td><td><b>state</b></td><td><b>arr</b></td>"
+            f"<td><b>{'result' if rep['apply'] else 'apply would'}</b></td></tr>"
+            f"{body or '<tr><td>none</td></tr>'}</table>")
+
+
 def maintenance_scheduler():
     """Every 6 hours: heal errored torrents, then look for duplicate library
     folders. Shares one thread because the dupe scan is scandir-only (sizes
@@ -9236,6 +9382,10 @@ def maintenance_scheduler():
             downloads_audit_tick()
         except Exception as e:
             log.error(f'Downloads audit failed: {e}')
+        try:
+            unregistered_sweep_tick()
+        except Exception as e:
+            log.error(f'Unregistered sweep failed: {e}')
         time.sleep(DELUGE_REPAIR_INTERVAL)
 
 
