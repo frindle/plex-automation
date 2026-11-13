@@ -2698,11 +2698,38 @@ def dedup_via_sonarr(dry_run=False):
 # .mkv into Media, so the torrent's disk-space cost is pure archive. After
 # SEED_DAYS have passed since unpack we remove the torrent + its rar files.
 #
-# We identify "unpacked" torrents by: the torrent's save_path contains .rar
-# files AND Radarr/Sonarr has an imported file that references this download.
+# We identify "unpacked" torrents by: the torrent's file list has RAR volumes
+# and no main video. Removal also waits until Sonarr or Radarr has imported the
+# download (a DownloadFolderImported event for its hash), so a RAR release that
+# was never unpacked and imported (Unpackerr down) is kept, not deleted. Library
+# seeds skip that wait: their files are kept by the library guard anyway.
 # Track state in a sidecar JSON so we know the "unpacked at" timestamp.
 
 _UNPACK_STATE_PATH = os.environ.get('UNPACK_STATE_PATH', '/data/unpacked_torrents.json')
+
+
+def _arr_imported(torrent_hash):
+    """True when Sonarr or Radarr has imported this download, False when every
+    configured *arr answered and neither has, None when none is configured or a
+    lookup failed. Callers keep the torrent unless this is True."""
+    answered, failed = False, False
+    for who, url, key in (('Sonarr', SONARR_URL, SONARR_API_KEY), ('Radarr', RADARR_URL, RADARR_API_KEY)):
+        if not key:
+            continue
+        try:
+            r = requests.get(f'{url}/api/v3/history', headers={'X-Api-Key': key},
+                             params={'downloadId': torrent_hash.upper(), 'eventType': 3, 'pageSize': 10},
+                             timeout=15)
+            r.raise_for_status()
+            records = r.json().get('records') or []
+        except Exception as e:
+            log.warning(f'[unpack] {who} import check for {torrent_hash[:8]} failed ({type(e).__name__}); keeping it')
+            failed = True
+            continue
+        if any(rec.get('eventType') == 'downloadFolderImported' for rec in records):
+            return True
+        answered = True
+    return None if failed or not answered else False
 
 def _load_unpack_state():
     try:
@@ -2757,6 +2784,12 @@ def cleanup_unpacked_torrents():
                 continue
             age = now - state[h].get('first_seen_rar_at', now)
             if age >= threshold:
+                if not is_library_path(torrents[h].get('save_path')) and _arr_imported(h) is not True:
+                    if not state[h].get('import_wait'):
+                        state[h]['import_wait'] = now
+                        log.info(f'[unpack] keeping rar-torrent aged {age/86400:.1f}d: no Sonarr/Radarr import yet: {state[h].get("name")}')
+                        record_activity('cleanup', f'Kept rar-torrent "{state[h].get("name")}": past the {SEED_DAYS}-day window but Sonarr/Radarr never imported it (is Unpackerr running?)')
+                    continue
                 log.info(f'[unpack] removing rar-torrent aged {age/86400:.1f}d: {state[h].get("name")}')
                 r = remove_torrent(h)
                 if r == DEFERRED:
