@@ -21,7 +21,7 @@ MEDIA_ROOTS="${MEDIA_ROOTS:-data/Media}"
 MAIN_EXT="${MAIN_EXT:-mkv mp4 avi m4v ts m2ts wmv mov mpg mpeg webm mp3 flac m4a m4b aac ogg opus wav wma alac ape}"
 SIDE_EXT="${SIDE_EXT:-srt ass ssa sub idx sup vtt nfo}"
 # Never moved, whatever the extension: any path part equal to one of these (case-insensitive).
-# Frigate prunes its own recordings; on glacier every prune would wake disk1...
+# Frigate (decommissioned 2026-11): its leftover recordings stay put until deleted, never filling glacier...
 EXCLUDE_NAMES="${EXCLUDE_NAMES:-Downloads Incomplete Frigate InfluxDB Docker Documents Sandbox ollama-models appdata system domains Vault bloom-ledger GC lost+found}"
 # ...or containing one of these (Time Machine shares, the reselling app).
 EXCLUDE_CONTAINS="${EXCLUDE_CONTAINS:-timemachine resell}"
