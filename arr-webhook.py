@@ -55,20 +55,60 @@ LLM_DECISIONS_LOG = os.environ.get('LLM_DECISIONS_LOG', '/data/llm_decisions.jso
 def _llm_record(category, info):
     """record= callback for advise(): the /digest page needs a string summary."""
     info = info if isinstance(info, dict) else {}
+    if category == 'llm-escalation':
+        record_activity(category, f"{info.get('kind')} ({info.get('mode')}): escalated to {info.get('layer')} "
+                                  f"({info.get('reason')})")
+        return
     record_activity(category, f"{info.get('kind')} ({info.get('mode')}): "
                               f"rules={info.get('rules_action')} llm={info.get('llm_action')}")
 
 
-def _llm_advise(kind, facts, rules_action):
-    """Ask the advisor; a missing module, an exception or a non-string answer returns rules_action."""
+def _llm_advise(kind, facts, rules_action, info=None):
+    """Ask the advisor; a missing module, an exception or a non-string answer returns rules_action.
+    `info` (dict) receives pending/layer/pending_min when the caller cares about a pending decision."""
     if llm_advisor is None:
         return rules_action
     try:
-        action = llm_advisor.advise(kind, facts, rules_action, record=_llm_record)
+        action = llm_advisor.advise(kind, facts, rules_action, record=_llm_record, info=info)
     except Exception as e:  # noqa: BLE001
         log.warning(f'[llm] advise({kind}) failed: {e}')
         return rules_action
     return action if isinstance(action, str) else rules_action
+
+
+LLM_LATE_POLL_S = 60.0
+
+
+def _late_gate(source, download_id, title, facts, rules_action, upgrade_label, poll_s=None):
+    """Upgrade-gate decision that was pending when the grab arrived. The rules action was applied already; this
+    thread retries the chain until it answers, then applies a late reject/throttle (enforce) or just logs (shadow).
+    A restart drops the thread; startup clears the pending entries and the rules action stands."""
+    poll = LLM_LATE_POLL_S if poll_s is None else poll_s
+    try:
+        for _ in range(int(24 * 3600 / max(poll, 1)) + 1):
+            time.sleep(poll)
+            info = {}
+            action = _llm_advise('upgrade_gate', facts, rules_action, info)
+            if info.get('pending'):
+                continue
+            mode = (os.environ.get('LLM_DECISIONS', 'off') or '').strip().lower()
+            if mode != 'enforce' or action == rules_action:
+                return
+            if action == 'reject':
+                log.warning(f"{source}: late LLM reject of upgrade grab {download_id} ({title})")
+                deluge_login()
+                remove_torrent(download_id, remove_data=True)
+                record_activity('llm-reject-late', f'{source}: upgrade grab "{title}" rejected late by LLM advisor')
+            elif action == 'throttle' and rules_action == 'allow':
+                deluge_login()
+                ensure_label_exists_named(upgrade_label)
+                set_torrent_label(download_id, upgrade_label)
+                session.post(f'{DELUGE_URL}/json',
+                             json={'method': 'core.queue_bottom', 'params': [[download_id]], 'id': 11}, timeout=10)
+                record_activity('llm-throttle-late', f'{source}: upgrade grab "{title}" throttled late by LLM advisor')
+            return
+    except Exception as e:  # noqa: BLE001
+        log.error(f"{source}: late LLM gate failed: {e}")
 
 
 def _llm_tags(name):
@@ -4506,7 +4546,13 @@ def handle_grab(data, source):
         'candidate_dv_web': tags['dv'] and tags['web'],
         'seed_days': SEED_DAYS,
     }
-    action = _llm_advise('upgrade_gate', facts, rules_action)
+    llm_info = {}
+    action = _llm_advise('upgrade_gate', facts, rules_action, llm_info)
+    if llm_info.get('pending'):
+        action = rules_action
+        up_label = SONARR_UPG_LABEL if source == 'Sonarr' else RADARR_UPG_LABEL
+        threading.Thread(target=_late_gate, args=(source, download_id, title, facts, rules_action, up_label),
+                         daemon=True, name='llm-late-gate').start()
     if action == 'reject':
         log.warning(f"{source}: LLM rejected upgrade grab {download_id} ({title})")
         time.sleep(3)
@@ -6939,6 +6985,18 @@ def llm_decisions():
         return jsonify({'ok': True, 'count': 0, 'entries': []}), 200
 
 
+@app.route('/llm-spend', methods=['GET'])
+def llm_spend():
+    month = request.args.get('month') or datetime.now().strftime('%Y-%m')
+    if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', month):
+        return jsonify({'ok': False, 'error': 'month must be YYYY-MM'}), 400
+    try:
+        layers = llm_advisor.spend_summary(LLM_DECISIONS_LOG, month)
+    except Exception:
+        layers = {}
+    return jsonify({'ok': True, 'month': month, 'layers': layers}), 200
+
+
 # Cross-reference Deluge completed torrents against Radarr/Sonarr state
 # to surface the "grabbed → downloaded → never imported" failures that
 # the queue endpoint hides once retries expire.
@@ -9219,6 +9277,15 @@ def _is_recent_year(year, now=None):
 
 
 if __name__ == '__main__':
+    # Late-gate threads do not survive a restart: forget pending upgrade grabs, the rules action stands.
+    if llm_advisor is not None:
+        try:
+            dropped = llm_advisor.drop_pending('upgrade_gate')
+            if dropped:
+                log.info(f'[llm] dropped {dropped} pending upgrade_gate decision(s) at startup; rules action stands')
+                record_activity('llm-pending-dropped', f'{dropped} pending upgrade_gate decision(s) dropped at restart')
+        except Exception as e:  # noqa: BLE001
+            log.debug(f'[llm] pending cleanup failed: {e}')
     port = int(os.environ.get('PORT', 9876))
     log.info(f'Starting arr-webhook listener on port {port}')
     log.info(f'Superseded torrents will be auto-removed after {SEED_DAYS} days of seeding')

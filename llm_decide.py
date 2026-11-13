@@ -152,7 +152,7 @@ def resolve_action(kind, rules_action, decision, mode='shadow'):
         return rules_action
 
 
-def log_decision(path, kind, context_summary, rules_action, decision, mode):
+def log_decision(path, kind, context_summary, rules_action, decision, mode, extra=None):
     try:
         # An int/bool path would be treated as a file descriptor (True -> stdout) and closed afterwards.
         if isinstance(path, bool) or not isinstance(path, (str, os.PathLike)) or not os.fspath(path):
@@ -175,6 +175,9 @@ def log_decision(path, kind, context_summary, rules_action, decision, mode):
             'mode': mode,
             'agree': agree,
         }
+        if isinstance(extra, dict):
+            for k, v in extra.items():
+                record.setdefault(k, v)
         try:
             line = json.dumps(record, default=str) + '\n'
         except (TypeError, ValueError, RecursionError):

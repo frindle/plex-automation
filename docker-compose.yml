@@ -49,13 +49,27 @@ services:
       UPLOAD_RATE_LIMIT_MBIT: "5"
       PLEX_URL: "http://10.0.0.6:32400"
       PLEX_TOKEN: ${PLEX_TOKEN}
-      # Advisory local-LLM decisions (llm_decide/llm_advisor). off = rules only (default),
-      # shadow = log what the model would do next to what the rules did, enforce = model may
-      # override rules at confidence >= 0.75 (hard rules still win). Needs LLM_DECIDE_URL
-      # (OpenAI-compatible chat endpoint) or no model call is ever made.
-      LLM_DECISIONS: "off"
-      LLM_DECIDE_URL: ""
+      # Advisory LLM decisions (llm_decide/llm_advisor). off = rules only (default), shadow = log
+      # what the chain would do next to what the rules did, enforce = the chain may override rules
+      # at confidence >= 0.75 (hard rules still win). Layers, each skipped when its env is unset:
+      # local Darkbloom -> paid Darkbloom -> Claude -> rules. Values live in .env, never here.
+      LLM_DECISIONS: "${LLM_DECISIONS:-off}"
+      DARKBLOOM_BASE_URL: "${DARKBLOOM_BASE_URL:-}"
+      DARKBLOOM_API_KEY: "${DARKBLOOM_API_KEY:-}"
+      LLM_LOCAL_MODEL: "${LLM_LOCAL_MODEL:-}"
+      LLM_DECIDE_TIMEOUT: "${LLM_DECIDE_TIMEOUT:-20}"
+      LLM_DECIDE_URL: "${LLM_DECIDE_URL:-}"
+      LLM_DECIDE_MODEL: "${LLM_DECIDE_MODEL:-}"
+      LLM_DECIDE_KEY: "${LLM_DECIDE_KEY:-}"
+      LLM_LOCAL_HOLD_URL: "${LLM_LOCAL_HOLD_URL:-}"
+      LLM_LOCAL_HOLD_TOKEN: "${LLM_LOCAL_HOLD_TOKEN:-}"
+      LLM_LOCAL_WAIT_MIN: "${LLM_LOCAL_WAIT_MIN:-15}"
+      DARKBLOOM_CLOUD_API_KEY: "${DARKBLOOM_CLOUD_API_KEY:-}"
+      DARKBLOOM_CLOUD_MODEL: "${DARKBLOOM_CLOUD_MODEL:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      LLM_CLAUDE_MODEL: "${LLM_CLAUDE_MODEL:-}"
       LLM_DECISIONS_LOG: "/data/llm_decisions.jsonl"
+      LLM_PENDING_PATH: "/data/llm_pending.json"
     mac_address: "02:8e:b2:5d:a1:37"
     networks:
       br0:
