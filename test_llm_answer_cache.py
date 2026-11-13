@@ -1,4 +1,4 @@
-"""Shadow mode never pays; import_identity/dupe_keeper answers are cached by pending key; an unsure identity
+"""Shadow mode never pays; import_identity answers are cached by pending key; an unsure identity
 answer never imports in enforce; a pending identity check doesn't push 'import stuck'."""
 import json
 
@@ -54,20 +54,13 @@ def test_identity_cache_expires_after_ttl(tmp_path):
     assert info['layer'] == 'local' and http.n('local.invalid') > n_local
 
 
-def test_dupe_keeper_cached_but_upgrade_gate_not(tmp_path):
+def test_upgrade_gate_answers_are_not_cached(tmp_path):
     clock = Clock()
-    http = FakeHttp({'local.invalid': chat('keep_first', 0.95)})
-    facts = {'first': 'A', 'second': 'B'}
-    run(tmp_path, clock, http, kind='dupe_keeper', rules='keep_both', facts=facts)
+    http = FakeHttp({'local.invalid': chat('allow', 0.95)})
+    run(tmp_path, clock, http)
     n = http.n('local.invalid')
-    _, info, _ = run(tmp_path, clock, http, kind='dupe_keeper', rules='keep_both', facts=facts)
-    assert info['layer'] == 'cache' and http.n('local.invalid') == n
-
-    http2 = FakeHttp({'local.invalid': chat('allow', 0.95)})
-    run(tmp_path, clock, http2)
-    n2 = http2.n('local.invalid')
-    _, info, _ = run(tmp_path, clock, http2)
-    assert info['layer'] == 'local' and http2.n('local.invalid') > n2
+    _, info, _ = run(tmp_path, clock, http)
+    assert info['layer'] == 'local' and http.n('local.invalid') > n
 
 
 def test_pending_answer_is_not_cached(tmp_path):

@@ -34,9 +34,9 @@ def test_prompt_names_kind_actions_and_answer_format():
 
 def test_context_is_embedded_as_sorted_key_json():
     m = _load()
-    p = m.build_prompt('dupe_keeper', {'b': 2, 'a': 1})
+    p = m.build_prompt('import_identity', {'b': 2, 'a': 1})
     assert '{"a": 1, "b": 2}' in p
-    assert m.build_prompt('dupe_keeper', {'b': 2, 'a': 1}) == m.build_prompt('dupe_keeper', {'a': 1, 'b': 2})
+    assert m.build_prompt('import_identity', {'b': 2, 'a': 1}) == m.build_prompt('import_identity', {'a': 1, 'b': 2})
 
 
 def test_non_serialisable_context_values_become_str():

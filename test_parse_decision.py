@@ -29,7 +29,8 @@ def test_rejects_unknown_kind_and_action_outside_kind():
     assert m.parse_decision(None, GOOD) is None
     assert m.parse_decision('import_identity', GOOD) is None  # 'allow' belongs to upgrade_gate
     assert m.parse_decision('upgrade_gate', '{"confidence": 0.9, "reason": "x"}') is None
-    assert m.parse_decision('dupe_keeper', '{"action": "keep_second", "confidence": 1, "reason": "r"}')['action'] == 'keep_second'
+    assert m.parse_decision('import_identity', '{"action": "mismatch", "confidence": 1, "reason": "r"}')['action'] == 'mismatch'
+    assert m.parse_decision('dupe_keeper', '{"action": "keep_second", "confidence": 1, "reason": "r"}') is None
 
 
 def test_rejects_bad_confidence_values():

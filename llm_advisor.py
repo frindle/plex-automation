@@ -8,8 +8,8 @@ Decision chain (each layer is skipped when its env is unset):
 While the local layer is unavailable the decision is PENDING for LLM_LOCAL_WAIT_MIN minutes (default 15)
 before a paid layer is used. A valid but low-confidence open-model answer escalates to Claude at once.
 Shadow mode only asks the local layer: it changes nothing, so it never spends paid calls.
-import_identity and dupe_keeper answers are cached by pending key for LLM_ANSWER_TTL_H hours (default 24), so a
-stuck import or a repeated dupe scan isn't re-asked every pass. Hard rules still run on the current facts.
+import_identity answers are cached by pending key for LLM_ANSWER_TTL_H hours (default 24), so a stuck import
+isn't re-asked every pass. Hard rules still run on the current facts.
 llm_decide stays the source of truth for the prompt, parsing, MIN_CONFIDENCE and hard rules.
 """
 
@@ -33,10 +33,10 @@ PENDING_MAX_AGE = 24 * 3600.0
 DEFAULT_WAIT_MIN = 15.0
 DEFAULT_ANSWER_TTL_H = 24.0
 ANSWER_CACHE_MAX = 2000
-CACHE_KINDS = frozenset({'import_identity', 'dupe_keeper'})
+CACHE_KINDS = frozenset({'import_identity'})
 
 # What a seam does while a decision is pending in enforce mode (shadow always keeps the rules action).
-PENDING_ACTION = {'import_identity': 'unsure', 'dupe_keeper': 'keep_both'}
+PENDING_ACTION = {'import_identity': 'unsure'}
 
 
 def http_transport(url, model, timeout=20):
@@ -252,9 +252,8 @@ def hold_active(env, http=None):
 
 # ── pending store ────────────────────────────────────────────────────────────
 
-# Facts that drift while a decision waits (seeding age, swarm size). They stay in the prompt but are left out of
-# the pending key, so the wait-for-local clock isn't restarted each time one ticks over (seeded_days is rounded
-# to 0.1 day, which used to give dupe_keeper a new key about every 2.4 hours).
+# Facts that drift while a decision waits (swarm size, seeding age). They stay in the prompt but are left out of
+# the pending and answer-cache keys, so the wait-for-local clock isn't restarted each time one ticks over.
 VOLATILE_FACTS = frozenset({'seeded_days', 'seeders'})
 
 

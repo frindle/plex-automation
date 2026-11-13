@@ -111,7 +111,7 @@ def test_local_down_under_wait_no_paid_call_pending_recorded(tmp_path):
 def test_pending_seam_actions_by_kind_and_mode(tmp_path):
     http = FakeHttp({'local.invalid': ConnectionError('down')})
     assert run(tmp_path, Clock(), http, kind='import_identity', rules='match')[0] == 'unsure'
-    assert run(tmp_path, Clock(), http, kind='dupe_keeper', rules='keep_both')[0] == 'keep_both'
+    assert run(tmp_path, Clock(), http)[0] == 'allow'
     assert run(tmp_path, Clock(), http, kind='import_identity', rules='match', mode='shadow')[0] == 'match'
 
 
@@ -192,29 +192,29 @@ def test_restart_keeps_first_seen(tmp_path):
     assert info['layer'] == 'paid' and first == 1_000_000.0
 
 
-def _dupe(days_a, days_b, seeding=True):
-    v = lambda d: {'path': '/m/a.mkv', 'size_gb': 20, 'res': '2160p', 'hdr': 'dv', 'seeding': seeding, 'seeded_days': d}
-    return {'title': 'T', 'seed_days': 21, 'first': v(days_a), 'second': dict(v(days_b), path='/m/b.mkv')}
+def _gate(seeders, freeleech='full'):
+    return {'title': 'T', 'release': 'T.2021.2160p.BluRay-GRP', 'existing_quality': 'WEBDL-1080p',
+            'freeleech': freeleech, 'seeders': seeders}
 
 
-def test_seeded_days_tick_keeps_the_pending_clock(tmp_path):
+def test_seeders_tick_keeps_the_pending_clock(tmp_path):
     clock = Clock()
-    http = FakeHttp({'local.invalid': ConnectionError('down'), 'api.darkbloom.dev': chat('keep_both')})
-    out, info, _ = run(tmp_path, clock, http, kind='dupe_keeper', rules='keep_first', facts=_dupe(3.0, 0.4))
+    http = FakeHttp({'local.invalid': ConnectionError('down'), 'api.darkbloom.dev': chat('reject')})
+    out, info, _ = run(tmp_path, clock, http, facts=_gate(12))
     assert info['pending'] is True
     clock.minutes(10)
-    out, info, _ = run(tmp_path, clock, http, kind='dupe_keeper', rules='keep_first', facts=_dupe(3.1, 0.5))
+    out, info, _ = run(tmp_path, clock, http, facts=_gate(15))
     assert info['pending'] is True and info['pending_min'] == 10.0
     clock.minutes(6)
-    out, info, _ = run(tmp_path, clock, http, kind='dupe_keeper', rules='keep_first', facts=_dupe(3.1, 0.5))
+    out, info, _ = run(tmp_path, clock, http, facts=_gate(15))
     assert info['layer'] == 'paid' and http.n('api.darkbloom.dev') == 1
     assert len(json.loads((tmp_path / 'llm_pending.json').read_text())) == 0
 
 
 def test_material_fact_change_is_a_new_pending_decision():
-    a = la.pending_key('dupe_keeper', _dupe(3.0, 0.4))
-    assert a == la.pending_key('dupe_keeper', _dupe(9.9, 7.7))
-    assert a != la.pending_key('dupe_keeper', _dupe(3.0, 0.4, seeding=False))
+    a = la.pending_key('upgrade_gate', _gate(12))
+    assert a == la.pending_key('upgrade_gate', _gate(40))
+    assert a != la.pending_key('upgrade_gate', _gate(12, freeleech='no'))
     assert la.pending_key('upgrade_gate', {'title': 'T', 'seeders': 3}) == la.pending_key('upgrade_gate', {'title': 'T', 'seeders': 40})
 
 

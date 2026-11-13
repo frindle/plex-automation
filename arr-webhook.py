@@ -1836,6 +1836,10 @@ def cleanup_scheduler():
         cleanup_sonarr_queue_dupes()
         dedup_via_radarr()
         dedup_via_sonarr()
+        try:
+            plex_dupe_fix_daily()
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'plex dupe fix daily crashed: {e}')
         cleanup_unpacked_torrents()
         time.sleep(86400)
 
@@ -6737,6 +6741,63 @@ def torrent_move():
 # gets relabeled `superseded` and moved to SEEDING_DIR so Plex loses
 # sight of it and cleanup_superseded takes it out after SEED_DAYS.
 # Dry-run default. ?apply=1 executes.
+def _torrents_with_basename(torrents, filepath):
+    """Hashes of torrents holding a file with this basename (any folder)."""
+    base = os.path.basename((filepath or '').rstrip('/'))
+    hits = set()
+    if not base:
+        return hits
+    for h, info in torrents.items():
+        if (info.get('name') or '') == base:
+            hits.add(h)
+            continue
+        for f in (info.get('files') or []):
+            p = f.get('path') if isinstance(f, dict) else str(f)
+            if p and os.path.basename(p) == base:
+                hits.add(h)
+                break
+    return hits
+
+
+def _same_physical_file(a, b):
+    """True when two paths are one file (same real path, or the same inode with a
+    single link, i.e. two views of one file). Separate hardlinks are not the same."""
+    if not a or not b:
+        return False
+    try:
+        if os.path.realpath(a) == os.path.realpath(b):
+            return True
+        if os.path.exists(b) and os.path.samefile(a, b):
+            return os.stat(a).st_nlink == 1
+    except OSError:
+        return True  # can't tell: treat as the keeper and don't delete
+    return False
+
+
+def _torrent_path_hits(torrents, filepath):
+    """Hashes whose save_path+file (or a file's relative path as a suffix) matches
+    filepath: pass 1 of _find_torrent_by_filepath, every hit instead of the first."""
+    target = (filepath or '').rstrip('/')
+    hits = []
+    if not target:
+        return hits
+    for h, info in torrents.items():
+        save_path = (info.get('save_path') or '').rstrip('/')
+        name = info.get('name') or ''
+        if name and save_path and f'{save_path}/{name}' == target:
+            hits.append(h)
+            continue
+        for f in (info.get('files') or []):
+            p = f.get('path') if isinstance(f, dict) else str(f)
+            if not p:
+                continue
+            full = f'{save_path}/{p}' if save_path else p
+            if full == target or target.endswith('/' + p):
+                hits.append(h)
+                break
+    return hits
+
+
 def _find_torrent_by_filepath(torrents, filepath):
     """Find the Deluge torrent seeding a specific file.
 
@@ -6826,16 +6887,28 @@ def plex_dupe_fix():
         media_list = entry.get('media') or []
         if len(media_list) < 2:
             continue
-        # Identical filenames = Plex ghost entry. Manual fix (Refresh Metadata).
-        basenames = [os.path.basename(m.get('file') or '') for m in media_list]
-        if len(set(basenames)) == 1:
+        # Plex can list the same file twice (a ghost entry). Only an identical
+        # full path is a ghost; the same filename in two folders is two real
+        # copies and goes through the quality-upgrade path below. Duplicate
+        # paths are collapsed first so a "loser" can never be the keeper's own
+        # file.
+        unique_media, seen_paths = [], set()
+        for m in media_list:
+            f = m.get('file') or ''
+            key = os.path.normpath(f) if f else ('', id(m))
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            unique_media.append(m)
+        if len(unique_media) == 1:
             plan['same_file_ghost'].append({
                 'plex_key': plex_key,
                 'title': entry.get('title'),
-                'file': basenames[0],
+                'file': os.path.basename(unique_media[0].get('file') or ''),
                 'action': 'Plex → item → ⋯ → Refresh Metadata',
             })
             continue
+        media_list = unique_media
         # Score each Media: (resolution_rank, size_gb). Higher wins.
         res_rank = {'4k': 4, '2160': 4, '1080': 3, '720': 2, '576': 1, '480': 1, None: 0}
         def score(m):
@@ -6877,36 +6950,26 @@ def plex_dupe_fix():
         sorted_media = sorted(media_list, key=score, reverse=True)
         keeper = sorted_media[0]
         losers = sorted_media[1:]
+        keeper_file = keeper.get('file') or ''
+        keeper_base = os.path.basename(keeper_file)
         upgrade_actions = []
-        # LLM dupe-keeper advisory for 2-version groups only.
-        if len(media_list) == 2:
-            def _version_dict(m):
-                f = m.get('file') or ''
-                h, tinfo = _find_torrent_by_filepath(torrents, f)
-                secs = (tinfo or {}).get('seeding_time')
-                return {
-                    'path': _translate_plex_path(f),
-                    'size_gb': m.get('size_gb'),
-                    'res': m.get('resolution'),
-                    'hdr': _llm_tags(os.path.basename(f))['hdr'],
-                    'seeding': bool(h and tinfo),
-                    'seeded_days': round(secs / 86400, 1) if isinstance(secs, (int, float)) else None,
-                }
-            facts = {
-                'title': entry.get('title'),
-                'seed_days': SEED_DAYS,
-                'first': _version_dict(media_list[0]),
-                'second': _version_dict(media_list[1]),
-            }
-            rules_action = 'keep_first' if keeper is media_list[0] else 'keep_second'
-            if _llm_advise('dupe_keeper', facts, rules_action) == 'keep_both':
-                plan.setdefault('kept_by_llm', []).append({
-                    'plex_key': plex_key, 'title': entry.get('title'),
-                })
-                continue
         for loser in losers:
             fpath = loser.get('file') or ''
-            h, tinfo = _find_torrent_by_filepath(torrents, fpath)
+            ambiguous = False
+            if keeper_base and os.path.basename(fpath) == keeper_base:
+                # Same filename as the keeper: a basename or short-suffix hit
+                # could be the keeper's own torrent. Only a torrent that matches
+                # this path and not the keeper's counts; if some torrent holds
+                # the name but none tells the two apart, leave it for a human.
+                only = [x for x in _torrent_path_hits(torrents, fpath)
+                        if x not in set(_torrent_path_hits(torrents, keeper_file))]
+                if len(set(only)) == 1:
+                    h, tinfo = only[0], torrents[only[0]]
+                else:
+                    h, tinfo = None, None
+                    ambiguous = bool(only) or bool(_torrents_with_basename(torrents, fpath))
+            else:
+                h, tinfo = _find_torrent_by_filepath(torrents, fpath)
             action = {
                 'file': fpath,
                 'basename': os.path.basename(fpath),
@@ -6917,7 +6980,10 @@ def plex_dupe_fix():
                 'torrent_name': tinfo.get('name') if tinfo else None,
                 'torrent_label': tinfo.get('label') if tinfo else None,
             }
-            if apply:
+            if ambiguous:
+                action['result'] = ('skipped: a torrent seeds a file with this name but not this path; '
+                                    'check by hand')
+            elif apply:
                 try:
                     if h and tinfo:
                         supersede_torrent(h)
@@ -6931,6 +6997,8 @@ def plex_dupe_fix():
                         action['local_path'] = local
                         if not os.path.exists(local):
                             action['result'] = f'file not found at {local} (path map miss?)'
+                        elif _same_physical_file(local, _translate_plex_path(keeper.get('file') or '')):
+                            action['result'] = 'skipped: same file on disk as the keeper'
                         else:
                             try:
                                 os.remove(local)
@@ -6958,6 +7026,87 @@ def plex_dupe_fix():
         'counts': {k: len(v) for k, v in plan.items()},
         'plan': plan,
     }), 200
+
+# Daily /plex-dupe-fix run from cleanup_scheduler.
+# PLEX_DUPE_FIX_DAILY: off | dry (default: plan only, writes the report) | apply.
+# The report at PLEX_DUPE_FIX_REPORT is the last run's full plan, so a dry run
+# can be compared against it before switching to apply. Pushes only when an
+# apply run fails (scan error, delete/supersede error); everything else goes
+# to the activity log.
+PLEX_DUPE_FIX_REPORT = os.environ.get('PLEX_DUPE_FIX_REPORT', '/data/plex_dupe_fix_last.json')
+_DUPE_FIX_FAIL_PREFIXES = ('FAILED', 'PERMISSION DENIED', 'delete failed', 'file not found')
+
+
+def _plex_dupe_fix_daily_mode():
+    v = (os.environ.get('PLEX_DUPE_FIX_DAILY') or 'dry').strip().lower()
+    return v if v in ('off', 'dry', 'apply') else 'dry'
+
+
+def _dupe_fix_failures(body):
+    out = []
+    for item in ((body or {}).get('plan') or {}).get('quality_upgrade') or []:
+        for a in item.get('supersede') or []:
+            res = a.get('result') or ''
+            if res.startswith(_DUPE_FIX_FAIL_PREFIXES):
+                out.append(f"{item.get('title')}: {a.get('basename')} -> {res}")
+    return out
+
+
+def _write_json_atomic(path, obj):
+    d = os.path.dirname(path) or '.'
+    os.makedirs(d, exist_ok=True)
+    tmp = f'{path}.tmp'
+    with open(tmp, 'w') as f:
+        _json.dump(obj, f, indent=1, default=str)
+    os.replace(tmp, path)
+
+
+def plex_dupe_fix_daily():
+    """Run /plex-dupe-fix in the background. Returns the report dict, or None when off."""
+    mode = _plex_dupe_fix_daily_mode()
+    if mode == 'off':
+        return None
+    qs = {'apply': '1'} if mode == 'apply' else {}
+    try:
+        with app.test_request_context('/plex-dupe-fix', query_string=qs):
+            res = plex_dupe_fix()
+        resp, status = (res if isinstance(res, tuple) else (res, 200))
+        body = resp.get_json() or {}
+    except Exception as e:  # noqa: BLE001
+        status, body = 500, {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+    failures = _dupe_fix_failures(body)
+    report = {
+        'ts': datetime.now().isoformat(timespec='seconds'),
+        'mode': mode,
+        'status': status,
+        'ok': bool(body.get('ok')),
+        'error': body.get('error'),
+        'counts': body.get('counts') or {},
+        'failures': failures,
+        'plan': body.get('plan') or {},
+    }
+    try:
+        _write_json_atomic(PLEX_DUPE_FIX_REPORT, report)
+    except OSError as e:
+        log.warning(f'plex dupe fix report write failed: {e}')
+    c = report['counts']
+    if report['ok']:
+        n_sup = sum(len(i.get('supersede') or []) for i in report['plan'].get('quality_upgrade') or [])
+        summary = (f"{mode}: {c.get('quality_upgrade', 0)} titles, {n_sup} extra copies, "
+                   f"{c.get('same_file_ghost', 0)} ghosts, {len(failures)} failed")
+    else:
+        summary = f"{mode}: did not run ({report['error']})"
+    record_activity('plex_dupe_fix', summary)
+    log.info(f'plex dupe fix daily {summary}')
+    if mode == 'apply' and (not report['ok'] or failures):
+        lines = failures[:8] if failures else [str(report['error'])]
+        more = f'\n…and {len(failures) - 8} more' if len(failures) > 8 else ''
+        try:
+            send_pushover('Plex dupe fix failed', '\n'.join(lines) + more)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'plex dupe fix push failed: {e}')
+    return report
+
 
 # List Sonarr seasons where NO episode has a season-pack import in
 # history — i.e. seasons that were only ever grabbed as individual

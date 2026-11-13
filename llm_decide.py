@@ -4,18 +4,14 @@ import datetime
 import json
 import math
 import os
-import posixpath
 import re
 
 KINDS = {
     'upgrade_gate': ('allow', 'throttle', 'reject'),
     'import_identity': ('match', 'mismatch', 'unsure'),
-    'dupe_keeper': ('keep_first', 'keep_second', 'keep_both'),
 }
 MIN_CONFIDENCE = 0.75
-SEED_DAYS_DEFAULT = 21
 MIN_SEEDERS = 10
-LIBRARY_ROOTS = ('/media/movies', '/media/tv')
 
 # Penn's standing preferences, shown to the model. Advisory only: apply_hard_rules() enforces the
 # non-negotiable ones in code. Edit here, not in the prompts.
@@ -34,11 +30,6 @@ POLICY = {
         'Answer match only when title AND year both agree with the matched item. A different year, a remake, a '
         'reboot or a different series is a mismatch. Doubled year tokens (Title.2015.2015) are not a mismatch. '
         'Use unsure whenever the evidence is thin; unsure sends Penn a notification instead of importing.'),
-    'dupe_keeper': (
-        'Keep the best version: highest resolution, then HDR10 or disc DV over SDR or WEB DV P5, then lossless audio, '
-        'then the better release group. Never choose a keeper that would delete a file still seeding on the tracker '
-        'inside the minimum seed window, and only library files under /media/movies or /media/tv may be removed. '
-        'When versions are close or the evidence is unclear choose keep_both.'),
 }
 
 
@@ -197,7 +188,7 @@ def log_decision(path, kind, context_summary, rules_action, decision, mode, extr
         return False
 
 
-_SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_keeper': 'keep_both'}
+_SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
 
@@ -220,21 +211,11 @@ def _num(v):
     return f
 
 
-def _library_path(p):
-    if not isinstance(p, str) or not p.startswith('/') or '\x00' in p:
-        return None
-    norm = posixpath.normpath(p)
-    if any(norm.startswith(root + '/') for root in LIBRARY_ROOTS):
-        return norm
-    return None
-
-
 def apply_hard_rules(kind, action, facts):
     """Deterministic rules the model can never override. Returns (action, rule_or_None).
 
-    facts keys (all optional, missing => no veto from that rule): seed_days (required window, default 21),
-    seeders, candidate_dv_web (bool, DV Profile 5 WEB release), year_matches (bool),
-    first/second: {path, seeding (bool), seeded_days}. Present-but-malformed facts fail closed.
+    facts keys (all optional, missing => no veto from that rule): seeders, candidate_dv_web (bool, DV Profile 5
+    WEB release), year_matches (bool). Present-but-malformed facts fail closed.
     """
     try:
         facts = facts if isinstance(facts, dict) else {}
@@ -249,28 +230,6 @@ def apply_hard_rules(kind, action, facts):
             ym = facts.get('year_matches')
             if ym is not None and not _flag(ym):
                 return 'unsure', 'year_mismatch'
-        elif kind == 'dupe_keeper' and action in ('keep_first', 'keep_second'):
-            try:
-                need = _num(facts.get('seed_days'))
-            except (TypeError, ValueError):
-                need = None
-            if need is None or need < 0:
-                need = SEED_DAYS_DEFAULT
-            keeper = facts.get('first' if action == 'keep_first' else 'second')
-            loser = facts.get('second' if action == 'keep_first' else 'first')
-            keeper = keeper if isinstance(keeper, dict) else {}
-            loser = loser if isinstance(loser, dict) else {}
-            loser_path = _library_path(loser.get('path'))
-            if loser_path is None:
-                return 'keep_both', 'not_library_path'
-            if _flag(loser.get('seeding')):
-                days = _num(loser.get('seeded_days'))
-                if days is None or days < need:
-                    return 'keep_both', 'seed_window'
-            keeper_path = keeper.get('path')
-            if isinstance(keeper_path, str) and keeper_path.startswith('/') and \
-                    posixpath.normpath(keeper_path) == loser_path:
-                return 'keep_both', 'same_file'
         return action, None
     except Exception:
         if isinstance(kind, str) and kind in _SAFE_ACTION and action != _SAFE_ACTION[kind]:
