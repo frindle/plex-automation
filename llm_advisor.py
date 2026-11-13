@@ -442,6 +442,10 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
             wait_min = float(env.get('LLM_LOCAL_WAIT_MIN', DEFAULT_WAIT_MIN))
         except (TypeError, ValueError):
             wait_min = DEFAULT_WAIT_MIN
+        path = log_path or env.get('LLM_DECISIONS_LOG', DEFAULT_LOG)
+        capped = paid_cap_reached(env, path, time.strftime('%Y-%m', time.gmtime(now())))
+        if capped:
+            layers = {k: v for k, v in layers.items() if k not in ('paid', 'claude')}
 
         res = run_chain(kind, facts, layers, store, now, wait_min, env, hold_http)
         decision = res['decision']
@@ -452,9 +456,10 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
                 decision = dict(decision, action=action,
                                 reason='[hard rule %s] %s' % (rule, decision['reason']))
 
-        path = log_path or env.get('LLM_DECISIONS_LOG', DEFAULT_LOG)
-        extra = {'layer': res['layer'] or ('pending' if res['pending'] else None), 'model': res['model'],
+        extra ={'layer': res['layer'] or ('pending' if res['pending'] else None), 'model': res['model'],
                  'latency_ms': res['latency_ms'], 'pending_min': res['pending_min']}
+        if capped:
+            extra['paid_cap'] = True
         if res['hold_cause'] is not None:
             extra['hold_cause'] = res['hold_cause']
         if res['calls']:
@@ -513,4 +518,18 @@ def spend_summary(path, month):
 
 
 def paid_cap_reached(env, path, month):
-    raise NotImplementedError('not implemented: paid_cap_reached')
+    try:
+        if env is None:
+            return False
+        raw = env.get('LLM_PAID_MONTHLY_MAX_CALLS')
+        try:
+            cap = int(str(raw).strip())
+            if cap < 0:
+                cap = 300
+        except (ValueError, TypeError):
+            cap = 300
+        summary = spend_summary(path, month)
+        count = sum(v['calls'] for v in summary.values())
+        return count >= cap
+    except Exception:
+        return False
