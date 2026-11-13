@@ -87,10 +87,10 @@ ENV = {'DARKBLOOM_BASE_URL': 'http://local.invalid', 'DARKBLOOM_API_KEY': 'k', '
        'DARKBLOOM_CLOUD_API_KEY': KEY, 'ANTHROPIC_API_KEY': 'sk-fake'}
 
 
-def run(tmp_path, clock, http, env=None, claude=None, kind='upgrade_gate', rules='allow', mode='enforce', **kw):
+def run(tmp_path, clock, http, env=None, claude=None, kind='upgrade_gate', rules='allow', mode='enforce', facts=None, **kw):
     log = tmp_path / 'l.jsonl'
     info = {}
-    out = la.advise(kind, FACTS, rules, mode=mode, log_path=str(log), env=dict(env or ENV, LLM_PENDING_PATH=str(tmp_path / 'llm_pending.json')), now=clock, http=http,
+    out = la.advise(kind, facts or FACTS, rules, mode=mode, log_path=str(log), env=dict(env or ENV, LLM_PENDING_PATH=str(tmp_path / 'llm_pending.json')), now=clock, http=http,
                     hold_http=http, claude_client=claude, info=info, **kw)
     rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
     return out, info, rows
@@ -190,6 +190,32 @@ def test_restart_keeps_first_seen(tmp_path):
     clock.minutes(16)
     out, info, _ = run(tmp_path, clock, http)
     assert info['layer'] == 'paid' and first == 1_000_000.0
+
+
+def _dupe(days_a, days_b, seeding=True):
+    v = lambda d: {'path': '/m/a.mkv', 'size_gb': 20, 'res': '2160p', 'hdr': 'dv', 'seeding': seeding, 'seeded_days': d}
+    return {'title': 'T', 'seed_days': 21, 'first': v(days_a), 'second': dict(v(days_b), path='/m/b.mkv')}
+
+
+def test_seeded_days_tick_keeps_the_pending_clock(tmp_path):
+    clock = Clock()
+    http = FakeHttp({'local.invalid': ConnectionError('down'), 'api.darkbloom.dev': chat('keep_both')})
+    out, info, _ = run(tmp_path, clock, http, kind='dupe_keeper', rules='keep_first', facts=_dupe(3.0, 0.4))
+    assert info['pending'] is True
+    clock.minutes(10)
+    out, info, _ = run(tmp_path, clock, http, kind='dupe_keeper', rules='keep_first', facts=_dupe(3.1, 0.5))
+    assert info['pending'] is True and info['pending_min'] == 10.0
+    clock.minutes(6)
+    out, info, _ = run(tmp_path, clock, http, kind='dupe_keeper', rules='keep_first', facts=_dupe(3.1, 0.5))
+    assert info['layer'] == 'paid' and http.n('api.darkbloom.dev') == 1
+    assert len(json.loads((tmp_path / 'llm_pending.json').read_text())) == 0
+
+
+def test_material_fact_change_is_a_new_pending_decision():
+    a = la.pending_key('dupe_keeper', _dupe(3.0, 0.4))
+    assert a == la.pending_key('dupe_keeper', _dupe(9.9, 7.7))
+    assert a != la.pending_key('dupe_keeper', _dupe(3.0, 0.4, seeding=False))
+    assert la.pending_key('upgrade_gate', {'title': 'T', 'seeders': 3}) == la.pending_key('upgrade_gate', {'title': 'T', 'seeders': 40})
 
 
 def test_pending_entries_expire_after_24h(tmp_path):

@@ -246,8 +246,22 @@ def hold_active(env, http=None):
 
 # ── pending store ────────────────────────────────────────────────────────────
 
+# Facts that drift while a decision waits (seeding age, swarm size). They stay in the prompt but are left out of
+# the pending key, so the wait-for-local clock isn't restarted each time one ticks over (seeded_days is rounded
+# to 0.1 day, which used to give dupe_keeper a new key about every 2.4 hours).
+VOLATILE_FACTS = frozenset({'seeded_days', 'seeders'})
+
+
+def _stable(v):
+    if isinstance(v, dict):
+        return {k: _stable(x) for k, x in v.items() if k not in VOLATILE_FACTS}
+    if isinstance(v, (list, tuple)):
+        return [_stable(x) for x in v]
+    return v
+
+
 def pending_key(kind, facts):
-    blob = json.dumps(facts, sort_keys=True, default=str)
+    blob = json.dumps(_stable(facts), sort_keys=True, default=str)
     return '%s:%s' % (kind, hashlib.sha256(blob.encode('utf-8')).hexdigest())
 
 
