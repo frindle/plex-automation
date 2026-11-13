@@ -9,7 +9,13 @@ path (no side effects):
          The /mnt/user path is unchanged by a disk-to-disk move, so a resumed
          torrent keeps seeding with no recheck. Nothing is ever removed.
   wait   an owning torrent is incomplete, erroring, checking/moving, or its
-         state is unknown: leave the file, try again another night
+         state is unknown: leave the file, try again another night.
+         With keep_seeding (the fill phase), a complete owner that is still
+         seeding or queued also waits: seeding data stays off the glacier disk
+         so it can spin down. Only owners that are already paused may move.
+
+active_roots() lists the content roots of torrents that are not paused, for
+the evict phase (it moves those roots off the glacier disk).
 
 Pure logic here; arr-webhook.py supplies the Deluge data and does the pausing.
 """
@@ -63,8 +69,9 @@ def is_paused(t):
     return isinstance(st, str) and st.lower() in PAUSED_STATES
 
 
-def classify_paths(paths, torrents):
-    """-> [{'path', 'status', 'reason', 'hashes'}] in input order."""
+def classify_paths(paths, torrents, keep_seeding=False):
+    """-> [{'path', 'status', 'reason', 'hashes'}] in input order. keep_seeding:
+    a complete owner that is not paused (seeding, queued) makes the path wait."""
     roots = content_roots(torrents)
     out = []
     for path in paths:
@@ -74,11 +81,30 @@ def classify_paths(paths, torrents):
             continue
         states = [(h,) + torrent_ok(torrents[h]) for h in hs]
         blockers = [f'{h[:8]} {why}' for h, ok, why in states if not ok]
+        if not blockers and keep_seeding:
+            blockers = [f'{h[:8]} seeding (kept off glacier)' for h in hs if not is_paused(torrents[h])]
         if blockers:
             out.append({'path': path, 'status': WAIT, 'reason': '; '.join(blockers), 'hashes': hs})
         else:
             out.append({'path': path, 'status': PAUSE, 'reason': 'complete, pause around move', 'hashes': hs})
     return out
+
+
+def active_roots(torrents):
+    """-> sorted [(state, root)] for every torrent that is not paused/stopped or
+    erroring (seeding, queued, downloading, checking, unknown state...). A root
+    owned by several torrents is listed once per torrent."""
+    out = []
+    for h, t in (torrents or {}).items():
+        t = t or {}
+        sp, name, st = t.get('save_path'), t.get('name'), t.get('state')
+        if not isinstance(sp, str) or not sp or not isinstance(name, str) or not name:
+            continue
+        st = st.lower() if isinstance(st, str) and st else 'unknown'
+        if st in PAUSED_STATES or st == 'error':
+            continue
+        out.append((st, posixpath.normpath(posixpath.join(sp, name))))
+    return sorted(out, key=lambda r: (r[1], r[0]))
 
 
 def pause_plan(rows, torrents):

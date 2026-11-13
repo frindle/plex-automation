@@ -262,7 +262,80 @@ def test_tiering_path_never_removes_a_torrent():
     import inspect
     src = ''.join(inspect.getsource(f) for f in (
         aw.tiering_torrent_gate_route, aw.tiering_torrent_pause_route, aw.tiering_torrent_resume_route,
-        aw._tiering_resume_stale, aw._tiering_torrents))
+        aw.tiering_active_roots_route, aw._tiering_resume_stale, aw._tiering_torrents))
     assert 'remove_torrent' not in src and 'apply_releases' not in src
     assert not hasattr(tiering_gate, 'apply_releases') and not hasattr(tiering_gate, 'seed_state')
     assert 'SEED_DAYS' not in src
+
+
+# --- keep_seeding (fill phase) and active roots (evict phase) -----------------
+
+def test_keep_seeding_makes_seeding_owners_wait_but_paused_ones_move(client):
+    c, calls, box = client
+    box['torrents']['hhhhhhhh88'] = tor('Q', '/data/Media/Q', state='Queued')
+    rows = by_path(post(c, [P_SHOW, P_MOVIE, P_FREE, P_PACK, '/data/Media/Q/Q/a.mkv'], '?keep_seeding=1'))
+    assert rows[P_SHOW]['status'] == 'wait' and 'seeding (kept off glacier)' in rows[P_SHOW]['reason']
+    assert rows['/data/Media/Q/Q/a.mkv']['status'] == 'wait'      # queued to seed counts as seeding
+    assert rows[P_MOVIE]['status'] == 'pause'                     # paused by the user: may move
+    assert rows[P_FREE]['status'] == 'free'
+    assert rows[P_PACK]['reason'].endswith('torrent not complete')  # the old reason still wins
+    assert calls['paused'] == []
+
+
+def test_keep_seeding_two_owners_one_paused_one_seeding_waits(client):
+    c, calls, box = client
+    box['torrents']['ffffffff66'] = tor('Show.S01.1080p', '/data/Media/TV Shows/Show', state='Paused')
+    assert by_path(post(c, [P_SHOW], '?keep_seeding=1'))[P_SHOW]['status'] == 'wait'
+    box['torrents']['aaaaaaaa11']['state'] = 'Paused'
+    assert by_path(post(c, [P_SHOW], '?keep_seeding=1'))[P_SHOW]['status'] == 'pause'
+
+
+def test_keep_seeding_pause_refuses_a_seeding_owner(client):
+    c, calls, box = client
+    resp = post(c, [P_SHOW], '?keep_seeding=1', route='torrent-pause')
+    assert resp.status_code == 409 and calls['paused'] == []
+    resp = post(c, [P_SHOW], route='torrent-pause')               # evict phase: pauses it
+    assert resp.status_code == 200 and calls['paused'] == ['aaaaaaaa11']
+
+
+def test_active_roots_lists_unpaused_torrents_only():
+    rows = tiering_gate.active_roots({
+        'a': tor('Show.S01', '/data/Downloads/Complete'),
+        'b': tor('Movie.mkv', '/data/Downloads/Complete', state='Paused'),
+        'c': tor('Pack', '/data/Downloads/Incomplete', progress=10.0, state='Downloading'),
+        'd': tor('Q', '/data/Media/TV Shows/Q', state='Queued'),
+        'e': tor('Err', '/data/x', state='Error'),
+        'f': tor('S', '/data/x', state='Stopped'),
+        'g': tor('Odd', '/data/y/', state=None),
+        'h': {'name': None, 'save_path': '/data'},
+        'i': {'name': '', 'save_path': '/data'},
+    })
+    assert rows == [
+        ('seeding', '/data/Downloads/Complete/Show.S01'),
+        ('downloading', '/data/Downloads/Incomplete/Pack'),
+        ('queued', '/data/Media/TV Shows/Q/Q'),
+        ('unknown', '/data/y/Odd'),
+    ]
+
+
+def test_active_roots_route_tsv_and_json(client):
+    c, calls, box = client
+    resp = c.get('/tiering/active-roots?format=tsv')
+    assert resp.status_code == 200 and resp.mimetype == 'text/plain'
+    lines = resp.get_data(as_text=True).splitlines()
+    assert 'seeding\t/data/Media/TV Shows/Show/Show.S01.1080p' in lines
+    assert 'seeding\t/data/Media/Other/Pack' in lines                   # incomplete: listed (the gate makes it wait)
+    assert not any(ln.endswith('/Movie.2020.mkv') for ln in lines)     # paused by the user
+    assert not any(ln.endswith('/Err') for ln in lines)                # erroring
+    js = c.get('/tiering/active-roots').get_json()
+    assert js['ok'] and {'state': 'unknown', 'root': '/data/Media/Odd/Odd'} in js['roots']
+    assert calls['paused'] == [] and calls['resumed'] == []
+
+
+def test_active_roots_route_deluge_down_answers_503(client, monkeypatch):
+    c, calls, box = client
+
+    def boom(method, params):
+        raise RuntimeError('down')
+    monkeypatch.setattr(aw, '_deluge_rpc', boom)
+    assert c.get('/tiering/active-roots?format=tsv').status_code == 503

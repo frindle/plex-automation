@@ -9012,11 +9012,31 @@ def _tiering_torrents():
     return torrents, None
 
 
+def _tiering_keep_seeding():
+    return request.args.get('keep_seeding') == '1'
+
+
+@app.route('/tiering/active-roots', methods=['GET'])
+def tiering_active_roots_route():
+    """Content roots (Deluge namespace) of torrents that are not paused, for the
+    glacier mover's evict phase: it moves those roots off the glacier disk so the
+    disk can spin down. ?format=tsv returns state<TAB>root lines. Read-only
+    (besides resuming stale pauses); Deluge trouble answers 503."""
+    torrents, err = _tiering_torrents()
+    if err:
+        return err
+    rows = tiering_gate.active_roots(torrents)
+    if request.args.get('format') == 'tsv':
+        return app.response_class(''.join(f'{st}\t{root}\n' for st, root in rows), mimetype='text/plain'), 200
+    return jsonify({'ok': True, 'roots': [{'state': st, 'root': root} for st, root in rows]}), 200
+
+
 @app.route('/tiering/torrent-gate', methods=['POST'])
 def tiering_torrent_gate_route():
     """Glacier mover gate, classification only (no side effects besides resuming
     stale pauses). Body: newline-separated paths (Deluge namespace) or
     {"paths": [...]}. Each path comes back free / pause / wait (see tiering_gate).
+    ?keep_seeding=1 (the fill phase) makes paths of seeding/queued torrents wait.
     ?format=tsv returns status<TAB>reason<TAB>path lines for the bash mover. Any
     Deluge trouble answers 503 so the mover treats every file as 'wait'.
     Torrents are never removed from here."""
@@ -9026,7 +9046,7 @@ def tiering_torrent_gate_route():
     torrents, err = _tiering_torrents()
     if err:
         return err
-    rows = tiering_gate.classify_paths(paths, torrents)
+    rows = tiering_gate.classify_paths(paths, torrents, keep_seeding=_tiering_keep_seeding())
     if request.args.get('format') == 'tsv':
         return app.response_class(tiering_gate.to_tsv(rows), mimetype='text/plain'), 200
     counts = {}
@@ -9038,8 +9058,8 @@ def tiering_torrent_gate_route():
 @app.route('/tiering/torrent-pause', methods=['POST'])
 def tiering_torrent_pause_route():
     """Pause the torrents owning one unit's files, right before the mover copies it.
-    Body as /tiering/torrent-gate (the unit's Deluge-namespace paths). Re-classifies
-    first: any 'wait' path -> 409 and nothing is paused. A torrent someone else
+    Body as /tiering/torrent-gate (the unit's Deluge-namespace paths, same
+    ?keep_seeding). Re-classifies first: any 'wait' path -> 409 and nothing is paused. A torrent someone else
     already paused is left alone (reported as foreign, never resumed by us). Each
     torrent we pause is written to the ledger (TIERING_PAUSE_STATE_PATH) so a
     crashed mover cannot strand it paused: stale entries (TIERING_PAUSE_MAX_MIN)
@@ -9052,7 +9072,7 @@ def tiering_torrent_pause_route():
     torrents, err = _tiering_torrents()
     if err:
         return err
-    rows = tiering_gate.classify_paths(paths, torrents)
+    rows = tiering_gate.classify_paths(paths, torrents, keep_seeding=_tiering_keep_seeding())
     to_pause, already, blockers = tiering_gate.pause_plan(rows, torrents)
     if blockers:
         return jsonify({'ok': False, 'error': 'not pausable: ' + blockers[0]['reason']}), 409

@@ -29,6 +29,7 @@ EOF
 gate_call() { echo gate >>"$R/gate.calls"; while IFS= read -r p; do echo "$p" >>"$R/gate.paths"; printf 'free\tno torrent\t%s\n' "$p"; done; }
 pause_call() { local n=0 p; while IFS= read -r p; do [ -n "$p" ] || continue; echo "$p" >>"$R/pause.paths"; n=$((n+1)); printf 'paused\th%s\n' "$(basename "$p")"; done; echo pause >>"$R/pause.calls"; }
 resume_call() { while IFS= read -r h; do echo "$h" >>"$R/resume.hashes"; done; echo resume >>"$R/resume.calls"; }
+active_roots_call() { cat "$R/active.tsv" 2>/dev/null; return 0; }    # default: no torrent is active
 EOF
   : >"$R/notify.log"
   printf '#!/bin/sh\necho "$@" >>"%s/notify.log"\n' "$R" >"$R/bin/notify"; chmod +x "$R/bin/notify"
@@ -515,6 +516,214 @@ mkdir -p "$M/user"
 run --apply >/dev/null
 check "no /mnt/user entry created" test -z "$(ls -A "$M/user")"
 ! grep -q "/mnt/user" "$SCRIPT" 2>/dev/null && ok || bad "script never references /mnt/user"
+
+# --- evict phase (disk1 -> disk2) -------------------------------------------
+evict_cfg() { mkdir -p "$R/boot/config/shares"; printf '%s\n' "${1:-shareExclude=\"disk1\"}" >"$R/boot/config/shares/data.cfg"; }
+EVICT_GATE_OVR='gate_call() { echo "keep=${GATE_KEEP:-none}" >>"$R/gate.keep"; while IFS= read -r p; do echo "$p" >>"$R/gate.paths"; case "$p" in
+  */dl/*) printf "wait\ttorrent not complete\t%s\n" "$p";; /data/Downloads/*) printf "pause\tcomplete\t%s\n" "$p";; *) printf "free\tno torrent\t%s\n" "$p";; esac; done; }
+pause_call() { echo "keep=${GATE_KEEP:-none}" >>"$R/pause.keep"; while IFS= read -r p; do [ -n "$p" ] && echo "$p" >>"$R/pause.paths"; done; echo pause >>"$R/pause.calls"; printf "paused\th%s\n" "$(wc -l <"$R/pause.calls")"; }'
+D=data/Downloads/Complete
+
+setup evict_seeding_root_moves_with_pause
+evict_cfg
+mkf disk1 "$D/Pack/e1.mkv" 300 5
+mkf disk1 "$D/Pack/sub/e2.mkv" 300 5
+mkf disk1 "$D/unrelated.txt" 10 5
+printf 'seeding\t/%s/Pack\n' "$D" >"$R/active.tsv"
+EXTRA_OVR="$EVICT_GATE_OVR"
+out="$(run --apply)"; rc=$?
+EXTRA_OVR=""; export EXTRA_OVR
+eq "exit code" "$rc" 0
+check "e1 on disk2" src disk2 "$D/Pack/e1.mkv"
+check "e2 on disk2" src disk2 "$D/Pack/sub/e2.mkv"
+check "e1 gone from disk1" gone "$D/Pack/e1.mkv"
+check "file of no torrent stays" onglacier "$D/unrelated.txt"
+eq "one pause for the whole torrent" "$(wc -l <"$R/pause.calls")" 1
+eq "resumed what it paused" "$(cat "$R/resume.hashes")" "h1"
+check "emptied torrent folder removed from disk1" test ! -d "$M/disk1/$D/Pack"
+check "folder still holding a file kept" test -d "$M/disk1/$D"
+check "share top folder kept" test -d "$M/disk1/data/Downloads"
+echo "$out" | grep -q 'per-disk  disk1 -> disk2: 2 file(s), 600 B' && ok || bad "per-disk line for evict: $out"
+echo "$out" | grep -q 'evict disk1 -> disk2: moved=2 (600 B)' && ok || bad "evict summary: $out"
+grep -q 'off it to disk2' "$R/notify.log" && ok || bad "notify mentions evict: $(cat "$R/notify.log")"
+
+setup evict_seeding_files_held_open_until_pause
+evict_cfg
+mkf disk1 "$D/Pack/e1.mkv" 300 5
+printf 'seeding\t/%s/Pack\n' "$D" >"$R/active.tsv"
+EXTRA_OVR="$EVICT_GATE_OVR"'
+is_open() { [ ! -e "$R/pause.calls" ]; }'
+out="$(run --apply)"
+EXTRA_OVR=""; export EXTRA_OVR
+check "open-before-pause seeding file still moves" src disk2 "$D/Pack/e1.mkv"
+
+setup evict_still_open_after_pause_stays
+evict_cfg
+mkf disk1 "$D/Pack/e1.mkv" 300 5
+printf 'seeding\t/%s/Pack\n' "$D" >"$R/active.tsv"
+EXTRA_OVR="$EVICT_GATE_OVR"'
+is_open() { return 0; }'
+out="$(run --apply)"
+EXTRA_OVR=""; export EXTRA_OVR
+check "still-open file stays on disk1" onglacier "$D/Pack/e1.mkv"
+check "resumed after the skip" test -s "$R/resume.hashes"
+
+setup evict_downloading_torrent_waits
+evict_cfg
+mkf disk1 "$D/dl/part.mkv" 300 5
+printf 'downloading\t/%s/dl\n' "$D" >"$R/active.tsv"
+EXTRA_OVR="$EVICT_GATE_OVR"
+out="$(run --apply)"
+EXTRA_OVR=""; export EXTRA_OVR
+check "downloading data stays" onglacier "$D/dl/part.mkv"
+check "never paused" test ! -e "$R/pause.calls"
+echo "$out" | grep -q 'waiting-on-torrent=1 unit(s)' && ok || bad "counts the waiting unit: $out"
+echo "$out" | grep -q 'downloading 1' && ok || bad "logs root states: $out"
+
+setup evict_hardlink_partner_moves_and_stays_linked
+evict_cfg
+mkf disk1 "$D/Show.S01/e1.mkv" 300 7
+mkdir -p "$M/disk1/data/Media/TV/Show"; ln "$M/disk1/$D/Show.S01/e1.mkv" "$M/disk1/data/Media/TV/Show/e1.mkv"
+printf 'seeding\t/%s/Show.S01\n' "$D" >"$R/active.tsv"
+EXTRA_OVR="$EVICT_GATE_OVR"
+out="$(run --apply)"
+EXTRA_OVR=""; export EXTRA_OVR
+check "torrent copy on disk2" src disk2 "$D/Show.S01/e1.mkv"
+check "library link on disk2" src disk2 data/Media/TV/Show/e1.mkv
+check "library link gone from disk1" gone data/Media/TV/Show/e1.mkv
+eq "still one inode" "$(stat -c %i "$M/disk2/$D/Show.S01/e1.mkv")" "$(stat -c %i "$M/disk2/data/Media/TV/Show/e1.mkv" 2>/dev/null)"
+eq "access time kept" "$(stat -c %X "$M/disk2/data/Media/TV/Show/e1.mkv" 2>/dev/null)" "$((NOW - 7 * DAY))"
+echo "$out" | grep -q 'evict disk1 -> disk2: moved=2 (300 B)' && ok || bad "linked bytes counted once: $out"
+
+setup evict_cross_seed_is_one_unit
+evict_cfg
+mkf disk1 "$D/A/x.mkv" 300 5
+mkdir -p "$M/disk1/$D/B"; ln "$M/disk1/$D/A/x.mkv" "$M/disk1/$D/B/x.mkv"
+mkf disk1 "$D/B/x.nfo" 10 5
+printf 'seeding\t/%s/A\nseeding\t/%s/B\n' "$D" "$D" >"$R/active.tsv"
+EXTRA_OVR="$EVICT_GATE_OVR"
+run --apply >/dev/null
+EXTRA_OVR=""; export EXTRA_OVR
+eq "one pause covers both torrents" "$(wc -l <"$R/pause.calls")" 1
+check "A on disk2" src disk2 "$D/A/x.mkv"
+check "B link on disk2" src disk2 "$D/B/x.mkv"
+check "B's own file on disk2" src disk2 "$D/B/x.nfo"
+
+setup evict_blocked_units_stay
+evict_cfg
+mkf disk1 "$D/C/c.mkv" 300 5
+mkdir -p "$M/disk1/data/Sandbox"; ln "$M/disk1/$D/C/c.mkv" "$M/disk1/data/Sandbox/c.mkv"
+mkf disk1 "$D/E/e.mkv" 300 5
+ln "$M/disk1/$D/E/e.mkv" "$M/disk1/data/odd"$'\n'"name.mkv"
+mkf disk1 "$D/F/f.mkv" 300 5
+printf 'seeding\t/%s/C\nseeding\t/%s/E\nseeding\t/%s/F\n' "$D" "$D" "$D" >"$R/active.tsv"
+EXTRA_OVR="$EVICT_GATE_OVR"
+out="$(run --apply)"
+EXTRA_OVR=""; export EXTRA_OVR
+check "link in a never-touch folder: stays" onglacier "$D/C/c.mkv"
+check "never-touch link untouched" test -f "$M/disk1/data/Sandbox/c.mkv"
+check "link count mismatch: stays" onglacier "$D/E/e.mkv"
+check "clean torrent still moves" src disk2 "$D/F/f.mkv"
+echo "$out" | grep -q 'evict left 2 unit(s) on disk1' && ok || bad "reports blocked units: $out"
+echo "$out" | grep -q 'never-touch folder' && ok || bad "names the never-touch reason: $out"
+echo "$out" | grep -q 'link count does not match' && ok || bad "names the link-count reason: $out"
+
+setup evict_hot_roots_move_databases_stay
+evict_cfg
+mkf disk1 data/Documents/notes.txt 100 3
+mkf disk1 data/Documents/app/state.db 100 3
+mkf disk1 data/ollama-models/blobs/sha256-abc 400 3
+mkf disk1 data/Other/keep.txt 100 3
+out="$(run --apply)"
+check "Documents file on disk2" src disk2 data/Documents/notes.txt
+check "model blob on disk2" src disk2 data/ollama-models/blobs/sha256-abc
+check "database stays" onglacier data/Documents/app/state.db
+check "folder outside the hot list stays" onglacier data/Other/keep.txt
+echo "$out" | grep -q 'evict: unit left on disk1 (database or VM disk file)' && ok || bad "names the database rule: $out"
+
+setup evict_too_broad_roots_ignored
+evict_cfg
+mkf disk1 data/Media/TV/Show/e.mkv 300 5
+mkf disk1 data/Downloads/x.mkv 300 5
+printf 'seeding\t/data/Media/TV\nseeding\t/data/Downloads\n' >"$R/active.tsv"
+EXTRA_OVR="$EVICT_GATE_OVR"
+out="$(run --apply)"
+EXTRA_OVR=""; export EXTRA_OVR
+check "library folder root ignored" onglacier data/Media/TV/Show/e.mkv
+check "share folder root ignored" onglacier data/Downloads/x.mkv
+eq "two too-broad warnings" "$(echo "$out" | grep -c 'too broad')" 2
+
+setup evict_needs_share_exclusion_to_apply
+mkf disk1 data/Documents/notes.txt 100 3
+out="$(run --apply)"
+check "no exclusion: nothing evicted" onglacier data/Documents/notes.txt
+echo "$out" | grep -q 'SKIP evict: disk1 is not excluded' && ok || bad "says why: $out"
+evict_cfg 'shareInclude="disk2,disk3"'
+run --apply >/dev/null
+check "include list without disk1 counts as excluded" src disk2 data/Documents/notes.txt
+setup evict_include_list_with_glacier_skips
+mkf disk1 data/Documents/notes.txt 100 3
+evict_cfg 'shareInclude="disk1,disk2"'
+run --apply >/dev/null
+check "include list naming disk1: skipped" onglacier data/Documents/notes.txt
+
+setup evict_no_torrent_answer_keeps_torrent_data
+evict_cfg
+mkf disk1 "$D/Pack/e1.mkv" 300 5
+mkf disk1 data/Documents/notes.txt 100 3
+EXTRA_OVR="$EVICT_GATE_OVR"'
+active_roots_call() { echo "connection refused"; return 7; }'
+out="$(run --apply)"
+EXTRA_OVR=""; export EXTRA_OVR
+check "torrent data stays" onglacier "$D/Pack/e1.mkv"
+check "hot roots still move" src disk2 data/Documents/notes.txt
+echo "$out" | grep -q 'no answer from the torrent list' && ok || bad "warns: $out"
+
+setup evict_dry_run_moves_nothing_and_frees_room_for_fill
+evict_cfg
+mkf disk1 data/Documents/big.bin 3000 3
+mkf disk1 data/Media/existing.mkv 6500 400
+mkf disk2 data/Media/a.mkv 1000 300
+out="$(run)"
+check "dry run: hot file stays" onglacier data/Documents/big.bin
+check "dry run: cold file stays" src disk2 data/Media/a.mkv
+echo "$out" | grep -q 'WOULD MOVE  disk1 -> disk2  3.00 KB' && ok || bad "would evict: $out"
+echo "$out" | grep -q 'WOULD MOVE  disk2 -> disk1  1.00 KB' && ok || bad "fill counts the room evict frees: $out"
+check "dry run sent no notification" test ! -s "$R/notify.log"
+
+setup evict_and_fill_gate_modes
+evict_cfg
+mkf disk1 "$D/Pack/e1.mkv" 300 5
+mkf disk2 data/Media/a.mkv 300 300
+printf 'seeding\t/%s/Pack\n' "$D" >"$R/active.tsv"
+EXTRA_OVR="$EVICT_GATE_OVR"
+run --apply >/dev/null
+EXTRA_OVR=""; export EXTRA_OVR
+eq "evict gate without keep_seeding, then fill with it" "$(tr '\n' '|' <"$R/gate.keep")" "keep=none|keep=1|"
+eq "evict pause without keep_seeding" "$(cat "$R/pause.keep")" "keep=none"
+check "fill still ran" onglacier data/Media/a.mkv
+
+setup evict_and_fill_share_the_nightly_cap
+evict_cfg
+mkf disk1 data/Documents/hot.bin 1000 3
+mkf disk2 data/Media/cold.mkv 1000 300
+out="$(ENVX="NIGHTLY_CAP_BYTES=1500" run --apply)"
+check "evict used the cap first" src disk2 data/Documents/hot.bin
+check "fill left with 500 B: cold file waits" src disk2 data/Media/cold.mkv
+echo "$out" | grep -q 'fill -> disk1: .*cap left=500 B' && ok || bad "fill sees the leftover cap: $out"
+
+setup evict_respects_destination_limit
+evict_cfg
+mkf disk2 data/Media/filler.mkv 9000 300
+mkf disk1 data/Documents/hot.bin 600 3
+ENVX="PHASES=evict" run --apply >/dev/null
+check "disk2 would pass 95%: stays" onglacier data/Documents/hot.bin
+
+setup evict_off_with_phases_fill
+evict_cfg
+mkf disk1 data/Documents/notes.txt 100 3
+ENVX="PHASES=fill" run --apply >/dev/null
+check "PHASES=fill leaves disk1 data alone" onglacier data/Documents/notes.txt
 
 echo
 echo "glacier tests: $PASS passed, $FAIL failed"
