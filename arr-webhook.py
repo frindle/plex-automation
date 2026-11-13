@@ -123,6 +123,150 @@ def _llm_tags(name):
             'web': any(t in n for t in ('.web.', '.webdl.', '.webrip.')),
             'group': m.group(1) if m else None}
 
+
+def _llm_mode():
+    mode = (os.environ.get('LLM_DECISIONS', 'off') or '').strip().lower()
+    return mode if mode in ('shadow', 'enforce') else 'off'
+
+
+LLM_SEEDERS_POLLS = 4
+LLM_SEEDERS_POLL_S = 3.0
+
+
+def _flag_bits(raw, flag_map):
+    """IndexerFlags as an int from an int, a list of names/ints, or a comma string. None when absent."""
+    if raw is None or isinstance(raw, bool) or raw in ('', []):
+        return None
+    if isinstance(raw, int):
+        return raw
+    bits = 0
+    for tok in (raw if isinstance(raw, (list, tuple)) else str(raw).split(',')):
+        if isinstance(tok, int) and not isinstance(tok, bool):
+            bits |= tok
+            continue
+        t = str(tok).strip().lower()
+        if t.isdigit():
+            bits |= int(t)
+        elif t:
+            bits |= flag_map.get(t) or flag_map.get(t[2:] if t.startswith('g_') else 'g_' + t) or 0
+    return bits
+
+
+def _freeleech(bits, flag_map):
+    """'full', 'partial', 'no', or None when the flags are unknown."""
+    if bits is None:
+        return None
+    full = flag_map.get('g_freeleech') or flag_map.get('freeleech') or 0
+    partial = 0
+    for name in ('halfleech', 'freeleech75', 'freeleech25'):
+        partial |= flag_map.get('g_' + name) or flag_map.get(name) or 0
+    if bits & full:
+        return 'full'
+    if bits & partial:
+        return 'partial'
+    return 'no'
+
+
+def _grab_freeleech(source, data, download_id):
+    """Freeleech status of a grab: the payload's release.indexerFlags, else the grab history's. None if unknown."""
+    flag_map = _SONARR_INDEXER_FLAGS if source == 'Sonarr' else _RADARR_INDEXER_FLAGS
+    bits = _flag_bits((data.get('release') or {}).get('indexerFlags'), flag_map)
+    if bits is None:
+        url, key = (SONARR_URL, SONARR_API_KEY) if source == 'Sonarr' else (RADARR_URL, RADARR_API_KEY)
+        try:
+            r = requests.get(
+                f'{url}/api/v3/history',
+                headers={'X-Api-Key': key},
+                params={'downloadId': download_id, 'eventType': 1, 'pageSize': 10,
+                        'sortKey': 'date', 'sortDirection': 'descending'},
+                timeout=10,
+            )
+            r.raise_for_status()
+            records = (r.json() or {}).get('records') or []
+            if records:
+                newest = max(records, key=lambda x: x.get('date') or '')
+                bits = _flag_bits((newest.get('data') or {}).get('indexerFlags'), flag_map)
+                if bits is None:
+                    bits = 0  # a grab record with no flags is a plain release
+        except Exception as e:  # noqa: BLE001
+            log.info(f'{source}: indexerFlags lookup failed for {download_id}: {e}')
+    return _freeleech(bits, flag_map)
+
+
+def _existing_file_facts(source, data):
+    """Quality, size, group, HDR and audio of the file an upgrade would replace. {} on any error."""
+    try:
+        if source == 'Sonarr':
+            eps = data.get('episodes') or []
+            ep_id = (eps[0] or {}).get('id') if eps else None
+            if not ep_id:
+                return {}
+            hdr = {'X-Api-Key': SONARR_API_KEY}
+            r = requests.get(f'{SONARR_URL}/api/v3/episode/{ep_id}', headers=hdr, timeout=10)
+            r.raise_for_status()
+            fid = (r.json() or {}).get('episodeFileId')
+            if not fid:
+                return {}
+            r = requests.get(f'{SONARR_URL}/api/v3/episodefile/{fid}', headers=hdr, timeout=10)
+            r.raise_for_status()
+            f = r.json() or {}
+        else:
+            mid = (data.get('movie') or {}).get('id')
+            if not mid:
+                return {}
+            r = requests.get(f'{RADARR_URL}/api/v3/moviefile', headers={'X-Api-Key': RADARR_API_KEY},
+                             params={'movieId': mid}, timeout=10)
+            r.raise_for_status()
+            files = r.json() or []
+            if not files:
+                return {}
+            f = max(files, key=lambda x: x.get('size') or 0)
+        if not isinstance(f, dict):
+            return {}
+        size = f.get('size')
+        mi = f.get('mediaInfo') or {}
+        return {
+            'existing_quality': ((f.get('quality') or {}).get('quality') or {}).get('name'),
+            'existing_size_gb': round(size / (1024 ** 3), 2) if isinstance(size, (int, float)) and size > 0 else None,
+            'existing_group': f.get('releaseGroup') or None,
+            'existing_hdr': mi.get('videoDynamicRangeType') or None,
+            'existing_audio': mi.get('audioCodec') or None,
+        }
+    except Exception as e:  # noqa: BLE001
+        log.info(f'{source}: existing-file lookup failed: {e}')
+        return {}
+
+
+def _grab_seeders(download_id, polls=None, poll_s=None):
+    """Swarm seeders for a fresh grab from Deluge's total_seeds, polled briefly while the tracker scrapes.
+    libtorrent reports -1 until it knows, so a negative or missing count is None (unknown), never 0."""
+    polls = LLM_SEEDERS_POLLS if polls is None else polls
+    poll_s = LLM_SEEDERS_POLL_S if poll_s is None else poll_s
+    try:
+        deluge_login()
+        for i in range(max(polls, 1)):
+            if i:
+                time.sleep(poll_s)
+            res = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.get_torrent_status', 'params': [download_id, ['total_seeds']], 'id': 94},
+                timeout=10,
+            ).json().get('result') or {}
+            n = res.get('total_seeds')
+            if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+                return n
+    except Exception as e:  # noqa: BLE001
+        log.info(f'seeders lookup failed for {download_id}: {e}')
+    return None
+
+
+def _upgrade_gate_extra(source, data, download_id):
+    """Facts the gate needs beyond the release name: what it replaces, freeleech, seeders."""
+    extra = _existing_file_facts(source, data)
+    extra['freeleech'] = _grab_freeleech(source, data, download_id)
+    extra['seeders'] = _grab_seeders(download_id)
+    return extra
+
 ACTIVITY_LOG_RETENTION_DAYS = int(os.environ.get('ACTIVITY_LOG_RETENTION_DAYS', '7'))
 
 def trim_activity_log(retention_days=ACTIVITY_LOG_RETENTION_DAYS):
@@ -1692,6 +1836,10 @@ def cleanup_scheduler():
         cleanup_sonarr_queue_dupes()
         dedup_via_radarr()
         dedup_via_sonarr()
+        try:
+            plex_dupe_fix_daily()
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'plex dupe fix daily crashed: {e}')
         cleanup_unpacked_torrents()
         time.sleep(86400)
 
@@ -3753,6 +3901,20 @@ def send_pushover(title, message, url=None):
 
 _ib_seen = {}  # downloadId → epoch of last notify
 
+IMPORT_LLM_PENDING = 'LLM advisor still waiting on the local model; will retry'
+
+
+def _identity_refusal(facts):
+    """None when the advisor confirms the match; else the resolver detail. A decision still pending on the local
+    model gets IMPORT_LLM_PENDING, which check_import_blocked retries quietly instead of pushing."""
+    info = {}
+    if _llm_advise('import_identity', facts, 'match', info) == 'match':
+        return None
+    if info.get('pending'):
+        return IMPORT_LLM_PENDING
+    return 'LLM advisor did not confirm the match; needs manual review'
+
+
 def _ib_seen_recently(download_id, ttl_hours=24):
     now = time.time()
     for k, ts in list(_ib_seen.items()):
@@ -3841,8 +4003,9 @@ def _try_radarr_manual_import(record):
     queue_years = _year_in_title(queue_title)
     year = matched.get('year')
     facts = {'service': 'Radarr', 'queue_title': queue_title, 'matched_title': matched.get('title'), 'matched_year': year, 'year_matches': (year in queue_years) if (year and queue_years) else None, 'files': len(files)}
-    if _llm_advise('import_identity', facts, 'match') != 'match':
-        return False, 'LLM advisor did not confirm the match; needs manual review'
+    refused = _identity_refusal(facts)
+    if refused:
+        return False, refused
     try:
         cmd = requests.post(
             f'{RADARR_URL}/api/v3/command',
@@ -3894,8 +4057,9 @@ def _try_sonarr_manual_import(record):
     queue_years = _year_in_title(re.sub(r'(?<!\d)(19|20)\d{2}[.\- ]\d{2}[.\- ]\d{2}(?!\d)', ' ', queue_title))
     year = matched.get('year')
     facts = {'service': 'Sonarr', 'queue_title': queue_title, 'matched_title': matched.get('title'), 'matched_year': year, 'year_matches': (year in queue_years) if (year and queue_years) else None, 'files': len(files)}
-    if _llm_advise('import_identity', facts, 'match') != 'match':
-        return False, 'LLM advisor did not confirm the match; needs manual review'
+    refused = _identity_refusal(facts)
+    if refused:
+        return False, refused
     try:
         cmd = requests.post(
             f'{SONARR_URL}/api/v3/command',
@@ -3942,6 +4106,10 @@ def check_import_blocked():
             if ok:
                 log.info(f'[importBlocked] {label}: auto-imported "{title}" — {detail}')
                 record_activity('import-rescue', f'{label}: auto-imported stuck download "{title}"')
+                continue
+            if detail == IMPORT_LLM_PENDING:
+                # Not stuck yet: the advisor answers on a later pass. No push, and the 24 h dedupe isn't started.
+                log.info(f'[importBlocked] {label}: "{title}" waiting on the LLM advisor; retrying next pass')
                 continue
             if _ib_seen_recently(download_id):
                 continue
@@ -4557,6 +4725,9 @@ def handle_grab(data, source):
         'candidate_dv_web': tags['dv'] and tags['web'],
         'seed_days': SEED_DAYS,
     }
+    if _llm_mode() != 'off':
+        # Only paid for when the advisor will read them (extra *arr/Deluge calls, a short seeders poll).
+        facts.update(_upgrade_gate_extra(source, data, download_id))
     llm_info = {}
     action = _llm_advise('upgrade_gate', facts, rules_action, llm_info)
     if llm_info.get('pending'):
@@ -6570,6 +6741,63 @@ def torrent_move():
 # gets relabeled `superseded` and moved to SEEDING_DIR so Plex loses
 # sight of it and cleanup_superseded takes it out after SEED_DAYS.
 # Dry-run default. ?apply=1 executes.
+def _torrents_with_basename(torrents, filepath):
+    """Hashes of torrents holding a file with this basename (any folder)."""
+    base = os.path.basename((filepath or '').rstrip('/'))
+    hits = set()
+    if not base:
+        return hits
+    for h, info in torrents.items():
+        if (info.get('name') or '') == base:
+            hits.add(h)
+            continue
+        for f in (info.get('files') or []):
+            p = f.get('path') if isinstance(f, dict) else str(f)
+            if p and os.path.basename(p) == base:
+                hits.add(h)
+                break
+    return hits
+
+
+def _same_physical_file(a, b):
+    """True when two paths are one file (same real path, or the same inode with a
+    single link, i.e. two views of one file). Separate hardlinks are not the same."""
+    if not a or not b:
+        return False
+    try:
+        if os.path.realpath(a) == os.path.realpath(b):
+            return True
+        if os.path.exists(b) and os.path.samefile(a, b):
+            return os.stat(a).st_nlink == 1
+    except OSError:
+        return True  # can't tell: treat as the keeper and don't delete
+    return False
+
+
+def _torrent_path_hits(torrents, filepath):
+    """Hashes whose save_path+file (or a file's relative path as a suffix) matches
+    filepath: pass 1 of _find_torrent_by_filepath, every hit instead of the first."""
+    target = (filepath or '').rstrip('/')
+    hits = []
+    if not target:
+        return hits
+    for h, info in torrents.items():
+        save_path = (info.get('save_path') or '').rstrip('/')
+        name = info.get('name') or ''
+        if name and save_path and f'{save_path}/{name}' == target:
+            hits.append(h)
+            continue
+        for f in (info.get('files') or []):
+            p = f.get('path') if isinstance(f, dict) else str(f)
+            if not p:
+                continue
+            full = f'{save_path}/{p}' if save_path else p
+            if full == target or target.endswith('/' + p):
+                hits.append(h)
+                break
+    return hits
+
+
 def _find_torrent_by_filepath(torrents, filepath):
     """Find the Deluge torrent seeding a specific file.
 
@@ -6659,16 +6887,28 @@ def plex_dupe_fix():
         media_list = entry.get('media') or []
         if len(media_list) < 2:
             continue
-        # Identical filenames = Plex ghost entry. Manual fix (Refresh Metadata).
-        basenames = [os.path.basename(m.get('file') or '') for m in media_list]
-        if len(set(basenames)) == 1:
+        # Plex can list the same file twice (a ghost entry). Only an identical
+        # full path is a ghost; the same filename in two folders is two real
+        # copies and goes through the quality-upgrade path below. Duplicate
+        # paths are collapsed first so a "loser" can never be the keeper's own
+        # file.
+        unique_media, seen_paths = [], set()
+        for m in media_list:
+            f = m.get('file') or ''
+            key = os.path.normpath(f) if f else ('', id(m))
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            unique_media.append(m)
+        if len(unique_media) == 1:
             plan['same_file_ghost'].append({
                 'plex_key': plex_key,
                 'title': entry.get('title'),
-                'file': basenames[0],
+                'file': os.path.basename(unique_media[0].get('file') or ''),
                 'action': 'Plex → item → ⋯ → Refresh Metadata',
             })
             continue
+        media_list = unique_media
         # Score each Media: (resolution_rank, size_gb). Higher wins.
         res_rank = {'4k': 4, '2160': 4, '1080': 3, '720': 2, '576': 1, '480': 1, None: 0}
         def score(m):
@@ -6710,36 +6950,26 @@ def plex_dupe_fix():
         sorted_media = sorted(media_list, key=score, reverse=True)
         keeper = sorted_media[0]
         losers = sorted_media[1:]
+        keeper_file = keeper.get('file') or ''
+        keeper_base = os.path.basename(keeper_file)
         upgrade_actions = []
-        # LLM dupe-keeper advisory for 2-version groups only.
-        if len(media_list) == 2:
-            def _version_dict(m):
-                f = m.get('file') or ''
-                h, tinfo = _find_torrent_by_filepath(torrents, f)
-                secs = (tinfo or {}).get('seeding_time')
-                return {
-                    'path': _translate_plex_path(f),
-                    'size_gb': m.get('size_gb'),
-                    'res': m.get('resolution'),
-                    'hdr': _llm_tags(os.path.basename(f))['hdr'],
-                    'seeding': bool(h and tinfo),
-                    'seeded_days': round(secs / 86400, 1) if isinstance(secs, (int, float)) else None,
-                }
-            facts = {
-                'title': entry.get('title'),
-                'seed_days': SEED_DAYS,
-                'first': _version_dict(media_list[0]),
-                'second': _version_dict(media_list[1]),
-            }
-            rules_action = 'keep_first' if keeper is media_list[0] else 'keep_second'
-            if _llm_advise('dupe_keeper', facts, rules_action) == 'keep_both':
-                plan.setdefault('kept_by_llm', []).append({
-                    'plex_key': plex_key, 'title': entry.get('title'),
-                })
-                continue
         for loser in losers:
             fpath = loser.get('file') or ''
-            h, tinfo = _find_torrent_by_filepath(torrents, fpath)
+            ambiguous = False
+            if keeper_base and os.path.basename(fpath) == keeper_base:
+                # Same filename as the keeper: a basename or short-suffix hit
+                # could be the keeper's own torrent. Only a torrent that matches
+                # this path and not the keeper's counts; if some torrent holds
+                # the name but none tells the two apart, leave it for a human.
+                only = [x for x in _torrent_path_hits(torrents, fpath)
+                        if x not in set(_torrent_path_hits(torrents, keeper_file))]
+                if len(set(only)) == 1:
+                    h, tinfo = only[0], torrents[only[0]]
+                else:
+                    h, tinfo = None, None
+                    ambiguous = bool(only) or bool(_torrents_with_basename(torrents, fpath))
+            else:
+                h, tinfo = _find_torrent_by_filepath(torrents, fpath)
             action = {
                 'file': fpath,
                 'basename': os.path.basename(fpath),
@@ -6750,7 +6980,10 @@ def plex_dupe_fix():
                 'torrent_name': tinfo.get('name') if tinfo else None,
                 'torrent_label': tinfo.get('label') if tinfo else None,
             }
-            if apply:
+            if ambiguous:
+                action['result'] = ('skipped: a torrent seeds a file with this name but not this path; '
+                                    'check by hand')
+            elif apply:
                 try:
                     if h and tinfo:
                         supersede_torrent(h)
@@ -6764,6 +6997,8 @@ def plex_dupe_fix():
                         action['local_path'] = local
                         if not os.path.exists(local):
                             action['result'] = f'file not found at {local} (path map miss?)'
+                        elif _same_physical_file(local, _translate_plex_path(keeper.get('file') or '')):
+                            action['result'] = 'skipped: same file on disk as the keeper'
                         else:
                             try:
                                 os.remove(local)
@@ -6791,6 +7026,87 @@ def plex_dupe_fix():
         'counts': {k: len(v) for k, v in plan.items()},
         'plan': plan,
     }), 200
+
+# Daily /plex-dupe-fix run from cleanup_scheduler.
+# PLEX_DUPE_FIX_DAILY: off | dry (default: plan only, writes the report) | apply.
+# The report at PLEX_DUPE_FIX_REPORT is the last run's full plan, so a dry run
+# can be compared against it before switching to apply. Pushes only when an
+# apply run fails (scan error, delete/supersede error); everything else goes
+# to the activity log.
+PLEX_DUPE_FIX_REPORT = os.environ.get('PLEX_DUPE_FIX_REPORT', '/data/plex_dupe_fix_last.json')
+_DUPE_FIX_FAIL_PREFIXES = ('FAILED', 'PERMISSION DENIED', 'delete failed', 'file not found')
+
+
+def _plex_dupe_fix_daily_mode():
+    v = (os.environ.get('PLEX_DUPE_FIX_DAILY') or 'dry').strip().lower()
+    return v if v in ('off', 'dry', 'apply') else 'dry'
+
+
+def _dupe_fix_failures(body):
+    out = []
+    for item in ((body or {}).get('plan') or {}).get('quality_upgrade') or []:
+        for a in item.get('supersede') or []:
+            res = a.get('result') or ''
+            if res.startswith(_DUPE_FIX_FAIL_PREFIXES):
+                out.append(f"{item.get('title')}: {a.get('basename')} -> {res}")
+    return out
+
+
+def _write_json_atomic(path, obj):
+    d = os.path.dirname(path) or '.'
+    os.makedirs(d, exist_ok=True)
+    tmp = f'{path}.tmp'
+    with open(tmp, 'w') as f:
+        _json.dump(obj, f, indent=1, default=str)
+    os.replace(tmp, path)
+
+
+def plex_dupe_fix_daily():
+    """Run /plex-dupe-fix in the background. Returns the report dict, or None when off."""
+    mode = _plex_dupe_fix_daily_mode()
+    if mode == 'off':
+        return None
+    qs = {'apply': '1'} if mode == 'apply' else {}
+    try:
+        with app.test_request_context('/plex-dupe-fix', query_string=qs):
+            res = plex_dupe_fix()
+        resp, status = (res if isinstance(res, tuple) else (res, 200))
+        body = resp.get_json() or {}
+    except Exception as e:  # noqa: BLE001
+        status, body = 500, {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+    failures = _dupe_fix_failures(body)
+    report = {
+        'ts': datetime.now().isoformat(timespec='seconds'),
+        'mode': mode,
+        'status': status,
+        'ok': bool(body.get('ok')),
+        'error': body.get('error'),
+        'counts': body.get('counts') or {},
+        'failures': failures,
+        'plan': body.get('plan') or {},
+    }
+    try:
+        _write_json_atomic(PLEX_DUPE_FIX_REPORT, report)
+    except OSError as e:
+        log.warning(f'plex dupe fix report write failed: {e}')
+    c = report['counts']
+    if report['ok']:
+        n_sup = sum(len(i.get('supersede') or []) for i in report['plan'].get('quality_upgrade') or [])
+        summary = (f"{mode}: {c.get('quality_upgrade', 0)} titles, {n_sup} extra copies, "
+                   f"{c.get('same_file_ghost', 0)} ghosts, {len(failures)} failed")
+    else:
+        summary = f"{mode}: did not run ({report['error']})"
+    record_activity('plex_dupe_fix', summary)
+    log.info(f'plex dupe fix daily {summary}')
+    if mode == 'apply' and (not report['ok'] or failures):
+        lines = failures[:8] if failures else [str(report['error'])]
+        more = f'\n…and {len(failures) - 8} more' if len(failures) > 8 else ''
+        try:
+            send_pushover('Plex dupe fix failed', '\n'.join(lines) + more)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'plex dupe fix push failed: {e}')
+    return report
+
 
 # List Sonarr seasons where NO episode has a season-pack import in
 # history — i.e. seasons that were only ever grabbed as individual

@@ -1,4 +1,4 @@
-"""Frozen test: advise() honours the monthly paid-call cap (plex-llm-paid-cap step 2)."""
+"""Frozen test: advise() honours the monthly paid-call cap (plex-llm-paid-cap step 2). Shadow never pays (11-13)."""
 import json
 import os
 import sys
@@ -49,7 +49,7 @@ def _run(cap, logged, mode='shadow'):
 
 
 def test_capped_skips_paid_and_claude():
-    out, calls, rows, _ = _run(cap=2, logged=2)
+    out, calls, rows, _ = _run(cap=2, logged=2, mode='enforce')
     assert out == 'allow', out
     assert calls == ['local'], calls
     assert len(rows) == 2, rows
@@ -65,13 +65,21 @@ def test_zero_cap_enforce_rules_only():
 
 
 def test_under_cap_still_calls_paid():
-    out, calls, rows, _ = _run(cap=5, logged=2)
-    assert out == 'allow', out
+    out, calls, rows, _ = _run(cap=5, logged=2, mode='enforce')
+    assert out == 'reject', out
     assert calls == ['local', 'paid'], calls
     assert 'paid_cap' not in rows[-1], rows[-1]
 
 
-TESTS = [test_capped_skips_paid_and_claude, test_zero_cap_enforce_rules_only, test_under_cap_still_calls_paid]
+def test_shadow_never_calls_paid_even_under_cap():
+    out, calls, rows, _ = _run(cap=5, logged=2)
+    assert out == 'allow', out
+    assert calls == ['local'], calls
+    assert 'paid_cap' not in rows[-1], rows[-1]
+
+
+TESTS = [test_capped_skips_paid_and_claude, test_zero_cap_enforce_rules_only, test_under_cap_still_calls_paid,
+         test_shadow_never_calls_paid_even_under_cap]
 GUARDS = [test_under_cap_still_calls_paid]
 
 

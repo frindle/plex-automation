@@ -44,7 +44,7 @@ def test_appends_instead_of_overwriting(tmp_path):
     m = _load()
     p = tmp_path / 'd.jsonl'
     for i in range(3):
-        assert m.log_decision(str(p), 'dupe_keeper', {'i': i}, 'keep_first', None, 'shadow') is True
+        assert m.log_decision(str(p), 'import_identity', {'i': i}, 'match', None, 'shadow') is True
     assert [r['context_summary']['i'] for r in _lines(p)] == [0, 1, 2]
     assert p.read_text().endswith('\n')
 

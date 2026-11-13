@@ -3,7 +3,6 @@ import json
 import llm_advisor as la
 
 GOOD = '{"action": "%s", "confidence": %s, "reason": "why"}'
-LIB = '/media/movies/A (2020)/a.mkv'
 
 
 def _t(action, conf=0.9, calls=None):
@@ -40,10 +39,9 @@ def test_enforce_follows_confident_model_not_weak_one(tmp_path):
 
 def test_enforce_hard_rule_vetoes_model_and_is_logged(tmp_path):
     log = tmp_path / 'l.jsonl'
-    facts = {'first': {'path': LIB}, 'second': {'path': LIB.replace('a.mkv', 'b.mkv'), 'seeding': True, 'seeded_days': 5}}
-    out = la.advise('dupe_keeper', facts, 'keep_both', mode='enforce', transport=_t('keep_first'), log_path=str(log))
-    assert out == 'keep_both'
-    assert 'seed_window' in _lines(log)[0]['reason']
+    out = la.advise('upgrade_gate', {'seeders': 3}, 'reject', mode='enforce', transport=_t('allow', 0.95), log_path=str(log))
+    assert out == 'reject'
+    assert 'min_seeders' in _lines(log)[0]['reason']
 
 
 def test_failures_never_propagate(tmp_path):

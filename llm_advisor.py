@@ -7,6 +7,9 @@ Decision chain (each layer is skipped when its env is unset):
   4. rules                   the caller keeps rules_action
 While the local layer is unavailable the decision is PENDING for LLM_LOCAL_WAIT_MIN minutes (default 15)
 before a paid layer is used. A valid but low-confidence open-model answer escalates to Claude at once.
+Shadow mode only asks the local layer: it changes nothing, so it never spends paid calls.
+import_identity answers are cached by pending key for LLM_ANSWER_TTL_H hours (default 24), so a stuck import
+isn't re-asked every pass. Hard rules still run on the current facts.
 llm_decide stays the source of truth for the prompt, parsing, MIN_CONFIDENCE and hard rules.
 """
 
@@ -28,9 +31,12 @@ CLAUDE_MODEL = 'claude-sonnet-5-5'
 MODELS_TTL = 600.0
 PENDING_MAX_AGE = 24 * 3600.0
 DEFAULT_WAIT_MIN = 15.0
+DEFAULT_ANSWER_TTL_H = 24.0
+ANSWER_CACHE_MAX = 2000
+CACHE_KINDS = frozenset({'import_identity'})
 
 # What a seam does while a decision is pending in enforce mode (shadow always keeps the rules action).
-PENDING_ACTION = {'import_identity': 'unsure', 'dupe_keeper': 'keep_both'}
+PENDING_ACTION = {'import_identity': 'unsure'}
 
 
 def http_transport(url, model, timeout=20):
@@ -246,9 +252,8 @@ def hold_active(env, http=None):
 
 # ── pending store ────────────────────────────────────────────────────────────
 
-# Facts that drift while a decision waits (seeding age, swarm size). They stay in the prompt but are left out of
-# the pending key, so the wait-for-local clock isn't restarted each time one ticks over (seeded_days is rounded
-# to 0.1 day, which used to give dupe_keeper a new key about every 2.4 hours).
+# Facts that drift while a decision waits (swarm size, seeding age). They stay in the prompt but are left out of
+# the pending and answer-cache keys, so the wait-for-local clock isn't restarted each time one ticks over.
 VOLATILE_FACTS = frozenset({'seeded_days', 'seeders'})
 
 
@@ -331,6 +336,67 @@ def get_store(path, now=time.time):
         st = _STORES[path] = PendingStore(path, now)
     st.now = now
     return st
+
+
+class AnswerCache:
+    """Final chain answers by pending key, kept LLM_ANSWER_TTL_H hours (atomic tmp+rename under a lock)."""
+
+    def __init__(self, path, now=time.time):
+        self.path = path
+        self.now = now
+        self.lock = threading.Lock()
+        self.data = {}
+        try:
+            with open(path, encoding='utf-8') as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                self.data = {k: v for k, v in loaded.items()
+                             if isinstance(v, dict) and isinstance(v.get('at'), (int, float)) and isinstance(v.get('decision'), dict)}
+        except (OSError, ValueError):
+            pass
+
+    def get(self, key, ttl_s):
+        with self.lock:
+            ent = self.data.get(key)
+            if ent is None:
+                return None
+            if self.now() - ent['at'] > ttl_s:
+                del self.data[key]
+                self._save()
+                return None
+            return dict(ent)
+
+    def put(self, key, decision, layer, model):
+        with self.lock:
+            self.data[key] = {'at': self.now(), 'decision': dict(decision), 'layer': layer, 'model': model}
+            if len(self.data) > ANSWER_CACHE_MAX:
+                for k in sorted(self.data, key=lambda k: self.data[k]['at'])[:len(self.data) - ANSWER_CACHE_MAX]:
+                    del self.data[k]
+            self._save()
+
+    def _save(self):
+        try:
+            tmp = '%s.%d.tmp' % (self.path, os.getpid())
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(self.data, fh)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+
+def get_answers(path, now=time.time):
+    st = _STORES.get(('answers', path))
+    if st is None:
+        st = _STORES[('answers', path)] = AnswerCache(path, now)
+    st.now = now
+    return st
+
+
+def _answers_path(env):
+    p = (env.get('LLM_ANSWERS_PATH') or '').strip()
+    if p:
+        return p
+    return os.path.join(os.path.dirname(env.get('LLM_PENDING_PATH', DEFAULT_PENDING)) or '.', 'llm_answers.json')
 
 
 def drop_pending(kind, env=None, path=None):
@@ -443,12 +509,40 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
         except (TypeError, ValueError):
             wait_min = DEFAULT_WAIT_MIN
         path = log_path or env.get('LLM_DECISIONS_LOG', DEFAULT_LOG)
-        capped = paid_cap_reached(env, path, time.strftime('%Y-%m', time.gmtime(now())))
-        if capped:
+        capped = False
+        if mode == 'shadow':
+            # Shadow changes nothing, so it never pays for an answer.
             layers = {k: v for k, v in layers.items() if k not in ('paid', 'claude')}
+        else:
+            capped = paid_cap_reached(env, path, time.strftime('%Y-%m', time.gmtime(now())))
+            if capped:
+                layers = {k: v for k, v in layers.items() if k not in ('paid', 'claude')}
+
+        answers, akey, ttl_s = None, None, 0.0
+        if kind in CACHE_KINDS:
+            try:
+                ttl_s = float(env.get('LLM_ANSWER_TTL_H', DEFAULT_ANSWER_TTL_H)) * 3600.0
+            except (TypeError, ValueError):
+                ttl_s = DEFAULT_ANSWER_TTL_H * 3600.0
+            if ttl_s > 0:
+                answers = get_answers(_answers_path(env), now)
+                akey = pending_key(kind, facts)
+        hit = answers.get(akey, ttl_s) if answers is not None else None
+        if hit is not None:
+            # Same question answered recently: no new call, no new log row; hard rules use today's facts.
+            store.remove(akey)
+            decision = hit['decision']
+            action, rule = llm_decide.apply_hard_rules(kind, decision.get('action'), facts)
+            if rule is not None:
+                decision = dict(decision, action=action)
+            if info is not None:
+                info.update(pending=False, layer='cache', pending_min=None)
+            return llm_decide.resolve_action(kind, rules_action, decision, mode)
 
         res = run_chain(kind, facts, layers, store, now, wait_min, env, hold_http)
         decision = res['decision']
+        if decision is not None and answers is not None:
+            answers.put(akey, decision, res['layer'], res['model'])
 
         if decision is not None:
             action, rule = llm_decide.apply_hard_rules(kind, decision['action'], facts)

@@ -28,7 +28,8 @@ def test_enforce_follows_model_only_at_or_above_min_confidence():
     assert m.resolve_action('upgrade_gate', 'allow', _dec('reject', 0.75), 'enforce') == 'reject'
     assert m.resolve_action('upgrade_gate', 'allow', _dec('reject', 0.74), 'enforce') == 'allow'
     assert m.resolve_action('upgrade_gate', 'allow', _dec('throttle', 1.0), 'enforce') == 'throttle'
-    assert m.resolve_action('dupe_keeper', 'keep_first', _dec('keep_second', 0.8), 'enforce') == 'keep_second'
+    assert m.resolve_action('import_identity', 'match', _dec('mismatch', 0.8), 'enforce') == 'mismatch'
+    assert m.resolve_action('dupe_keeper', 'keep_first', _dec('keep_second', 0.99), 'enforce') == 'keep_first'
 
 
 def test_enforce_with_missing_or_malformed_decision_keeps_rules():
