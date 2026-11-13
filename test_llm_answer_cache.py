@@ -102,7 +102,9 @@ def test_unsure_identity_low_confidence_never_imports_in_enforce():
     assert llm_decide.resolve_action('import_identity', 'match', dict(dec, confidence=0.0), 'enforce') == 'unsure'
     assert llm_decide.resolve_action('import_identity', 'match', dec, 'shadow') == 'match'
     low_mismatch = {'action': 'mismatch', 'confidence': 0.5, 'reason': 'r'}
-    assert llm_decide.resolve_action('import_identity', 'match', low_mismatch, 'enforce') == 'match'
+    assert llm_decide.resolve_action('import_identity', 'match', low_mismatch, 'enforce') == 'mismatch'
+    assert llm_decide.resolve_action('import_identity', 'match', dict(low_mismatch, confidence=0.0), 'enforce') == 'mismatch'
+    assert llm_decide.resolve_action('import_identity', 'match', low_mismatch, 'shadow') == 'match'
     assert llm_decide.resolve_action('import_identity', 'match', dict(dec, confidence=1.5), 'enforce') == 'match'
 
 

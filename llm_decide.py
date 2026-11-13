@@ -29,7 +29,9 @@ POLICY = {
     'import_identity': (
         'Answer match only when title AND year both agree with the matched item. A different year, a remake, a '
         'reboot or a different series is a mismatch. Doubled year tokens (Title.2015.2015) are not a mismatch. '
-        'Use unsure whenever the evidence is thin; unsure sends Penn a notification instead of importing.'),
+        'Use unsure whenever the evidence is thin; unsure sends Penn a notification instead of importing. '
+        "For Sonarr, queue titles usually carry no year and matched_year is the series' first-air year: judge the "
+        'series name (and season/episode if present); a missing year is not a mismatch.'),
 }
 
 
@@ -140,8 +142,8 @@ def resolve_action(kind, rules_action, decision, mode='shadow'):
         conf = float(conf)
         if not math.isfinite(conf) or conf > 1:
             return rules_action
-        # An unsure identity answer never imports, however low its confidence: unsure is the safe side.
-        if kind == 'import_identity' and action == 'unsure':
+        # An unsure or mismatch identity answer never imports, however low its confidence: both are the safe side.
+        if kind == 'import_identity' and action in ('unsure', 'mismatch'):
             return action
         if conf < MIN_CONFIDENCE:
             return rules_action
