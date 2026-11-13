@@ -670,7 +670,7 @@ report() {
         for (i = 1; i <= m; i++) k = k (i > 1 ? "/" : "") a[i]
         if (k == "") k = "(top)"; bytes[k] += $2; files[k]++ }
       END { for (k in bytes) printf "%.0f\t%d\t%s\n", bytes[k], files[k], k }' "$TMP/plan" |
-      sort -t "$TAB" -k1,1nr | head -20 |
+      sort -t "$TAB" -k1,1nr 2>/dev/null | head -20 |
       while IFS="$TAB" read -r b c k; do log "  $(hr "$b")  $c file(s)  $k"; done
   else
     log "nothing to move"
