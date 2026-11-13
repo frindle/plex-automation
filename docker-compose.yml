@@ -52,8 +52,13 @@ services:
       # Advisory LLM decisions (llm_decide/llm_advisor). off = rules only (default), shadow = log
       # what the chain would do next to what the rules did, enforce = the chain may override rules
       # at confidence >= 0.75 (hard rules still win). Layers, each skipped when its env is unset:
-      # local Darkbloom -> paid Darkbloom -> Claude -> rules. Values live in .env, never here.
+      # Unraid Ollama -> local Darkbloom -> paid Darkbloom -> Claude -> rules. Values live in .env, never here.
       LLM_DECISIONS: "${LLM_DECISIONS:-off}"
+      UNRAID_OLLAMA_URL: "${UNRAID_OLLAMA_URL:-}"
+      LLM_UNRAID_MODEL: "${LLM_UNRAID_MODEL:-}"
+      LLM_UNRAID_KINDS: "${LLM_UNRAID_KINDS:-}"
+      LLM_UNRAID_HOLD_URL: "${LLM_UNRAID_HOLD_URL:-}"
+      LLM_UNRAID_HOLD_TOKEN: "${LLM_UNRAID_HOLD_TOKEN:-}"
       DARKBLOOM_BASE_URL: "${DARKBLOOM_BASE_URL:-}"
       DARKBLOOM_API_KEY: "${DARKBLOOM_API_KEY:-}"
       LLM_LOCAL_MODEL: "${LLM_LOCAL_MODEL:-}"
