@@ -298,6 +298,15 @@ eq "one notification" "$(wc -l <"$R/notify.log")" 1
 grep -q 'moved 2, failed 0, skipped 0' "$R/notify.log" && ok || bad "notify subject counts: $(cat "$R/notify.log")"
 check "free files are never paused" test ! -e "$R/pause.calls"
 
+setup dry_run_sums_match_total
+mkf disk2 data/Media/Movie/c.mkv 3000 100
+mkf disk2 data/Media/Movie/c.en.srt 10 100
+mkf disk2 data/Media/Movie/c.nfo 5 100
+out="$(run)"
+echo "$out" | grep -q 'per-disk  disk2 -> disk1: 3 file(s), 3.02 KB' && ok || bad "per-disk bytes count the unit once: $(echo "$out" | grep per-disk)"
+echo "$out" | grep -q 'totals: moved=3 (3.02 KB)' && ok || bad "totals match per-disk: $(echo "$out" | grep totals)"
+echo "$out" | grep -qE '^.*3\.02 KB  3 file\(s\)  data/Media/Movie' && ok || bad "top folder bytes count the unit once: $(echo "$out" | grep -A3 'top folders')"
+
 setup top_20_folders
 for i in $(seq 1 25); do mkf disk2 "data/Media/Show$i/S01/e.mkv" $((100 + i)) 100; done
 out="$(run)"

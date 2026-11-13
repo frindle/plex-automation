@@ -352,7 +352,7 @@ resume_unit() {
 }
 
 process_chunk() {
-  local i j n=${#CH_AT[@]} p unitstat reason line st rs path
+  local i j n=${#CH_AT[@]} p psz unitstat reason line st rs path
   [ "$n" -eq 0 ] && return 0
   local -A G=()
   if [ "$NO_TORRENT_CHECK" != 1 ]; then
@@ -382,8 +382,10 @@ process_chunk() {
     fi
     [ "$unitstat" = pause ] && N_PAUSED=$((N_PAUSED + 1))
     if [ "$APPLY" != 1 ]; then
+      psz=${CH_SZ[$i]}   # the unit's bytes go on its first file only, so the per-disk and folder sums match the total
       for p in "${paths[@]}"; do
-        printf '%s\t%s\t%s\n' "${CH_DK[$i]}" "${CH_SZ[$i]}" "${p#"$MNT/${CH_DK[$i]}/"}" >>"$TMP/plan"
+        printf '%s\t%s\t%s\n' "${CH_DK[$i]}" "$psz" "${p#"$MNT/${CH_DK[$i]}/"}" >>"$TMP/plan"
+        psz=0
       done
       log "WOULD MOVE  ${CH_DK[$i]} -> $GLACIER  $(hr "${CH_SZ[$i]}")  ${#paths[@]} file(s)  ${paths[0]}$([ "$unitstat" = pause ] && echo '  [torrent: pause]')"
       N_MOVED=$((N_MOVED + ${#paths[@]})); B_MOVED=$((B_MOVED + CH_SZ[i]))
@@ -404,9 +406,11 @@ process_chunk() {
     resume_unit
     case $mrc in
       0) N_MOVED=$((N_MOVED + ${#paths[@]})); B_MOVED=$((B_MOVED + CH_SZ[i]))
+         psz=${CH_SZ[$i]}
          for p in "${paths[@]}"; do
-           printf '%s\t%s\t%s\n' "${CH_DK[$i]}" "${CH_SZ[$i]}" "${p#"$MNT/${CH_DK[$i]}/"}" >>"$TMP/plan"
-           log "MOVED  ${CH_DK[$i]} -> $GLACIER  ${CH_SZ[$i]} bytes  $p"
+           printf '%s\t%s\t%s\n' "${CH_DK[$i]}" "$psz" "${p#"$MNT/${CH_DK[$i]}/"}" >>"$TMP/plan"
+           log "MOVED  ${CH_DK[$i]} -> $GLACIER  $psz bytes  $p"
+           psz=0
          done ;;
       3) ROOM_LEFT=$((ROOM_LEFT + CH_SZ[i])); CAP_LEFT=$((CAP_LEFT + CH_SZ[i]))
          note_skip "$SKIP_REASON" "${paths[@]}" ;;
