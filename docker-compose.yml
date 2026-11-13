@@ -49,6 +49,8 @@ services:
       UPLOAD_RATE_LIMIT_MBIT: "5"
       PLEX_URL: "http://10.0.0.6:32400"
       PLEX_TOKEN: ${PLEX_TOKEN}
+      # Daily duplicate cleanup: off | dry (plan only, report in /data/plex_dupe_fix_last.json) | apply.
+      PLEX_DUPE_FIX_DAILY: "${PLEX_DUPE_FIX_DAILY:-dry}"
       # Advisory LLM decisions (llm_decide/llm_advisor). off = rules only (default), shadow = log
       # what the chain would do next to what the rules did, enforce = the chain may override rules
       # at confidence >= 0.75 (hard rules still win). Layers, each skipped when its env is unset:
