@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 
 KINDS = {
     'upgrade_gate': ('allow', 'throttle', 'reject'),
@@ -190,6 +191,47 @@ def log_decision(path, kind, context_summary, rules_action, decision, mode, extr
         return False
 
 
+# Spin-off guard: a release named "NCIS Origins ..." matched to the series "NCIS" is a different show.
+# The release's show name is the text before the first season/episode tag, year, resolution or
+# anime episode marker. Extra words after the matched title make the match unsure, except
+# country tags and filler words, which arr titles often leave out ("Shameless US" is "Shameless").
+# Sonarr only: for movies year_matches already catches sequels, and releases add subtitles the
+# Radarr title leaves out ("Mad Max 2 The Road Warrior" is "Mad Max 2").
+_NAME_STOP = re.compile(
+    r'(?<![a-z0-9])(?:s\d{1,2}(?:e\d{1,4})?|(?:season|series|part|vol|volume) ?\d+|\d+(?:st|nd|rd|th) season|'
+    r'\d{1,2}x\d{2,3}|\d{3,4}p|\d{3}|4k|uhd|complete|ep? ?\d{1,4})(?![a-z0-9])|\s-\s*\d|[\(\[]')
+_SPINOFF_IGNORE = frozenset(('us', 'uk', 'au', 'nz', 'ca', 'the', 'a', 'an', 'and', 'of'))
+_YEAR_TOKEN = re.compile(r'(?:19|20)\d{2}')
+
+
+def _title_tokens(s):
+    s = ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+    s = s.lower().replace('&', ' and ')
+    s = re.sub(r"['\u2019]", '', s)
+    return [t for t in re.sub(r'[^a-z0-9]+', ' ', s).split() if not _YEAR_TOKEN.fullmatch(t)]
+
+
+def release_show_name(queue_title):
+    """Show/movie name at the front of a release title: 'NCIS.Origins.S03E05.1080p' -> 'ncis origins'."""
+    t = str(queue_title or '')
+    t = re.sub(r'^\s*(?:\[[^\]]*\]\s*)+', '', t)          # leading [Group] tags
+    t = re.sub(r'\.(?:mkv|mp4|avi|m4v|ts)$', '', t, flags=re.I)
+    t = re.sub(r'[._]+', ' ', t).lower().strip()
+    t = ''.join(c for c in unicodedata.normalize('NFKD', t) if not unicodedata.combining(c))
+    t = re.sub(r'(?<![a-z0-9])(?:19|20)\d{2}(?![a-z0-9])', '(', t, count=1)  # a year ends the name too
+    m = _NAME_STOP.search(t)
+    return ' '.join(_title_tokens(t[:m.start()] if m else t))
+
+
+def spinoff_words(queue_title, matched_title):
+    """Words the release's name adds after the matched title ([] when it doesn't extend it)."""
+    rel = release_show_name(queue_title).split()
+    mt = _title_tokens(str(matched_title or ''))
+    if not rel or not mt or rel[:len(mt)] != mt:
+        return []
+    return [w for w in rel[len(mt):] if w not in _SPINOFF_IGNORE]
+
+
 _SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
@@ -217,7 +259,8 @@ def apply_hard_rules(kind, action, facts):
     """Deterministic rules the model can never override. Returns (action, rule_or_None).
 
     facts keys (all optional, missing => no veto from that rule): seeders, candidate_dv_web (bool, DV Profile 5
-    WEB release), year_matches (bool). Present-but-malformed facts fail closed.
+    WEB release), year_matches (bool), queue_title + matched_title (spin-off guard). Present-but-malformed facts
+    fail closed.
     """
     try:
         facts = facts if isinstance(facts, dict) else {}
@@ -232,6 +275,9 @@ def apply_hard_rules(kind, action, facts):
             ym = facts.get('year_matches')
             if ym is not None and not _flag(ym):
                 return 'unsure', 'year_mismatch'
+            qt, mt = facts.get('queue_title'), facts.get('matched_title')
+            if facts.get('service') != 'Radarr' and isinstance(qt, str) and isinstance(mt, str) and spinoff_words(qt, mt):
+                return 'unsure', 'spinoff_title'
         return action, None
     except Exception:
         if isinstance(kind, str) and kind in _SAFE_ACTION and action != _SAFE_ACTION[kind]:
