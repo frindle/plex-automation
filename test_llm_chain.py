@@ -123,7 +123,7 @@ def test_after_wait_paid_is_called_and_logged_with_usage(tmp_path):
     out, info, rows = run(tmp_path, clock, http)
     assert out == 'throttle' and info['layer'] == 'paid'
     row = rows[-1]
-    assert row['layer'] == 'paid' and row['model'] == 'qwen3.5-27b-claude-opus-8bit'
+    assert row['layer'] == 'paid' and row['model'] == 'qwen3.5-35b-a3b'
     call = row['paid_calls'][0]
     assert call['prompt_tokens'] == 100 and call['completion_tokens'] == 10 and call['request_id'] == 'req-1'
     paid_post = [c for c in http.calls if 'api.darkbloom.dev' in c[1]][0]

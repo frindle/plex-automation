@@ -44,7 +44,7 @@ Advisory decisions for upgrade grabs, import identity and duplicate keepers (`ll
 Layers, each skipped when its env is unset:
 
 1. Local Darkbloom: `DARKBLOOM_BASE_URL` + `DARKBLOOM_API_KEY` (OpenAI-compatible). Model is `LLM_LOCAL_MODEL`, else the first id from `/v1/models` (cached 10 min). `LLM_DECIDE_URL`/`LLM_DECIDE_MODEL`/`LLM_DECIDE_KEY` still work when `DARKBLOOM_BASE_URL` is unset. Optional hold check: `LLM_LOCAL_HOLD_URL` + `LLM_LOCAL_HOLD_TOKEN`; the local layer is skipped only when the response is 200 with top-level `hold: true` (errors fail open).
-2. Paid Darkbloom: `DARKBLOOM_CLOUD_API_KEY`, `DARKBLOOM_CLOUD_MODEL` (default `qwen3.5-27b-claude-opus-8bit`).
+2. Paid Darkbloom: `DARKBLOOM_CLOUD_API_KEY`, `DARKBLOOM_CLOUD_MODEL` (default `qwen3.5-35b-a3b`).
 3. Claude: `ANTHROPIC_API_KEY`, `LLM_CLAUDE_MODEL` (default `claude-sonnet-5-5`), structured output via the `anthropic` SDK.
 4. Rules: an exhausted chain returns nothing and the rules action stands.
 
