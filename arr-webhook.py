@@ -123,6 +123,150 @@ def _llm_tags(name):
             'web': any(t in n for t in ('.web.', '.webdl.', '.webrip.')),
             'group': m.group(1) if m else None}
 
+
+def _llm_mode():
+    mode = (os.environ.get('LLM_DECISIONS', 'off') or '').strip().lower()
+    return mode if mode in ('shadow', 'enforce') else 'off'
+
+
+LLM_SEEDERS_POLLS = 4
+LLM_SEEDERS_POLL_S = 3.0
+
+
+def _flag_bits(raw, flag_map):
+    """IndexerFlags as an int from an int, a list of names/ints, or a comma string. None when absent."""
+    if raw is None or isinstance(raw, bool) or raw in ('', []):
+        return None
+    if isinstance(raw, int):
+        return raw
+    bits = 0
+    for tok in (raw if isinstance(raw, (list, tuple)) else str(raw).split(',')):
+        if isinstance(tok, int) and not isinstance(tok, bool):
+            bits |= tok
+            continue
+        t = str(tok).strip().lower()
+        if t.isdigit():
+            bits |= int(t)
+        elif t:
+            bits |= flag_map.get(t) or flag_map.get(t[2:] if t.startswith('g_') else 'g_' + t) or 0
+    return bits
+
+
+def _freeleech(bits, flag_map):
+    """'full', 'partial', 'no', or None when the flags are unknown."""
+    if bits is None:
+        return None
+    full = flag_map.get('g_freeleech') or flag_map.get('freeleech') or 0
+    partial = 0
+    for name in ('halfleech', 'freeleech75', 'freeleech25'):
+        partial |= flag_map.get('g_' + name) or flag_map.get(name) or 0
+    if bits & full:
+        return 'full'
+    if bits & partial:
+        return 'partial'
+    return 'no'
+
+
+def _grab_freeleech(source, data, download_id):
+    """Freeleech status of a grab: the payload's release.indexerFlags, else the grab history's. None if unknown."""
+    flag_map = _SONARR_INDEXER_FLAGS if source == 'Sonarr' else _RADARR_INDEXER_FLAGS
+    bits = _flag_bits((data.get('release') or {}).get('indexerFlags'), flag_map)
+    if bits is None:
+        url, key = (SONARR_URL, SONARR_API_KEY) if source == 'Sonarr' else (RADARR_URL, RADARR_API_KEY)
+        try:
+            r = requests.get(
+                f'{url}/api/v3/history',
+                headers={'X-Api-Key': key},
+                params={'downloadId': download_id, 'eventType': 1, 'pageSize': 10,
+                        'sortKey': 'date', 'sortDirection': 'descending'},
+                timeout=10,
+            )
+            r.raise_for_status()
+            records = (r.json() or {}).get('records') or []
+            if records:
+                newest = max(records, key=lambda x: x.get('date') or '')
+                bits = _flag_bits((newest.get('data') or {}).get('indexerFlags'), flag_map)
+                if bits is None:
+                    bits = 0  # a grab record with no flags is a plain release
+        except Exception as e:  # noqa: BLE001
+            log.info(f'{source}: indexerFlags lookup failed for {download_id}: {e}')
+    return _freeleech(bits, flag_map)
+
+
+def _existing_file_facts(source, data):
+    """Quality, size, group, HDR and audio of the file an upgrade would replace. {} on any error."""
+    try:
+        if source == 'Sonarr':
+            eps = data.get('episodes') or []
+            ep_id = (eps[0] or {}).get('id') if eps else None
+            if not ep_id:
+                return {}
+            hdr = {'X-Api-Key': SONARR_API_KEY}
+            r = requests.get(f'{SONARR_URL}/api/v3/episode/{ep_id}', headers=hdr, timeout=10)
+            r.raise_for_status()
+            fid = (r.json() or {}).get('episodeFileId')
+            if not fid:
+                return {}
+            r = requests.get(f'{SONARR_URL}/api/v3/episodefile/{fid}', headers=hdr, timeout=10)
+            r.raise_for_status()
+            f = r.json() or {}
+        else:
+            mid = (data.get('movie') or {}).get('id')
+            if not mid:
+                return {}
+            r = requests.get(f'{RADARR_URL}/api/v3/moviefile', headers={'X-Api-Key': RADARR_API_KEY},
+                             params={'movieId': mid}, timeout=10)
+            r.raise_for_status()
+            files = r.json() or []
+            if not files:
+                return {}
+            f = max(files, key=lambda x: x.get('size') or 0)
+        if not isinstance(f, dict):
+            return {}
+        size = f.get('size')
+        mi = f.get('mediaInfo') or {}
+        return {
+            'existing_quality': ((f.get('quality') or {}).get('quality') or {}).get('name'),
+            'existing_size_gb': round(size / (1024 ** 3), 2) if isinstance(size, (int, float)) and size > 0 else None,
+            'existing_group': f.get('releaseGroup') or None,
+            'existing_hdr': mi.get('videoDynamicRangeType') or None,
+            'existing_audio': mi.get('audioCodec') or None,
+        }
+    except Exception as e:  # noqa: BLE001
+        log.info(f'{source}: existing-file lookup failed: {e}')
+        return {}
+
+
+def _grab_seeders(download_id, polls=None, poll_s=None):
+    """Swarm seeders for a fresh grab from Deluge's total_seeds, polled briefly while the tracker scrapes.
+    libtorrent reports -1 until it knows, so a negative or missing count is None (unknown), never 0."""
+    polls = LLM_SEEDERS_POLLS if polls is None else polls
+    poll_s = LLM_SEEDERS_POLL_S if poll_s is None else poll_s
+    try:
+        deluge_login()
+        for i in range(max(polls, 1)):
+            if i:
+                time.sleep(poll_s)
+            res = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.get_torrent_status', 'params': [download_id, ['total_seeds']], 'id': 94},
+                timeout=10,
+            ).json().get('result') or {}
+            n = res.get('total_seeds')
+            if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+                return n
+    except Exception as e:  # noqa: BLE001
+        log.info(f'seeders lookup failed for {download_id}: {e}')
+    return None
+
+
+def _upgrade_gate_extra(source, data, download_id):
+    """Facts the gate needs beyond the release name: what it replaces, freeleech, seeders."""
+    extra = _existing_file_facts(source, data)
+    extra['freeleech'] = _grab_freeleech(source, data, download_id)
+    extra['seeders'] = _grab_seeders(download_id)
+    return extra
+
 ACTIVITY_LOG_RETENTION_DAYS = int(os.environ.get('ACTIVITY_LOG_RETENTION_DAYS', '7'))
 
 def trim_activity_log(retention_days=ACTIVITY_LOG_RETENTION_DAYS):
@@ -3753,6 +3897,20 @@ def send_pushover(title, message, url=None):
 
 _ib_seen = {}  # downloadId → epoch of last notify
 
+IMPORT_LLM_PENDING = 'LLM advisor still waiting on the local model; will retry'
+
+
+def _identity_refusal(facts):
+    """None when the advisor confirms the match; else the resolver detail. A decision still pending on the local
+    model gets IMPORT_LLM_PENDING, which check_import_blocked retries quietly instead of pushing."""
+    info = {}
+    if _llm_advise('import_identity', facts, 'match', info) == 'match':
+        return None
+    if info.get('pending'):
+        return IMPORT_LLM_PENDING
+    return 'LLM advisor did not confirm the match; needs manual review'
+
+
 def _ib_seen_recently(download_id, ttl_hours=24):
     now = time.time()
     for k, ts in list(_ib_seen.items()):
@@ -3841,8 +3999,9 @@ def _try_radarr_manual_import(record):
     queue_years = _year_in_title(queue_title)
     year = matched.get('year')
     facts = {'service': 'Radarr', 'queue_title': queue_title, 'matched_title': matched.get('title'), 'matched_year': year, 'year_matches': (year in queue_years) if (year and queue_years) else None, 'files': len(files)}
-    if _llm_advise('import_identity', facts, 'match') != 'match':
-        return False, 'LLM advisor did not confirm the match; needs manual review'
+    refused = _identity_refusal(facts)
+    if refused:
+        return False, refused
     try:
         cmd = requests.post(
             f'{RADARR_URL}/api/v3/command',
@@ -3894,8 +4053,9 @@ def _try_sonarr_manual_import(record):
     queue_years = _year_in_title(re.sub(r'(?<!\d)(19|20)\d{2}[.\- ]\d{2}[.\- ]\d{2}(?!\d)', ' ', queue_title))
     year = matched.get('year')
     facts = {'service': 'Sonarr', 'queue_title': queue_title, 'matched_title': matched.get('title'), 'matched_year': year, 'year_matches': (year in queue_years) if (year and queue_years) else None, 'files': len(files)}
-    if _llm_advise('import_identity', facts, 'match') != 'match':
-        return False, 'LLM advisor did not confirm the match; needs manual review'
+    refused = _identity_refusal(facts)
+    if refused:
+        return False, refused
     try:
         cmd = requests.post(
             f'{SONARR_URL}/api/v3/command',
@@ -3942,6 +4102,10 @@ def check_import_blocked():
             if ok:
                 log.info(f'[importBlocked] {label}: auto-imported "{title}" — {detail}')
                 record_activity('import-rescue', f'{label}: auto-imported stuck download "{title}"')
+                continue
+            if detail == IMPORT_LLM_PENDING:
+                # Not stuck yet: the advisor answers on a later pass. No push, and the 24 h dedupe isn't started.
+                log.info(f'[importBlocked] {label}: "{title}" waiting on the LLM advisor; retrying next pass')
                 continue
             if _ib_seen_recently(download_id):
                 continue
@@ -4557,6 +4721,9 @@ def handle_grab(data, source):
         'candidate_dv_web': tags['dv'] and tags['web'],
         'seed_days': SEED_DAYS,
     }
+    if _llm_mode() != 'off':
+        # Only paid for when the advisor will read them (extra *arr/Deluge calls, a short seeders poll).
+        facts.update(_upgrade_gate_extra(source, data, download_id))
     llm_info = {}
     action = _llm_advise('upgrade_gate', facts, rules_action, llm_info)
     if llm_info.get('pending'):

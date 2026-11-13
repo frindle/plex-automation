@@ -27,6 +27,8 @@ POLICY = {
         'Reject sidegrades, smaller re-encodes of a better file, and anything Plex cannot play: Dolby Vision Profile 5 '
         '(any WEB-DL DV except Hulu) is never wanted, HDR10 is preferred over WEB DV. '
         'Private-tracker ratio matters: prefer freeleech; releases with fewer than 10 seeders are always rejected. '
+        'The existing_* facts describe the file this upgrade would replace: judge the improvement against them. '
+        'freeleech is full, partial or no; a null freeleech or seeders value means unknown, not zero. '
         'Prefer throttle when unsure.'),
     'import_identity': (
         'Answer match only when title AND year both agree with the matched item. A different year, a remake, a '
@@ -145,7 +147,12 @@ def resolve_action(kind, rules_action, decision, mode='shadow'):
         if isinstance(conf, bool) or not isinstance(conf, (int, float)):
             return rules_action
         conf = float(conf)
-        if not math.isfinite(conf) or conf > 1 or conf < MIN_CONFIDENCE:
+        if not math.isfinite(conf) or conf > 1:
+            return rules_action
+        # An unsure identity answer never imports, however low its confidence: unsure is the safe side.
+        if kind == 'import_identity' and action == 'unsure':
+            return action
+        if conf < MIN_CONFIDENCE:
             return rules_action
         return action
     except Exception:
