@@ -1,13 +1,18 @@
 """llm_advisor.py -- glue between arr-webhook seams and llm_decide: mode, layered transport, hard rules, logging.
 
 Decision chain (each layer is skipped when its env is unset):
+  0. Unraid Ollama (LAN)     UNRAID_OLLAMA_URL, model LLM_UNRAID_MODEL (default qwen3:14b), only for
+                             LLM_UNRAID_KINDS (default import_identity). Asked only when the GPU is free
+                             (nothing loaded, or its own model loaded) and LLM_UNRAID_HOLD_URL isn't holding.
+                             Its answer is kept only when, after hard rules, it is decisive (not unsure) at
+                             confidence >= MIN_CONFIDENCE; anything else passes on to local Darkbloom.
   1. local Darkbloom (LAN)   DARKBLOOM_BASE_URL + DARKBLOOM_API_KEY  (alias: LLM_DECIDE_URL/_MODEL/_KEY)
   2. paid Darkbloom          DARKBLOOM_CLOUD_API_KEY
   3. Claude                  ANTHROPIC_API_KEY (official SDK, structured output)
   4. rules                   the caller keeps rules_action
 While the local layer is unavailable the decision is PENDING for LLM_LOCAL_WAIT_MIN minutes (default 15)
 before a paid layer is used. A valid but low-confidence open-model answer escalates to Claude at once.
-Shadow mode only asks the local layer: it changes nothing, so it never spends paid calls.
+Shadow mode only asks the free layers (Unraid, local): it changes nothing, so it never spends paid calls.
 import_identity answers are cached by pending key for LLM_ANSWER_TTL_H hours (default 24), so a stuck import
 isn't re-asked every pass. Hard rules still run on the current facts.
 llm_decide stays the source of truth for the prompt, parsing, MIN_CONFIDENCE and hard rules.
@@ -34,6 +39,12 @@ DEFAULT_WAIT_MIN = 15.0
 DEFAULT_ANSWER_TTL_H = 24.0
 ANSWER_CACHE_MAX = 2000
 CACHE_KINDS = frozenset({'import_identity'})
+UNRAID_MODEL = 'qwen3:14b'
+UNRAID_KINDS = 'import_identity'
+# Actions an Unraid answer may settle on its own; unsure (or a hard rule turning an answer into unsure)
+# always passes on to local Darkbloom.
+UNRAID_DECISIVE = {'import_identity': frozenset({'match', 'mismatch'}),
+                   'upgrade_gate': frozenset({'allow', 'throttle', 'reject'})}
 
 # What a seam does while a decision is pending in enforce mode (shadow always keeps the rules action).
 PENDING_ACTION = {'import_identity': 'unsure'}
@@ -71,12 +82,14 @@ class Meta(str):
 
 
 class Layer:
-    """One transport: fn(prompt) -> raw text. model() names the model that answers (for the log)."""
+    """One transport: fn(prompt) -> raw text. model() names the model that answers (for the log).
+    gate(), when set, returns None to go ahead or a short reason to skip the layer this time."""
 
-    def __init__(self, name, fn, model=None):
+    def __init__(self, name, fn, model=None, gate=None):
         self.name = name
         self.fn = fn
         self._model = model
+        self.gate = gate
 
     def model(self):
         try:
@@ -143,6 +156,50 @@ def _chat_fn(url, model_fn, key, http, total, connect, extra_body=None):
     return fn
 
 
+def _model_tag(name):
+    """Ollama's name for a model: 'qwen3' and 'qwen3:latest' are the same model."""
+    n = str(name or '').strip()
+    return n if ':' in n.rsplit('/', 1)[-1] else n + ':latest'
+
+
+def _ollama_chat_fn(base, model, http, total=30.0, connect=2.0):
+    """Native Ollama /api/chat, the shape the back-test ran: no stream, no thinking, temperature 0.2."""
+    url = base.rstrip('/') + '/api/chat'
+
+    def fn(prompt):
+        body = {'model': model, 'messages': [{'role': 'user', 'content': prompt}], 'stream': False, 'think': False,
+                'options': {'temperature': 0.2, 'num_predict': 1024}}
+        r = http.post(url, json=body, headers={'Content-Type': 'application/json'}, timeout=(connect, total))
+        r.raise_for_status()
+        data = r.json()
+        meta = {}
+        if isinstance(data, dict):
+            meta['prompt_tokens'] = data.get('prompt_eval_count')
+            meta['completion_tokens'] = data.get('eval_count')
+        return Meta(data['message']['content'], meta)
+    return fn
+
+
+def _unraid_gate(base, model, env, http):
+    """Skip reason, or None when the Unraid GPU is free for this model. The queue shares that GPU: asking
+    while it has another model loaded would evict it, so a different resident model means skip."""
+    def gate():
+        held, _ = hold_active(env, http, 'LLM_UNRAID_HOLD')
+        if held:
+            return 'hold'
+        try:
+            r = http.get(base.rstrip('/') + '/api/ps', timeout=1)
+            r.raise_for_status()
+            loaded = {_model_tag(m.get('model') or m.get('name')) for m in (r.json().get('models') or [])
+                      if isinstance(m, dict)}
+        except Exception as e:  # noqa: BLE001
+            return 'timeout' if 'timeout' in type(e).__name__.lower() else 'error'
+        if loaded and _model_tag(model) not in loaded:
+            return 'other-model-resident'
+        return None
+    return gate
+
+
 def claude_schema(kind):
     return {
         'type': 'object',
@@ -202,6 +259,11 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
     if http is None:
         import requests as http
     layers = {}
+    ubase = (env.get('UNRAID_OLLAMA_URL') or '').strip()
+    ukinds = {k.strip() for k in (env.get('LLM_UNRAID_KINDS') or UNRAID_KINDS).split(',') if k.strip()}
+    if ubase and kind in ukinds:
+        um = (env.get('LLM_UNRAID_MODEL') or '').strip() or UNRAID_MODEL
+        layers['unraid'] = Layer('unraid', _ollama_chat_fn(ubase, um, http), um, _unraid_gate(ubase, um, env, http))
     total = float(env.get('LLM_DECIDE_TIMEOUT') or 20)
     base = (env.get('DARKBLOOM_BASE_URL') or '').strip()
     legacy = (env.get('LLM_DECIDE_URL') or '').strip()
@@ -228,15 +290,16 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
     return layers
 
 
-def hold_active(env, http=None):
-    """(held, cause). Held only on a 200 whose JSON has hold exactly true; anything else fails open."""
-    url = (env.get('LLM_LOCAL_HOLD_URL') or '').strip()
+def hold_active(env, http=None, prefix='LLM_LOCAL_HOLD'):
+    """(held, cause) from {prefix}_URL / {prefix}_TOKEN. Held only on a 200 whose JSON has hold exactly true;
+    anything else fails open."""
+    url = (env.get(prefix + '_URL') or '').strip()
     if not url:
         return False, None
     try:
         if http is None:
             import requests as http
-        tok = env.get('LLM_LOCAL_HOLD_TOKEN')
+        tok = env.get(prefix + '_TOKEN')
         headers = {'Authorization': 'Bearer ' + tok} if tok else {}
         r = http.get(url, headers=headers, timeout=1)
         if getattr(r, 'status_code', None) != 200:
@@ -433,11 +496,13 @@ def _ask(kind, prompt, layer, calls=None):
 
 
 def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
-    """Return a dict: decision, layer, model, latency_ms, pending, pending_min, escalations, hold_cause, error."""
+    """Return a dict: decision, layer, model, latency_ms, pending, pending_min, escalations, hold_cause, error,
+    unraid (what the Unraid layer did, when it is configured)."""
     prompt = llm_decide.build_prompt(kind, facts)
     key = pending_key(kind, facts)
     res = {'decision': None, 'layer': None, 'model': None, 'latency_ms': None, 'pending': False,
-           'pending_min': None, 'escalations': [], 'calls': [], 'hold_cause': None, 'error': None, 'first_pending': False}
+           'pending_min': None, 'escalations': [], 'calls': [], 'hold_cause': None, 'error': None, 'first_pending': False,
+           'unraid': None}
 
     def answered(layer, dec, lat):
         store.remove(key)
@@ -446,8 +511,37 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
     def weak(dec):
         return dec['confidence'] < llm_decide.MIN_CONFIDENCE
 
+    unraid = layers.get('unraid')
+    if unraid is not None:
+        # Free first try. Its pass-ons don't touch the pending clock, which stays keyed to local Darkbloom,
+        # and a weak answer goes to local, never straight to Claude.
+        step = {'model': unraid.model(), 'latency_ms': None, 'pass': None}
+        res['unraid'] = step
+        try:
+            skip = unraid.gate() if unraid.gate is not None else None
+        except Exception:  # noqa: BLE001
+            skip = 'error'
+        if skip:
+            step['pass'] = skip
+        else:
+            dec, err, lat = _ask(kind, prompt, unraid)
+            step['latency_ms'] = lat
+            if dec is None:
+                kind_of = (err or '').split(':', 1)[0].lower()
+                step['pass'] = ('timeout' if 'timeout' in kind_of else
+                                'unparseable' if kind_of.startswith('unparseable') else 'error')
+                step['error'] = err
+            else:
+                ruled, _ = llm_decide.apply_hard_rules(kind, dec['action'], facts)
+                if ruled not in UNRAID_DECISIVE.get(kind, ()):
+                    step['pass'] = 'unsure'
+                elif weak(dec):
+                    step['pass'] = 'weak'
+                else:
+                    answered(unraid, dec, lat)
+
     local = layers.get('local')
-    if local is not None:
+    if local is not None and res['decision'] is None:
         held, cause = hold_active(env, hold_http)
         if held:
             dec, err, lat = None, 'hold', 0
@@ -511,7 +605,7 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
         path = log_path or env.get('LLM_DECISIONS_LOG', DEFAULT_LOG)
         capped = False
         if mode == 'shadow':
-            # Shadow changes nothing, so it never pays for an answer.
+            # Shadow changes nothing, so it never pays for an answer (Unraid and local are free).
             layers = {k: v for k, v in layers.items() if k not in ('paid', 'claude')}
         else:
             capped = paid_cap_reached(env, path, time.strftime('%Y-%m', time.gmtime(now())))
@@ -560,6 +654,8 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
             extra['paid_calls'] = res['calls']
         if res['error'] and decision is None:
             extra['error'] = res['error']
+        if res['unraid'] is not None:
+            extra['unraid'] = res['unraid']
         if not res['pending'] or res['first_pending']:
             llm_decide.log_decision(path, kind, json.dumps(facts, default=str, sort_keys=True)[:500],
                                     rules_action, decision, mode, extra)
