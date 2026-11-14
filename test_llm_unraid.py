@@ -48,7 +48,7 @@ def test_confident_match_settles_on_unraid_with_the_tested_request_shape(tmp_pat
     assert out == 'match' and info['layer'] == 'unraid' and info['pending'] is False
     assert http.n('local.invalid') == 0
     (_, url, kw), = [c for c in http.calls if c[1].endswith('/api/chat')]
-    assert url == 'http://unraid.invalid:11434/api/chat' and kw['timeout'] == (2.0, 30.0)
+    assert url == 'http://unraid.invalid:11434/api/chat' and kw['timeout'] == (2.0, 120.0)  # nothing loaded: cold
     body = kw['json']
     assert body['model'] == 'qwen3:14b' and body['stream'] is False and body['think'] is False
     assert body['options'] == {'temperature': 0.2, 'num_predict': 1024}
@@ -201,3 +201,27 @@ def test_without_unraid_url_chain_is_unchanged(tmp_path):
     http = world(ollama('match', 0.95), chat('match', 0.9))
     _, info, rows = go(tmp_path, http, env=ENV)
     assert http.n('unraid.invalid') == 0 and info['layer'] == 'local' and 'unraid' not in rows[-1]
+
+
+def _chat_timeout(http):
+    (_, _, kw), = [c for c in http.calls if c[1].endswith('/api/chat')]
+    return kw['timeout']
+
+
+def test_cold_load_gets_the_long_timeout_warm_keeps_30s(tmp_path):
+    http = world(ollama('match', 0.95))
+    go(fresh(tmp_path, 'cold'), http)
+    assert _chat_timeout(http) == (2.0, 120.0)
+    http = world(ollama('match', 0.95), loaded=('qwen3:14b',))
+    go(fresh(tmp_path, 'warm'), http)
+    assert _chat_timeout(http) == (2.0, 30.0)
+    http = world(ollama('match', 0.95))
+    go(fresh(tmp_path, 'env'), http, env=dict(UENV, LLM_UNRAID_COLD_TIMEOUT='200'))
+    assert _chat_timeout(http) == (2.0, 200.0)
+
+
+def test_grab_time_kind_keeps_30s_even_cold(tmp_path):
+    http = world(ollama('allow', 0.95), extra={'unraid.invalid:11434/api/chat': ollama('allow', 0.95)})
+    run(tmp_path, Clock(), http, env=dict(UENV, LLM_UNRAID_KINDS='import_identity,upgrade_gate'), kind='upgrade_gate',
+        rules='allow', facts={'title': 'T', 'seeders': 50})
+    assert _chat_timeout(http) == (2.0, 30.0)

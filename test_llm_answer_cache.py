@@ -7,7 +7,7 @@ import llm_decide
 from test_llm_chain import ENV, Clock, FakeClaude, FakeHttp, chat, run
 
 aw = __import__('arr-webhook')
-ID_FACTS = {'queue_title': 'Some.Show.S01E01.1080p.WEB-GRP', 'matched_title': 'Other Show', 'seeders': 5}
+ID_FACTS = {'queue_title': 'Some.Show.S01E01.1080p.WEB-GRP', 'matched_title': 'Some Show', 'seeders': 5}
 
 
 def test_shadow_past_wait_makes_no_paid_or_claude_call(tmp_path):

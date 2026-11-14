@@ -83,3 +83,34 @@ def test_spinoff_guard_skips_radarr_and_missing_titles():
                                                                'matched_title': 'NCIS'}) == ('mismatch', None)
     assert ld.release_show_name('NCIS.Origins.S03E05.1080p.WEB.H264-CAKES') == 'ncis origins'
     assert ld.spinoff_words('NCIS.S23E05.1080p.WEB.h264-ETHEL', 'NCIS: Origins') == []
+
+
+def test_reverse_spinoff_is_never_a_match():
+    # The matched title extends the release's name: the release is the parent show, not the spin-off.
+    for q, m in (('NCIS.S23E05.1080p.WEB.h264-ETHEL', 'NCIS: Origins'),
+                 ('Chicago.S01E01.1080p.WEB.h264-GRP', 'Chicago Fire')):
+        assert _spin(q, m) == ('unsure', 'spinoff_title_reverse'), q
+    # Radarr titles often drop a subtitle ('Borat' for the long TMDB title); the year rule covers sequels there.
+    assert _spin('Borat.2006.1080p.BluRay.x264-GRP', 'Borat: Cultural Learnings of America', 'Radarr') == ('match', None)
+    assert ld.reverse_spinoff_words('NCIS.S23E05.1080p.WEB.h264-ETHEL', 'NCIS') == []
+    assert ld.reverse_spinoff_words('The.Office.US.S01E01.720p', 'The Office') == []
+
+
+def test_different_first_word_is_never_a_match():
+    for q, m, svc in (('Chicago.Fire.S13E01.1080p.WEB.h264-GRP', 'Line of Fire', 'Sonarr'),
+                      ('It.Chapter.Two.2019.1080p.BluRay.x264-GRP', 'John Wick: Chapter 3 - Parabellum', 'Radarr')):
+        assert ld.apply_hard_rules('import_identity', 'match',
+                                   {'service': svc, 'queue_title': q, 'matched_title': m}) == ('unsure', 'title_first_word'), q
+    # Articles are skipped; a mismatch/unsure answer is never changed.
+    assert not ld.first_word_differs('The.Bear.S03E01.1080p', 'Bear')
+    assert ld.apply_hard_rules('import_identity', 'mismatch',
+                               {'queue_title': 'Chicago.Fire.S13E01', 'matched_title': 'Line of Fire'}) == ('mismatch', None)
+
+
+def test_title_guards_leave_real_matches_alone():
+    for q, m in (('Chicago.P.D.S12E01.1080p.WEB.h264-GRP', 'Chicago P.D.'),
+                 ('Law.and.Order.SVU.S26E01.1080p.WEB.h264-GRP', 'Law & Order: Special Victims Unit'),
+                 ('Shogun.2024.S01E01.1080p.WEB.h264-GRP', 'Shōgun (2024)'),
+                 ('The.Office.US.S01E01.720p.WEB.h264-GRP', 'The Office (US)')):
+        assert ld.apply_hard_rules('import_identity', 'match',
+                                   {'service': 'Sonarr', 'queue_title': q, 'matched_title': m}) == ('match', None), q

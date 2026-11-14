@@ -33,7 +33,15 @@ DEFAULT_PENDING = '/data/llm_pending.json'
 PAID_BASE = 'https://api.darkbloom.dev/v1'
 PAID_MODEL = 'qwen3.5-35b-a3b'
 CLAUDE_MODEL = 'claude-sonnet-5-5'
-MODELS_TTL = 600.0
+MODELS_TTL = 15.0
+# Auto-picked local models a kind may use: only models whose back-test passed for that kind. Whatever Darkbloom
+# has loaded is used as is; one that isn't listed skips the local layer (never a model swap). Override per kind
+# with LLM_LOCAL_APPROVED_<KIND> (comma-separated, '*' = any). An LLM_LOCAL_MODEL pin bypasses this.
+LOCAL_APPROVED = {'import_identity': ('qwen3.5-35b-a3b',), 'upgrade_gate': ('qwen3.5-35b-a3b',)}
+UNRAID_TIMEOUT = 30.0
+UNRAID_COLD_TIMEOUT = 120.0
+# Kinds asked from a background poller, where waiting out a cold Unraid load is fine. Grab-time kinds keep 30 s.
+UNRAID_COLD_KINDS = frozenset({'import_identity'})
 PENDING_MAX_AGE = 24 * 3600.0
 DEFAULT_WAIT_MIN = 15.0
 DEFAULT_ANSWER_TTL_H = 24.0
@@ -102,7 +110,8 @@ _MODELS_CACHE = {}
 
 
 def pick_local_model(base, key, http, now=time.time, timeout=(2, 5)):
-    """LLM_LOCAL_MODEL is handled by the caller; otherwise the first id from GET {base}/v1/models, cached 10 min."""
+    """LLM_LOCAL_MODEL is handled by the caller; otherwise the first id from GET {base}/v1/models, cached
+    MODELS_TTL seconds (short, so a model Darkbloom swaps in is seen on the next decision)."""
     hit = _MODELS_CACHE.get(base)
     if hit and now() - hit[0] < MODELS_TTL:
         return hit[1]
@@ -162,14 +171,16 @@ def _model_tag(name):
     return n if ':' in n.rsplit('/', 1)[-1] else n + ':latest'
 
 
-def _ollama_chat_fn(base, model, http, total=30.0, connect=2.0):
-    """Native Ollama /api/chat, the shape the back-test ran: no stream, no thinking, temperature 0.2."""
+def _ollama_chat_fn(base, model, http, total=UNRAID_TIMEOUT, connect=2.0, state=None, cold_total=None):
+    """Native Ollama /api/chat, the shape the back-test ran: no stream, no thinking, temperature 0.2.
+    When the gate saw nothing loaded (state['cold']), the read timeout is cold_total so the model load fits."""
     url = base.rstrip('/') + '/api/chat'
 
     def fn(prompt):
         body = {'model': model, 'messages': [{'role': 'user', 'content': prompt}], 'stream': False, 'think': False,
                 'options': {'temperature': 0.2, 'num_predict': 1024}}
-        r = http.post(url, json=body, headers={'Content-Type': 'application/json'}, timeout=(connect, total))
+        t = cold_total if cold_total and state is not None and state.get('cold') else total
+        r = http.post(url, json=body, headers={'Content-Type': 'application/json'}, timeout=(connect, t))
         r.raise_for_status()
         data = r.json()
         meta = {}
@@ -180,10 +191,13 @@ def _ollama_chat_fn(base, model, http, total=30.0, connect=2.0):
     return fn
 
 
-def _unraid_gate(base, model, env, http):
+def _unraid_gate(base, model, env, http, state=None):
     """Skip reason, or None when the Unraid GPU is free for this model. The queue shares that GPU: asking
-    while it has another model loaded would evict it, so a different resident model means skip."""
+    while it has another model loaded would evict it, so a different resident model means skip.
+    Sets state['cold'] when nothing is loaded (the ask will include a model load)."""
     def gate():
+        if state is not None:
+            state['cold'] = False
         held, _ = hold_active(env, http, 'LLM_UNRAID_HOLD')
         if held:
             return 'hold'
@@ -196,7 +210,38 @@ def _unraid_gate(base, model, env, http):
             return 'timeout' if 'timeout' in type(e).__name__.lower() else 'error'
         if loaded and _model_tag(model) not in loaded:
             return 'other-model-resident'
+        if state is not None:
+            state['cold'] = not loaded
         return None
+    return gate
+
+
+def _model_key(name):
+    """'mlx-community/Qwen3.5-35B-A3B' and 'qwen3.5-35b-a3b' compare equal."""
+    return str(name or '').strip().rsplit('/', 1)[-1].lower()
+
+
+def local_approved(kind, env):
+    """Approved model keys for kind, or None when any model is allowed."""
+    raw = env.get('LLM_LOCAL_APPROVED_' + kind.upper())
+    names = [n.strip() for n in raw.split(',')] if raw is not None and raw.strip() else list(LOCAL_APPROVED.get(kind, ()))
+    if '*' in names:
+        return None
+    return {_model_key(n) for n in names if n}
+
+
+def _local_gate(kind, env, model_fn):
+    """Skip reason for the auto-picked local model: 'model-not-approved' when its back-test hasn't passed for
+    this kind, 'model-unknown' when /v1/models can't be read. None to go ahead."""
+    approved = local_approved(kind, env)
+    if approved is None:
+        return None
+
+    def gate():
+        name = model_fn()
+        if not name:
+            return 'model-unknown'
+        return None if _model_key(name) in approved else 'model-not-approved'
     return gate
 
 
@@ -263,21 +308,27 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
     ukinds = {k.strip() for k in (env.get('LLM_UNRAID_KINDS') or UNRAID_KINDS).split(',') if k.strip()}
     if ubase and kind in ukinds:
         um = (env.get('LLM_UNRAID_MODEL') or '').strip() or UNRAID_MODEL
-        layers['unraid'] = Layer('unraid', _ollama_chat_fn(ubase, um, http), um, _unraid_gate(ubase, um, env, http))
+        state = {}
+        cold = float(env.get('LLM_UNRAID_COLD_TIMEOUT') or UNRAID_COLD_TIMEOUT) if kind in UNRAID_COLD_KINDS else None
+        layers['unraid'] = Layer('unraid', _ollama_chat_fn(ubase, um, http, state=state, cold_total=cold), um,
+                                 _unraid_gate(ubase, um, env, http, state))
     total = float(env.get('LLM_DECIDE_TIMEOUT') or 20)
     base = (env.get('DARKBLOOM_BASE_URL') or '').strip()
     legacy = (env.get('LLM_DECIDE_URL') or '').strip()
     if base or legacy:
         key = env.get('DARKBLOOM_API_KEY') if base else env.get('LLM_DECIDE_KEY')
+        gate = None
         if base:
             fixed = (env.get('LLM_LOCAL_MODEL') or '').strip()
             model_fn = (lambda: fixed) if fixed else (lambda: pick_local_model(base, key, http, now))
+            if not fixed:
+                gate = _local_gate(kind, env, model_fn)
             url = _chat_url(base)
         else:
             model_fn = (lambda: env.get('LLM_DECIDE_MODEL') or DEFAULT_MODEL)
             url = legacy
         layers['local'] = Layer('local', _chat_fn(url, model_fn, key, http, total, 2.0,
-                                                  {'chat_template_kwargs': {'enable_thinking': False}}), model_fn)
+                                                  {'chat_template_kwargs': {'enable_thinking': False}}), model_fn, gate)
     paid_key = (env.get('DARKBLOOM_CLOUD_API_KEY') or '').strip()
     if paid_key:
         pm = (env.get('DARKBLOOM_CLOUD_MODEL') or '').strip() or PAID_MODEL
@@ -502,7 +553,7 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
     key = pending_key(kind, facts)
     res = {'decision': None, 'layer': None, 'model': None, 'latency_ms': None, 'pending': False,
            'pending_min': None, 'escalations': [], 'calls': [], 'hold_cause': None, 'error': None, 'first_pending': False,
-           'unraid': None}
+           'unraid': None, 'local_skip': None}
 
     def answered(layer, dec, lat):
         store.remove(key)
@@ -543,9 +594,18 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
     local = layers.get('local')
     if local is not None and res['decision'] is None:
         held, cause = hold_active(env, hold_http)
+        skip = None
+        if not held and local.gate is not None:
+            try:
+                skip = local.gate()
+            except Exception:  # noqa: BLE001
+                skip = 'model-unknown'
         if held:
             dec, err, lat = None, 'hold', 0
             res['hold_cause'] = cause
+        elif skip:
+            dec, err, lat = None, skip, 0
+            res['local_skip'] = skip
         else:
             dec, err, lat = _ask(kind, prompt, local)
         if dec is not None:
@@ -656,6 +716,8 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
             extra['error'] = res['error']
         if res['unraid'] is not None:
             extra['unraid'] = res['unraid']
+        if res.get('local_skip'):
+            extra['local_skip'] = res['local_skip']
         if not res['pending'] or res['first_pending']:
             llm_decide.log_decision(path, kind, json.dumps(facts, default=str, sort_keys=True)[:500],
                                     rules_action, decision, mode, extra)
