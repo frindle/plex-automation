@@ -354,34 +354,64 @@ def release_show_name(queue_title):
     return ' '.join(_title_tokens(t[:m.start()] if m else t))
 
 
+def _core(words):
+    """Words with country tags and filler words dropped ('the traitors us' -> ['traitors'])."""
+    return [w for w in words if w not in _SPINOFF_IGNORE]
+
+
 def spinoff_words(queue_title, matched_title):
-    """Words the release's name adds after the matched title ([] when it doesn't extend it)."""
-    rel = release_show_name(queue_title).split()
-    mt = _title_tokens(str(matched_title or ''))
+    """Words the release's name adds after the matched title ([] when it doesn't extend it).
+    Compared without country tags and filler words, so 'The Traitors New Blood' extends 'The Traitors (US)'."""
+    rel = _core(release_show_name(queue_title).split())
+    mt = _core(_title_tokens(str(matched_title or '')))
     if not rel or not mt or rel[:len(mt)] != mt:
         return []
-    return [w for w in rel[len(mt):] if w not in _SPINOFF_IGNORE]
+    return rel[len(mt):]
 
 
 def reverse_spinoff_words(queue_title, matched_title):
-    """Words the matched title adds after the release's name ('NCIS' release matched to 'NCIS: Origins')."""
-    rel = release_show_name(queue_title).split()
-    mt = _title_tokens(str(matched_title or ''))
+    """Words the matched title adds after the release's name ('NCIS' release matched to 'NCIS: Origins',
+    'The Traitors US' to 'The Traitors: New Blood')."""
+    rel = _core(release_show_name(queue_title).split())
+    mt = _core(_title_tokens(str(matched_title or '')))
     # A name with no real word ('The.100' parses to 'the') says nothing about which show it is.
-    if not any(w not in _SPINOFF_IGNORE for w in rel) or not mt or mt[:len(rel)] != rel:
+    if not rel or not mt or mt[:len(rel)] != rel:
         return []
-    return [w for w in mt[len(rel):] if w not in _SPINOFF_IGNORE]
+    return mt[len(rel):]
+
+
+_COUNTRIES = frozenset(('us', 'uk', 'au', 'nz', 'ca'))
+
+
+def country_differs(queue_title, matched_title):
+    """True when both names carry a country tag and the tags differ: 'The Traitors UK' is not 'The Traitors (US)'."""
+    rel = _COUNTRIES.intersection(release_show_name(queue_title).split())
+    mt = _COUNTRIES.intersection(_title_tokens(str(matched_title or '')))
+    return bool(rel and mt and rel != mt)
 
 
 _ARTICLES = frozenset(('the', 'a', 'an'))
 
 
+# A possessive brand in front of the real title: "Tom Clancy's ", "Marvel's ", "Dr. Seuss' ".
+_POSSESSIVE_LEAD = re.compile(r"^[^:]{0,40}?\w['\u2019]s?\s+")
+
+
 def first_word_differs(queue_title, matched_title):
     """True when the release name and the matched title start with different words (articles skipped).
-    Back-test: 0 of 150 real matches differ here, so a 'match' across different first words is never trusted."""
+    Back-test: 0 of 150 real matches differ here, so a 'match' across different first words is never trusted.
+    One exception: the release drops a possessive brand and the rest is the same title of 2+ real words
+    ('Without Remorse' is "Tom Clancy's Without Remorse"; a lone 'Anatomy' is not "Grey's Anatomy")."""
     rel = [w for w in release_show_name(queue_title).split() if w not in _ARTICLES]
     mt = [w for w in _title_tokens(str(matched_title or '')) if w not in _ARTICLES]
-    return bool(rel and mt and rel[0] != mt[0])
+    if not (rel and mt and rel[0] != mt[0]):
+        return False
+    lead = _POSSESSIVE_LEAD.match(str(matched_title))
+    if lead:
+        rest = [w for w in _title_tokens(str(matched_title)[lead.end():]) if w not in _ARTICLES]
+        if rest == rel and len(_core(rest)) >= 2:
+            return False
+    return True
 
 
 def _same_words(a, b):
@@ -435,7 +465,7 @@ def apply_hard_rules(kind, action, facts):
     """Deterministic rules the model can never override. Returns (action, rule_or_None).
 
     facts keys (all optional, missing => no veto from that rule): seeders, candidate_dv_web (bool, DV Profile 5
-    WEB release), year_matches (bool), queue_title + matched_title (spin-off, reverse spin-off,
+    WEB release), year_matches (bool), queue_title + matched_title (spin-off, reverse spin-off, country,
     first-word and diverging-title guards). Present-but-malformed facts
     fail closed.
     """
@@ -458,6 +488,8 @@ def apply_hard_rules(kind, action, facts):
                     return 'unsure', 'spinoff_title'
                 if facts.get('service') != 'Radarr' and reverse_spinoff_words(qt, mt):
                     return 'unsure', 'spinoff_title_reverse'
+                if facts.get('service') != 'Radarr' and country_differs(qt, mt):
+                    return 'unsure', 'title_country'
                 if first_word_differs(qt, mt):
                     return 'unsure', 'title_first_word'
                 if facts.get('service') != 'Radarr' and title_diverges(qt, mt):
