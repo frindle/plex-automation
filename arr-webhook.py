@@ -194,7 +194,7 @@ def _grab_freeleech(source, data, download_id):
 
 
 def _existing_file_facts(source, data):
-    """Quality, size, group, HDR and audio of the file an upgrade would replace. {} on any error."""
+    """Quality, size, group, HDR, audio and video codec of the file an upgrade would replace. {} on any error."""
     try:
         if source == 'Sonarr':
             eps = data.get('episodes') or []
@@ -231,6 +231,7 @@ def _existing_file_facts(source, data):
             'existing_group': f.get('releaseGroup') or None,
             'existing_hdr': mi.get('videoDynamicRangeType') or None,
             'existing_audio': mi.get('audioCodec') or None,
+            'existing_codec': mi.get('videoCodec') or None,
         }
     except Exception as e:  # noqa: BLE001
         log.info(f'{source}: existing-file lookup failed: {e}')

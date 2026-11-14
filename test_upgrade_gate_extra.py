@@ -77,12 +77,12 @@ def test_grab_freeleech_history_without_flags_is_no_and_errors_are_unknown(monke
 def test_existing_file_facts_radarr_picks_largest_file(monkeypatch):
     files = [{'size': 4 * GB, 'quality': {'quality': {'name': 'WEBDL-1080p'}}, 'releaseGroup': 'SMALL'},
              {'size': 20 * GB, 'quality': {'quality': {'name': 'Bluray-2160p'}}, 'releaseGroup': 'BIG',
-              'mediaInfo': {'videoDynamicRangeType': 'DV HDR10', 'audioCodec': 'TrueHD Atmos'}}]
+              'mediaInfo': {'videoDynamicRangeType': 'DV HDR10', 'audioCodec': 'TrueHD Atmos', 'videoCodec': 'x265'}}]
     calls = []
     _requests(monkeypatch, {'/api/v3/moviefile': _Resp(files)}, calls)
     out = aw._existing_file_facts('Radarr', {'movie': {'id': 7}})
     assert out == {'existing_quality': 'Bluray-2160p', 'existing_size_gb': 20.0, 'existing_group': 'BIG',
-                   'existing_hdr': 'DV HDR10', 'existing_audio': 'TrueHD Atmos'}
+                   'existing_hdr': 'DV HDR10', 'existing_audio': 'TrueHD Atmos', 'existing_codec': 'x265'}
     assert calls[0][1] == {'movieId': 7}
 
 
@@ -93,7 +93,7 @@ def test_existing_file_facts_sonarr_follows_episode_file(monkeypatch):
                             '/api/v3/episodefile/99': _Resp(ep_file)}, [])
     out = aw._existing_file_facts('Sonarr', {'episodes': [{'id': 11}]})
     assert out['existing_quality'] == 'WEBDL-1080p' and out['existing_size_gb'] == 2.5
-    assert out['existing_hdr'] is None and out['existing_audio'] is None
+    assert out['existing_hdr'] is None and out['existing_audio'] is None and out['existing_codec'] is None
 
 
 def test_existing_file_facts_empty_on_missing_or_error(monkeypatch):
