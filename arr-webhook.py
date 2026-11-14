@@ -745,27 +745,47 @@ def move_torrent_storage(torrent_hash, dest):
     log.info(f'Moved {torrent_hash} to {dest}')
     _invalidate_snapshot()
 
-    # Verify the move actually succeeded by checking the save_path (fresh,
-    # single-torrent read -- never the cached snapshot)
-    status_resp = session.post(
-        f'{DELUGE_URL}/json',
-        json={
-            'method': 'core.get_torrents_status',
-            'params': [{'id': [torrent_hash]}, ['save_path']],
-            'id': 6,
-        },
-        timeout=10
-    )
-    try:
-        status_result = status_resp.json().get('result', {})
-        if torrent_hash in status_result:
-            save_path = status_result[torrent_hash].get('save_path', '')
-            if not save_path.startswith(dest):
-                log.error(f'Move verification failed: {torrent_hash} did not land at expected destination {dest}')
-                record_activity('supersede-move-failed', f'torrent {torrent_hash} move to {dest} failed')
-    except Exception as e:
-        log.warning(f'Failed to verify move for {torrent_hash}: {e}')
+    # Deluge moves the files in the background and only updates save_path when they are done, so a read right
+    # after move_storage usually still shows the old path. Check once now; if it hasn't landed, keep checking in
+    # a thread and record a failure only if it never does.
+    if _move_landed(torrent_hash, dest) is False:
+        threading.Thread(target=_verify_move, args=(torrent_hash, dest), daemon=True, name='move-verify').start()
     return True
+
+
+MOVE_VERIFY_POLL_S = 10.0
+MOVE_VERIFY_TRIES = 180  # 30 min: a large file moving between disks takes minutes
+
+
+def _move_landed(torrent_hash, dest):
+    """True/False from a fresh single-torrent save_path read (never the cached snapshot); None when Deluge can't
+    say (torrent gone, bad reply)."""
+    try:
+        resp = session.post(
+            f'{DELUGE_URL}/json',
+            json={'method': 'core.get_torrents_status', 'params': [{'id': [torrent_hash]}, ['save_path']], 'id': 6},
+            timeout=10,
+        )
+        st = (resp.json().get('result') or {}).get(torrent_hash)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'Failed to verify move for {torrent_hash}: {e}')
+        return None
+    if not isinstance(st, dict):
+        return None
+    return (st.get('save_path') or '').startswith(dest)
+
+
+def _verify_move(torrent_hash, dest, tries=None, poll_s=None):
+    tries = max(int(MOVE_VERIFY_TRIES if tries is None else tries), 1)
+    poll = MOVE_VERIFY_POLL_S if poll_s is None else poll_s
+    for i in range(tries):
+        time.sleep(poll)
+        landed = _move_landed(torrent_hash, dest)
+        if landed is None or landed:
+            return landed
+    log.error(f'Move verification failed: {torrent_hash} did not land at expected destination {dest}')
+    record_activity('supersede-move-failed', f'torrent {torrent_hash} move to {dest} failed')
+    return False
 
 def _torrent_has_local_data(torrent_hash):
     """True if Deluge reports data on disk for this torrent (total_done > 0).
