@@ -384,6 +384,30 @@ def first_word_differs(queue_title, matched_title):
     return bool(rel and mt and rel[0] != mt[0])
 
 
+def _same_words(a, b):
+    """Two word runs name the same thing: equal once spaces go ('pd' / 'p d', 'shield' / 's h i e l d')
+    or one is the initials of the other ('svu' / 'special victims unit', 'la' / 'los angeles')."""
+    ja, jb = ''.join(a), ''.join(b)
+    return ja == jb or (len(a) == 1 and len(b) > 1 and ja == ''.join(w[0] for w in b)) or \
+        (len(b) == 1 and len(a) > 1 and jb == ''.join(w[0] for w in a))
+
+
+def title_diverges(queue_title, matched_title):
+    """True when the release name and the matched title start the same, then go different ways:
+    'Chicago PD' matched to 'Chicago Fire', 'Star Trek Discovery' to 'Star Trek: Strange New Worlds'.
+    Country tags and filler words are skipped; spelling ('P.D.') and initialisms ('SVU') still match.
+    A name that only extends the other is the spin-off guards' job, a different first word is first_word_differs'."""
+    rel = [w for w in release_show_name(queue_title).split() if w not in _SPINOFF_IGNORE]
+    mt = [w for w in _title_tokens(str(matched_title or '')) if w not in _SPINOFF_IGNORE]
+    if not rel or not mt or rel[0] != mt[0]:
+        return False
+    k = 0
+    while k < min(len(rel), len(mt)) and rel[k] == mt[k]:
+        k += 1
+    ra, mb = rel[k:], mt[k:]
+    return bool(ra and mb) and not _same_words(ra, mb)
+
+
 _SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
@@ -411,8 +435,8 @@ def apply_hard_rules(kind, action, facts):
     """Deterministic rules the model can never override. Returns (action, rule_or_None).
 
     facts keys (all optional, missing => no veto from that rule): seeders, candidate_dv_web (bool, DV Profile 5
-    WEB release), year_matches (bool), queue_title + matched_title (spin-off, reverse spin-off and
-    first-word guards). Present-but-malformed facts
+    WEB release), year_matches (bool), queue_title + matched_title (spin-off, reverse spin-off,
+    first-word and diverging-title guards). Present-but-malformed facts
     fail closed.
     """
     try:
@@ -436,6 +460,8 @@ def apply_hard_rules(kind, action, facts):
                     return 'unsure', 'spinoff_title_reverse'
                 if first_word_differs(qt, mt):
                     return 'unsure', 'title_first_word'
+                if facts.get('service') != 'Radarr' and title_diverges(qt, mt):
+                    return 'unsure', 'title_diverges'
         return action, None
     except Exception:
         if isinstance(kind, str) and kind in _SAFE_ACTION and action != _SAFE_ACTION[kind]:
