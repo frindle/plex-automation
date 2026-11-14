@@ -175,6 +175,7 @@ def test_llm_mode_values(monkeypatch):
 
 def _grab_world(mp, mode):
     seen, extra_calls = [], []
+    mp.setenv("GRAB_IDENTITY_CHECK", "0")  # its import_identity advise call would race this test's capture
     if mode is None:
         mp.delenv('LLM_DECISIONS', raising=False)
     else:

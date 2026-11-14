@@ -56,6 +56,7 @@ services:
       # at confidence >= 0.75 (hard rules still win). Layers, each skipped when its env is unset:
       # Unraid Ollama -> local Darkbloom -> paid Darkbloom -> Claude -> rules. Values live in .env, never here.
       LLM_DECISIONS: "${LLM_DECISIONS:-off}"
+      GRAB_IDENTITY_CHECK: "${GRAB_IDENTITY_CHECK:-1}"
       UNRAID_OLLAMA_URL: "${UNRAID_OLLAMA_URL:-}"
       LLM_UNRAID_MODEL: "${LLM_UNRAID_MODEL:-}"
       LLM_UNRAID_KINDS: "${LLM_UNRAID_KINDS:-}"

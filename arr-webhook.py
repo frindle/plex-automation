@@ -49,6 +49,10 @@ try:
     import llm_advisor
 except Exception:  # noqa: BLE001
     llm_advisor = None
+try:
+    import llm_decide
+except Exception:  # noqa: BLE001
+    llm_decide = None
 LLM_DECISIONS_LOG = os.environ.get('LLM_DECISIONS_LOG', '/data/llm_decisions.jsonl')
 
 
@@ -4003,6 +4007,104 @@ def _ib_seen_recently(download_id, ttl_hours=24):
     _ib_seen[download_id] = now
     return False
 
+# ── Grab-time identity check (alert-only) ────────────────────────────────────
+# Every grab is compared with the series/movie it was grabbed for, so a wrong
+# match that auto-imports (no importBlocked stop) still gets noticed. Hard rules
+# first, then the model in whatever LLM_DECISIONS mode is set. Never removes,
+# blocks or relabels anything. GRAB_IDENTITY_CHECK=0 disables it.
+
+def _grab_identity_enabled():
+    return (os.environ.get('GRAB_IDENTITY_CHECK', '1') or '').strip().lower() not in ('0', 'false', 'off', 'no')
+
+
+def _grab_identity_facts(data, source):
+    """(facts, item_id) from a Grab payload, built like the importBlocked path. (None, None) when unusable."""
+    data = data if isinstance(data, dict) else {}
+    release_title = (data.get('release') or {}).get('releaseTitle') or ''
+    if source == 'Sonarr':
+        item, service = data.get('series') or {}, 'Sonarr'
+        # Daily shows carry an air date (Show.2026.10.30), not the series year.
+        years = _year_in_title(re.sub(r'(?<!\d)(19|20)\d{2}[.\- ]\d{2}[.\- ]\d{2}(?!\d)', ' ', release_title))
+    else:
+        item, service = data.get('movie') or {}, 'Radarr'
+        years = _year_in_title(release_title)
+    if not release_title or not item.get('title'):
+        return None, None
+    year = item.get('year')
+    return ({'service': service, 'queue_title': release_title, 'matched_title': item.get('title'),
+             'matched_year': year, 'year_matches': (year in years) if (year and years) else None},
+            item.get('id'))
+
+
+def _grab_alt_titles(source, item_id):
+    """Alias titles for a series/movie from the *arr API. [] on any failure."""
+    try:
+        if not item_id:
+            return []
+        if source == 'Sonarr':
+            r = requests.get(f'{SONARR_URL}/api/v3/series/{item_id}', headers={'X-Api-Key': SONARR_API_KEY}, timeout=5)
+            r.raise_for_status()
+            body = r.json() or {}
+            alts = [a.get('title') for a in (body.get('alternateTitles') or []) if isinstance(a, dict)]
+        else:
+            r = requests.get(f'{RADARR_URL}/api/v3/movie/{item_id}', headers={'X-Api-Key': RADARR_API_KEY}, timeout=5)
+            r.raise_for_status()
+            body = r.json() or {}
+            alts = [a.get('title') for a in (body.get('alternativeTitles') or []) if isinstance(a, dict)]
+            alts.append(body.get('originalTitle'))
+        return [a for a in alts if isinstance(a, str) and a.strip()]
+    except Exception as e:  # noqa: BLE001
+        log.debug(f'grab identity: alt titles fetch failed: {e}')
+        return []
+
+
+def _grab_identity_check(data, source):
+    """Check one Grab payload. Alerts (Pushover + activity) when the hard rules flag it and no alias clears it, or
+    when the model says mismatch. Never raises."""
+    try:
+        if not _grab_identity_enabled():
+            return
+        facts, item_id = _grab_identity_facts(data, source)
+        if not facts:
+            return
+        download_id = (data.get('downloadId') or '').lower()
+        action, rule = llm_decide.apply_hard_rules('import_identity', 'match', facts)
+        if action != 'match':
+            for alt in _grab_alt_titles(source, item_id):
+                if llm_decide.apply_hard_rules('import_identity', 'match', dict(facts, matched_title=alt))[0] == 'match':
+                    log.info(f"grab identity: {facts['queue_title']} flagged ({rule}) but alias '{alt}' fits")
+                    return
+        flagged = action != 'match'
+        model = None
+        if _llm_mode() != 'off':
+            info = {}
+            ret = _llm_advise('import_identity', facts, 'match', info)
+            # shadow returns the rules action; the advisor reports the model's own raw answer in info
+            model = info.get('llm_action') if 'llm_action' in info else (None if info.get('pending') else ret)
+        if not flagged and model != 'mismatch':
+            return
+        why = rule if flagged else 'model mismatch'
+        msg = f"{facts['queue_title']} was grabbed for {facts['matched_title']} ({why}; model={model or 'none'})"
+        # tier a: flagged and the model did not say match -> push. b: flagged but model says match, c: model-only
+        # mismatch -> activity log only.
+        push = flagged and model != 'match'
+        if _ib_seen_recently(f'grab-identity:{download_id}'):
+            return
+        if push:
+            send_pushover('Possible wrong match', msg)
+        record_activity('identity-grab', f'{source}: {msg}' + ('' if push else ' [log only]'))
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'grab identity check failed: {e}')
+
+
+def _start_grab_identity_check(data, source):
+    """Fire-and-forget daemon thread; never raises, never delays the caller."""
+    try:
+        if _grab_identity_enabled():
+            threading.Thread(target=_grab_identity_check, args=(data, source), daemon=True).start()
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'grab identity thread failed: {e}')
+
 # IndexerFlags enum values; Radarr and Sonarr differ (Radarr/Radarr and Sonarr/Sonarr
 # src/NzbDrone.Core/Parser/Model/IndexerFlags.cs)
 _RADARR_INDEXER_FLAGS = {
@@ -4776,6 +4878,8 @@ def handle_grab(data, source):
     # Label blank/missing Sonarr categories before any upgrade logic
     if source == 'Sonarr':
         label_blank_sonarr_grab(download_id)
+
+    _start_grab_identity_check(data, source)
 
     # Check if this is an upgrade via API since isUpgrade is not in Grab payload
     if source == 'Sonarr':
