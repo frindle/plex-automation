@@ -140,3 +140,38 @@ def test_spelling_and_initialisms_are_not_divergence():
         assert _spin(q, m) == ('match', None), q
     assert not ld.title_diverges('Chicago.Fire.S13E01', 'Chicago Fire')
     assert ld.title_diverges('Chicago.Fire.S13E01', 'Chicago Med')
+
+
+def test_country_tag_does_not_hide_a_spinoff():
+    # Held-out back-test 11-14: all three were imported as matches by 805e51c.
+    assert _spin('The.Traitors.US.S05E05.Wake.of.the.Living.Dead.1080p.WEB.h264-Kitsune',
+                 'The Traitors: New Blood (2026)') == ('unsure', 'spinoff_title_reverse')
+    assert _spin('The Traitors US S05E07 Its Like Fighting Two Pigs 1080p WEB h264-RAWR',
+                 'The Traitors: New Blood (2026)') == ('unsure', 'spinoff_title_reverse')
+    assert _spin('The.Traitors.New.Blood.S01E08.1080p.WEB.H264-HOTDOGWATER',
+                 'The Traitors (US) (2023)') == ('unsure', 'spinoff_title')
+    for q, m in (('The.Traitors.US.S05E05.1080p.WEB.h264-GRP', 'The Traitors (US)'),
+                 ('The.Traitors.New.Blood.S01E01.1080p.WEB.H264-GRP', 'The Traitors: New Blood'),
+                 ('The.Traitors.UK.S03E01.1080p.WEB.h264-GRP', 'The Traitors (UK)'),
+                 ('The.Traitors.S03E01.1080p.WEB.h264-GRP', 'The Traitors (US)')):
+        assert _spin(q, m) == ('match', None), q
+
+
+def test_different_country_is_never_a_match():
+    assert _spin('The.Traitors.UK.S03E01.1080p.WEB.h264-GRP', 'The Traitors (US)') == ('unsure', 'title_country')
+    assert _spin('Ghosts.US.S04E05.1080p.WEB.h264-GRP', 'Ghosts (UK)') == ('unsure', 'title_country')
+    assert _spin('This.Is.Us.S06E01.1080p.WEB.h264-GRP', 'This Is Us') == ('match', None)
+    assert not ld.country_differs('Ghosts.S04E05.1080p', 'Ghosts (US)')
+
+
+def test_possessive_brand_left_out_of_the_release_still_matches():
+    assert ld.apply_hard_rules('import_identity', 'match', {
+        'service': 'Radarr', 'queue_title': 'Without Remorse 2021 2160p AMZN WEB-DL DDP5 1 HDR H 265-GRP',
+        'matched_title': "Tom Clancy's Without Remorse", 'year_matches': True}) == ('match', None)
+    assert _spin('Jack.Ryan.S04E01.1080p.WEB.h264-GRP', "Tom Clancy's Jack Ryan") == ('match', None)
+    assert _spin('Agents.of.S.H.I.E.L.D.S07E01.1080p.WEB.h264-GRP', "Marvel's Agents of S.H.I.E.L.D.") == ('match', None)
+    # One word after the brand is too little to trust; a different title after it is still refused.
+    assert _spin('Daredevil.S01E01.1080p.WEB.h264-GRP', "Marvel's Daredevil") == ('unsure', 'title_first_word')
+    assert _spin('Anatomy.of.a.Scandal.S01E01.1080p.WEB.h264-GRP', "Grey's Anatomy") == ('unsure', 'title_first_word')
+    # A real-world refusal that stays: the release adds a word in front, the brand is not possessive.
+    assert _spin('Apollo.Has.Fallen.S02E04.1080p.WEB.h264-GRP', 'Has Fallen') == ('unsure', 'title_first_word')
