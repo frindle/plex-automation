@@ -24,19 +24,25 @@ POLICY = {
         'x265 means x265, h265 or HEVC; x264 means x264, h264 or AVC. '
         'Source tiers: Remux and Bluray are the top tier. WEB-DL, WEBRip and HDTV are one tier: none of them is '
         'better or worse than another (Sonarr labels most x265 re-encodes HDTV). '
+        'When a Comparison line follows the Context, use it: it is computed from these facts. '
         'Decide in this order and stop at the first rule that applies: '
-        '1. Reject: fewer than 10 seeders; Dolby Vision Profile 5 (any WEB-DL DV except Hulu; HDR10 is preferred '
-        'over WEB DV); anything Plex cannot play. '
-        '2. Allow, even when the candidate is much bigger: a higher resolution; a Bluray or Remux candidate over a '
-        'WEB-DL, WEBRip or HDTV file; HDR10 or disc Dolby Vision (Bluray/Remux) over SDR; lossless or Atmos audio '
-        'over lossy; a replacement of a poor release group. '
-        '3. Allow: an x265 candidate replacing an x264 file at the same resolution, unless size_gb shows it is '
-        'bigger. A re-encode of a WEB-DL counts: x265 saves space. '
-        '4. Allow: same codec, resolution and source tier when size_gb is at least 1.4 times existing_size_gb '
-        '(a higher-bitrate encode is better quality), or when it is smaller (saves space). '
+        '1. Reject when the CANDIDATE has fewer than 10 seeders, is Dolby Vision Profile 5 (any WEB-DL DV except '
+        'Hulu; HDR10 is preferred over WEB DV), or cannot play in Plex. Only the candidate counts here: replacing '
+        'an existing WEB DV file is fine and is often the point of the upgrade. '
+        '2. Allow, even when the candidate is much bigger: a higher resolution; a better source tier (Bluray or '
+        'Remux over a WEB-DL, WEBRip or HDTV file); HDR10 or disc Dolby Vision (Bluray/Remux) over SDR; lossless '
+        'or Atmos audio over lossy; replacing an AV1 file (many Plex clients cannot play AV1 directly); a PROPER '
+        'or REPACK (it fixes a broken release); a replacement of a poor release group. '
+        '3. Allow: an x265 candidate replacing an x264 file at the same resolution when it is smaller or about '
+        'the same size. A re-encode of a WEB-DL counts: x265 saves space. '
+        '4. Allow at the same resolution and source tier: a candidate at least 1.4 times the existing size (a '
+        'higher-bitrate encode is better quality), unless it is x264 replacing x265; or a smaller candidate with '
+        'the same codec (saves space). '
         '5. Reject: an x264 candidate that is bigger than the x265 file it replaces at the same resolution and '
         'source tier: it costs space for no visible gain. '
-        '6. Anything else is a sidegrade: reject it, or throttle when unsure. '
+        '6. Throttle: same resolution and source tier from a different release group when no rule above '
+        'applies. Sonarr and Radarr rank release groups by Penn\'s preferences, which these facts do not show. '
+        '7. Anything else is a sidegrade (for example the same group at about the same size): reject it. '
         'Private-tracker ratio matters: prefer freeleech. freeleech is full, partial or no. '
         'For a season pack, episodes is how many episodes it holds, size_gb is the whole pack and '
         'existing_size_gb is the total of the existing files of those episodes (episodes_with_file of them have '
@@ -122,16 +128,125 @@ def parse_decision(kind, raw):
         return None
 
 
+_RES = re.compile(r'(2160|1080|720|576|480)p', re.I)
+
+
+def _res(quality):
+    if not isinstance(quality, str):
+        return None
+    m = _RES.search(quality)
+    if m:
+        return int(m.group(1))
+    return 480 if 'dvd' in quality.lower() else None
+
+
+def _tier(quality):
+    """2 = disc (Remux/Bluray), 1 = WEB-DL/WEBRip/HDTV, 0 = DVD/SD, None = unknown."""
+    if not isinstance(quality, str):
+        return None
+    q = quality.lower()
+    if 'remux' in q or 'bluray' in q or 'blu-ray' in q:
+        return 2
+    if 'web' in q or 'hdtv' in q:
+        return 1
+    if 'dvd' in q or 'sdtv' in q:
+        return 0
+    return None
+
+
+_FIX_TAG = re.compile(r'(?<![a-z0-9])(proper|repack|rerip)(?![a-z0-9])', re.I)
+_TIER_NAME = {2: 'disc (Bluray/Remux)', 1: 'WEB/HDTV', 0: 'DVD/SD'}
+
+
+def _codec_family(codec):
+    if not isinstance(codec, str):
+        return None
+    c = re.sub(r'[^a-z0-9]', '', codec.lower())
+    if c in ('x265', 'h265', 'hevc'):
+        return 'x265'
+    if c in ('x264', 'h264', 'avc'):
+        return 'x264'
+    if c == 'av1':
+        return 'AV1'
+    return None
+
+
+def _size_ratio(context):
+    """Candidate size over existing size, per episode when only some episodes of a pack have a file."""
+    try:
+        new, old = _num(context.get('size_gb')), _num(context.get('existing_size_gb'))
+    except (TypeError, ValueError):
+        return None
+    if new is None or old is None or new <= 0 or old <= 0:
+        return None
+    try:
+        eps, have = _num(context.get('episodes')), _num(context.get('episodes_with_file'))
+    except (TypeError, ValueError):
+        eps = have = None
+    if eps and have and 0 < have < eps:
+        new, old = new / eps, old / have
+    return new / old
+
+
+def upgrade_comparison(context):
+    """Plain-words comparison of the candidate against the file it replaces, computed in code so the model
+    does not have to parse quality strings or divide sizes. Empty when nothing is known about the existing file."""
+    if not isinstance(context, dict):
+        return ''
+    parts = []
+    r_new, r_old = _res(context.get('quality')), _res(context.get('existing_quality'))
+    if r_new and r_old:
+        parts.append('resolution %s (%dp vs %dp)' % (
+            'higher' if r_new > r_old else 'lower' if r_new < r_old else 'same', r_new, r_old))
+    t_new, t_old = _tier(context.get('quality')), _tier(context.get('existing_quality'))
+    if t_new is not None and t_old is not None:
+        word = 'better' if t_new > t_old else 'worse' if t_new < t_old else 'same'
+        parts.append('source tier %s (%s vs %s)' % (word, _TIER_NAME[t_new], _TIER_NAME[t_old]))
+    c_new, c_old = _codec_family(context.get('codec')), _codec_family(context.get('existing_codec'))
+    if c_new and c_old:
+        parts.append('codec %s -> %s' % (c_old, c_new))
+    ratio = _size_ratio(context)
+    if ratio is not None:
+        if ratio >= 1.4:
+            word = 'much bigger: a higher-bitrate encode'
+        elif ratio > 1.05:
+            word = 'a little bigger'
+        elif ratio >= 0.95:
+            word = 'about the same size'
+        else:
+            word = 'smaller: saves space'
+        parts.append('size %.2f times the existing file (%s)' % (ratio, word))
+    g_new, g_old = context.get('group'), context.get('existing_group')
+    if isinstance(g_new, str) and g_new.strip() and isinstance(g_old, str) and g_old.strip():
+        parts.append('release group %s' % ('same' if g_new.strip().lower() == g_old.strip().lower() else 'different'))
+    title = context.get('title')
+    if isinstance(title, str) and _FIX_TAG.search(title):
+        parts.append('the title marks a PROPER/REPACK (a fixed re-release)')
+    hdr_old = context.get('existing_hdr')
+    if 'hdr' in context and 'existing_hdr' in context:
+        has_old = bool(hdr_old) and str(hdr_old).strip().lower() not in _FALSE_STRINGS
+        if _flag(context.get('hdr')) and not has_old:
+            parts.append('HDR gained (existing file is SDR)')
+        elif has_old and not _flag(context.get('hdr')):
+            parts.append('HDR lost (existing file has %s)' % hdr_old)
+    if not parts:
+        return ''
+    return 'Comparison (computed from the facts, candidate vs existing file; trust it over your own reading): ' + \
+        '; '.join(parts) + '.'
+
+
 def build_prompt(kind, context):
     if kind is None or kind == '' or kind not in KINDS:
         raise ValueError('unknown kind: %r' % (kind,))
     actions = ', '.join(KINDS[kind])
     ctx_json = json.dumps(context, sort_keys=True, default=str)
+    compare = upgrade_comparison(context) if kind == 'upgrade_gate' else ''
     return (
         'Decision kind: ' + str(kind) + '\n'
         'Allowed actions: ' + actions + '\n'
         'Policy: ' + POLICY[kind] + '\n'
         'Context: ' + ctx_json + '\n'
+        + (compare + '\n' if compare else '') +
         'Respond ONLY with valid JSON: {"action": <one of ' + actions + '>, "confidence": 0-1, "reason": "..."}'
     )
 
