@@ -690,7 +690,7 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
             if rule is not None:
                 decision = dict(decision, action=action)
             if info is not None:
-                info.update(pending=False, layer='cache', pending_min=None)
+                info.update(pending=False, layer='cache', pending_min=None, llm_action=hit['decision'].get('action'))
             return llm_decide.resolve_action(kind, rules_action, decision, mode)
 
         res = run_chain(kind, facts, layers, store, now, wait_min, env, hold_http)
@@ -698,6 +698,7 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
         if decision is not None and answers is not None:
             answers.put(akey, decision, res['layer'], res['model'])
 
+        raw_action = decision['action'] if decision is not None else None
         if decision is not None:
             action, rule = llm_decide.apply_hard_rules(kind, decision['action'], facts)
             if rule is not None:
@@ -735,7 +736,8 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
                 pass
 
         if info is not None:
-            info.update(pending=res['pending'], layer=res['layer'], pending_min=res['pending_min'])
+            info.update(pending=res['pending'], layer=res['layer'], pending_min=res['pending_min'],
+                        llm_action=raw_action)
 
         if res['pending']:
             return PENDING_ACTION.get(kind, rules_action) if mode == 'enforce' else rules_action
