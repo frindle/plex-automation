@@ -114,3 +114,29 @@ def test_title_guards_leave_real_matches_alone():
                  ('The.Office.US.S01E01.720p.WEB.h264-GRP', 'The Office (US)')):
         assert ld.apply_hard_rules('import_identity', 'match',
                                    {'service': 'Sonarr', 'queue_title': q, 'matched_title': m}) == ('match', None), q
+
+
+def test_titles_that_go_different_ways_are_never_a_match():
+    # Same first word, then a different show (back-test false match dd305d160a56 was the first pair).
+    for q, m in (('Chicago PD S14E06 1080p x265-ELiTE', 'Chicago Fire'),
+                 ('Chicago.Med.S11E02.1080p.WEB.h264-GRP', 'Chicago P.D.'),
+                 ('Star.Trek.Discovery.S05E01.2160p.WEB.H265-GRP', 'Star Trek: Strange New Worlds'),
+                 ('FBI.International.S04E01.1080p.WEB.h264-GRP', 'FBI: Most Wanted')):
+        assert _spin(q, m) == ('unsure', 'title_diverges'), q
+    # Radarr titles and releases word sequels and subtitles differently; the year rule covers movies.
+    assert _spin('Harry.Potter.and.the.Sorcerers.Stone.2001.1080p.BluRay.x264-GRP',
+                 "Harry Potter and the Philosopher's Stone", 'Radarr') == ('match', None)
+
+
+def test_spelling_and_initialisms_are_not_divergence():
+    for q, m in (('Chicago.PD.S12E01.1080p.WEB.h264-GRP', 'Chicago P.D.'),
+                 ('Law.Order.SVU.S26E01.1080p.WEB.h264-GRP', 'Law & Order: Special Victims Unit'),
+                 ('NCIS.LA.S14E01.1080p.WEB.h264-GRP', 'NCIS: Los Angeles'),
+                 ('NCIS.Hawaii.S03E01.1080p.WEB.h264-GRP', "NCIS: Hawai'i"),
+                 ('Marvels.Agents.of.SHIELD.S07E01.1080p.WEB.h264-GRP', "Marvel's Agents of S.H.I.E.L.D."),
+                 ('Its.Always.Sunny.in.Philadelphia.S17E01.1080p.WEB.h264-GRP', "It's Always Sunny in Philadelphia"),
+                 ('Dancing.with.the.Stars.US.S34E01.1080p.WEB.h264-GRP', 'Dancing with the Stars'),
+                 ('Hells.Kitchen.US.S24E01.1080p.WEB.h264-GRP', "Hell's Kitchen (US)")):
+        assert _spin(q, m) == ('match', None), q
+    assert not ld.title_diverges('Chicago.Fire.S13E01', 'Chicago Fire')
+    assert ld.title_diverges('Chicago.Fire.S13E01', 'Chicago Med')
