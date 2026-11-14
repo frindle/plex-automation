@@ -363,6 +363,27 @@ def spinoff_words(queue_title, matched_title):
     return [w for w in rel[len(mt):] if w not in _SPINOFF_IGNORE]
 
 
+def reverse_spinoff_words(queue_title, matched_title):
+    """Words the matched title adds after the release's name ('NCIS' release matched to 'NCIS: Origins')."""
+    rel = release_show_name(queue_title).split()
+    mt = _title_tokens(str(matched_title or ''))
+    # A name with no real word ('The.100' parses to 'the') says nothing about which show it is.
+    if not any(w not in _SPINOFF_IGNORE for w in rel) or not mt or mt[:len(rel)] != rel:
+        return []
+    return [w for w in mt[len(rel):] if w not in _SPINOFF_IGNORE]
+
+
+_ARTICLES = frozenset(('the', 'a', 'an'))
+
+
+def first_word_differs(queue_title, matched_title):
+    """True when the release name and the matched title start with different words (articles skipped).
+    Back-test: 0 of 150 real matches differ here, so a 'match' across different first words is never trusted."""
+    rel = [w for w in release_show_name(queue_title).split() if w not in _ARTICLES]
+    mt = [w for w in _title_tokens(str(matched_title or '')) if w not in _ARTICLES]
+    return bool(rel and mt and rel[0] != mt[0])
+
+
 _SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
@@ -390,7 +411,8 @@ def apply_hard_rules(kind, action, facts):
     """Deterministic rules the model can never override. Returns (action, rule_or_None).
 
     facts keys (all optional, missing => no veto from that rule): seeders, candidate_dv_web (bool, DV Profile 5
-    WEB release), year_matches (bool), queue_title + matched_title (spin-off guard). Present-but-malformed facts
+    WEB release), year_matches (bool), queue_title + matched_title (spin-off, reverse spin-off and
+    first-word guards). Present-but-malformed facts
     fail closed.
     """
     try:
@@ -407,8 +429,13 @@ def apply_hard_rules(kind, action, facts):
             if ym is not None and not _flag(ym):
                 return 'unsure', 'year_mismatch'
             qt, mt = facts.get('queue_title'), facts.get('matched_title')
-            if facts.get('service') != 'Radarr' and isinstance(qt, str) and isinstance(mt, str) and spinoff_words(qt, mt):
-                return 'unsure', 'spinoff_title'
+            if isinstance(qt, str) and isinstance(mt, str):
+                if facts.get('service') != 'Radarr' and spinoff_words(qt, mt):
+                    return 'unsure', 'spinoff_title'
+                if facts.get('service') != 'Radarr' and reverse_spinoff_words(qt, mt):
+                    return 'unsure', 'spinoff_title_reverse'
+                if first_word_differs(qt, mt):
+                    return 'unsure', 'title_first_word'
         return action, None
     except Exception:
         if isinstance(kind, str) and kind in _SAFE_ACTION and action != _SAFE_ACTION[kind]:

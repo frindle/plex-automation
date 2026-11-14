@@ -228,18 +228,72 @@ def test_pending_entries_expire_after_24h(tmp_path):
     assert len(ent) == 1 and ent[0]['attempts'] == 1
 
 
-def test_model_discovery_first_id_cached_10_min(tmp_path):
+def test_model_discovery_first_id_cached_15_s(tmp_path):
     clock = Clock()
-    env = {k: v for k, v in ENV.items() if k != 'LLM_LOCAL_MODEL'}
+    env = dict({k: v for k, v in ENV.items() if k != 'LLM_LOCAL_MODEL'}, LLM_LOCAL_APPROVED_UPGRADE_GATE='first')
     http = FakeHttp({'/v1/models': Resp(200, {'data': [{'id': 'first'}, {'id': 'second'}]}),
                      '/v1/chat/completions': chat('allow')})
     run(tmp_path, clock, http, env=env)
     run(tmp_path, clock, http, env=env)
     assert http.n('/v1/models') == 1
     assert [c for c in http.calls if 'chat' in c[1]][0][2]['json']['model'] == 'first'
-    clock.minutes(11)
+    clock.t += 16
     run(tmp_path, clock, http, env=env)
     assert http.n('/v1/models') == 2
+
+
+def _loaded(model_id):
+    return FakeHttp({'/v1/models': Resp(200, {'data': [{'id': model_id}]}), '/v1/chat/completions': chat('allow', 0.9)})
+
+
+AUTO = {k: v for k, v in ENV.items() if k not in ('LLM_LOCAL_MODEL', 'DARKBLOOM_CLOUD_API_KEY', 'ANTHROPIC_API_KEY')}
+
+
+def test_unapproved_loaded_model_skips_local_never_swaps(tmp_path):
+    la._MODELS_CACHE.clear()
+    http = _loaded('gemma-4-26b')
+    out, info, rows = run(tmp_path, Clock(), http, env=AUTO)
+    assert http.n('/v1/chat/completions') == 0 and info['pending'] is True and out == 'allow'
+    assert rows[-1]['local_skip'] == 'model-not-approved' and rows[-1]['layer'] == 'pending'
+
+
+def test_approved_loaded_model_is_used_case_and_org_prefix_ignored(tmp_path):
+    la._MODELS_CACHE.clear()
+    http = _loaded('mlx-community/Qwen3.5-35B-A3B')
+    out, info, rows = run(tmp_path, Clock(), http, env=AUTO, rules='reject')
+    assert out == 'allow' and info['layer'] == 'local' and 'local_skip' not in rows[-1]
+
+
+def test_approved_list_env_override_and_wildcard(tmp_path):
+    for i, (approved, asked) in enumerate((('gemma-4-26b, other', 1), ('*', 1), ('qwen3.5-35b-a3b', 0))):
+        la._MODELS_CACHE.clear()
+        http = _loaded('gemma-4-26b')
+        d = tmp_path / str(i)
+        d.mkdir()
+        run(d, Clock(), http, env=dict(AUTO, LLM_LOCAL_APPROVED_UPGRADE_GATE=approved))
+        assert http.n('/v1/chat/completions') == asked, approved
+
+
+def test_approved_list_is_per_kind(tmp_path):
+    la._MODELS_CACHE.clear()
+    http = FakeHttp({'/v1/models': Resp(200, {'data': [{'id': 'gemma-4-26b'}]}), '/v1/chat/completions': chat('match', 0.9)})
+    run(tmp_path, Clock(), http, env=dict(AUTO, LLM_LOCAL_APPROVED_UPGRADE_GATE='gemma-4-26b'), kind='import_identity',
+        rules='match', facts={'service': 'Sonarr', 'queue_title': 'Some.Show.S01E01', 'matched_title': 'Some Show'})
+    assert http.n('/v1/chat/completions') == 0
+
+
+def test_pinned_model_bypasses_the_approved_list(tmp_path):
+    http = FakeHttp({'local.invalid': chat('allow')})
+    out, info, _ = run(tmp_path, Clock(), http, env=dict(ENV, LLM_LOCAL_MODEL='gemma-4-26b'), rules='reject')
+    assert out == 'allow' and info['layer'] == 'local' and http.n('/v1/models') == 0
+
+
+def test_models_endpoint_down_is_model_unknown(tmp_path):
+    la._MODELS_CACHE.clear()
+    http = FakeHttp({'/v1/models': ConnectionError('down'), '/v1/chat/completions': chat('allow')})
+    _, info, rows = run(tmp_path, Clock(), http, env=AUTO)
+    assert http.n('/v1/chat/completions') == 0 and info['pending'] is True
+    assert rows[-1]['local_skip'] == 'model-unknown'
 
 
 def test_local_timeouts_connect_2s_total_configurable(tmp_path):
