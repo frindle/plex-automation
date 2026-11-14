@@ -186,3 +186,21 @@ def test_handle_grab_adds_extra_facts_only_when_advisor_is_on(monkeypatch):
         assert extra_calls == ['abcdef'] or extra_calls == ['ABCDEF']
         assert seen[0]['freeleech'] == 'full' and seen[0]['seeders'] == 12
         assert seen[0]['existing_quality'] == 'WEBDL-1080p'
+
+
+def test_grab_total_size_polls_until_metadata_arrives(monkeypatch):
+    polls, sleeps = _deluge(monkeypatch, [{'total_size': 0}, {}, {'total_size': 12 * GB}])
+    assert aw._grab_total_size_gb('H', polls=4, poll_s=2.0) == 12.0
+    assert len(polls) == 3 and sleeps == [2.0, 2.0]
+    assert polls[0] == ['H', ['total_size']]
+
+
+def test_grab_total_size_unknown_is_none_never_zero(monkeypatch):
+    _deluge(monkeypatch, [{'total_size': 0}] * 3)
+    assert aw._grab_total_size_gb('H', polls=3, poll_s=0) is None
+    _deluge(monkeypatch, [{'total_size': True}])
+    assert aw._grab_total_size_gb('H', polls=1, poll_s=0) is None
+    _deluge(monkeypatch, [{'total_size': -5}])
+    assert aw._grab_total_size_gb('H', polls=1, poll_s=0) is None
+    _deluge(monkeypatch, [RuntimeError('deluge down')])
+    assert aw._grab_total_size_gb('H', polls=3, poll_s=0) is None

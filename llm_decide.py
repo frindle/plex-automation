@@ -25,7 +25,8 @@ POLICY = {
         '(any WEB-DL DV except Hulu) is never wanted, HDR10 is preferred over WEB DV. '
         'Private-tracker ratio matters: prefer freeleech; releases with fewer than 10 seeders are always rejected. '
         'The existing_* facts describe the file this upgrade would replace: judge the improvement against them. '
-        'freeleech is full, partial or no; a null freeleech or seeders value means unknown, not zero. '
+        'freeleech is full, partial or no; a null freeleech, seeders, size_gb or existing_size_gb value means '
+        'unknown, not zero: never reject a release for an unknown size. '
         'Prefer throttle when unsure.'),
     'import_identity': (
         'Answer match only when title AND year both agree with the matched item. A different year, a remake, a '

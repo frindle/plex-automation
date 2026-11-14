@@ -260,6 +260,29 @@ def _grab_seeders(download_id, polls=None, poll_s=None):
     return None
 
 
+def _grab_total_size_gb(download_id, polls=None, poll_s=None):
+    """Size of a fresh grab from Deluge's total_size, for when the *arr reports none. Sonarr sends size 0 for
+    some releases, and a magnet has no size until its metadata arrives, so 0 or missing is None (unknown)."""
+    polls = LLM_SEEDERS_POLLS if polls is None else polls
+    poll_s = LLM_SEEDERS_POLL_S if poll_s is None else poll_s
+    try:
+        deluge_login()
+        for i in range(max(polls, 1)):
+            if i:
+                time.sleep(poll_s)
+            res = session.post(
+                f'{DELUGE_URL}/json',
+                json={'method': 'core.get_torrent_status', 'params': [download_id, ['total_size']], 'id': 95},
+                timeout=10,
+            ).json().get('result') or {}
+            n = res.get('total_size')
+            if isinstance(n, (int, float)) and not isinstance(n, bool) and n > 0:
+                return round(n / (1024 ** 3), 2)
+    except Exception as e:  # noqa: BLE001
+        log.info(f'size lookup failed for {download_id}: {e}')
+    return None
+
+
 def _upgrade_gate_extra(source, data, download_id):
     """Facts the gate needs beyond the release name: what it replaces, freeleech, seeders."""
     extra = _existing_file_facts(source, data)
@@ -4712,12 +4735,19 @@ def handle_grab(data, source):
 
     # Only throttle if release is over 10GB
     release = data.get('release') or {}
-    size_gb = (release.get('size') or 0) / (1024 ** 3)
+    raw_size = release.get('size')
+    # Sonarr reports size 0 for some releases: that is unknown, not 0 GB. Ask Deluge; if it can't say either,
+    # throttle (upgrades are throttled by design; only a known small one runs unthrottled).
+    if isinstance(raw_size, (int, float)) and not isinstance(raw_size, bool) and raw_size > 0:
+        size_gb = round(raw_size / (1024 ** 3), 2)
+    else:
+        size_gb = _grab_total_size_gb(download_id)
     title = release.get('releaseTitle') or ''
     tags = _llm_tags(title)
-    rules_action = 'allow' if size_gb < 10 else 'throttle'
+    rules_action = 'allow' if size_gb is not None and size_gb < 10 else 'throttle'
+    size_txt = 'unknown size' if size_gb is None else f'{size_gb:.1f}GB'
     facts = {
-        'source': source, 'title': title, 'size_gb': round(size_gb, 2),
+        'source': source, 'title': title, 'size_gb': size_gb,
         'quality': str(release.get('quality') or '') or None,
         'indexer': release.get('indexer'),
         'group': release.get('releaseGroup') or tags['group'],
@@ -4746,12 +4776,12 @@ def handle_grab(data, source):
             log.error(f"{source}: reject failed: {e}")
         return
 
-    if size_gb < 10 and action != 'throttle':
-        log.info(f"{source}: upgrade grab {download_id} is {size_gb:.1f}GB, under 10GB threshold, not throttling")
+    if size_gb is not None and size_gb < 10 and action != 'throttle':
+        log.info(f"{source}: upgrade grab {download_id} is {size_txt}, under 10GB threshold, not throttling")
         return
 
     upgrade_label = SONARR_UPG_LABEL if source == 'Sonarr' else RADARR_UPG_LABEL
-    log.info(f"{source}: upgrade grab {download_id} is {size_gb:.1f}GB, will label as '{upgrade_label}'")
+    log.info(f"{source}: upgrade grab {download_id} is {size_txt}, will label as '{upgrade_label}'")
     # Brief delay to let Deluge register the torrent
     time.sleep(3)
     try:

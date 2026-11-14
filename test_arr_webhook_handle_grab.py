@@ -96,3 +96,52 @@ def test_radarr_grab_with_blank_label_is_unchanged(monkeypatch):
     data = {'downloadId': 'ABC123', 'movie': {'id': 7}, 'release': {'size': GB, 'releaseTitle': 'M.2021'}}
     aw.handle_grab(data, 'Radarr')
     assert w.labels == []
+
+
+def _capture_facts(mp):
+    seen = []
+
+    def advise(kind, facts, rules_action, **kw):
+        seen.append((dict(facts), rules_action))
+        return rules_action
+    mp.setattr(aw.llm_advisor, 'advise', advise)
+    return seen
+
+
+def test_size_zero_upgrade_uses_deluge_size(monkeypatch):
+    # Sonarr sends size 0 for some releases: that is unknown, not 0 GB. A small one per Deluge is not throttled.
+    w = World(monkeypatch, {'label': 'sonarr', 'progress': 0.0, 'total_size': 4 * GB}, upgrade=True)
+    seen = _capture_facts(monkeypatch)
+    aw.handle_grab(_grab(0), 'Sonarr')
+    assert seen and seen[0][0]['size_gb'] == 4.0 and seen[0][1] == 'allow'
+    assert w.labels == []
+    w = World(monkeypatch, {'label': 'sonarr', 'progress': 0.0, 'total_size': 40 * GB}, upgrade=True)
+    seen = _capture_facts(monkeypatch)
+    aw.handle_grab(_grab(0), 'Sonarr')
+    assert seen[0][0]['size_gb'] == 40.0 and seen[0][1] == 'throttle'
+    assert w.labels[-1] == ('abc123', aw.SONARR_UPG_LABEL)
+
+
+def test_unknown_size_upgrade_is_none_and_throttled(monkeypatch):
+    for release_size in (0, None, 'missing'):
+        w = World(monkeypatch, {'label': 'sonarr', 'progress': 0.0}, upgrade=True)
+        seen = _capture_facts(monkeypatch)
+        data = _grab(1)
+        if release_size == 'missing':
+            del data['release']['size']
+        else:
+            data['release']['size'] = release_size
+        aw.handle_grab(data, 'Sonarr')
+        assert seen[0][0]['size_gb'] is None, release_size
+        assert seen[0][1] == 'throttle'
+        assert w.labels[-1] == ('abc123', aw.SONARR_UPG_LABEL)
+
+
+def test_known_size_skips_deluge_size_lookup(monkeypatch):
+    w = World(monkeypatch, {'label': 'sonarr', 'progress': 0.0, 'total_size': 40 * GB}, upgrade=True)
+    seen = _capture_facts(monkeypatch)
+    calls = []
+    monkeypatch.setattr(aw, '_grab_total_size_gb', lambda *a, **k: calls.append(a))
+    aw.handle_grab(_grab(4), 'Sonarr')
+    assert calls == [] and seen[0][0]['size_gb'] == 4.0 and seen[0][1] == 'allow'
+    assert w.labels == []
