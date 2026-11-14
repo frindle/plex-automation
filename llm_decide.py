@@ -20,8 +20,9 @@ POLICY = {
     'upgrade_gate': (
         'Upgrades are throttled by design (30 KiB/s upgrade label); never ask for unlimited speed. '
         'Allow an upgrade that is a clear, visible improvement (higher resolution, HDR10 or disc Dolby Vision '
-        '(Bluray/Remux) over SDR, lossless or Atmos audio over lossy, or a replacement of a poor release group) or '
-        'that saves space. x265/HEVC saves space over x264/H.264/AVC: a smaller x265/HEVC release replacing an '
+        '(Bluray/Remux) over SDR, lossless or Atmos audio over lossy, a better source: Bluray or Remux over WEB-DL, '
+        'WEBRip or HDTV, judged from quality against existing_quality, or a replacement of a poor release group) or '
+        'that saves space. A clear improvement may be bigger than the file it replaces. x265/HEVC saves space over x264/H.264/AVC: a smaller x265/HEVC release replacing an '
         'x264/H.264/AVC file at the same resolution is an upgrade, even when it is a re-encode of a WEB-DL. '
         'An x265/HEVC release replacing an x265/HEVC file is allowed only when it is reliably better quality '
         '(a better source such as Bluray over WEB, higher resolution, HDR, or better audio); otherwise it is a '
@@ -31,6 +32,9 @@ POLICY = {
         '(any WEB-DL DV except Hulu) is never wanted, HDR10 is preferred over WEB DV. '
         'Private-tracker ratio matters: prefer freeleech; releases with fewer than 10 seeders are always rejected. '
         'The existing_* facts describe the file this upgrade would replace: judge the improvement against them. '
+        'For a season pack, episodes is how many episodes it holds, size_gb is the whole pack and '
+        'existing_size_gb is the total of the existing files of those episodes (episodes_with_file of them have '
+        'one). '
         'freeleech is full, partial or no; a null freeleech, seeders, size_gb or existing_size_gb value means '
         'unknown, not zero: never reject a release for an unknown size. '
         'Prefer throttle when unsure.'),

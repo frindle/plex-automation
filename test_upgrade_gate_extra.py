@@ -96,6 +96,32 @@ def test_existing_file_facts_sonarr_follows_episode_file(monkeypatch):
     assert out['existing_hdr'] is None and out['existing_audio'] is None and out['existing_codec'] is None
 
 
+def test_existing_file_facts_sonarr_pack_totals_distinct_files(monkeypatch):
+    eps = [{'id': 11}, {'id': 12}, {'id': 13}, {'id': 14}]
+    series_eps = [{'id': 11, 'episodeFileId': 101}, {'id': 12, 'episodeFileId': 102},
+                  {'id': 13, 'episodeFileId': 102}, {'id': 14, 'episodeFileId': None}, {'id': 99, 'episodeFileId': 199}]
+    files = [{'id': 101, 'size': 1 * GB, 'quality': {'quality': {'name': 'HDTV-720p'}}, 'releaseGroup': 'A'},
+             {'id': 102, 'size': 2 * GB, 'quality': {'quality': {'name': 'WEBDL-1080p'}}, 'releaseGroup': 'B',
+              'mediaInfo': {'videoCodec': 'h264'}},
+             {'id': 199, 'size': 50 * GB}]
+    calls = []
+    _requests(monkeypatch, {'/api/v3/episodefile': _Resp(files), '/api/v3/episode': _Resp(series_eps)}, calls)
+    out = aw._existing_file_facts('Sonarr', {'series': {'id': 5}, 'episodes': eps})
+    assert out['existing_size_gb'] == 3.0  # 101 + 102 once; 199 is another season's file
+    assert out['existing_quality'] == 'WEBDL-1080p' and out['existing_group'] == 'B' and out['existing_codec'] == 'h264'
+    assert out['episodes'] == 4 and out['episodes_with_file'] == 3
+    assert [c[1] for c in calls] == [{'seriesId': 5}, {'seriesId': 5}]
+
+
+def test_existing_file_facts_sonarr_pack_without_files_is_empty(monkeypatch):
+    calls = []
+    _requests(monkeypatch, {'/api/v3/episode': _Resp([{'id': 11, 'episodeFileId': 0}, {'id': 12}])}, calls)
+    assert aw._existing_file_facts('Sonarr', {'series': {'id': 5}, 'episodes': [{'id': 11}, {'id': 12}]}) == {}
+    assert len(calls) == 1
+    _requests(monkeypatch, {'/api/v3/episode': RuntimeError('down')}, [])
+    assert aw._existing_file_facts('Sonarr', {'series': {'id': 5}, 'episodes': [{'id': 11}, {'id': 12}]}) == {}
+
+
 def test_existing_file_facts_empty_on_missing_or_error(monkeypatch):
     _requests(monkeypatch, {'/api/v3/episode/11': _Resp({'episodeFileId': None})}, [])
     assert aw._existing_file_facts('Sonarr', {'episodes': [{'id': 11}]}) == {}

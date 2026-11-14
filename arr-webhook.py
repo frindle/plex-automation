@@ -193,12 +193,42 @@ def _grab_freeleech(source, data, download_id):
     return _freeleech(bits, flag_map)
 
 
+def _sonarr_pack_files(series_id, ep_ids):
+    """Distinct existing files of a season pack's episodes, plus how many of the episodes have one."""
+    hdr = {'X-Api-Key': SONARR_API_KEY}
+    r = requests.get(f'{SONARR_URL}/api/v3/episode', headers=hdr, params={'seriesId': series_id}, timeout=15)
+    r.raise_for_status()
+    file_of = {e.get('id'): e.get('episodeFileId') for e in (r.json() or []) if isinstance(e, dict)}
+    fids = [file_of.get(i) for i in ep_ids]
+    fids = [f for f in fids if f]
+    if not fids:
+        return [], 0
+    r = requests.get(f'{SONARR_URL}/api/v3/episodefile', headers=hdr, params={'seriesId': series_id}, timeout=15)
+    r.raise_for_status()
+    by_id = {f.get('id'): f for f in (r.json() or []) if isinstance(f, dict)}
+    return [by_id[f] for f in dict.fromkeys(fids) if f in by_id], len(fids)
+
+
 def _existing_file_facts(source, data):
-    """Quality, size, group, HDR, audio and video codec of the file an upgrade would replace. {} on any error."""
+    """Quality, size, group, HDR, audio and video codec of the file an upgrade would replace. {} on any error.
+    For a Sonarr season pack the size is the total of the distinct existing files of its episodes, since the
+    pack's size_gb covers every episode; the other facts come from the largest of those files."""
     try:
         if source == 'Sonarr':
-            eps = data.get('episodes') or []
-            ep_id = (eps[0] or {}).get('id') if eps else None
+            eps = [e for e in (data.get('episodes') or []) if isinstance(e, dict) and e.get('id')]
+            series_id = (data.get('series') or {}).get('id')
+            if len(eps) > 1 and series_id:
+                files, with_file = _sonarr_pack_files(series_id, [e['id'] for e in eps])
+                if not files:
+                    return {}
+                out = _file_facts(max(files, key=lambda x: x.get('size') or 0))
+                sizes = [f.get('size') for f in files]
+                total = sum(s for s in sizes if isinstance(s, (int, float)) and s > 0)
+                out['existing_size_gb'] = round(total / (1024 ** 3), 2) if total > 0 else None
+                out['episodes'] = len(eps)
+                out['episodes_with_file'] = with_file
+                return out
+            ep_id = eps[0]['id'] if eps else None
             if not ep_id:
                 return {}
             hdr = {'X-Api-Key': SONARR_API_KEY}
@@ -223,19 +253,23 @@ def _existing_file_facts(source, data):
             f = max(files, key=lambda x: x.get('size') or 0)
         if not isinstance(f, dict):
             return {}
-        size = f.get('size')
-        mi = f.get('mediaInfo') or {}
-        return {
-            'existing_quality': ((f.get('quality') or {}).get('quality') or {}).get('name'),
-            'existing_size_gb': round(size / (1024 ** 3), 2) if isinstance(size, (int, float)) and size > 0 else None,
-            'existing_group': f.get('releaseGroup') or None,
-            'existing_hdr': mi.get('videoDynamicRangeType') or None,
-            'existing_audio': mi.get('audioCodec') or None,
-            'existing_codec': mi.get('videoCodec') or None,
-        }
+        return _file_facts(f)
     except Exception as e:  # noqa: BLE001
         log.info(f'{source}: existing-file lookup failed: {e}')
         return {}
+
+
+def _file_facts(f):
+    size = f.get('size')
+    mi = f.get('mediaInfo') or {}
+    return {
+        'existing_quality': ((f.get('quality') or {}).get('quality') or {}).get('name'),
+        'existing_size_gb': round(size / (1024 ** 3), 2) if isinstance(size, (int, float)) and size > 0 else None,
+        'existing_group': f.get('releaseGroup') or None,
+        'existing_hdr': mi.get('videoDynamicRangeType') or None,
+        'existing_audio': mi.get('audioCodec') or None,
+        'existing_codec': mi.get('videoCodec') or None,
+    }
 
 
 def _grab_seeders(download_id, polls=None, poll_s=None):
