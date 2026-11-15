@@ -29,6 +29,9 @@ POLICY = {
         '1. Reject when the CANDIDATE has fewer than 10 seeders, is Dolby Vision Profile 5 (any WEB-DL DV except '
         'Hulu; HDR10 is preferred over WEB DV), or cannot play in Plex. Only the candidate counts here: replacing '
         'an existing WEB DV file is fine and is often the point of the upgrade. '
+        'Also reject an SDR candidate replacing an HDR file (a WEB DV file does not count as HDR here) unless '
+        'the candidate has 5.1 or more audio channels, the existing file has fewer, and hdr_surround_available is '
+        'false (no HDR release with 5.1 audio is available). '
         '2. Allow, even when the candidate is much bigger: a higher resolution; a better source tier (Bluray or '
         'Remux over a WEB-DL, WEBRip or HDTV file); HDR10 or disc Dolby Vision (Bluray/Remux) over SDR; lossless '
         'or Atmos audio over lossy; replacing an AV1 file (many Plex clients cannot play AV1 directly); a PROPER '
@@ -204,6 +207,48 @@ def _num_or_none(v):
     return n if n is not None and n > 0 else None
 
 
+SURROUND_CHANNELS = 5.0
+_SDR_TAG = re.compile(r'(?<![a-z0-9])sdr(?![a-z0-9])', re.I)
+
+
+def _existing_is_hdr(facts):
+    """True when the existing file is HDR that an SDR candidate would lose. A WEB-tier Dolby Vision file is not:
+    replacing WEB DV (Profile 5) is fine."""
+    old = facts.get('existing_hdr')
+    if not old or str(old).strip().lower() in _FALSE_STRINGS:
+        return False
+    return not (_tier(facts.get('existing_quality')) == 1 and str(old).strip().lower() in _WEB_DV_ONLY)
+
+
+def _candidate_is_sdr(facts):
+    """True only when the candidate is surely SDR: no HDR/DV tag and either 1080p or lower, or an explicit SDR
+    tag. An untagged 2160p release may still be HDR, so it is not called SDR."""
+    if 'hdr' not in facts or _flag(facts.get('hdr')):
+        return False
+    title = facts.get('title')
+    if isinstance(title, str) and _SDR_TAG.search(title):
+        return True
+    r = _res(facts.get('quality'))
+    return r is not None and r <= 1080
+
+
+def sdr_over_hdr(facts):
+    """An SDR candidate that would replace an HDR file. Needs both hdr facts; missing ones mean no."""
+    if not isinstance(facts, dict) or 'hdr' not in facts or 'existing_hdr' not in facts:
+        return False
+    return _existing_is_hdr(facts) and _candidate_is_sdr(facts)
+
+
+def sdr_surround_exception_possible(facts):
+    """Penn's one exception to keeping HDR: the SDR candidate brings 5.1 audio the HDR file lacks. True when the
+    channel facts allow it, so the caller should look for an HDR release with 5.1 audio (hdr_surround_available)."""
+    if not sdr_over_hdr(facts):
+        return False
+    new = _num_or_none(facts.get('audio_channels'))
+    old = _num_or_none(facts.get('existing_audio_channels'))
+    return new is not None and new >= SURROUND_CHANNELS and (old is None or old < SURROUND_CHANNELS)
+
+
 def upgrade_comparison(context):
     """Plain-words comparison of the candidate against the file it replaces, computed in code so the model
     does not have to parse quality strings or divide sizes. Empty when nothing is known about the existing file."""
@@ -250,6 +295,14 @@ def upgrade_comparison(context):
                 parts.append('drops the existing WEB Dolby Vision file (replacing WEB DV is fine: not a loss)')
             else:
                 parts.append('HDR lost (existing file has %s)' % hdr_old)
+    a_new, a_old = _num_or_none(context.get('audio_channels')), _num_or_none(context.get('existing_audio_channels'))
+    if a_new is not None and a_old is not None and (a_new >= SURROUND_CHANNELS) != (a_old >= SURROUND_CHANNELS):
+        parts.append('audio %s (%g vs %g channels)' % (
+            'gains surround' if a_new >= SURROUND_CHANNELS else 'loses surround', a_new, a_old))
+    if context.get('hdr_surround_available') is True:
+        parts.append('an HDR release with 5.1 audio is available')
+    elif context.get('hdr_surround_available') is False:
+        parts.append('no HDR release with 5.1 audio is available')
     if not parts:
         return ''
     return 'Comparison (computed from the facts, candidate vs existing file; trust it over your own reading): ' + \
@@ -603,7 +656,7 @@ def apply_hard_rules(kind, action, facts):
     """Deterministic rules the model can never override. Returns (action, rule_or_None).
 
     facts keys (all optional, missing => no veto from that rule): seeders, candidate_dv_web (bool, DV Profile 5
-    WEB release), year_matches (bool), queue_title + matched_title (spin-off, reverse spin-off, country,
+    WEB release), hdr + existing_hdr (+ audio_channels, existing_audio_channels, hdr_surround_available: SDR over HDR), year_matches (bool), queue_title + matched_title (spin-off, reverse spin-off, country,
     first-word and diverging-title guards). Present-but-malformed facts
     fail closed.
     """
@@ -616,6 +669,11 @@ def apply_hard_rules(kind, action, facts):
             seeders = _num(facts.get('seeders'))
             if seeders is not None and seeders < MIN_SEEDERS:
                 return 'reject', 'min_seeders'
+            # Keep HDR: SDR replaces it only for 5.1 audio the HDR file lacks, and only when no HDR release has
+            # 5.1 (hdr_surround_available is False; unknown keeps the HDR file).
+            if sdr_over_hdr(facts) and not (sdr_surround_exception_possible(facts)
+                                            and facts.get('hdr_surround_available') is False):
+                return 'reject', 'sdr_over_hdr'
         elif kind == 'import_identity' and action == 'match':
             ym = facts.get('year_matches')
             if ym is not None and not _flag(ym) and not _same_name_year_off_by_one(facts):

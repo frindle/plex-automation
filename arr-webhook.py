@@ -125,7 +125,22 @@ def _llm_tags(name):
     return {'codec': codec, 'dv': dv,
             'hdr': dv or any(t in n for t in ('.hdr.', '.hdr10.', '.hdr10+.')),
             'web': any(t in n for t in ('.web.', '.webdl.', '.webrip.')),
-            'group': m.group(1) if m else None}
+            'group': m.group(1) if m else None,
+            'channels': _audio_channels(n)}
+
+
+_AUDIO_CH = re.compile(r'(?:ddp|dd\+|dd|eac3|ac3|aac|truehd|atmos|dts|ma|hd|x|flac|opus|lpcm|pcm)\.?([1-9])\.([01])(?!\d)')
+_ANY_CH = re.compile(r'(?<!\d)([1-7])\.([01])(?!\d)')
+
+
+def _audio_channels(n):
+    """Audio channels from a normalised release name ('.ddp5.1.', '.aac.2.0.'), as 5.1 / 2.0; Atmos alone means
+    at least 5.1. None when the name does not say."""
+    hits = [int(a) + int(b) / 10 for a, b in _AUDIO_CH.findall(n)] or \
+           [int(a) + int(b) / 10 for a, b in _ANY_CH.findall(n)]
+    if '.atmos.' in n:
+        hits.append(5.1)
+    return max(hits) if hits else None
 
 
 def _llm_mode():
@@ -273,6 +288,7 @@ def _file_facts(f):
         'existing_hdr': mi.get('videoDynamicRangeType') or None,
         'existing_audio': mi.get('audioCodec') or None,
         'existing_codec': mi.get('videoCodec') or None,
+        'existing_audio_channels': mi.get('audioChannels') or None,
     }
 
 
@@ -322,12 +338,72 @@ def _grab_total_size_gb(download_id, polls=None, poll_s=None):
     return None
 
 
-def _upgrade_gate_extra(source, data, download_id):
-    """Facts the gate needs beyond the release name: what it replaces, freeleech, seeders."""
+def _upgrade_gate_extra(source, data, download_id, facts=None):
+    """Facts the gate needs beyond the release name: what it replaces, freeleech, seeders, and, only for an SDR
+    candidate with 5.1 audio replacing an HDR file without it, whether an HDR release with 5.1 is available."""
     extra = _existing_file_facts(source, data)
     extra['freeleech'] = _grab_freeleech(source, data, download_id)
     extra['seeders'] = _grab_seeders(download_id)
+    if facts is not None and llm_decide is not None:
+        try:
+            if llm_decide.sdr_surround_exception_possible(dict(facts, **extra)):
+                extra['hdr_surround_available'] = _hdr_surround_available(source, data, facts.get('quality'))
+        except Exception as e:  # noqa: BLE001
+            log.info(f'{source}: HDR 5.1 lookup skipped: {e}')
     return extra
+
+
+HDR_SURROUND_SEARCH_TIMEOUT_S = 180
+# Rejections that only say the release is no upgrade over what is on disk or in the queue: it still exists.
+_SOFT_REJECTION = re.compile(r'existing file|cutoff|upgrade|queue|history|equal or higher', re.I)
+
+
+def _hdr_surround_available(source, data, candidate_quality):
+    """Is there an HDR release with 5.1+ audio (not WEB DV, enough seeders, at least the candidate's resolution)?
+    Asks the *arr's release search for this movie / episode / season. True, False, or None when the search
+    fails."""
+    try:
+        if source == 'Sonarr':
+            eps = [e for e in (data.get('episodes') or []) if isinstance(e, dict) and e.get('id')]
+            series_id = (data.get('series') or {}).get('id')
+            if len(eps) > 1 and series_id and eps[0].get('seasonNumber') is not None:
+                params = {'seriesId': series_id, 'seasonNumber': eps[0]['seasonNumber']}
+            elif eps:
+                params = {'episodeId': eps[0]['id']}
+            else:
+                return None
+            url, key = f'{SONARR_URL}/api/v3/release', SONARR_API_KEY
+        else:
+            mid = (data.get('movie') or {}).get('id')
+            if not mid:
+                return None
+            url, key, params = f'{RADARR_URL}/api/v3/release', RADARR_API_KEY, {'movieId': mid}
+        r = requests.get(url, headers={'X-Api-Key': key}, params=params, timeout=HDR_SURROUND_SEARCH_TIMEOUT_S)
+        r.raise_for_status()
+        releases = r.json() or []
+    except Exception as e:  # noqa: BLE001
+        log.info(f'{source}: HDR 5.1 release search failed: {e}')
+        return None
+    want = llm_decide._res(candidate_quality) or 0
+    for rel in releases:
+        if not isinstance(rel, dict):
+            continue
+        quality = ((rel.get('quality') or {}).get('quality') or {}).get('name')
+        tags = _llm_tags(rel.get('title') or '')
+        if not tags['hdr'] or (tags['dv'] and tags['web']):
+            continue
+        if (tags['channels'] or 0) < llm_decide.SURROUND_CHANNELS:
+            continue
+        if (llm_decide._res(quality) or 0) < want:
+            continue
+        seeders = rel.get('seeders')
+        if not isinstance(seeders, int) or seeders < llm_decide.MIN_SEEDERS:
+            continue
+        hard = [x for x in (rel.get('rejections') or []) if not _SOFT_REJECTION.search(str(x))]
+        if hard:
+            continue
+        return True
+    return False
 
 ACTIVITY_LOG_RETENTION_DAYS = int(os.environ.get('ACTIVITY_LOG_RETENTION_DAYS', '7'))
 
@@ -4911,12 +4987,13 @@ def handle_grab(data, source):
         'indexer': release.get('indexer'),
         'group': release.get('releaseGroup') or tags['group'],
         'codec': tags['codec'], 'hdr': tags['hdr'],
+        'audio_channels': tags['channels'],
         'candidate_dv_web': tags['dv'] and tags['web'],
         'seed_days': SEED_DAYS,
     }
     if _llm_mode() != 'off':
         # Only paid for when the advisor will read them (extra *arr/Deluge calls, a short seeders poll).
-        facts.update(_upgrade_gate_extra(source, data, download_id))
+        facts.update(_upgrade_gate_extra(source, data, download_id, facts))
     llm_info = {}
     action = _llm_advise('upgrade_gate', facts, rules_action, llm_info)
     if llm_info.get('pending'):

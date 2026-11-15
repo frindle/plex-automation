@@ -82,7 +82,8 @@ def test_existing_file_facts_radarr_picks_largest_file(monkeypatch):
     _requests(monkeypatch, {'/api/v3/moviefile': _Resp(files)}, calls)
     out = aw._existing_file_facts('Radarr', {'movie': {'id': 7}})
     assert out == {'existing_quality': 'Bluray-2160p', 'existing_size_gb': 20.0, 'existing_group': 'BIG',
-                   'existing_hdr': 'DV HDR10', 'existing_audio': 'TrueHD Atmos', 'existing_codec': 'x265'}
+                   'existing_hdr': 'DV HDR10', 'existing_audio': 'TrueHD Atmos', 'existing_codec': 'x265',
+                   'existing_audio_channels': None}
     assert calls[0][1] == {'movieId': 7}
 
 
@@ -189,7 +190,7 @@ def _grab_world(mp, mode):
     mp.setattr(aw, 'record_activity', lambda *a, **k: None)
     mp.setattr(aw.time, 'sleep', lambda s: None)
 
-    def extra(source, data, download_id):
+    def extra(source, data, download_id, facts=None):
         extra_calls.append(download_id)
         return {'existing_quality': 'WEBDL-1080p', 'freeleech': 'full', 'seeders': 12}
     mp.setattr(aw, '_upgrade_gate_extra', extra)
