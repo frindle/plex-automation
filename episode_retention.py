@@ -58,6 +58,26 @@ def is_sample(rel_path):
     return base.startswith('sample') or stem.endswith(('-sample', '.sample', '_sample'))
 
 
+# Release clutter Plex and the *arrs never use: info/checksum files, and the
+# proof/screenshot pictures some releases ship. Subtitles, videos and RAR
+# volumes are never junk; neither is artwork outside a proof/screens folder
+# (Plex can read poster.jpg and friends as local artwork).
+JUNK_EXT = ('.nfo', '.txt', '.sfv', '.srr', '.srs', '.md5', '.sha1', '.sha256', '.url', '.diz', '.nzb',
+            '.exe', '.lnk', '.website', '.html', '.htm')
+JUNK_IMG_DIRS = {'proof', 'proofs', 'screens', 'screenshots', 'screenshot', 'screen'}
+_IMG_EXT = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp')
+
+
+def is_junk(rel_path):
+    """Release clutter: an info/checksum/link file, or an image inside a
+    Proof/Screens folder. Never a video, subtitle or archive."""
+    parts = (rel_path or '').split('/')
+    base = parts[-1].lower()
+    if base.endswith(JUNK_EXT):
+        return True
+    return base.endswith(_IMG_EXT) and any(p.lower() in JUNK_IMG_DIRS for p in parts[:-1])
+
+
 def is_subtitle(rel_path):
     return (rel_path or '').lower().endswith(SUB_EXT)
 
