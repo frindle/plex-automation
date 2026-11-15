@@ -603,9 +603,11 @@ SEED_RETIRE_PER_RUN = int(os.environ.get('SEED_RETIRE_PER_RUN', '100'))
 SEED_RETIRE_INTERVAL = int(os.environ.get('SEED_RETIRE_INTERVAL', str(86400)))
 # Idle rule (Penn, 11-15: "can we do variable based on seeding activity?"): a
 # managed torrent that has uploaded nothing for SEED_IDLE_DAYS retires once it
-# has seeded SEED_IDLE_MIN_DAYS; one still uploading keeps seeding until
-# SEED_RETIRE_DAYS. The idle floor never drops below SEED_DAYS (remove_torrent
-# would only defer it). 0 idle days = idle rule off.
+# has seeded SEED_IDLE_MIN_DAYS. One still uploading keeps seeding at any age
+# (Penn, 11-15: "if its seeding actively i want to leave it"): with the idle
+# rule on, SEED_RETIRE_DAYS only puts idle torrents past it first in line. The
+# idle floor never drops below SEED_DAYS (remove_torrent would only defer it).
+# 0 idle days = idle rule off (then SEED_RETIRE_DAYS alone retires by age).
 SEED_IDLE_DAYS = int(os.environ.get('SEED_IDLE_DAYS', '14'))
 SEED_IDLE_MIN_DAYS = max(int(os.environ.get('SEED_IDLE_MIN_DAYS', str(SEED_DAYS))), SEED_DAYS)
 UPGRADE_LANE_LABELS = (SONARR_UPG_LABEL, RADARR_UPG_LABEL, SONARR_UPG_PRIORITY_LABEL, RADARR_UPG_PRIORITY_LABEL)

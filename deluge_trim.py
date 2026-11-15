@@ -91,7 +91,12 @@ def idle_seconds(t):
 def seed_retire_rule(t, labels, min_days, min_swarm, idle_days=0, idle_min_days=0):
     """'age' (seeded min_days), 'idle' (seeded idle_min_days and no upload in
     idle_days) or None. min_days <= 0 turns the age rule off, idle_days <= 0
-    the idle rule. Unknown seed time, swarm size or activity never qualifies."""
+    the idle rule. Unknown seed time, swarm size or activity never qualifies.
+
+    With the idle rule on, a torrent still uploading is never retired, however
+    long it has seeded (Penn, 11-15: "if its seeding actively i want to leave
+    it, just torrents that aren't doing anything"): the age rule then only
+    puts idle torrents that are past min_days first in line."""
     if (t.get('label') or '') not in labels:
         return None
     if t.get('state') != 'Seeding' or t.get('is_finished') is not True:
@@ -100,19 +105,22 @@ def seed_retire_rule(t, labels, min_days, min_swarm, idle_days=0, idle_min_days=
     seeds = _num(t.get('total_seeds'))
     if st is None or seeds is None or seeds < 0 or seeds <= min_swarm:
         return None
+    idle_on = bool(idle_days and idle_days > 0)
+    if idle_on:
+        idle = idle_seconds(t)
+        if idle is None or idle < idle_days * 86400:
+            return None
     if min_days and min_days > 0 and st >= min_days * 86400:
         return 'age'
-    if idle_days and idle_days > 0 and st >= max(idle_min_days or 0, 0) * 86400:
-        idle = idle_seconds(t)
-        if idle is not None and idle >= idle_days * 86400:
-            return 'idle'
+    if idle_on and st >= max(idle_min_days or 0, 0) * 86400:
+        return 'idle'
     return None
 
 
 def seed_retire_picks(torrents, labels, min_days, min_swarm, idle_days=0, idle_min_days=0, limit=0):
     """[(hash, rule)] to stop seeding: aged-out torrents first (longest seeded
     first), then idle ones (longest idle first, never-uploaded before all).
-    limit > 0 caps one run."""
+    With the idle rule on, both are idle torrents only. limit > 0 caps one run."""
     out = []
     for h, t in (torrents or {}).items():
         rule = seed_retire_rule(t, labels, min_days, min_swarm, idle_days, idle_min_days)
