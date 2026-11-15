@@ -7312,6 +7312,17 @@ def _dupe_facts(entry, keeper, loser):
     return facts
 
 
+# Pairs a check kept, or (in shadow) the model doubted, listed in the report so Penn can look at each one
+# ("never keeping dupes of the exact same media": a kept pair is not left quietly). Capped per run.
+DUPE_REVIEW_MAX = 200
+
+
+def _dupe_review(state, entry, keeper, loser, why):
+    if len(state['review']) < DUPE_REVIEW_MAX:
+        state['review'].append({'title': entry.get('title'), 'keep': os.path.basename(keeper.get('file') or ''),
+                                'other': os.path.basename(loser.get('file') or ''), 'why': why})
+
+
 def _dupe_check(entry, keeper, loser, state):
     """(keep_reason, check_info) for one copy the cleanup would remove. keep_reason is None when it may go."""
     counts = state['counts']
@@ -7320,6 +7331,8 @@ def _dupe_check(entry, keeper, loser, state):
         conflict = llm_decide.dupe_conflict(facts)
         if conflict:
             counts['rule_kept'] += 1
+            counts['rules'][conflict[0]] = counts['rules'].get(conflict[0], 0) + 1
+            _dupe_review(state, entry, keeper, loser, conflict[0])
             return f'kept: {conflict[1]} (not the same media)', {'rule': conflict[0]}
     mode = state['mode']
     if mode == 'off':
@@ -7347,8 +7360,12 @@ def _dupe_check(entry, keeper, loser, state):
         counts['pending'] += 1
     elif raw == 'same':
         counts['model_same'] += 1
+    elif raw in ('different', 'unsure'):
+        counts[f'model_{raw}'] += 1
     elif raw:
         counts['model_other'] += 1
+    if raw and raw != 'same':
+        _dupe_review(state, entry, keeper, loser, f'model {raw} ({mode})')
     if mode == 'enforce' and action != 'same':
         counts['model_kept'] += 1
         why = 'pending, next run' if info.get('pending') else f'says {raw}' if raw else 'no answer, next run'
@@ -7366,8 +7383,9 @@ def plex_dupe_fix():
         'ask': apply or request.args.get('llm', '').lower() in ('1', 'true', 'yes'),
         'asked': 0,
         'max': _dupe_confirm_max(),
-        'counts': {'rule_kept': 0, 'model_same': 0, 'model_other': 0, 'model_kept': 0, 'pending': 0,
-                   'not_asked': 0},
+        'counts': {'rule_kept': 0, 'rules': {}, 'model_same': 0, 'model_different': 0, 'model_unsure': 0,
+                   'model_other': 0, 'model_kept': 0, 'pending': 0, 'not_asked': 0},
+        'review': [],
     }
     # Reuse the scan output rather than duplicating the walk.
     # Flask views return (response, status) tuples — unpack first.
@@ -7560,7 +7578,8 @@ def plex_dupe_fix():
         'ok': True,
         'apply': apply,
         'counts': {k: len(v) for k, v in plan.items()},
-        'checks': dict(check_state['counts'], mode=check_state['mode'], asked=check_state['asked']),
+        'checks': dict(check_state['counts'], mode=check_state['mode'], asked=check_state['asked'],
+                       review=check_state['review']),
         'plan': plan,
     }), 200
 
@@ -7638,8 +7657,9 @@ def plex_dupe_fix_daily():
                    f"{c.get('same_file_ghost', 0)} ghosts, {len(failures)} failed")
         if kept:
             summary += f', {kept} kept by checks'
-        if ck.get('mode') == 'shadow' and ck.get('model_other'):
-            summary += f" (shadow: model doubts {ck['model_other']})"
+        doubts = [f'{ck[k]} {k[6:]}' for k in ('model_different', 'model_unsure', 'model_other') if ck.get(k)]
+        if ck.get('mode') == 'shadow' and doubts:
+            summary += f" (shadow: model says {', '.join(doubts)})"
     else:
         summary = f"{mode}: did not run ({report['error']})"
     record_activity('plex_dupe_fix', summary)

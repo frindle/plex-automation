@@ -660,7 +660,9 @@ def _same_name_year_off_by_one(facts):
 # dupe_confirm: two files Plex lists under one item, the keeper and the copy the cleanup would remove.
 _EPISODE = re.compile(r'(?<![a-z0-9])s(\d{1,3})((?:[ ._-]?e\d{1,4})+)(?![0-9])', re.I)
 _EP_NUM = re.compile(r'e(\d{1,4})', re.I)
-_EP_RANGE = re.compile(r'(?<![a-z0-9])s(\d{1,3})[ ._]?e(\d{1,4})[ ._]?-[ ._]?e?(\d{1,4})(?![0-9])', re.I)
+# A range's dash touches both numbers (S01E01-02, S01E01-E02), as Sonarr writes it: spaces around a dash are
+# Sonarr's "Series - S01E05 - 7 Days" title separator, not a range.
+_EP_RANGE = re.compile(r'(?<![a-z0-9])s(\d{1,3})[ ._]?e(\d{1,4})-e?(\d{1,4})(?![0-9])', re.I)
 _PLEX_EDITION = re.compile(r'\{edition-([^}]+)\}', re.I)
 _EDITIONS = (
     ('extended', re.compile(r'(?<![a-z0-9])extended(?![a-z0-9])', re.I)),
@@ -718,24 +720,36 @@ def file_editions(name):
     return frozenset(out)
 
 
+def _dupe_head(name):
+    """The part of a file name the year and edition guards read. For an episode that is the text before its
+    SxxEyy or air date: Sonarr names put the episode title after it, and titles hold words like "Extended" or
+    "1999" that say nothing about the file. A movie name is read whole."""
+    if not isinstance(name, str):
+        return name
+    cut = [m.start() for rx in (_EPISODE, _DAILY_DATE) for m in [rx.search(name)] if m]
+    return name[:min(cut)] if cut else name
+
+
 def _ep_label(eps):
     return ', '.join('S%02dE%02d' % e for e in sorted(eps))
 
 
 def dupe_conflict(facts):
     """(rule, words) when the two files are surely not the same media, from their names and durations; None
-    otherwise. Checks: episodes, years more than one apart, edition tags, durations."""
+    otherwise. Checks: episodes, years more than one apart, edition tags, durations. Years and edition tags are
+    read only before an episode's SxxEyy or air date (_dupe_head)."""
     if not isinstance(facts, dict):
         return None
     kf, lf = facts.get('keeper_file'), facts.get('loser_file')
     ke, le = file_episodes(kf), file_episodes(lf)
     if ke and le and ke != le:
         return 'episode_differs', 'episodes differ (keeper %s, other %s)' % (_ep_label(ke), _ep_label(le))
-    ky, ly = file_years(kf), file_years(lf)
+    kh, lh = _dupe_head(kf), _dupe_head(lf)
+    ky, ly = file_years(kh), file_years(lh)
     if ky and ly and not any(abs(a - b) <= 1 for a in ky for b in ly):
         return 'year_differs', 'years differ (keeper %s, other %s)' % (
             '/'.join(map(str, sorted(ky))), '/'.join(map(str, sorted(ly))))
-    ked, led = file_editions(kf), file_editions(lf)
+    ked, led = file_editions(kh), file_editions(lh)
     if ked != led:
         return 'edition_differs', 'edition tags differ (keeper %s, other %s)' % (
             ', '.join(sorted(ked)) or 'none', ', '.join(sorted(led)) or 'none')
@@ -758,13 +772,16 @@ def dupe_comparison(facts):
     ke, le = file_episodes(kf), file_episodes(lf)
     if ke and ke == le:
         parts.append('same episodes (%s)' % _ep_label(ke))
-    ky, ly = file_years(kf), file_years(lf)
+    kh, lh = _dupe_head(kf), _dupe_head(lf)
+    ky, ly = file_years(kh), file_years(lh)
     if ky and ly:
         parts.append('years agree (%s)' % '/'.join(map(str, sorted(ky | ly))))
-    if not file_editions(kf) and not file_editions(lf):
-        parts.append('neither name carries an edition tag')
-    else:
-        parts.append('same edition tags (%s)' % ', '.join(sorted(file_editions(kf))))
+    # For an episode, words in its title are not edition tags, so say nothing about editions either way.
+    if kh == kf and lh == lf:
+        if not file_editions(kf) and not file_editions(lf):
+            parts.append('neither name carries an edition tag')
+        else:
+            parts.append('same edition tags (%s)' % ', '.join(sorted(file_editions(kf))))
     kd, ld = _num_or_none(facts.get('keeper_duration_min')), _num_or_none(facts.get('loser_duration_min'))
     if kd and ld:
         parts.append('running times %g and %g min (close)' % (kd, ld))

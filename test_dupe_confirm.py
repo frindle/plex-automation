@@ -30,6 +30,57 @@ def test_file_episodes(name, eps):
     assert ld.file_episodes(name) == frozenset(eps)
 
 
+# Sonarr's "Series - SxxEyy - Episode Title" names: a title starting with a number is not a range, and words
+# or years in a title are not edition tags or release years (offload review of PR #34).
+SONARR_PAIRS = [
+    ('Show (2005) - S01E05 - 7 Days [WEBDL-1080p].mkv', 'Show.S01E05.1080p.WEB.x265-GRP.mkv'),
+    ('Show - S02E03 - 24 Hours.mkv', 'Show.S02E03.720p.HDTV.x264-GRP.mkv'),
+    ('Show - S01E09 - 10 Years Later.mkv', 'Show.S01E09.1080p.WEB.x265-GRP.mkv'),
+    ('Show - S02E03 - The Extended Family.mkv', 'Show.S02E03.1080p.WEB.x265-GRP.mkv'),
+    ('Show - S03E01 - Theatrical Release [HDTV-720p].mkv', 'Show.S03E01.720p.HDTV.x264-GRP.mkv'),
+    ('Show - S03E02 - Redux.mkv', 'Show.S03E02.1080p.WEB.x265-GRP.mkv'),
+    ('Show - S03E03 - Special Edition.mkv', 'Show.S03E03.1080p.WEB.x265-GRP.mkv'),
+    ('Show - S03E04 - Alternate Ending.mkv', 'Show.S03E04.1080p.WEB.x265-GRP.mkv'),
+    ('Show - S03E05 - Back to 1984.mkv', 'Show.2019.S03E05.1080p.WEB.x265-GRP.mkv'),
+    ('Talk Show - 2026-10-30 - The Extended Interview.mkv', 'Talk.Show.2026.10.30.Guest.1080p.mkv'),
+]
+
+
+@pytest.mark.parametrize('keeper,loser', SONARR_PAIRS)
+def test_sonarr_episode_titles_are_not_conflicts(keeper, loser):
+    f = F(keeper, loser, media_type='episode')
+    assert ld.dupe_conflict(f) is None
+    assert ld.dupe_conflict(F(loser, keeper, media_type='episode')) is None
+    assert 'not the same media' not in ld.dupe_comparison(f)
+
+
+@pytest.mark.parametrize('name,eps', [
+    ('Show (2005) - S01E05 - 7 Days [WEBDL-1080p].mkv', {(1, 5)}),
+    ('Show - S02E03 - 24 Hours.mkv', {(2, 3)}),
+    ('Show - S01E09 - 10 Years Later.mkv', {(1, 9)}),
+    ('Show - S01E05-E06 - Two Parter.mkv', {(1, 5), (1, 6)}),
+    ('Show - S01E05-06 - Two Parter.mkv', {(1, 5), (1, 6)}),
+])
+def test_sonarr_names_episodes(name, eps):
+    assert ld.file_episodes(name) == frozenset(eps)
+
+
+def test_sonarr_names_still_catch_real_differences():
+    assert ld.dupe_conflict(F('Show - S02E03 - 24 Hours.mkv', 'Show.S02E04.720p.mkv'))[0] == 'episode_differs'
+    assert ld.dupe_conflict(F('Show - S01E05-06 - Two Parter.mkv', 'Show.S01E05.720p.mkv'))[0] == \
+        'episode_differs'
+    assert ld.dupe_conflict(F('Show (2005) - S01E01 - Pilot.mkv', 'Show.1987.S01E01.720p.mkv'))[0] == \
+        'year_differs'
+    # a real extended episode cut shows up in the running time
+    assert ld.dupe_conflict(F('Show - S01E01 - Pilot.mkv', 'Show.S01E01.Extended.720p.mkv', 44, 58))[0] == \
+        'duration_differs'
+
+
+def test_movie_titles_keep_the_edition_guard():
+    assert ld.dupe_conflict(F('Some Movie (2010).mkv', 'Some.Movie.2010.Extended.1080p.mkv'))[0] == \
+        'edition_differs'
+
+
 def test_file_years_skip_daily_dates_and_resolutions():
     assert ld.file_years('Some.Movie.2021.2160p.mkv') == {2021}
     assert ld.file_years('Talk.Show.2026.10.30.Guest.1080p.mkv') == frozenset()
@@ -267,6 +318,7 @@ def test_guard_keeps_a_different_cut_in_every_mode(world, monkeypatch):
     act = out['plan']['quality_upgrade'][0]['supersede'][0]
     assert act['result'].startswith('kept: edition tags differ') and world['superseded'] == []
     assert act['check'] == {'rule': 'edition_differs'} and out['checks']['rule_kept'] == 1
+    assert out['checks']['review'][0]['why'] == 'edition_differs'
     assert world['asked'] == []
 
 
@@ -278,7 +330,9 @@ def test_shadow_asks_but_changes_nothing(world, monkeypatch):
     act = out['plan']['quality_upgrade'][0]['supersede'][0]
     assert world['superseded'] == ['H1'] and act['check']['model'] == 'different'
     assert world['asked'] == [('dupe_confirm', 'Film.2010.720p.x264-B.mkv', 'same', 'shadow')]
-    assert out['checks']['model_other'] == 1 and out['checks']['mode'] == 'shadow'
+    assert out['checks']['model_different'] == 1 and out['checks']['mode'] == 'shadow'
+    assert out['checks']['review'] == [{'title': 'Film', 'keep': 'Film.2010.2160p.x265-A.mkv',
+                                        'other': 'Film.2010.720p.x264-B.mkv', 'why': 'model different (shadow)'}]
 
 
 def test_default_mode_is_shadow(world):
@@ -341,4 +395,6 @@ def test_daily_run_asks_and_reports_checks(world, monkeypatch, tmp_path):
     world['entries'] = [_entry(KEEP, LOW), dict(_entry(KEEP, EXT), plex_key='2')]
     rep = aw.plex_dupe_fix_daily()
     assert len(world['asked']) == 1 and world['superseded'] == []
-    assert rep['checks']['rule_kept'] == 1 and rep['checks']['model_other'] == 1
+    assert rep['checks']['rule_kept'] == 1 and rep['checks']['model_different'] == 1
+    assert rep['checks']['rules'] == {'edition_differs': 1}
+    assert [r['why'] for r in rep['checks']['review']] == ['model different (shadow)', 'edition_differs']
