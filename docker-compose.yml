@@ -64,6 +64,8 @@ services:
       UPGRADE_LANE_MAX: "${UPGRADE_LANE_MAX:-30}"
       # Stop seeding managed torrents seeded this many days in a swarm with >5 other seeds (0 = off).
       SEED_RETIRE_DAYS: "${SEED_RETIRE_DAYS:-180}"
+      # ...or sooner when idle: no upload in this many days, seeded at least SEED_DAYS (0 = off).
+      SEED_IDLE_DAYS: "${SEED_IDLE_DAYS:-14}"
       UNRAID_OLLAMA_URL: "${UNRAID_OLLAMA_URL:-}"
       LLM_UNRAID_MODEL: "${LLM_UNRAID_MODEL:-}"
       LLM_UNRAID_KINDS: "${LLM_UNRAID_KINDS:-}"
