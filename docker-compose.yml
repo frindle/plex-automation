@@ -57,6 +57,9 @@ services:
       # Unraid Ollama -> local Darkbloom -> paid Darkbloom -> Claude -> rules. Values live in .env, never here.
       LLM_DECISIONS: "${LLM_DECISIONS:-off}"
       GRAB_IDENTITY_CHECK: "${GRAB_IDENTITY_CHECK:-1}"
+      # Sonarr/Radarr health: outage + removed-from-TVDB pushes always; broken library files are
+      # report-only (/digest) unless ARR_HEALTH_APPLY=1 (Deluge recheck, else delete + search).
+      ARR_HEALTH_APPLY: "${ARR_HEALTH_APPLY:-0}"
       UNRAID_OLLAMA_URL: "${UNRAID_OLLAMA_URL:-}"
       LLM_UNRAID_MODEL: "${LLM_UNRAID_MODEL:-}"
       LLM_UNRAID_KINDS: "${LLM_UNRAID_KINDS:-}"
