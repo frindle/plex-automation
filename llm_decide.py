@@ -10,6 +10,7 @@ import unicodedata
 KINDS = {
     'upgrade_gate': ('allow', 'throttle', 'reject'),
     'import_identity': ('match', 'mismatch', 'unsure'),
+    'dupe_confirm': ('same', 'different', 'unsure'),
 }
 MIN_CONFIDENCE = 0.75
 MIN_SEEDERS = 10
@@ -63,6 +64,15 @@ POLICY = {
         'means nothing in it was certain either way, so judge the names yourself. A release that names '
         'exactly the matched title with a year one off the matched year is the same film or show (festival vs. wide '
         'release, a late-December premiere).'),
+    'dupe_confirm': (
+        'Plex lists two files under one library item. The duplicate cleanup keeps the keeper file and removes the '
+        'other file, because Penn never keeps two copies of exactly the same media. Answer same only when both '
+        'files hold the same film, or the same episode(s) of the same show, in the same cut: a different '
+        'resolution, codec, size, release group or source is still the same media. Answer different when they '
+        'are different films or episodes, a remake or another year, or a different cut or edition (Extended, '
+        "Director's Cut, Theatrical, Unrated, IMAX and the like). A file holding more episodes than the other "
+        '(S01E01E02 vs S01E01) is different. Use unsure whenever the names do not settle it; unsure keeps both '
+        'files. When a Comparison line follows the Context, use it: it is computed from these facts.'),
 }
 
 
@@ -381,7 +391,8 @@ def build_prompt(kind, context):
     actions = ', '.join(KINDS[kind])
     ctx_json = json.dumps(context, sort_keys=True, default=str)
     compare = upgrade_comparison(context) if kind == 'upgrade_gate' else \
-        identity_comparison(context) if kind == 'import_identity' else ''
+        identity_comparison(context) if kind == 'import_identity' else \
+        dupe_comparison(context) if kind == 'dupe_confirm' else ''
     return (
         'Decision kind: ' + str(kind) + '\n'
         'Allowed actions: ' + actions + '\n'
@@ -417,6 +428,9 @@ def resolve_action(kind, rules_action, decision, mode='shadow'):
             return rules_action
         # An unsure or mismatch identity answer never imports, however low its confidence: both are the safe side.
         if kind == 'import_identity' and action in ('unsure', 'mismatch'):
+            return action
+        # Likewise a dupe answer other than same keeps both files.
+        if kind == 'dupe_confirm' and action in ('unsure', 'different'):
             return action
         if conf < MIN_CONFIDENCE:
             return rules_action
@@ -643,7 +657,122 @@ def _same_name_year_off_by_one(facts):
     return year not in years and any(abs(y - year) == 1 for y in years)
 
 
-_SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure'}
+# dupe_confirm: two files Plex lists under one item, the keeper and the copy the cleanup would remove.
+_EPISODE = re.compile(r'(?<![a-z0-9])s(\d{1,3})((?:[ ._-]?e\d{1,4})+)(?![0-9])', re.I)
+_EP_NUM = re.compile(r'e(\d{1,4})', re.I)
+_EP_RANGE = re.compile(r'(?<![a-z0-9])s(\d{1,3})[ ._]?e(\d{1,4})[ ._]?-[ ._]?e?(\d{1,4})(?![0-9])', re.I)
+_PLEX_EDITION = re.compile(r'\{edition-([^}]+)\}', re.I)
+_EDITIONS = (
+    ('extended', re.compile(r'(?<![a-z0-9])extended(?![a-z0-9])', re.I)),
+    ('directors cut', re.compile(r"(?<![a-z0-9])director'?s?[ ._-]?cut(?![a-z0-9])", re.I)),
+    ('theatrical', re.compile(r'(?<![a-z0-9])theatrical(?![a-z0-9])', re.I)),
+    ('unrated', re.compile(r'(?<![a-z0-9])(unrated|uncut|uncensored)(?![a-z0-9])', re.I)),
+    ('imax', re.compile(r'(?<![a-z0-9])imax(?![a-z0-9])', re.I)),
+    ('final cut', re.compile(r'(?<![a-z0-9])final[ ._-]?cut(?![a-z0-9])', re.I)),
+    ('ultimate', re.compile(r'(?<![a-z0-9])ultimate[ ._-]?(cut|edition)(?![a-z0-9])', re.I)),
+    ('special edition', re.compile(r'(?<![a-z0-9])special[ ._-]?edition(?![a-z0-9])', re.I)),
+    ('redux', re.compile(r'(?<![a-z0-9])redux(?![a-z0-9])', re.I)),
+    ('alternate', re.compile(r'(?<![a-z0-9])alternate[ ._-]?(cut|ending|version)(?![a-z0-9])', re.I)),
+    ('rogue cut', re.compile(r'(?<![a-z0-9])rogue[ ._-]?cut(?![a-z0-9])', re.I)),
+)
+# Durations further apart than this (minutes, and a share of the longer one) are not one cut: a PAL speed-up
+# is about 4%, a re-encode a minute or two.
+DUPE_DURATION_MIN = 5.0
+DUPE_DURATION_SHARE = 0.08
+
+
+def file_episodes(name):
+    """Episodes a file name holds, as (season, episode) pairs: S01E01, S01E01E02, S01E01-E03. Empty when the
+    name carries no SxxEyy."""
+    if not isinstance(name, str):
+        return frozenset()
+    out = set()
+    for m in _EP_RANGE.finditer(name):
+        a, b = int(m.group(2)), int(m.group(3))
+        if a <= b <= a + 50:
+            out.update((int(m.group(1)), e) for e in range(a, b + 1))
+    for m in _EPISODE.finditer(name):
+        out.update((int(m.group(1)), int(e)) for e in _EP_NUM.findall(m.group(2)))
+    return frozenset(out)
+
+
+def file_years(name):
+    """Release years in a file name (a daily show's air date left out)."""
+    if not isinstance(name, str):
+        return frozenset()
+    return frozenset(int(y) for y in _RELEASE_YEAR.findall(_DAILY_DATE.sub(' ', name)))
+
+
+def file_editions(name):
+    """Edition tags in a file name (Plex {edition-...} tags too), normalised; empty for a plain release."""
+    if not isinstance(name, str):
+        return frozenset()
+    out = set()
+    for m in _PLEX_EDITION.finditer(name):
+        tag = ' '.join(_title_tokens(m.group(1)))
+        hit = next((k for k, rx in _EDITIONS if rx.search(m.group(1))), None)
+        out.add(hit or tag)
+    rest = _PLEX_EDITION.sub(' ', name)
+    out.update(k for k, rx in _EDITIONS if rx.search(rest))
+    out.discard('')
+    return frozenset(out)
+
+
+def _ep_label(eps):
+    return ', '.join('S%02dE%02d' % e for e in sorted(eps))
+
+
+def dupe_conflict(facts):
+    """(rule, words) when the two files are surely not the same media, from their names and durations; None
+    otherwise. Checks: episodes, years more than one apart, edition tags, durations."""
+    if not isinstance(facts, dict):
+        return None
+    kf, lf = facts.get('keeper_file'), facts.get('loser_file')
+    ke, le = file_episodes(kf), file_episodes(lf)
+    if ke and le and ke != le:
+        return 'episode_differs', 'episodes differ (keeper %s, other %s)' % (_ep_label(ke), _ep_label(le))
+    ky, ly = file_years(kf), file_years(lf)
+    if ky and ly and not any(abs(a - b) <= 1 for a in ky for b in ly):
+        return 'year_differs', 'years differ (keeper %s, other %s)' % (
+            '/'.join(map(str, sorted(ky))), '/'.join(map(str, sorted(ly))))
+    ked, led = file_editions(kf), file_editions(lf)
+    if ked != led:
+        return 'edition_differs', 'edition tags differ (keeper %s, other %s)' % (
+            ', '.join(sorted(ked)) or 'none', ', '.join(sorted(led)) or 'none')
+    kd, ld = _num_or_none(facts.get('keeper_duration_min')), _num_or_none(facts.get('loser_duration_min'))
+    if kd and ld and abs(kd - ld) > max(DUPE_DURATION_MIN, DUPE_DURATION_SHARE * max(kd, ld)):
+        return 'duration_differs', 'running times differ (keeper %g min, other %g min)' % (kd, ld)
+    return None
+
+
+def dupe_comparison(facts):
+    """Plain-words comparison of the two files for dupe_confirm, computed in code. Empty when nothing is known."""
+    if not isinstance(facts, dict):
+        return ''
+    conflict = dupe_conflict(facts)
+    if conflict:
+        return ('Comparison (computed from the facts; trust it over your own reading): %s: not the same media.'
+                % conflict[1])
+    parts = []
+    kf, lf = facts.get('keeper_file'), facts.get('loser_file')
+    ke, le = file_episodes(kf), file_episodes(lf)
+    if ke and ke == le:
+        parts.append('same episodes (%s)' % _ep_label(ke))
+    ky, ly = file_years(kf), file_years(lf)
+    if ky and ly:
+        parts.append('years agree (%s)' % '/'.join(map(str, sorted(ky | ly))))
+    if not file_editions(kf) and not file_editions(lf):
+        parts.append('neither name carries an edition tag')
+    else:
+        parts.append('same edition tags (%s)' % ', '.join(sorted(file_editions(kf))))
+    kd, ld = _num_or_none(facts.get('keeper_duration_min')), _num_or_none(facts.get('loser_duration_min'))
+    if kd and ld:
+        parts.append('running times %g and %g min (close)' % (kd, ld))
+    return ('Comparison (computed from the facts; trust it over your own reading): ' + '; '.join(parts) +
+            '. Quality differences (resolution, codec, size, group) do not make the media different.')
+
+
+_SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
 
@@ -672,7 +801,8 @@ def apply_hard_rules(kind, action, facts):
     facts keys (all optional, missing => no veto from that rule): seeders, candidate_dv_web (bool, DV Profile 5
     WEB release), codec + existing_codec (non-HEVC over HEVC), hdr + existing_hdr (+ audio_channels, existing_audio_channels,
     hdr_surround_available: SDR over HDR), year_matches (bool), queue_title + matched_title (spin-off, reverse spin-off, country,
-    first-word and diverging-title guards). Present-but-malformed facts
+    first-word and diverging-title guards), keeper_file + loser_file (+ keeper_duration_min, loser_duration_min:
+    dupe_confirm episode, year, edition and running-time guards). Present-but-malformed facts
     fail closed.
     """
     try:
@@ -707,6 +837,10 @@ def apply_hard_rules(kind, action, facts):
                     return 'unsure', 'title_first_word'
                 if facts.get('service') != 'Radarr' and title_diverges(qt, mt):
                     return 'unsure', 'title_diverges'
+        elif kind == 'dupe_confirm' and action == 'same':
+            conflict = dupe_conflict(facts)
+            if conflict:
+                return 'different', conflict[0]
         return action, None
     except Exception:
         if isinstance(kind, str) and kind in _SAFE_ACTION and action != _SAFE_ACTION[kind]:
