@@ -54,7 +54,12 @@ POLICY = {
         'reboot or a different series is a mismatch. Doubled year tokens (Title.2015.2015) are not a mismatch. '
         'Use unsure whenever the evidence is thin; unsure sends Penn a notification instead of importing. '
         "For Sonarr, queue titles usually carry no year and matched_year is the series' first-air year: judge the "
-        'series name (and season/episode if present); a missing year is not a mismatch.'),
+        'series name (and season/episode if present); a missing year is not a mismatch. A later season (S02, S03...) '
+        'can air in the first-air year or any year after it. '
+        'When a Comparison line follows the Context, use it: it is computed from these facts; no Comparison line '
+        'means nothing in it was certain either way, so judge the names yourself. A release that names '
+        'exactly the matched title with a year one off the matched year is the same film or show (festival vs. wide '
+        'release, a late-December premiere).'),
 }
 
 
@@ -188,6 +193,17 @@ def _size_ratio(context):
     return new / old
 
 
+_WEB_DV_ONLY = ('dv', 'dovi', 'dolby vision', 'dolbyvision')
+
+
+def _num_or_none(v):
+    try:
+        n = _num(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n is not None and n > 0 else None
+
+
 def upgrade_comparison(context):
     """Plain-words comparison of the candidate against the file it replaces, computed in code so the model
     does not have to parse quality strings or divide sizes. Empty when nothing is known about the existing file."""
@@ -206,6 +222,8 @@ def upgrade_comparison(context):
     if c_new and c_old:
         parts.append('codec %s -> %s' % (c_old, c_new))
     ratio = _size_ratio(context)
+    if ratio is None and context.get('size_gb') is None and _num_or_none(context.get('existing_size_gb')):
+        parts.append('candidate size unknown (never reject for an unknown size)')
     if ratio is not None:
         if ratio >= 1.4:
             word = 'much bigger: a higher-bitrate encode'
@@ -228,11 +246,66 @@ def upgrade_comparison(context):
         if _flag(context.get('hdr')) and not has_old:
             parts.append('HDR gained (existing file is SDR)')
         elif has_old and not _flag(context.get('hdr')):
-            parts.append('HDR lost (existing file has %s)' % hdr_old)
+            if t_old == 1 and str(hdr_old).strip().lower() in _WEB_DV_ONLY:
+                parts.append('drops the existing WEB Dolby Vision file (replacing WEB DV is fine: not a loss)')
+            else:
+                parts.append('HDR lost (existing file has %s)' % hdr_old)
     if not parts:
         return ''
     return 'Comparison (computed from the facts, candidate vs existing file; trust it over your own reading): ' + \
         '; '.join(parts) + '.'
+
+
+def identity_comparison(facts):
+    """Plain-words name and year check for import_identity, computed in code. It states agreement only when the
+    whole name agrees and the year does not conflict, and it states a year conflict whenever plex's year check
+    would fail. A partial agreement (same year, different name) says nothing: the model judges it alone, and
+    apply_hard_rules() still checks every "match". Empty when there is nothing certain to say."""
+    if not isinstance(facts, dict):
+        return ''
+    qt, mt = facts.get('queue_title'), facts.get('matched_title')
+    if not (isinstance(qt, str) and isinstance(mt, str)):
+        return ''
+    year = facts.get('matched_year')
+    try:
+        year = None if isinstance(year, bool) else int(year)
+    except (TypeError, ValueError):
+        year = None
+    years = sorted({int(y) for y in _RELEASE_YEAR.findall(_DAILY_DATE.sub(' ', qt))})
+    shown = '/'.join(map(str, years))
+    ym = facts.get('year_matches')
+    off_by_one = _same_name_year_off_by_one(facts)
+    if ym is not None and not _flag(ym) and not off_by_one:
+        part = ('release year %s is not the matched year %s' % (shown, year)) if years and year else \
+            'the release year does not match the matched year'
+        return ('Comparison (computed from the facts; trust it over your own reading): ' + part +
+                '; a title from another year is usually a remake, reboot, sequel or a different show or film.')
+    name = release_show_name(qt)
+    mt_name = ' '.join(_title_tokens(mt))
+    if name and name != mt_name and _core(name.split()) == _core(mt_name.split()):
+        tags_r = sorted(_COUNTRIES.intersection(name.split()))
+        tags_m = sorted(_COUNTRIES.intersection(mt_name.split()))
+        if tags_r and tags_m and tags_r != tags_m:
+            return ('Comparison (computed from the facts; trust it over your own reading): country tags differ '
+                    '(release %s, matched title %s): a different version of the show.' % (
+                        '/'.join(tags_r).upper(), '/'.join(tags_m).upper()))
+        if tags_r != tags_m:
+            return ('Comparison (computed from the facts; trust it over your own reading): the names agree apart '
+                    'from the country tag %s, which only the %s carries.' % (
+                        '/'.join(tags_r or tags_m).upper(), 'release' if tags_r else 'matched title'))
+        return ''
+    if not name or name != mt_name:
+        return ''
+    parts = ['the release names exactly the matched title']
+    if off_by_one:
+        parts.append('release year %s is one off the matched year %d: not a year mismatch' % (shown, year))
+    elif year and years and year in years:
+        parts.append('year %d agrees' % year)
+    elif year and not years and facts.get('service') == 'Sonarr':
+        parts.append('it carries no year (normal for Sonarr; %d is the first-air year)' % year)
+    elif years:
+        return ''
+    return 'Comparison (computed from the facts; trust it over your own reading): ' + '; '.join(parts) + '.'
 
 
 def build_prompt(kind, context):
@@ -240,7 +313,8 @@ def build_prompt(kind, context):
         raise ValueError('unknown kind: %r' % (kind,))
     actions = ', '.join(KINDS[kind])
     ctx_json = json.dumps(context, sort_keys=True, default=str)
-    compare = upgrade_comparison(context) if kind == 'upgrade_gate' else ''
+    compare = upgrade_comparison(context) if kind == 'upgrade_gate' else \
+        identity_comparison(context) if kind == 'import_identity' else ''
     return (
         'Decision kind: ' + str(kind) + '\n'
         'Allowed actions: ' + actions + '\n'
@@ -416,13 +490,21 @@ def _is_tail(short, longer):
 _POSSESSIVE_LEAD = re.compile(r"^[^:]{0,40}?\w['\u2019]s?\s+")
 
 
+def _one_letter_dropped(short, full):
+    """short is full with exactly one letter left out ('ioness' / 'lioness'); full needs 5+ letters."""
+    return len(full) >= 5 and len(short) == len(full) - 1 and \
+        any(full[:i] + full[i + 1:] == short for i in range(len(full)))
+
+
 def first_word_differs(queue_title, matched_title, allow_tail=False):
     """True when the release name and the matched title start with different words (articles skipped).
     Back-test: 0 of 150 real matches differ here, so a 'match' across different first words is never trusted.
     Exceptions: digits standing in for letters ('PLUR1BUS' is 'Pluribus'); with allow_tail (the caller has a
     matching year), one name is the other's last 2+ real words ('Mandalorian and Grogu' 2026 is 'Star Wars:
     The Mandalorian and Grogu' 2026; without a year it is not trusted, since a franchise name in front of an
-    older show's name is a spin-off: 'Fear the Walking Dead', 'Dexter New Blood', '9-1-1 Lone Star');
+    older show's name is a spin-off: 'Fear the Walking Dead', 'Dexter New Blood', '9-1-1 Lone Star'); also with
+    allow_tail, a release that leaves one letter out of the first word and is otherwise the same name
+    ('ioness 2023' is 'Lioness' 2023);
     the release drops a possessive brand and the rest is the same title of 2+ real words ('Without Remorse'
     is "Tom Clancy's Without Remorse"; a lone 'Anatomy' is not "Grey's Anatomy", a lone 'Daredevil' is not
     "Marvel's Daredevil")."""
@@ -432,8 +514,12 @@ def first_word_differs(queue_title, matched_title, allow_tail=False):
         return False
     if rel[0].translate(_LOOKALIKE) == mt[0].translate(_LOOKALIKE):
         return False
+    if ''.join(rel) == ''.join(mt):  # the whole name, spaced differently: 'SpiderMan' is 'Spider-Man'
+        return False
     if allow_tail and (_is_tail(mt, rel) or _is_tail(rel, mt)):
         return False
+    if allow_tail and rel[1:] == mt[1:] and _one_letter_dropped(rel[0], mt[0]):
+        return False  # a typo in the release name with a matching year: 'ioness 2023 S03' is 'Lioness' (2023)
     lead = _POSSESSIVE_LEAD.match(str(matched_title))
     if lead:
         rest = [w for w in _title_tokens(str(matched_title)[lead.end():]) if w not in _ARTICLES]

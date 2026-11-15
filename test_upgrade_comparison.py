@@ -50,10 +50,27 @@ def test_partial_pack_compares_per_episode():
 def test_unknown_or_bad_values_say_nothing():
     assert ld.upgrade_comparison({}) == ''
     assert ld.upgrade_comparison(None) == ''
-    assert ld.upgrade_comparison({'size_gb': None, 'existing_size_gb': 3}) == ''
     assert ld.upgrade_comparison({'size_gb': 'big', 'existing_size_gb': 3}) == ''
     assert ld.upgrade_comparison({'size_gb': 0, 'existing_size_gb': 3}) == ''
     assert ld.upgrade_comparison({'quality': 'Unknown', 'existing_quality': 'WEBDL-1080p'}) == ''
+
+
+def test_unknown_candidate_size_is_said_out_loud():
+    c = ld.upgrade_comparison({'size_gb': None, 'existing_size_gb': 3})
+    assert 'candidate size unknown (never reject for an unknown size)' in c
+    assert 'candidate size unknown' not in ld.upgrade_comparison({'size_gb': None, 'existing_size_gb': None})
+
+
+def test_dropping_a_web_dv_file_is_not_called_an_hdr_loss():
+    web_dv = ld.upgrade_comparison({'quality': 'WEBDL-2160p', 'hdr': False, 'existing_quality': 'WEBDL-2160p',
+                                    'existing_hdr': 'DV'})
+    assert 'drops the existing WEB Dolby Vision file' in web_dv and 'HDR lost' not in web_dv
+    disc_dv = ld.upgrade_comparison({'quality': 'WEBDL-2160p', 'hdr': False, 'existing_quality': 'Bluray-2160p',
+                                     'existing_hdr': 'DV'})
+    assert 'HDR lost (existing file has DV)' in disc_dv
+    web_hdr10 = ld.upgrade_comparison({'quality': 'WEBDL-2160p', 'hdr': False, 'existing_quality': 'WEBDL-2160p',
+                                       'existing_hdr': 'HDR10'})
+    assert 'HDR lost (existing file has HDR10)' in web_hdr10
 
 
 def test_hdr_gain_and_loss_and_av1_and_repack():
@@ -73,7 +90,8 @@ def test_prompt_carries_comparison_only_for_upgrade_gate():
     p = ld.build_prompt('upgrade_gate', ctx)
     assert 'Comparison (computed from the facts' in p and 'source tier better' in p
     assert p.index('Context:') < p.index('Comparison (computed') < p.index('Respond ONLY')
-    assert 'Comparison' not in ld.build_prompt('import_identity', ctx)
+    ident = ld.build_prompt('import_identity', ctx)
+    assert 'Comparison (computed' not in ident and 'source tier' not in ident
     assert 'Comparison (computed' not in ld.build_prompt('upgrade_gate', {'title': 'x'})
 
 
