@@ -136,24 +136,27 @@ def test_idle_retires_quiet_seeds_past_the_floor_only():
     assert idle_plan(ts) == [('never', 'idle'), ('quiet', 'idle'), ('edge', 'idle')]
 
 
-def test_active_seeds_keep_going_until_the_age_ceiling():
-    ts = {'busy_old': quiet(days=200, idle=0), 'busy': quiet(days=100, idle=0), 'quiet': quiet(days=40, idle=60)}
-    assert idle_plan(ts) == [('busy_old', 'age'), ('quiet', 'idle')]
+def test_active_seeds_keep_seeding_at_any_age():
+    ts = {'busy_old': quiet(days=200, idle=0), 'busy_older': quiet(days=400, idle=13),
+          'busy': quiet(days=100, idle=0), 'old_unknown': quiet(days=300, idle=-1, uploaded=5),
+          'quiet': quiet(days=40, idle=60)}
+    assert idle_plan(ts) == [('quiet', 'idle')]
 
 
-def test_aged_out_come_before_idle_and_limit_applies():
-    ts = {'old': quiet(days=300, idle=1), 'older': quiet(days=400, idle=1),
+def test_aged_out_idle_come_first_and_limit_applies():
+    ts = {'old': quiet(days=300, idle=20), 'older': quiet(days=400, idle=15), 'old_busy': quiet(days=500, idle=1),
           'i30': quiet(idle=30), 'i90': quiet(idle=90), 'never': quiet(idle=-1, uploaded=0)}
     assert [h for h, _ in idle_plan(ts)] == ['older', 'old', 'never', 'i90', 'i30']
     assert dt.seed_retire_plan(ts, LABELS, 180, 5, limit=3, idle_days=14, idle_min_days=21) == ['older', 'old', 'never']
 
 
 def test_each_rule_has_its_own_off_switch():
-    ts = {'old': quiet(days=300, idle=1), 'quiet': quiet(idle=30)}
-    assert idle_plan(ts, idle_days=0) == [('old', 'age')]
-    assert idle_plan(ts, min_days=0) == [('quiet', 'idle')]
+    ts = {'old': quiet(days=300, idle=1), 'old_quiet': quiet(days=300, idle=30), 'quiet': quiet(idle=30)}
+    assert idle_plan(ts, idle_days=0) == [('old', 'age'), ('old_quiet', 'age')], 'idle rule off: age alone, active or not'
+    assert idle_plan(ts, min_days=0) == [('old_quiet', 'idle'), ('quiet', 'idle')]
+    assert idle_plan(ts) == [('old_quiet', 'age'), ('quiet', 'idle')]
     assert idle_plan(ts, min_days=0, idle_days=0) == []
-    assert dt.seed_retire_plan(ts, LABELS, 180, 5) == ['old'], 'no idle args: age rule alone, as before'
+    assert dt.seed_retire_plan(ts, LABELS, 180, 5) == ['old', 'old_quiet'], 'no idle args: age rule alone, as before'
 
 
 def test_parse_labels():
@@ -219,7 +222,8 @@ def test_enforce_off_and_deluge_failure_never_raise(monkeypatch):
 def test_retire_deletes_copy_only_when_library_has_it(monkeypatch):
     monkeypatch.setattr(aw, 'SEED_RETIRE_DAYS', 180)
     monkeypatch.setattr(aw, 'SEED_RETIRE_PER_RUN', 0)
-    ts = {'imp': seed('radarr', days=300), 'not': seed('sonarr', days=250), 'lib': seed('library-seed', days=400)}
+    ts = {'imp': quiet('radarr', days=300, idle=30), 'not': quiet('sonarr', days=250, idle=30),
+          'lib': quiet('library-seed', days=400, idle=30)}
     removed, activity = _wire(monkeypatch, ts)
     monkeypatch.setattr(aw, '_deluge_rpc', lambda m, p: {'files': [{'path': p[0] + '.mkv'}]})
     seen = []
@@ -238,7 +242,7 @@ def test_retire_deletes_copy_only_when_library_has_it(monkeypatch):
 def test_retire_respects_per_run_and_dry_run(monkeypatch):
     monkeypatch.setattr(aw, 'SEED_RETIRE_DAYS', 180)
     monkeypatch.setattr(aw, 'SEED_RETIRE_PER_RUN', 2)
-    ts = {f'h{i}': seed(days=200 + i) for i in range(5)}
+    ts = {f'h{i}': quiet(days=200 + i, idle=30) for i in range(5)}
     removed, _ = _wire(monkeypatch, ts)
     res = aw.retire_old_seeds(dry_run=True)
     assert removed == [] and res['eligible'] == 5 and [c['hash'] for c in res['candidates']] == ['h4', 'h3']
@@ -256,15 +260,16 @@ def test_retire_idle_rule_wiring(monkeypatch):
     monkeypatch.setattr(aw, 'SEED_IDLE_DAYS', 14)
     monkeypatch.setattr(aw, 'SEED_IDLE_MIN_DAYS', 21)
     monkeypatch.setattr(aw, 'SEED_RETIRE_PER_RUN', 0)
-    ts = {'old': seed('radarr', days=300), 'q': quiet('library-seed', idle=40),
-          'never': quiet('sonarr', idle=-1, uploaded=0), 'busy': quiet('sonarr', idle=2)}
+    ts = {'old': quiet('radarr', days=300, idle=20), 'q': quiet('library-seed', idle=40),
+          'never': quiet('sonarr', idle=-1, uploaded=0), 'busy': quiet('sonarr', idle=2),
+          'busy_old': quiet('radarr', days=400, idle=1), 'unknown_old': seed('radarr', days=400)}
     removed, activity = _wire(monkeypatch, ts)
     monkeypatch.setattr(aw, '_deluge_rpc', lambda m, p: {'files': []})
     monkeypatch.setattr(aw.episode_retention, 'remove_data_for', lambda t, has: False)
     res = aw.retire_old_seeds(dry_run=True)
     assert removed == [] and res['by_rule'] == {'age': 1, 'idle': 2}
     assert [(c['hash'], c['rule'], c['idle_days']) for c in res['candidates']] == [
-        ('old', 'age', None), ('never', 'idle', 'never uploaded'), ('q', 'idle', 40.0)]
+        ('old', 'age', 20.0), ('never', 'idle', 'never uploaded'), ('q', 'idle', 40.0)]
     res = aw.retire_old_seeds()
     assert removed == [('old', False), ('never', False), ('q', False)]
     assert res['removed_by_rule'] == {'age': 1, 'idle': 2}
@@ -287,7 +292,8 @@ def test_idle_floor_never_below_seed_floor():
 def test_endpoints_preview_by_default(monkeypatch):
     monkeypatch.setattr(aw, 'UPGRADE_LANE_MAX', 1)
     monkeypatch.setattr(aw, 'SEED_RETIRE_DAYS', 180)
-    removed, _ = _wire(monkeypatch, {'a': fresh(queue=1), 'b': fresh(queue=2), 'old': seed(days=300)})
+    removed, _ = _wire(monkeypatch, {'a': fresh(queue=1), 'b': fresh(queue=2), 'old': quiet(days=300, idle=30),
+                                      'busy_old': quiet(days=300, idle=0)})
     monkeypatch.setattr(aw, '_deluge_rpc', lambda m, p: {'files': []})
     c = aw.app.test_client()
     body = c.get('/upgrade-lane-cap').get_json()
