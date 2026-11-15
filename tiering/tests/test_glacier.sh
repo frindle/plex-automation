@@ -725,6 +725,82 @@ mkf disk1 data/Documents/notes.txt 100 3
 ENVX="PHASES=fill" run --apply >/dev/null
 check "PHASES=fill leaves disk1 data alone" onglacier data/Documents/notes.txt
 
+# --- turbo write ---------------------------------------------------------------
+# fake mdcmd: status says no parity check; set appends its args to mdcmd.calls
+# (exit $MDFAIL when set); var.ini holds md_write_method.
+turbo_setup() { # name var.ini-value|"-"(no file)
+  setup "$1"
+  mkdir -p "$R/var/local/emhttp" "$R/var/run"
+  [ "$2" = - ] || printf 'mdState="STARTED"\nmd_write_method="%s"\n' "$2" >"$R/var/local/emhttp/var.ini"
+  printf '#!/bin/sh\ncase "$1" in status) echo mdResync=0 ;; set) echo "$*" >>"%s/mdcmd.calls"; exit ${MDFAIL:-0} ;; esac\n' "$R" >"$R/bin/mdcmd"
+  chmod +x "$R/bin/mdcmd"; : >"$R/mdcmd.calls"
+}
+calls() { tr '\n' '|' <"$R/mdcmd.calls"; }
+ST() { echo "$R/var/run/glacier-turbo-write.restore"; }
+
+turbo_setup turbo_on_for_live_copies_then_back auto
+mkf disk2 data/Media/a.mkv 1000 100; mkf disk3 data/Media/b.mkv 1000 100
+out="$(MDCMD="$R/bin/mdcmd" run --apply)"; rc=$?
+eq "exit 0" "$rc" 0
+check "moved a" onglacier data/Media/a.mkv
+check "moved b" onglacier data/Media/b.mkv
+eq "on once, off once" "$(calls)" "set md_write_method 1|set md_write_method 0|"
+echo "$out" | grep -q 'turbo write: on for this run (was auto)' && ok || bad "logs turbo on: $out"
+echo "$out" | grep -q 'turbo write: off again' && ok || bad "logs turbo off: $out"
+check "no restore file left" test ! -e "$(ST)"
+
+turbo_setup turbo_already_on_left_alone 1
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(MDCMD="$R/bin/mdcmd" run --apply)"
+check "moved" onglacier data/Media/a.mkv
+eq "never set" "$(calls)" ""
+echo "$out" | grep -q 'turbo write: already on, left as is' && ok || bad "says already on: $out"
+
+turbo_setup turbo_dry_run_never_sets auto
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(MDCMD="$R/bin/mdcmd" run)"
+eq "dry run never sets" "$(calls)" ""
+
+turbo_setup turbo_nothing_to_move_never_sets auto
+out="$(MDCMD="$R/bin/mdcmd" run --apply)"; rc=$?
+eq "exit 0" "$rc" 0
+eq "no copy, no set" "$(calls)" ""
+
+turbo_setup turbo_off_by_env 0
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(MDCMD="$R/bin/mdcmd" ENVX="TURBO_WRITE=0" run --apply)"
+check "moved" onglacier data/Media/a.mkv
+eq "TURBO_WRITE=0 never sets" "$(calls)" ""
+
+turbo_setup turbo_unreadable_var_ini_left_alone -
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(MDCMD="$R/bin/mdcmd" run --apply)"
+check "still moves" onglacier data/Media/a.mkv
+eq "never set" "$(calls)" ""
+echo "$out" | grep -q 'WARN  turbo write: cannot read md_write_method' && ok || bad "warns: $out"
+
+turbo_setup turbo_set_fails_still_moves auto
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(MDFAIL=1 MDCMD="$R/bin/mdcmd" run --apply)"; rc=$?
+eq "exit 0" "$rc" 0
+check "still moves" onglacier data/Media/a.mkv
+eq "tried once, nothing to undo" "$(calls)" "set md_write_method 1|"
+echo "$out" | grep -q "WARN  turbo write: .* failed, copying at normal speed" && ok || bad "warns: $out"
+check "no restore file left" test ! -e "$(ST)"
+
+turbo_setup turbo_stale_from_killed_run_is_undone 1
+echo auto >"$(ST)"                    # a killed run left turbo on (var.ini now reads 1)
+out="$(MDCMD="$R/bin/mdcmd" run)"     # even a dry run with nothing to move undoes it
+eq "set back to 0" "$(calls)" "set md_write_method 0|"
+check "restore file cleared" test ! -e "$(ST)"
+echo "$out" | grep -q 'an earlier run left it on' && ok || bad "logs stale undo: $out"
+
+turbo_setup turbo_back_off_when_killed auto
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(EXTRA_OVR='move_unit() { turbo_on; kill -TERM $$; sleep 5; }' MDCMD="$R/bin/mdcmd" run --apply)"
+eq "on, then off from the TERM trap" "$(calls)" "set md_write_method 1|set md_write_method 0|"
+check "restore file cleared" test ! -e "$(ST)"
+
 echo
 echo "glacier tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -47,6 +47,9 @@ NOTIFY_ON_DRY="${NOTIFY_ON_DRY:-0}"
 LOCK_FILE="${LOCK_FILE:-$ROOT/var/run/glacier-mover.lock}"
 PROC_MOUNTS="${PROC_MOUNTS:-$ROOT/proc/mounts}"
 MDCMD="${MDCMD:-mdcmd}"
+TURBO_WRITE="${TURBO_WRITE:-1}"                   # 1 = turbo (reconstruct) write while a live run copies, set back at the end
+VAR_INI="${VAR_INI:-$ROOT/var/local/emhttp/var.ini}"   # Unraid's live settings (md_write_method: auto, 0 or 1)
+TURBO_STATE="${TURBO_STATE:-$ROOT/var/run/glacier-turbo-write.restore}"   # RAM: a reboot resets the setting too
 PHASES="${PHASES:-evict fill}"                    # evict first (it frees room on disk1 for fill)
 EVICT_TO="${EVICT_TO:-disk2}"                     # the disk that stays awake (seeding, hot data)
 EVICT_SHARE="${EVICT_SHARE:-data}"                # evict only inside this share...
@@ -128,6 +131,59 @@ active_roots_call() {
 resume_call() {
   curl -sS -f --max-time "$API_TIMEOUT" -X POST -H 'Content-Type: text/plain' --data-binary @- \
     "$TIERING_API/tiering/torrent-resume"
+}
+
+# --- turbo write -------------------------------------------------------------
+# By default Unraid writes parity by read/modify/write (md_write_method auto or 0):
+# each block written reads the old data and parity first, so array copies run at
+# roughly a third to a half of disk speed. Reconstruct write (1, "turbo") reads the
+# other data disks instead and writes much faster, but every array disk
+# spins while it copies. A live run turns it on just before its first copy and
+# sets it back to read/modify/write when the run ends (Unraid's help text: Auto
+# selects read/modify/write). Already on (Penn set it) = left alone both ways.
+# The value to restore waits in TURBO_STATE, so a run that was killed before it
+# could set it back is undone by the next run.
+TURBO_TRIED=0; TURBO_ON=0
+
+write_method() { # -> auto | 0 | 1 | "" (unreadable)
+  sed -n 's/^md_write_method="\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$VAR_INI" 2>/dev/null | head -1
+}
+
+turbo_on() {
+  [ "$APPLY" = 1 ] && [ "$TURBO_WRITE" = 1 ] && [ "$TURBO_TRIED" = 0 ] || return 0
+  TURBO_TRIED=1
+  local was
+  was="$(write_method)"
+  case "$was" in
+    auto|0) ;;
+    1) log "turbo write: already on, left as is"; return 0 ;;
+    *) log "WARN  turbo write: cannot read md_write_method from $VAR_INI, left as is"; return 0 ;;
+  esac
+  mkdir -p "$(dirname "$TURBO_STATE")" 2>/dev/null
+  printf '%s\n' "$was" >"$TURBO_STATE" 2>/dev/null
+  if "$MDCMD" set md_write_method 1 >/dev/null 2>&1; then
+    TURBO_ON=1; log "turbo write: on for this run (was $was)"
+  else
+    rm -f "$TURBO_STATE"; log "WARN  turbo write: '$MDCMD set md_write_method 1' failed, copying at normal speed"
+  fi
+}
+
+turbo_off() {
+  [ "$TURBO_ON" = 1 ] || return 0
+  if "$MDCMD" set md_write_method 0 >/dev/null 2>&1; then
+    TURBO_ON=0; rm -f "$TURBO_STATE"; log "turbo write: off again (read/modify/write)"
+  else
+    log "WARN  turbo write: could not set md_write_method back to 0; the next run retries (or Settings -> Disk Settings)"
+  fi
+}
+
+# A run that did not get to set it back (killed, crashed): undo before anything else.
+turbo_restore_stale() {
+  local was
+  was="$(cat "$TURBO_STATE" 2>/dev/null)"
+  [ -n "$was" ] || return 0
+  log "turbo write: an earlier run left it on, setting it back"
+  TURBO_ON=1; turbo_off
 }
 
 # --- helpers ---------------------------------------------------------------
@@ -416,6 +472,7 @@ build_evict_candidates() {
 # move_unit SRC_DISK DEST_DISK PATH...  -> 0 moved, 1 failed (source untouched), 3 skipped
 move_unit() {
   local dk="$1" to="$2"; shift 2
+  turbo_on
   local p rel dest pre sz mt ino i
   local -a src=() dst=() before=() rsrc=() atimes=()
   pre="$MNT/$dk/"
@@ -754,7 +811,8 @@ main() {
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then log "ABORT: another glacier run holds the lock"; return 2; fi
   TMP="$(mktemp -d)"
-  trap 'resume_unit; rm -rf "$TMP"' EXIT
+  trap 'resume_unit; turbo_off; rm -rf "$TMP"' EXIT
+  turbo_restore_stale
   trap 'exit 130' INT; trap 'exit 143' TERM
   : >"$TMP/plan"; : >"$TMP/reject"; : >"$TMP/skipped-groups"; : >"$TMP/evict-blocked"
   read -r total used <<<"$(fs_stats "$GLACIER")"

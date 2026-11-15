@@ -60,7 +60,10 @@ Rebuild/redeploy the plex-automation container so the new endpoints exist (`tier
 4. When happy, change the script body to run `--apply` (or the wrapper: `exec bash .../glacier-mover.sh --apply`).
 5. Set `LOG_DIR=/mnt/cache/appdata/tiering` to keep the log across reboots (default is `/var/log/tiering`, which is RAM). One Unraid notification per run with moved/failed/skipped counts.
 
-Settings via env vars (defaults in the script header): `PHASES MEDIA_ROOTS GLACIER SRC_DISKS TARGET_PCT NIGHTLY_CAP_BYTES MIN_AGE_DAYS EXCLUDE_NAMES EXCLUDE_CONTAINS MAIN_EXT SIDE_EXT EVICT_TO EVICT_SHARE EVICT_HOT_ROOTS EVICT_DEST_PCT EVICT_NEVER_TOP SHARE_CFG TIERING_API PAUSE_SETTLE_SEC NOTIFY_ON_DRY LOG_DIR`. `PHASES=fill` turns evict off.
+Settings via env vars (defaults in the script header): `PHASES MEDIA_ROOTS GLACIER SRC_DISKS TARGET_PCT NIGHTLY_CAP_BYTES MIN_AGE_DAYS EXCLUDE_NAMES EXCLUDE_CONTAINS MAIN_EXT SIDE_EXT EVICT_TO EVICT_SHARE EVICT_HOT_ROOTS EVICT_DEST_PCT EVICT_NEVER_TOP SHARE_CFG TIERING_API PAUSE_SETTLE_SEC NOTIFY_ON_DRY LOG_DIR TURBO_WRITE`. `PHASES=fill` turns evict off.
+
+## Turbo write
+A live run turns Unraid's turbo write on (`mdcmd set md_write_method 1`, reconstruct write) just before its first copy and sets it back to read/modify/write (`0`) when it ends, including on INT/TERM. Copies to the array run much faster, but every array disk spins while the run copies. If the setting already reads `1` in `/var/local/emhttp/var.ini` (turned on by hand), the run leaves it alone both ways. The value to restore is kept in `/var/run/glacier-turbo-write.restore` until it is set back, so a run that was killed outright is undone by the next run (dry runs too). Dry runs and runs with nothing to move never touch it. `TURBO_WRITE=0` turns this off. Settings -> Disk Settings keeps showing the saved choice (Auto); a reboot applies the saved choice again.
 
 The run aborts if the array is stopped, the mover is running, a parity check/rebuild is running, or another glacier run holds the lock.
 
