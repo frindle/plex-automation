@@ -1,6 +1,7 @@
 """Upgrade-lane cap and seed retirement: the pure planners (deluge_trim.py)
 and their wiring in arr-webhook.py. Synthetic torrents only."""
 import importlib.util
+import os
 
 import deluge_trim as dt
 
@@ -237,6 +238,38 @@ def test_retire_deletes_copy_only_when_library_has_it(monkeypatch):
     assert 'lib' not in seen, 'library-seed files are the library: never even considered for deletion'
     assert res['removed'] == 3 and res['files_deleted'] == 1
     assert activity and activity[0][0] == 'cleanup'
+
+
+def test_retire_keeps_download_hardlinked_into_library(monkeypatch, tmp_path):
+    # Penn 11-15: "we're linking them, so we need to keep them". A hardlinked
+    # download frees nothing when deleted and can seed again; a separate copy
+    # still goes once the library verifiably has it.
+    (tmp_path / 'link.mkv').write_bytes(b'x')
+    os.link(tmp_path / 'link.mkv', tmp_path / 'library.mkv')
+    (tmp_path / 'copy.mkv').write_bytes(b'x')
+    monkeypatch.setattr(aw, '_deluge_to_local', lambda p: p)
+    monkeypatch.setattr(aw, 'SEED_RETIRE_DAYS', 180)
+    monkeypatch.setattr(aw, 'SEED_RETIRE_PER_RUN', 0)
+    ts = {'link': dict(quiet('radarr', days=300, idle=30), save_path=str(tmp_path)),
+          'copy': dict(quiet('radarr', days=250, idle=30), save_path=str(tmp_path))}
+    removed, activity = _wire(monkeypatch, ts)
+    monkeypatch.setattr(aw, '_deluge_rpc', lambda m, p: {'files': [{'path': p[0] + '.mkv'}]})
+    monkeypatch.setattr(aw.episode_retention, 'remove_data_for', lambda t, has: True)
+    res = aw.retire_old_seeds()
+    assert removed == [('link', False), ('copy', True)]
+    assert res['files_deleted'] == 1 and res['kept_linked'] == 1
+    assert '1 hardlinked into the library kept' in activity[0][1]
+
+
+def test_download_is_hardlinked_reads_link_count(monkeypatch, tmp_path):
+    (tmp_path / 'a.mkv').write_bytes(b'x')
+    (tmp_path / 'b.mkv').write_bytes(b'x')
+    monkeypatch.setattr(aw, '_deluge_to_local', lambda p: p)
+    t = {'save_path': str(tmp_path), 'files': [{'path': 'a.mkv'}, {'path': 'b.mkv'}, {'path': 'gone.mkv'}]}
+    assert aw._download_is_hardlinked(t) is False
+    os.link(tmp_path / 'b.mkv', tmp_path / 'lib-b.mkv')
+    assert aw._download_is_hardlinked(t) is True
+    assert aw._download_is_hardlinked({'save_path': str(tmp_path), 'files': None}) is False
 
 
 def test_retire_respects_per_run_and_dry_run(monkeypatch):

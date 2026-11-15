@@ -5822,13 +5822,16 @@ def retire_old_seeds(dry_run=False):
     SEED_IDLE_MIN_DAYS with no upload for SEED_IDLE_DAYS ('idle'). At most
     SEED_RETIRE_PER_RUN per run, aged-out first. The download copy is
     deleted only when the library verifiably holds every video (as in
-    cleanup_stalled_seeds); library-seed torrents always keep their files,
-    since those files are the library. Never raises."""
+    cleanup_stalled_seeds) AND it is a separate copy: a download hardlinked
+    into the library is kept (11-15, Penn: "we're linking them, so we need to
+    keep them"), as deleting it frees nothing and it lets the torrent seed
+    again. library-seed torrents always keep their files, since those files
+    are the library. Never raises."""
     out = {'dry_run': dry_run, 'days': SEED_RETIRE_DAYS, 'idle_days': SEED_IDLE_DAYS,
            'idle_min_days': SEED_IDLE_MIN_DAYS, 'min_swarm': SEED_RETIRE_MIN_SWARM,
            'per_run': SEED_RETIRE_PER_RUN, 'eligible': 0, 'by_rule': {'age': 0, 'idle': 0},
            'candidates': [], 'removed': 0, 'removed_by_rule': {'age': 0, 'idle': 0},
-           'files_deleted': 0, 'deferred': 0}
+           'files_deleted': 0, 'kept_linked': 0, 'deferred': 0}
     if not _seed_retire_on():
         return out
     try:
@@ -5854,11 +5857,13 @@ def retire_old_seeds(dry_run=False):
                                   'ratio': t.get('ratio'), 'swarm_seeds': t.get('total_seeds')})
         if dry_run:
             continue
-        drop = False
+        drop = linked = False
         try:
             if (t.get('label') or '') != LIBRARY_SEED_LABEL:
                 files = (_deluge_rpc('core.get_torrent_status', [h, ['files']]) or {}).get('files')
-                drop = episode_retention.remove_data_for(dict(t, files=files, hash=h), _library_has_file)
+                full = dict(t, files=files, hash=h)
+                linked = _download_is_hardlinked(full)
+                drop = not linked and episode_retention.remove_data_for(full, _library_has_file)
             r = remove_torrent(h, remove_data=drop, info=t)
         except Exception as e:
             log.warning(f'Seed retirement: removing {h} failed: {e}')
@@ -5869,14 +5874,17 @@ def retire_old_seeds(dry_run=False):
         out['removed'] += 1
         out['removed_by_rule'][rule] += 1
         out['files_deleted'] += 1 if drop else 0
+        out['kept_linked'] += 1 if linked else 0
     if out['removed']:
         n_age, n_idle = out['removed_by_rule']['age'], out['removed_by_rule']['idle']
         log.info(f"Seed retirement: {out['removed']} retired ({n_age} aged out, {n_idle} idle; "
-                 f"{out['files_deleted']} download copies deleted), {out['eligible'] - out['removed']} eligible left")
+                 f"{out['files_deleted']} download copies deleted, {out['kept_linked']} hardlinked kept), "
+                 f"{out['eligible'] - out['removed']} eligible left")
         record_activity('cleanup', f"Retired {out['removed']} torrent(s) with >{SEED_RETIRE_MIN_SWARM} other seeds: "
                                    f"{n_age} seeded >= {SEED_RETIRE_DAYS}d, {n_idle} idle (no upload in "
                                    f"{SEED_IDLE_DAYS}d, seeded >= {SEED_IDLE_MIN_DAYS}d); {out['files_deleted']} "
-                                   f"imported download copies deleted, the rest unseeded with files kept")
+                                   f"imported download copies deleted, {out['kept_linked']} hardlinked into the "
+                                   f"library kept, the rest unseeded with files kept")
     return out
 
 
@@ -9738,6 +9746,22 @@ def _arr_extra_exts(who):
         return set()
     _arr_extras_cache[who] = (now, exts)
     return exts
+
+
+def _download_is_hardlinked(t):
+    """True when any file of the torrent is hardlinked into the library
+    (nlink > 1): deleting the download copy frees no space, since the library
+    link keeps the data, and only loses the ability to seed it again. Anything
+    unreadable -> False (the caller's other checks decide)."""
+    save_path = t.get('save_path') or ''
+    for f in t.get('files') or []:
+        local = _deluge_to_local(posixpath.normpath(posixpath.join(save_path, f.get('path') or '')))
+        try:
+            if local and os.stat(local).st_nlink >= 2:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _library_has_file(t):
