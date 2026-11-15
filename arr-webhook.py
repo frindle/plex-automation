@@ -20,6 +20,7 @@ import tiering_gate
 import library_audit
 import downloads_audit
 import arr_health
+import deluge_trim
 import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -587,6 +588,23 @@ UPGRADE_STATE_PATH = os.environ.get('UPGRADE_STATE_PATH', '/data/upgrade_batch_s
 # (/run-stalled-seeds, dry-run by default) still works regardless of this
 # flag — this only gates the automatic weekly background removal.
 STALL_AUTOMATION_ENABLED = os.environ.get('STALL_AUTOMATION_ENABLED', 'false').lower() in ('1', 'true', 'yes')
+# Upgrade-lane backlog cap (Penn, 2026-11-15: "cap the backlog at 30 torrents").
+# Untouched upgrade torrents beyond this many are dropped from Deluge; anything
+# with progress is always kept. 0 turns the cap off. See deluge_trim.py.
+UPGRADE_LANE_MAX = int(os.environ.get('UPGRADE_LANE_MAX', '30'))
+# Seed retirement (same day: "we also need to reduce seeding torrents"). Finished
+# torrents on these labels that have seeded SEED_RETIRE_DAYS, in a swarm with
+# more than SEED_RETIRE_MIN_SWARM other seeds, stop seeding (download copy
+# deleted only when the library verifiably holds every video). 0 days = off.
+# 180 matches Penn's earlier six-month target for unseeding (STALL_SEED_MIN_DAYS).
+SEED_RETIRE_DAYS = int(os.environ.get('SEED_RETIRE_DAYS', '180'))
+SEED_RETIRE_MIN_SWARM = int(os.environ.get('SEED_RETIRE_MIN_SWARM', str(STALL_MIN_SWARM_SEEDS)))
+SEED_RETIRE_PER_RUN = int(os.environ.get('SEED_RETIRE_PER_RUN', '100'))
+SEED_RETIRE_INTERVAL = int(os.environ.get('SEED_RETIRE_INTERVAL', str(86400)))
+UPGRADE_LANE_LABELS = (SONARR_UPG_LABEL, RADARR_UPG_LABEL, SONARR_UPG_PRIORITY_LABEL, RADARR_UPG_PRIORITY_LABEL)
+SEED_RETIRE_LABELS = deluge_trim.parse_labels(
+    os.environ.get('SEED_RETIRE_LABELS'),
+    ('sonarr', 'radarr', 'lidarr', LIBRARY_SEED_LABEL) + UPGRADE_LANE_LABELS)
 # Root of the movies library from the CONTAINER's perspective — used by
 # /orphan-scan. Radarr may report paths from the host's perspective, so
 # matching is done by filename basename rather than absolute path.
@@ -5114,6 +5132,7 @@ def handle_grab(data, source):
         # visible to the dedupe pass at all -- so this is the earliest point
         # the check can be both immediate and correct. Never raises.
         dedupe_grabbed_release(source, download_id)
+        _cap_new_upgrade_grab(source, download_id)
     except Exception as e:
         log.error(f"{source}: failed to label upgrade torrent: {e}")
 
@@ -5619,8 +5638,11 @@ def monthly_search_scheduler():
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         state = _load_upgrade_state()
         quota_entry = weekly_quota_state(state, now)
+        lane = upgrade_lane_count() if UPGRADE_LANE_MAX > 0 else None
         if WEEKLY_UPGRADE_QUOTA - quota_entry['count'] <= 0:
             log.info(f'weekly upgrade quota exhausted ({quota_entry["count"]}/{WEEKLY_UPGRADE_QUOTA}); skipping this poll')
+        elif lane is not None and lane >= UPGRADE_LANE_MAX:
+            log.info(f'upgrade lane full ({lane}/{UPGRADE_LANE_MAX}); skipping this poll')
         else:
             # Services run one at a time rather than in parallel so the two
             # bulk searches don't stack announces on the same tracker; the
@@ -5655,6 +5677,7 @@ def monthly_upgrade_cycle(service, wait_before_search=1800, wait_before_relabel=
     log.info(f'{service}: waiting {wait_before_relabel}s before relabeling upgrades...')
     time.sleep(wait_before_relabel)
     count = relabel()
+    enforce_upgrade_lane_cap()
     state = _load_upgrade_state()
     record_upgrades_found(state, count)
     log.info(f'{service}: monthly cycle complete ({count} upgrade(s) confirmed queued against the weekly quota)')
@@ -5679,10 +5702,146 @@ def prioritize_normal_torrents():
         log.error(f'Queue prioritization failed: {e}')
 
 def priority_scheduler():
-    """Run queue prioritization every hour."""
+    """Every hour: trim the upgrade lane to its cap, then reorder the queue."""
     while True:
         time.sleep(3600)
+        enforce_upgrade_lane_cap()
         prioritize_normal_torrents()
+
+
+LANE_FIELDS = ['name', 'label', 'state', 'progress', 'total_done', 'queue', 'time_added',
+               'seeding_time', 'total_uploaded', 'is_finished', 'save_path']
+SEED_RETIRE_FIELDS = ['name', 'label', 'state', 'is_finished', 'progress', 'seeding_time',
+                      'total_seeds', 'total_uploaded', 'save_path']
+
+
+def upgrade_lane_count():
+    """Unfinished upgrade-lane torrents right now; None when Deluge can't say."""
+    try:
+        deluge_login()
+        return len(deluge_trim.lane_torrents(get_all_torrents(LANE_FIELDS, force=True), UPGRADE_LANE_LABELS))
+    except Exception as e:
+        log.warning(f'Upgrade lane count failed: {e}')
+        return None
+
+
+def enforce_upgrade_lane_cap(dry_run=False, only=None):
+    """Trim the upgrade lane to UPGRADE_LANE_MAX (deluge_trim.upgrade_lane_plan).
+    Only untouched torrents (0 bytes) go, and their files are left alone: there
+    are none to free, and a keep-data removal can't take a cross-seed's files.
+    `only` (a hash) limits removal to that one torrent: the grab-time check.
+    Never raises; returns a summary for the endpoint and tests."""
+    out = {'cap': UPGRADE_LANE_MAX, 'dry_run': dry_run, 'lane': 0, 'kept': 0,
+           'drop': [], 'removed': 0, 'deferred': 0}
+    if UPGRADE_LANE_MAX <= 0:
+        return out
+    try:
+        deluge_login()
+        torrents = get_all_torrents(LANE_FIELDS, force=True)
+    except Exception as e:
+        log.error(f'Upgrade lane cap: Deluge read failed: {e}')
+        out['error'] = str(e)
+        return out
+    keep, drop = deluge_trim.upgrade_lane_plan(
+        torrents, UPGRADE_LANE_MAX, UPGRADE_LANE_LABELS,
+        (SONARR_UPG_PRIORITY_LABEL, RADARR_UPG_PRIORITY_LABEL))
+    out['lane'], out['kept'] = len(keep) + len(drop), len(keep)
+    if only is not None:
+        drop = [h for h in drop if h == only]
+    out['drop'] = [{'hash': h, 'name': torrents[h].get('name'), 'label': torrents[h].get('label'),
+                    'state': torrents[h].get('state')} for h in drop]
+    if dry_run or not drop:
+        return out
+    for h in drop:
+        try:
+            r = remove_torrent(h, remove_data=False, info=torrents[h])
+        except Exception as e:
+            log.warning(f'Upgrade lane cap: removing {h} failed: {e}')
+            continue
+        if r == DEFERRED:
+            out['deferred'] += 1
+        else:
+            out['removed'] += 1
+    if out['removed']:
+        log.info(f"Upgrade lane cap: dropped {out['removed']} untouched upgrade torrent(s); "
+                 f"lane {out['lane'] - out['removed']}/{UPGRADE_LANE_MAX}")
+        record_activity('cleanup', f"Upgrade lane over its cap of {UPGRADE_LANE_MAX}: dropped "
+                                   f"{out['removed']} untouched upgrade torrent(s) (0 bytes downloaded)")
+    return out
+
+
+def _cap_new_upgrade_grab(source, download_id):
+    """Grab-time half of the lane cap: an upgrade that lands in a full lane is
+    dropped at once instead of waiting an hour. Never raises."""
+    try:
+        res = enforce_upgrade_lane_cap(only=download_id)
+        if res.get('removed'):
+            log.info(f"{source}: upgrade lane full ({res['kept']}/{UPGRADE_LANE_MAX} kept); "
+                     f"dropped new grab {download_id}")
+    except Exception as e:
+        log.warning(f'{source}: lane cap check for {download_id} failed: {e}')
+
+
+def retire_old_seeds(dry_run=False):
+    """Stop seeding finished torrents that have seeded SEED_RETIRE_DAYS on a
+    managed label in a healthy swarm (deluge_trim.seed_retire_plan), at most
+    SEED_RETIRE_PER_RUN per run, longest-seeded first. The download copy is
+    deleted only when the library verifiably holds every video (as in
+    cleanup_stalled_seeds); library-seed torrents always keep their files,
+    since those files are the library. Never raises."""
+    out = {'dry_run': dry_run, 'days': SEED_RETIRE_DAYS, 'min_swarm': SEED_RETIRE_MIN_SWARM,
+           'per_run': SEED_RETIRE_PER_RUN, 'eligible': 0, 'candidates': [],
+           'removed': 0, 'files_deleted': 0, 'deferred': 0}
+    if SEED_RETIRE_DAYS <= 0:
+        return out
+    try:
+        deluge_login()
+        torrents = get_all_torrents(SEED_RETIRE_FIELDS, force=True)
+    except Exception as e:
+        log.error(f'Seed retirement: Deluge read failed: {e}')
+        out['error'] = str(e)
+        return out
+    every = deluge_trim.seed_retire_plan(torrents, SEED_RETIRE_LABELS, SEED_RETIRE_DAYS, SEED_RETIRE_MIN_SWARM)
+    out['eligible'] = len(every)
+    batch = every[:SEED_RETIRE_PER_RUN] if SEED_RETIRE_PER_RUN > 0 else every
+    for h in batch:
+        t = torrents[h]
+        out['candidates'].append({'hash': h, 'name': t.get('name'), 'label': t.get('label'),
+                                  'seeding_days': round(t['seeding_time'] / 86400, 1),
+                                  'swarm_seeds': t.get('total_seeds')})
+        if dry_run:
+            continue
+        drop = False
+        try:
+            if (t.get('label') or '') != LIBRARY_SEED_LABEL:
+                files = (_deluge_rpc('core.get_torrent_status', [h, ['files']]) or {}).get('files')
+                drop = episode_retention.remove_data_for(dict(t, files=files, hash=h), _library_has_file)
+            r = remove_torrent(h, remove_data=drop, info=t)
+        except Exception as e:
+            log.warning(f'Seed retirement: removing {h} failed: {e}')
+            continue
+        if r == DEFERRED:
+            out['deferred'] += 1
+            continue
+        out['removed'] += 1
+        out['files_deleted'] += 1 if drop else 0
+    if out['removed']:
+        log.info(f"Seed retirement: {out['removed']} retired ({out['files_deleted']} download copies deleted), "
+                 f"{out['eligible'] - out['removed']} eligible left")
+        record_activity('cleanup', f"Retired {out['removed']} torrent(s) seeded >= {SEED_RETIRE_DAYS}d "
+                                   f"(>{SEED_RETIRE_MIN_SWARM} other seeds); {out['files_deleted']} imported "
+                                   f"download copies deleted, the rest unseeded with files kept")
+    return out
+
+
+def seed_retire_scheduler():
+    if SEED_RETIRE_DAYS <= 0:
+        log.info('Seed retirement off (SEED_RETIRE_DAYS=0); preview with GET /retire-seeds')
+        return
+    time.sleep(900)
+    while True:
+        retire_old_seeds()
+        time.sleep(SEED_RETIRE_INTERVAL)
 
 def refresh_metadata_on_grab(data, source):
     """Best-effort metadata refresh on Grab.
@@ -8084,6 +8243,20 @@ def run_stalled_seeds():
         'candidates': candidates,
     }), 200
 
+
+# Upgrade-lane cap: preview by default, ?apply=1 drops the untouched overflow now.
+@app.route('/upgrade-lane-cap', methods=['GET', 'POST'])
+def upgrade_lane_cap_route():
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    return jsonify(dict(enforce_upgrade_lane_cap(dry_run=not apply), ok=True)), 200
+
+
+# Seed retirement: preview by default, ?apply=1 runs one batch now.
+@app.route('/retire-seeds', methods=['GET', 'POST'])
+def retire_seeds_route():
+    apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    return jsonify(dict(retire_old_seeds(dry_run=not apply), ok=True)), 200
+
 # Scan an Incomplete directory for files not backed by any Deluge torrent.
 # Deluge parks in-progress downloads under DOWNLOADS_MOUNT/Incomplete; when
 # a torrent gets removed (or crashes) mid-download the partial files can
@@ -10222,4 +10395,6 @@ if __name__ == '__main__':
     t12.start()
     t13 = threading.Thread(target=arr_health_scheduler, daemon=True)
     t13.start()
+    t14 = threading.Thread(target=seed_retire_scheduler, daemon=True)
+    t14.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
