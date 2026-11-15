@@ -1094,19 +1094,24 @@ def supersede_torrent(torrent_hash):
                         f'torrent {torrent_hash} superseded with no local data — '
                         f'not moved (orphan avoided; reaped by cleanup)')
 
-# Samples only matter while a torrent seeds. When a removal keeps the files,
-# the torrent's sample files are deleted right after the entry is gone, and
-# RAR sets in the library are queued for unpacking (Plex can't play .rar).
+# Samples and release clutter (.nfo, .txt, .sfv, proof pictures:
+# episode_retention.is_junk) only matter while a torrent seeds. When a removal
+# keeps the files, they are deleted right after the entry is gone, leaving the
+# videos and subtitles; RAR sets in the library are queued for unpacking
+# (Plex can't play .rar).
 SAMPLE_MAX_BYTES = 2 * 1024 ** 3  # a "sample" bigger than this is not deleted
+JUNK_MAX_BYTES = 50 * 1024 ** 2   # nor a "junk" file bigger than this
 
 
 def _keep_data_cleanup_plan(torrent_hash):
-    """Read BEFORE a keep-data removal: (sample paths to delete, library RAR
-    sets to unpack), as local paths. ([], []) on any doubt: lookup failure,
-    or another torrent with the same name and save_path (a cross-seed still
-    using the files). Samples also need a real main video in the torrent (the
-    "sample" might be the release); RAR sets only count under the library,
-    where nothing else would ever unpack them."""
+    """Read BEFORE a keep-data removal: (sample and junk paths to delete,
+    library RAR sets to unpack), as local paths. ([], []) on any doubt: lookup
+    failure, or another torrent with the same name and save_path (a cross-seed
+    still using the files). Samples and junk also need a real main video in the
+    torrent (the "sample" might be the release, and a RAR-only release keeps
+    its files until unpacked); RAR sets only count under the library, where
+    nothing else would ever unpack them. Only files the torrent lists are
+    touched, never anything an *arr or Plex wrote next to them."""
     try:
         resp = session.post(
             f'{DELUGE_URL}/json',
@@ -1124,10 +1129,15 @@ def _keep_data_cleanup_plan(torrent_hash):
         return [], []
     rels = [f.get('path') or '' for f in files if isinstance(f, dict)]
     samples = [r for r in rels if episode_retention.is_sample(r)]
+    junk = [r for r in rels if episode_retention.is_junk(r) and r not in samples]
     if not any(episode_retention.is_main_video(r) for r in rels):
-        samples = []
+        samples, junk = [], []
     deluge_paths = [posixpath.normpath(posixpath.join(save_path, r)) for r in rels]
     rsets = rar_extract.rar_sets(deluge_paths) if is_library_path(save_path) else []
+    if rsets:  # the RAR queue owns its .sfv files
+        owned = {v for rs in rsets for v in rs['extras']}
+        junk = [r for r in junk if posixpath.normpath(posixpath.join(save_path, r)) not in owned]
+    samples = [(r, SAMPLE_MAX_BYTES) for r in samples] + [(r, JUNK_MAX_BYTES) for r in junk]
     if not samples and not rsets:
         return [], []
     try:
@@ -1140,10 +1150,10 @@ def _keep_data_cleanup_plan(torrent_hash):
            and posixpath.normpath(t.get('save_path') or '/') == sp for h, t in (others or {}).items()):
         return [], []
     out = []
-    for r in samples:
+    for r, cap in samples:
         local = _deluge_to_local(posixpath.normpath(posixpath.join(save_path, r)))
         try:
-            if local and os.path.isfile(local) and os.path.getsize(local) <= SAMPLE_MAX_BYTES:
+            if local and os.path.isfile(local) and os.path.getsize(local) <= cap:
                 out.append(local)
         except OSError:
             continue
@@ -1157,11 +1167,11 @@ def _delete_samples(paths, torrent_hash):
     for p in paths:
         try:
             os.remove(p)
-            log.info(f'{torrent_hash}: deleted sample {p}')
+            log.info(f'{torrent_hash}: deleted leftover {p}')
         except OSError as e:
-            log.warning(f'{torrent_hash}: could not delete sample {p} ({e})')
+            log.warning(f'{torrent_hash}: could not delete leftover {p} ({e})')
     for d in sorted({os.path.dirname(p) for p in paths}, reverse=True):
-        if os.path.basename(d).lower() in ('sample', 'samples'):
+        if os.path.basename(d).lower() in {'sample', 'samples'} | episode_retention.JUNK_IMG_DIRS:
             try:
                 os.rmdir(d)
             except OSError:

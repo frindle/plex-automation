@@ -1,5 +1,6 @@
-"""Keep-data removals delete the torrent's sample files (samples only matter
-while seeding); data-delete removals, cross-seeds, failed removals and
+"""Keep-data removals delete the torrent's sample and junk files (.nfo, .txt,
+.sfv, proof pictures; they only matter while seeding) and keep videos,
+subtitles and artwork; data-delete removals, cross-seeds, failed removals and
 sample-only torrents leave them alone. Run: python test_remove_torrent_deletes_samples.py"""
 import importlib.util
 import os
@@ -15,7 +16,11 @@ aw = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(aw)
 H = 'h1'
 SP = '/data/Downloads/Complete'
-FILES = ['Show.S01E05/Show.S01E05.mkv', 'Show.S01E05/Sample/show.s01e05.sample.mkv', 'Show.S01E05/show.nfo']
+FILES = ['Show.S01E05/Show.S01E05.mkv', 'Show.S01E05/Sample/show.s01e05.sample.mkv', 'Show.S01E05/show.nfo',
+         'Show.S01E05/Show.S01E05.en.srt', 'Show.S01E05/poster.jpg', 'Show.S01E05/Proof/proof.jpg',
+         'Show.S01E05/show.sfv', 'Show.S01E05/RARBG.txt']
+KEPT = ['Show.S01E05/Show.S01E05.mkv', 'Show.S01E05/Show.S01E05.en.srt', 'Show.S01E05/poster.jpg']
+JUNK = ['Show.S01E05/show.nfo', 'Show.S01E05/Proof/proof.jpg', 'Show.S01E05/show.sfv', 'Show.S01E05/RARBG.txt']
 OLD = {'name': 'Show.S01E05', 'seeding_time': 40 * 86400, 'save_path': SP, 'progress': 100.0,
        'total_uploaded': 5, 'is_finished': True}
 
@@ -71,16 +76,29 @@ def run():
         assert aw.remove_torrent(H, remove_data=False, info=dict(OLD)) is True
         assert not os.path.exists(os.path.join(d, sample))
         assert not os.path.exists(os.path.join(d, 'Show.S01E05/Sample'))  # emptied dir removed
-        assert os.path.exists(os.path.join(d, FILES[0])) and os.path.exists(os.path.join(d, FILES[2]))
+        assert not os.path.exists(os.path.join(d, 'Show.S01E05/Proof'))
+        assert all(os.path.exists(os.path.join(d, f)) for f in KEPT)
+        assert not any(os.path.exists(os.path.join(d, f)) for f in JUNK)
         assert calls.index('core.remove_torrent') > calls.index('core.get_torrent_status')
 
     with tempfile.TemporaryDirectory() as d:
-        # Deluge reports failure -> sample kept
+        # Deluge reports failure -> sample and junk kept
         _mk(d, FILES)
         aw.session, _ = _session(FILES, remove_result=False)
         aw._invalidate_snapshot()
         aw.remove_torrent(H, remove_data=False, info=dict(OLD))
-        assert os.path.exists(os.path.join(d, sample))
+        assert all(os.path.exists(os.path.join(d, f)) for f in FILES)
+
+    with tempfile.TemporaryDirectory() as d:
+        # an oversized "junk" file is kept
+        _mk(d, FILES)
+        with open(os.path.join(d, 'Show.S01E05/RARBG.txt'), 'wb') as fh:
+            fh.truncate(aw.JUNK_MAX_BYTES + 1)
+        aw.session, _ = _session(FILES)
+        aw._invalidate_snapshot()
+        aw.remove_torrent(H, remove_data=False, info=dict(OLD))
+        assert os.path.exists(os.path.join(d, 'Show.S01E05/RARBG.txt'))
+        assert not os.path.exists(os.path.join(d, 'Show.S01E05/show.nfo'))
 
     with tempfile.TemporaryDirectory() as d:
         # cross-seed with same name+save_path still loaded -> sample kept
@@ -93,12 +111,12 @@ def run():
 
     with tempfile.TemporaryDirectory() as d:
         # only "sample" videos, no main video -> nothing deleted
-        only = ['X/sample-x.mkv']
+        only = ['X/sample-x.mkv', 'X/x.nfo']
         _mk(d, only)
         aw.session, _ = _session(only)
         aw._invalidate_snapshot()
         aw.remove_torrent(H, remove_data=False, info=dict(OLD))
-        assert os.path.exists(os.path.join(d, only[0]))
+        assert all(os.path.exists(os.path.join(d, f)) for f in only)
 
     with tempfile.TemporaryDirectory() as d:
         # seed floor defers -> nothing removed, nothing deleted, no sample lookup
@@ -107,7 +125,7 @@ def run():
         aw._invalidate_snapshot()
         r = aw.remove_torrent(H, remove_data=False, info=dict(OLD, seeding_time=86400))
         assert r == aw.DEFERRED and 'core.remove_torrent' not in calls
-        assert os.path.exists(os.path.join(d, sample))
+        assert all(os.path.exists(os.path.join(d, f)) for f in FILES)
 
     with tempfile.TemporaryDirectory() as d:
         # data-delete removal: Deluge deletes everything; no extra sample lookup
@@ -123,6 +141,10 @@ def run():
     assert episode_retention.is_sample('A/sample.mkv')
     assert not episode_retention.is_sample('A/A.mkv')
     assert not episode_retention.is_sample('A/sample.nfo')
+    for j in ('A/a.nfo', 'A/A.NFO', 'A/a.txt', 'A/a.sfv', 'A/a.srr', 'A/Proof/p.jpg', 'A/Screens/s1.png', 'A/a.url'):
+        assert episode_retention.is_junk(j), j
+    for k in ('A/a.mkv', 'A/a.srt', 'A/Subs/a.idx', 'A/poster.jpg', 'A/fanart.jpg', 'A/a.rar', 'A/a.r00', 'A/nfo'):
+        assert not episode_retention.is_junk(k), k
     print('test_remove_torrent_deletes_samples: all assertions passed')
 
 
