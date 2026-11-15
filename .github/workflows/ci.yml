@@ -15,8 +15,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt ruff
-      - run: python -m py_compile arr-webhook.py monthly_upgrade.py media_share.py
-      - run: ruff check arr-webhook.py monthly_upgrade.py media_share.py
+      - run: python -m py_compile arr-webhook.py arr_health.py monthly_upgrade.py media_share.py
+      - run: ruff check arr-webhook.py arr_health.py monthly_upgrade.py media_share.py
 
   shell-tests:
     runs-on: ubuntu-latest

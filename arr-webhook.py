@@ -19,6 +19,7 @@ import torrent_breakdown
 import tiering_gate
 import library_audit
 import downloads_audit
+import arr_health
 import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -5846,7 +5847,7 @@ def digest():
     entries.reverse()  # newest first
     if request.args.get('format') == 'json':
         return jsonify({'ok': True, 'since': since, 'count': len(entries), 'entries': entries,
-                        'unregistered': _unregistered_report})
+                        'unregistered': _unregistered_report, 'arr_health': _arr_health_load()})
 
     counts = {}
     for e in entries:
@@ -5880,6 +5881,7 @@ a {{ color:#78dce8; }}
 <form method="post" action="/digest/reviewed"><button type="submit">Mark all reviewed</button></form>
 <table>{rows or "<tr><td>Nothing to review 🎉</td></tr>"}</table>
 {_digest_unregistered_html()}
+{_digest_arr_health_html()}
 </body></html>'''
 
 @app.route('/digest/reviewed', methods=['POST'])
@@ -10004,6 +10006,112 @@ def _digest_unregistered_html():
             f"{body or '<tr><td>none</td></tr>'}</table>")
 
 
+# ── Sonarr/Radarr health (arr_health.py): outage and removed-from-TVDB pushes every tick, broken library
+# files every ARR_BROKEN_INTERVAL. Broken files are report-only unless ARR_HEALTH_APPLY=1.
+ARR_HEALTH_APPLY = os.environ.get('ARR_HEALTH_APPLY', '').lower() in ('1', 'true', 'yes')
+ARR_HEALTH_STATE = os.environ.get('ARR_HEALTH_STATE', '/data/arr_health_state.json')
+ARR_HEALTH_INTERVAL = int(os.environ.get('ARR_HEALTH_INTERVAL', '300'))
+ARR_BROKEN_INTERVAL = int(os.environ.get('ARR_BROKEN_INTERVAL', '21600'))
+_arr_health_lock = threading.Lock()
+
+
+class ArrHealthIO:
+    """The I/O arr_health needs, over this app's Sonarr/Radarr/Deluge settings."""
+
+    def __init__(self):
+        self._arrs = {who: (url, key) for who, url, key in
+                      (('Sonarr', SONARR_URL, SONARR_API_KEY), ('Radarr', RADARR_URL, RADARR_API_KEY)) if key}
+        self.services = list(self._arrs)
+
+    def _req(self, method, who, path, **kw):
+        url, key = self._arrs[who]
+        r = requests.request(method, f'{url}{path}', headers={'X-Api-Key': key}, timeout=60, **kw)
+        r.raise_for_status()
+        return r.json() if r.content else None
+
+    def get(self, who, path, params=None):
+        return self._req('GET', who, path, params=params)
+
+    def post(self, who, path, body):
+        return self._req('POST', who, path, json=body)
+
+    def delete(self, who, path):
+        return self._req('DELETE', who, path)
+
+    def deluge_ok(self):
+        ok = _deluge_rpc('web.connected', [])
+        if ok is None:   # session expired: log in once and ask again
+            deluge_login()
+            ok = _deluge_rpc('web.connected', [])
+        return bool(ok)
+
+    def deluge_has(self, h):
+        return bool(_deluge_rpc('core.get_torrent_status', [h, ['name']]))
+
+    def deluge_recheck(self, h):
+        deluge_force_recheck(h)
+
+    def push(self, title, message):
+        send_pushover(title, message)
+
+    def record(self, category, summary):
+        record_activity(category, summary)
+
+    def file_mtime(self, path):
+        local = _relink_path(path)   # arr '/data/X' -> RELINK_DATA_ROOT/X inside this container
+        if not local:
+            return None
+        try:
+            return os.stat(local).st_mtime
+        except OSError:
+            return None
+
+    def log(self, msg):
+        log.warning(msg)
+
+
+def _arr_health_load():
+    try:
+        with open(ARR_HEALTH_STATE) as f:
+            return _json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def arr_health_tick(now=None, io=None):
+    now = time.time() if now is None else now
+    io = io or ArrHealthIO()
+    with _arr_health_lock:
+        state = _arr_health_load()
+        health = arr_health.outage_tick(io, state, now)
+        for who, items in health.items():
+            arr_health.removed_tick(io, state, who, items)
+        if now - state.get('broken_last', 0) >= ARR_BROKEN_INTERVAL:
+            state['broken_last'] = now
+            rows = arr_health.broken_files_pass(io, state, now, apply=ARR_HEALTH_APPLY)
+            log.info(f'[arr-health] broken-file pass: {len(rows)} file(s), {"apply" if ARR_HEALTH_APPLY else "dry run"}')
+        _write_json_atomic(ARR_HEALTH_STATE, state)
+    return state
+
+
+def arr_health_scheduler():
+    while True:
+        try:
+            arr_health_tick()
+        except Exception as e:
+            log.error(f'[arr-health] tick failed: {type(e).__name__}: {e}')
+        time.sleep(ARR_HEALTH_INTERVAL)
+
+
+def _digest_arr_health_html():
+    fmt = lambda t: datetime.fromtimestamp(t).isoformat(timespec='minutes') if t else ''  # noqa: E731
+    try:
+        return arr_health.digest_html(_arr_health_load(), fmt)
+    except Exception as e:  # noqa: BLE001
+        log.debug(f'[arr-health] digest render failed: {e}')
+        return ''
+
+
 def maintenance_scheduler():
     """Every 6 hours: heal errored torrents, then look for duplicate library
     folders. Shares one thread because the dupe scan is scandir-only (sizes
@@ -10112,4 +10220,6 @@ if __name__ == '__main__':
     t11.start()
     t12 = threading.Thread(target=rar_extract_scheduler, daemon=True)
     t12.start()
+    t13 = threading.Thread(target=arr_health_scheduler, daemon=True)
+    t13.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
