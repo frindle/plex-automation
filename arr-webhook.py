@@ -601,6 +601,11 @@ SEED_RETIRE_DAYS = int(os.environ.get('SEED_RETIRE_DAYS', '180'))
 SEED_RETIRE_MIN_SWARM = int(os.environ.get('SEED_RETIRE_MIN_SWARM', str(STALL_MIN_SWARM_SEEDS)))
 SEED_RETIRE_PER_RUN = int(os.environ.get('SEED_RETIRE_PER_RUN', '100'))
 SEED_RETIRE_INTERVAL = int(os.environ.get('SEED_RETIRE_INTERVAL', str(86400)))
+# Last scheduled retirement run, so a container restart waits out the interval
+# instead of retiring another batch 15 minutes after every start (11-15: two
+# updates two hours apart retired two batches of 100).
+SEED_RETIRE_STATE = os.environ.get('SEED_RETIRE_STATE', '/data/seed_retire_state.json')
+SEED_RETIRE_FIRST_DELAY = 900
 # Idle rule (Penn, 11-15: "can we do variable based on seeding activity?"): a
 # managed torrent that has uploaded nothing for SEED_IDLE_DAYS retires once it
 # has seeded SEED_IDLE_MIN_DAYS. One still uploading keeps seeding at any age
@@ -5720,12 +5725,18 @@ def prioritize_normal_torrents():
     except Exception as e:
         log.error(f'Queue prioritization failed: {e}')
 
+PRIORITY_FIRST_DELAY = 300
+
+
 def priority_scheduler():
-    """Every hour: trim the upgrade lane to its cap, then reorder the queue."""
+    """Every hour: trim the upgrade lane to its cap, then reorder the queue.
+    The first pass runs 5 minutes after start, not an hour: with the container
+    restarted more often than hourly the cap never ran (11-15: lane at 256/30)."""
+    time.sleep(PRIORITY_FIRST_DELAY)
     while True:
-        time.sleep(3600)
         enforce_upgrade_lane_cap()
         prioritize_normal_torrents()
+        time.sleep(3600)
 
 
 LANE_FIELDS = ['name', 'label', 'state', 'progress', 'total_done', 'queue', 'time_added',
@@ -5869,12 +5880,44 @@ def retire_old_seeds(dry_run=False):
     return out
 
 
+def _seed_retire_last_run():
+    """Epoch seconds of the last scheduled run; None when never recorded or unreadable."""
+    try:
+        with open(SEED_RETIRE_STATE) as f:
+            last = _json.load(f).get('last_run')
+        return float(last) if isinstance(last, (int, float)) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _seed_retire_mark_run(now):
+    try:
+        with open(SEED_RETIRE_STATE, 'w') as f:
+            _json.dump({'last_run': now}, f)
+    except OSError as e:
+        log.warning(f'Seed retirement: could not record the run time ({e}); a restart may run it early')
+
+
+def seed_retire_first_wait(now, last_run, interval=None, first_delay=None):
+    """Seconds before the first run after a start: at least first_delay, and not
+    before last_run + interval, so a restart never adds an extra run. A last_run
+    in the future (clock jump) counts as unknown rather than as a long wait."""
+    interval = SEED_RETIRE_INTERVAL if interval is None else interval
+    first_delay = SEED_RETIRE_FIRST_DELAY if first_delay is None else first_delay
+    if last_run is None or last_run > now:
+        return first_delay
+    return max(first_delay, last_run + interval - now)
+
+
 def seed_retire_scheduler():
     if not _seed_retire_on():
         log.info('Seed retirement off (SEED_RETIRE_DAYS=0 and SEED_IDLE_DAYS=0); preview with GET /retire-seeds')
         return
-    time.sleep(900)
+    wait = seed_retire_first_wait(time.time(), _seed_retire_last_run())
+    log.info(f'Seed retirement: first run in {round(wait / 3600, 1)}h')
+    time.sleep(wait)
     while True:
+        _seed_retire_mark_run(time.time())
         retire_old_seeds()
         time.sleep(SEED_RETIRE_INTERVAL)
 

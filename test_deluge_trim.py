@@ -329,3 +329,90 @@ def test_monthly_scheduler_skips_when_lane_full(monkeypatch):
     except Stop:
         pass
     assert ran == ['radarr']
+
+
+# ── schedulers across restarts ───────────────────────────────────────────────
+
+class _Stop(Exception):
+    pass
+
+
+def _sleeps(monkeypatch, stop_after):
+    """Record time.sleep calls; raise _Stop on call number stop_after."""
+    calls = []
+
+    def sleep(s):
+        calls.append(s)
+        if len(calls) >= stop_after:
+            raise _Stop
+    monkeypatch.setattr(aw.time, 'sleep', sleep)
+    return calls
+
+
+def test_seed_retire_first_wait():
+    now = 10_000_000
+    assert aw.seed_retire_first_wait(now, None, 86400, 900) == 900
+    assert aw.seed_retire_first_wait(now, now - 3600, 86400, 900) == 86400 - 3600
+    assert aw.seed_retire_first_wait(now, now - 86000, 86400, 900) == 900
+    assert aw.seed_retire_first_wait(now, now - 2 * DAY, 86400, 900) == 900
+    assert aw.seed_retire_first_wait(now, now + 3600, 86400, 900) == 900
+
+
+def test_restart_does_not_add_a_retirement_run(monkeypatch, tmp_path):
+    now = 10_000_000
+    state = tmp_path / 'seed_retire_state.json'
+    state.write_text(aw._json.dumps({'last_run': now - 3600}))
+    monkeypatch.setattr(aw, 'SEED_RETIRE_STATE', str(state))
+    monkeypatch.setattr(aw, 'SEED_RETIRE_INTERVAL', 86400)
+    monkeypatch.setattr(aw, '_seed_retire_on', lambda: True)
+    monkeypatch.setattr(aw.time, 'time', lambda: now)
+    ran = []
+    monkeypatch.setattr(aw, 'retire_old_seeds', lambda: ran.append(1))
+    calls = _sleeps(monkeypatch, 1)
+    try:
+        aw.seed_retire_scheduler()
+    except _Stop:
+        pass
+    assert calls == [86400 - 3600] and ran == []
+
+
+def test_first_run_is_recorded_before_retiring(monkeypatch, tmp_path):
+    now = 10_000_000
+    state = tmp_path / 'seed_retire_state.json'
+    monkeypatch.setattr(aw, 'SEED_RETIRE_STATE', str(state))
+    monkeypatch.setattr(aw, 'SEED_RETIRE_INTERVAL', 86400)
+    monkeypatch.setattr(aw, '_seed_retire_on', lambda: True)
+    monkeypatch.setattr(aw.time, 'time', lambda: now)
+    seen = []
+    monkeypatch.setattr(aw, 'retire_old_seeds',
+                        lambda: seen.append(aw._seed_retire_last_run()))
+    calls = _sleeps(monkeypatch, 2)
+    try:
+        aw.seed_retire_scheduler()
+    except _Stop:
+        pass
+    assert calls == [aw.SEED_RETIRE_FIRST_DELAY, 86400]
+    assert seen == [now]
+
+
+def test_unreadable_state_counts_as_never_run(monkeypatch, tmp_path):
+    state = tmp_path / 'seed_retire_state.json'
+    state.write_text('not json')
+    monkeypatch.setattr(aw, 'SEED_RETIRE_STATE', str(state))
+    assert aw._seed_retire_last_run() is None
+    state.write_text('[1, 2]')
+    assert aw._seed_retire_last_run() is None
+    monkeypatch.setattr(aw, 'SEED_RETIRE_STATE', str(tmp_path / 'missing.json'))
+    assert aw._seed_retire_last_run() is None
+
+
+def test_lane_cap_first_pass_runs_soon_after_start(monkeypatch):
+    order = []
+    monkeypatch.setattr(aw, 'enforce_upgrade_lane_cap', lambda: order.append('cap'))
+    monkeypatch.setattr(aw, 'prioritize_normal_torrents', lambda: order.append('reorder'))
+    calls = _sleeps(monkeypatch, 2)
+    try:
+        aw.priority_scheduler()
+    except _Stop:
+        pass
+    assert calls == [300, 3600] and order == ['cap', 'reorder']
