@@ -173,5 +173,44 @@ def test_possessive_brand_left_out_of_the_release_still_matches():
     # One word after the brand is too little to trust; a different title after it is still refused.
     assert _spin('Daredevil.S01E01.1080p.WEB.h264-GRP', "Marvel's Daredevil") == ('unsure', 'title_first_word')
     assert _spin('Anatomy.of.a.Scandal.S01E01.1080p.WEB.h264-GRP', "Grey's Anatomy") == ('unsure', 'title_first_word')
-    # A real-world refusal that stays: the release adds a word in front, the brand is not possessive.
-    assert _spin('Apollo.Has.Fallen.S02E04.1080p.WEB.h264-GRP', 'Has Fallen') == ('unsure', 'title_first_word')
+
+
+def test_one_name_ending_the_other_is_the_same_title():
+    # Penn 2026-11-14: Sonarr's 'Has Fallen' is the show released as 'Apollo Has Fallen'.
+    assert _spin('Apollo.Has.Fallen.S02E04.1080p.WEB.h264-GRP', 'Has Fallen') == ('match', None)
+    assert _spin('Mandalorian.and.Grogu.S01E01.1080p.WEB.h264-GRP', 'Star Wars: The Mandalorian and Grogu') == ('match', None)
+    # One real word at the end is too little: 'Fallen' is not 'Apollo Has Fallen'.
+    assert _spin('Apollo.Fallen.S01E01.1080p.WEB.h264-GRP', 'Fallen') == ('unsure', 'title_first_word')
+    assert _spin('Fallen.S01E01.1080p.WEB.h264-GRP', 'Apollo Fallen') == ('unsure', 'title_first_word')
+    # The shared words must be the end of the name, not the middle.
+    assert _spin('Apollo.Has.Fallen.Again.S01E01.1080p.WEB.h264-GRP', 'Has Fallen') == ('unsure', 'title_first_word')
+
+
+def test_digits_for_letters_in_the_first_word():
+    assert _spin('PLUR1BUS.S01E03.1080p.WEB.h264-GRP', 'Pluribus') == ('match', None)
+    assert _spin('S3VERANCE.S02E01.1080p.WEB.h264-GRP', 'Severance') == ('match', None)
+    assert _spin('Plur2bus.S01E03.1080p.WEB.h264-GRP', 'Pluribus') == ('unsure', 'title_first_word')
+
+
+def _yr(queue_title, matched_title, matched_year, service='Radarr'):
+    years = {int(y) for y in ld._RELEASE_YEAR.findall(queue_title)}
+    return ld.apply_hard_rules('import_identity', 'match', {
+        'service': service, 'queue_title': queue_title, 'matched_title': matched_title, 'matched_year': matched_year,
+        'year_matches': (matched_year in years) if years else None})
+
+
+def test_year_one_off_passes_only_when_the_name_is_identical():
+    assert _yr('Nosferatu.2025.2160p.WEB-DL.DDP5.1.H.265-GRP', 'Nosferatu', 2024) == ('match', None)
+    assert _yr('Ghosts.2022.S01E01.1080p.WEB.h264-GRP', 'Ghosts (2021)', 2021, 'Sonarr') == ('match', None)
+    # Two years off is still a different film.
+    assert _yr('Nosferatu.2026.2160p.WEB-DL.DDP5.1.H.265-GRP', 'Nosferatu', 2024) == ('unsure', 'year_mismatch')
+    # One year off with any other name difference still fails the year check.
+    assert _yr('Nosferatu.the.Vampyre.1980.1080p.BluRay.x265-GRP', 'Nosferatu', 1979) == ('unsure', 'year_mismatch')
+    assert _yr('Without.Remorse.2022.2160p.WEB-DL.H.265-GRP', "Tom Clancy's Without Remorse", 2021) == ('unsure', 'year_mismatch')
+    # A daily show's air date is not a release year.
+    assert not ld._same_name_year_off_by_one({'queue_title': 'The.Daily.Show.2025.11.13.1080p.WEB.h264-GRP',
+                                              'matched_title': 'The Daily Show', 'matched_year': 1996})
+    assert not ld._same_name_year_off_by_one({'queue_title': 'Show.2026.11.13.1080p', 'matched_title': 'Show', 'matched_year': 2025})
+    # Malformed years never open the check.
+    for bad in (None, 'x', True, float('nan')):
+        assert not ld._same_name_year_off_by_one({'queue_title': 'Nosferatu.2025.2160p', 'matched_title': 'Nosferatu', 'matched_year': bad})
