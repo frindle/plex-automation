@@ -32,20 +32,20 @@ POLICY = {
         'Also reject an SDR candidate replacing an HDR file (a WEB DV file does not count as HDR here) unless '
         'the candidate has 5.1 or more audio channels, the existing file has fewer, and hdr_surround_available is '
         'false (no HDR release with 5.1 audio is available). '
+        'Also reject a candidate that is not x265 (x264, AV1 or any other codec) replacing an x265 file, even at a '
+        'higher resolution, a better source tier or with HDR: Penn always keeps HEVC over any other codec. '
         '2. Allow, even when the candidate is much bigger: a higher resolution; a better source tier (Bluray or '
         'Remux over a WEB-DL, WEBRip or HDTV file); HDR10 or disc Dolby Vision (Bluray/Remux) over SDR; lossless '
         'or Atmos audio over lossy; replacing an AV1 file (many Plex clients cannot play AV1 directly); a PROPER '
         'or REPACK (it fixes a broken release); a replacement of a poor release group. '
-        '3. Allow: an x265 candidate replacing an x264 file at the same resolution when it is smaller or about '
-        'the same size. A re-encode of a WEB-DL counts: x265 saves space. '
+        '3. Allow: an x265 candidate replacing a file that is not x265, whatever its size, resolution or source '
+        'tier: Penn always prefers HEVC. A re-encode of a WEB-DL counts. '
         '4. Allow at the same resolution and source tier: a candidate at least 1.4 times the existing size (a '
-        'higher-bitrate encode is better quality), unless it is x264 replacing x265; or a smaller candidate with '
+        'higher-bitrate encode is better quality); or a smaller candidate with '
         'the same codec (saves space). '
-        '5. Reject: an x264 candidate that is bigger than the x265 file it replaces at the same resolution and '
-        'source tier: it costs space for no visible gain. '
-        '6. Throttle: same resolution and source tier from a different release group when no rule above '
+        '5. Throttle: same resolution and source tier from a different release group when no rule above '
         'applies. Sonarr and Radarr rank release groups by Penn\'s preferences, which these facts do not show. '
-        '7. Anything else is a sidegrade (for example the same group at about the same size): reject it. '
+        '6. Anything else is a sidegrade (for example the same group at about the same size): reject it. '
         'Private-tracker ratio matters: prefer freeleech. freeleech is full, partial or no. '
         'For a season pack, episodes is how many episodes it holds, size_gb is the whole pack and '
         'existing_size_gb is the total of the existing files of those episodes (episodes_with_file of them have '
@@ -239,6 +239,18 @@ def sdr_over_hdr(facts):
     return _existing_is_hdr(facts) and _candidate_is_sdr(facts)
 
 
+def non_hevc_over_hevc(facts):
+    """A candidate of a known codec other than HEVC that would replace an HEVC file. Penn always keeps HEVC.
+    An unknown codec on either side means no (the model decides)."""
+    if not isinstance(facts, dict):
+        return False
+    old = _codec_family(facts.get('existing_codec'))
+    new = _codec_family(facts.get('codec'))
+    if new is None and isinstance(facts.get('codec'), str) and facts['codec'].strip():
+        new = 'other'
+    return old == 'x265' and new is not None and new != 'x265'
+
+
 def sdr_surround_exception_possible(facts):
     """Penn's one exception to keeping HDR: the SDR candidate brings 5.1 audio the HDR file lacks. True when the
     channel facts allow it, so the caller should look for an HDR release with 5.1 audio (hdr_surround_available)."""
@@ -265,7 +277,9 @@ def upgrade_comparison(context):
         parts.append('source tier %s (%s vs %s)' % (word, _TIER_NAME[t_new], _TIER_NAME[t_old]))
     c_new, c_old = _codec_family(context.get('codec')), _codec_family(context.get('existing_codec'))
     if c_new and c_old:
-        parts.append('codec %s -> %s' % (c_old, c_new))
+        note = ' (loses HEVC: Penn always keeps HEVC)' if c_old == 'x265' and c_new != 'x265' else \
+            ' (gains HEVC: Penn always prefers HEVC)' if c_new == 'x265' and c_old != 'x265' else ''
+        parts.append('codec %s -> %s%s' % (c_old, c_new, note))
     ratio = _size_ratio(context)
     if ratio is None and context.get('size_gb') is None and _num_or_none(context.get('existing_size_gb')):
         parts.append('candidate size unknown (never reject for an unknown size)')
@@ -656,7 +670,8 @@ def apply_hard_rules(kind, action, facts):
     """Deterministic rules the model can never override. Returns (action, rule_or_None).
 
     facts keys (all optional, missing => no veto from that rule): seeders, candidate_dv_web (bool, DV Profile 5
-    WEB release), hdr + existing_hdr (+ audio_channels, existing_audio_channels, hdr_surround_available: SDR over HDR), year_matches (bool), queue_title + matched_title (spin-off, reverse spin-off, country,
+    WEB release), codec + existing_codec (non-HEVC over HEVC), hdr + existing_hdr (+ audio_channels, existing_audio_channels,
+    hdr_surround_available: SDR over HDR), year_matches (bool), queue_title + matched_title (spin-off, reverse spin-off, country,
     first-word and diverging-title guards). Present-but-malformed facts
     fail closed.
     """
@@ -669,6 +684,8 @@ def apply_hard_rules(kind, action, facts):
             seeders = _num(facts.get('seeders'))
             if seeders is not None and seeders < MIN_SEEDERS:
                 return 'reject', 'min_seeders'
+            if non_hevc_over_hevc(facts):
+                return 'reject', 'non_hevc_over_hevc'
             # Keep HDR: SDR replaces it only for 5.1 audio the HDR file lacks, and only when no HDR release has
             # 5.1 (hdr_surround_available is False; unknown keeps the HDR file).
             if sdr_over_hdr(facts) and not (sdr_surround_exception_possible(facts)

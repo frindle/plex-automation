@@ -697,6 +697,11 @@ EPISODE_RE       = re.compile(r'S\d{2}E\d{2}', re.IGNORECASE)
 # /fix-stuck-upgrade-tags route far below.
 SEASON_RE = re.compile(r'[Ss](\d{1,2})(?:[Ee]\d{1,3})?')
 
+def _is_hevc(codec):
+    """Plex/*arr videoCodec value is HEVC (hevc, h265, x265)."""
+    return isinstance(codec, str) and re.sub(r'[^a-z0-9]', '', codec.lower()) in ('hevc', 'h265', 'x265')
+
+
 def codec_rank(name):
     n = (name or '').lower()
     if re.search(r'hevc|x265|h\.?265', n):
@@ -6609,6 +6614,7 @@ def plex_dupe_scan():
                             'file': f,
                             'size_gb': round((p.get('size') or 0) / (1024**3), 2),
                             'resolution': m.get('videoResolution'),
+                            'codec': m.get('videoCodec'),
                             'bitrate': m.get('bitrate'),
                             'duration_min': round((m.get('duration') or 0) / 60000, 1),
                         })
@@ -6682,6 +6688,7 @@ def plex_dupe_scan():
                                     'file': p.get('file'),
                                     'size_gb': round((p.get('size') or 0) / (1024**3), 2),
                                     'resolution': m.get('videoResolution'),
+                                    'codec': m.get('videoCodec'),
                                     'duration_min': round((m.get('duration') or 0) / 60000, 1),
                                 })
                         multi_version.append({
@@ -7175,10 +7182,12 @@ def plex_dupe_fix():
             })
             continue
         media_list = unique_media
-        # Score each Media: (resolution_rank, size_gb). Higher wins.
+        # Score each Media: (HEVC, resolution_rank, size_gb). Higher wins. Penn always keeps HEVC over any
+        # other codec, even a higher-resolution one.
         res_rank = {'4k': 4, '2160': 4, '1080': 3, '720': 2, '576': 1, '480': 1, None: 0}
         def score(m):
-            return (res_rank.get(str(m.get('resolution') or '').lower(), 0),
+            return (_is_hevc(m.get('codec')),
+                    res_rank.get(str(m.get('resolution') or '').lower(), 0),
                     m.get('size_gb') or 0)
         # Determine title-token overlap for each Media vs parent
         parent_title_tokens = set(TITLE_TOKEN_RE.findall((entry.get('title') or '').lower().replace("'", '')))
@@ -7283,6 +7292,7 @@ def plex_dupe_fix():
                 'file': os.path.basename(keeper.get('file') or ''),
                 'size_gb': keeper.get('size_gb'),
                 'resolution': keeper.get('resolution'),
+                'codec': keeper.get('codec'),
             },
             'supersede': upgrade_actions,
         })
