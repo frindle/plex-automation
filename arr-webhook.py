@@ -601,6 +601,13 @@ SEED_RETIRE_DAYS = int(os.environ.get('SEED_RETIRE_DAYS', '180'))
 SEED_RETIRE_MIN_SWARM = int(os.environ.get('SEED_RETIRE_MIN_SWARM', str(STALL_MIN_SWARM_SEEDS)))
 SEED_RETIRE_PER_RUN = int(os.environ.get('SEED_RETIRE_PER_RUN', '100'))
 SEED_RETIRE_INTERVAL = int(os.environ.get('SEED_RETIRE_INTERVAL', str(86400)))
+# Idle rule (Penn, 11-15: "can we do variable based on seeding activity?"): a
+# managed torrent that has uploaded nothing for SEED_IDLE_DAYS retires once it
+# has seeded SEED_IDLE_MIN_DAYS; one still uploading keeps seeding until
+# SEED_RETIRE_DAYS. The idle floor never drops below SEED_DAYS (remove_torrent
+# would only defer it). 0 idle days = idle rule off.
+SEED_IDLE_DAYS = int(os.environ.get('SEED_IDLE_DAYS', '14'))
+SEED_IDLE_MIN_DAYS = max(int(os.environ.get('SEED_IDLE_MIN_DAYS', str(SEED_DAYS))), SEED_DAYS)
 UPGRADE_LANE_LABELS = (SONARR_UPG_LABEL, RADARR_UPG_LABEL, SONARR_UPG_PRIORITY_LABEL, RADARR_UPG_PRIORITY_LABEL)
 SEED_RETIRE_LABELS = deluge_trim.parse_labels(
     os.environ.get('SEED_RETIRE_LABELS'),
@@ -5712,7 +5719,7 @@ def priority_scheduler():
 LANE_FIELDS = ['name', 'label', 'state', 'progress', 'total_done', 'queue', 'time_added',
                'seeding_time', 'total_uploaded', 'is_finished', 'save_path']
 SEED_RETIRE_FIELDS = ['name', 'label', 'state', 'is_finished', 'progress', 'seeding_time',
-                      'total_seeds', 'total_uploaded', 'save_path']
+                      'total_seeds', 'total_uploaded', 'time_since_upload', 'ratio', 'save_path']
 
 
 def upgrade_lane_count():
@@ -5782,17 +5789,24 @@ def _cap_new_upgrade_grab(source, download_id):
         log.warning(f'{source}: lane cap check for {download_id} failed: {e}')
 
 
+def _seed_retire_on():
+    return SEED_RETIRE_DAYS > 0 or SEED_IDLE_DAYS > 0
+
+
 def retire_old_seeds(dry_run=False):
-    """Stop seeding finished torrents that have seeded SEED_RETIRE_DAYS on a
-    managed label in a healthy swarm (deluge_trim.seed_retire_plan), at most
-    SEED_RETIRE_PER_RUN per run, longest-seeded first. The download copy is
+    """Stop seeding finished torrents on a managed label in a healthy swarm
+    (deluge_trim.seed_retire_picks): seeded SEED_RETIRE_DAYS ('age'), or seeded
+    SEED_IDLE_MIN_DAYS with no upload for SEED_IDLE_DAYS ('idle'). At most
+    SEED_RETIRE_PER_RUN per run, aged-out first. The download copy is
     deleted only when the library verifiably holds every video (as in
     cleanup_stalled_seeds); library-seed torrents always keep their files,
     since those files are the library. Never raises."""
-    out = {'dry_run': dry_run, 'days': SEED_RETIRE_DAYS, 'min_swarm': SEED_RETIRE_MIN_SWARM,
-           'per_run': SEED_RETIRE_PER_RUN, 'eligible': 0, 'candidates': [],
-           'removed': 0, 'files_deleted': 0, 'deferred': 0}
-    if SEED_RETIRE_DAYS <= 0:
+    out = {'dry_run': dry_run, 'days': SEED_RETIRE_DAYS, 'idle_days': SEED_IDLE_DAYS,
+           'idle_min_days': SEED_IDLE_MIN_DAYS, 'min_swarm': SEED_RETIRE_MIN_SWARM,
+           'per_run': SEED_RETIRE_PER_RUN, 'eligible': 0, 'by_rule': {'age': 0, 'idle': 0},
+           'candidates': [], 'removed': 0, 'removed_by_rule': {'age': 0, 'idle': 0},
+           'files_deleted': 0, 'deferred': 0}
+    if not _seed_retire_on():
         return out
     try:
         deluge_login()
@@ -5801,14 +5815,20 @@ def retire_old_seeds(dry_run=False):
         log.error(f'Seed retirement: Deluge read failed: {e}')
         out['error'] = str(e)
         return out
-    every = deluge_trim.seed_retire_plan(torrents, SEED_RETIRE_LABELS, SEED_RETIRE_DAYS, SEED_RETIRE_MIN_SWARM)
+    every = deluge_trim.seed_retire_picks(torrents, SEED_RETIRE_LABELS, SEED_RETIRE_DAYS, SEED_RETIRE_MIN_SWARM,
+                                          SEED_IDLE_DAYS, SEED_IDLE_MIN_DAYS)
     out['eligible'] = len(every)
+    for _, rule in every:
+        out['by_rule'][rule] += 1
     batch = every[:SEED_RETIRE_PER_RUN] if SEED_RETIRE_PER_RUN > 0 else every
-    for h in batch:
+    for h, rule in batch:
         t = torrents[h]
-        out['candidates'].append({'hash': h, 'name': t.get('name'), 'label': t.get('label'),
+        idle = deluge_trim.idle_seconds(t)
+        out['candidates'].append({'hash': h, 'name': t.get('name'), 'label': t.get('label'), 'rule': rule,
                                   'seeding_days': round(t['seeding_time'] / 86400, 1),
-                                  'swarm_seeds': t.get('total_seeds')})
+                                  'idle_days': None if idle is None else ('never uploaded' if idle == float('inf')
+                                                                          else round(idle / 86400, 1)),
+                                  'ratio': t.get('ratio'), 'swarm_seeds': t.get('total_seeds')})
         if dry_run:
             continue
         drop = False
@@ -5824,19 +5844,22 @@ def retire_old_seeds(dry_run=False):
             out['deferred'] += 1
             continue
         out['removed'] += 1
+        out['removed_by_rule'][rule] += 1
         out['files_deleted'] += 1 if drop else 0
     if out['removed']:
-        log.info(f"Seed retirement: {out['removed']} retired ({out['files_deleted']} download copies deleted), "
-                 f"{out['eligible'] - out['removed']} eligible left")
-        record_activity('cleanup', f"Retired {out['removed']} torrent(s) seeded >= {SEED_RETIRE_DAYS}d "
-                                   f"(>{SEED_RETIRE_MIN_SWARM} other seeds); {out['files_deleted']} imported "
-                                   f"download copies deleted, the rest unseeded with files kept")
+        n_age, n_idle = out['removed_by_rule']['age'], out['removed_by_rule']['idle']
+        log.info(f"Seed retirement: {out['removed']} retired ({n_age} aged out, {n_idle} idle; "
+                 f"{out['files_deleted']} download copies deleted), {out['eligible'] - out['removed']} eligible left")
+        record_activity('cleanup', f"Retired {out['removed']} torrent(s) with >{SEED_RETIRE_MIN_SWARM} other seeds: "
+                                   f"{n_age} seeded >= {SEED_RETIRE_DAYS}d, {n_idle} idle (no upload in "
+                                   f"{SEED_IDLE_DAYS}d, seeded >= {SEED_IDLE_MIN_DAYS}d); {out['files_deleted']} "
+                                   f"imported download copies deleted, the rest unseeded with files kept")
     return out
 
 
 def seed_retire_scheduler():
-    if SEED_RETIRE_DAYS <= 0:
-        log.info('Seed retirement off (SEED_RETIRE_DAYS=0); preview with GET /retire-seeds')
+    if not _seed_retire_on():
+        log.info('Seed retirement off (SEED_RETIRE_DAYS=0 and SEED_IDLE_DAYS=0); preview with GET /retire-seeds')
         return
     time.sleep(900)
     while True:

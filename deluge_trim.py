@@ -16,6 +16,14 @@ Seed retirement (same request: "we also need to reduce seeding torrents").
 A finished torrent that has seeded at least `min_days` on a label we manage,
 in a swarm that already has more than `min_swarm` other seeds, has paid its
 dues (TorrentLeech's hit-and-run rule is 10 days or 1:1) and can stop seeding.
+
+Idle rule (Penn, 11-15: "can we do variable based on seeding activity?"). A
+torrent nobody has downloaded from in `idle_days` retires as soon as it has
+seeded `idle_min_days`, instead of waiting out `min_days`; a torrent that is
+still uploading keeps seeding until `min_days`. Activity is Deluge's
+time_since_upload (libtorrent keeps it across restarts). -1 means no upload
+on record: idle only when total_uploaded is also known to be 0. Anything
+unknown is not idle. The swarm rule applies to both.
 """
 
 DROPPABLE_STATES = ('Queued', 'Paused', 'Downloading')
@@ -69,28 +77,59 @@ def upgrade_lane_plan(torrents, cap, lane_labels, recent_labels=()):
     return started + fresh[:room], fresh[room:]
 
 
-def seed_retire_plan(torrents, labels, min_days, min_swarm, limit=0):
-    """Hashes of finished torrents to stop seeding, longest-seeded first.
-    min_days <= 0 turns retirement off. limit > 0 caps one run. Unknown seed
-    time or swarm size never qualifies."""
-    if not min_days or min_days <= 0:
-        return []
+def idle_seconds(t):
+    """Seconds since this torrent last uploaded; inf when it never has (both
+    time_since_upload == -1 and total_uploaded == 0); None when unknown."""
+    tsu = _num(t.get('time_since_upload'))
+    if tsu is None:
+        return None
+    if tsu >= 0:
+        return tsu
+    return float('inf') if _num(t.get('total_uploaded')) == 0 else None
+
+
+def seed_retire_rule(t, labels, min_days, min_swarm, idle_days=0, idle_min_days=0):
+    """'age' (seeded min_days), 'idle' (seeded idle_min_days and no upload in
+    idle_days) or None. min_days <= 0 turns the age rule off, idle_days <= 0
+    the idle rule. Unknown seed time, swarm size or activity never qualifies."""
+    if (t.get('label') or '') not in labels:
+        return None
+    if t.get('state') != 'Seeding' or t.get('is_finished') is not True:
+        return None
+    st = _num(t.get('seeding_time'))
+    seeds = _num(t.get('total_seeds'))
+    if st is None or seeds is None or seeds < 0 or seeds <= min_swarm:
+        return None
+    if min_days and min_days > 0 and st >= min_days * 86400:
+        return 'age'
+    if idle_days and idle_days > 0 and st >= max(idle_min_days or 0, 0) * 86400:
+        idle = idle_seconds(t)
+        if idle is not None and idle >= idle_days * 86400:
+            return 'idle'
+    return None
+
+
+def seed_retire_picks(torrents, labels, min_days, min_swarm, idle_days=0, idle_min_days=0, limit=0):
+    """[(hash, rule)] to stop seeding: aged-out torrents first (longest seeded
+    first), then idle ones (longest idle first, never-uploaded before all).
+    limit > 0 caps one run."""
     out = []
     for h, t in (torrents or {}).items():
-        if (t.get('label') or '') not in labels:
-            continue
-        if t.get('state') != 'Seeding' or t.get('is_finished') is not True:
-            continue
-        st = _num(t.get('seeding_time'))
-        seeds = _num(t.get('total_seeds'))
-        if st is None or st < min_days * 86400:
-            continue
-        if seeds is None or seeds < 0 or seeds <= min_swarm:
-            continue
-        out.append((st, h))
-    out.sort(key=lambda x: (-x[0], x[1]))
-    hashes = [h for _, h in out]
-    return hashes[:limit] if limit and limit > 0 else hashes
+        rule = seed_retire_rule(t, labels, min_days, min_swarm, idle_days, idle_min_days)
+        if rule == 'age':
+            out.append((0, -t['seeding_time'], h, rule))
+        elif rule == 'idle':
+            out.append((1, -idle_seconds(t), h, rule))
+    out.sort()
+    picks = [(h, rule) for _, _, h, rule in out]
+    return picks[:limit] if limit and limit > 0 else picks
+
+
+def seed_retire_plan(torrents, labels, min_days, min_swarm, limit=0, idle_days=0, idle_min_days=0):
+    """Hashes of finished torrents to stop seeding (seed_retire_picks order).
+    With idle_days 0 this is the age rule alone: longest-seeded first."""
+    return [h for h, _ in seed_retire_picks(torrents, labels, min_days, min_swarm,
+                                            idle_days, idle_min_days, limit)]
 
 
 def parse_labels(raw, default):
