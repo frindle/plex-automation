@@ -55,7 +55,7 @@ Rebuild/redeploy the plex-automation container so the new endpoints exist (`tier
    cp glacier-mover.sh /boot/config/plugins/user.scripts/scripts/glacier-mover/script
    ```
    Or make `script` a two-line wrapper that sets env vars and runs `bash /boot/config/glacier-mover.sh "$@"`.
-2. Settings -> User Scripts: set the script to run **Custom** with cron `30 3 * * *` (03:30, after Mover Tuning at 01:30).
+2. Settings -> User Scripts: set the script to run **Custom** with cron `0 22 * * *` (22:00 local). Live copies stop at the end of `MOVE_WINDOW` (default `22:00-06:00`, host local time, may wrap midnight; `""` = any time); a unit that would start after it waits for the next night.
 3. Dry run first: click "Run Script" with no flag, read the output. Check the allowlist roots, rejected-by-rule counts, per-disk counts and the top-20 folders.
 4. When happy, change the script body to run `--apply` (or the wrapper: `exec bash .../glacier-mover.sh --apply`).
 5. Set `LOG_DIR=/mnt/cache/appdata/tiering` to keep the log across reboots (default is `/var/log/tiering`, which is RAM). One Unraid notification per run with moved/failed/skipped counts.

@@ -44,7 +44,7 @@ mkf() {
 
 run() { # [extra extras] ; env: EXTRA_OVR (code), flags in $FLAGS
   env SCRIPT="$SCRIPT" ROOT="$R" CAP="$CAP" R="$R" M="$M" LOG_FILE="$R/glacier.log" LOG_DIR="$R" LOCK_FILE="$R/lock" \
-      NOTIFY_CMD="$R/bin/notify" MIN_AGE_DAYS="${MIN_AGE_DAYS:-0}" PAUSE_SETTLE_SEC=0 ${ENVX:-} \
+      NOTIFY_CMD="$R/bin/notify" MIN_AGE_DAYS="${MIN_AGE_DAYS:-0}" PAUSE_SETTLE_SEC=0 MOVE_WINDOW= ${ENVX:-} \
       bash -c 'source "$SCRIPT"; source "$R/ovr.sh"; eval "$EXTRA_OVR"; main "$@"' harness "$@" 2>&1
 }
 EXTRA_OVR=""; export EXTRA_OVR
@@ -800,6 +800,45 @@ mkf disk2 data/Media/a.mkv 1000 100
 out="$(EXTRA_OVR='move_unit() { turbo_on; kill -TERM $$; sleep 5; }' MDCMD="$R/bin/mdcmd" run --apply)"
 eq "on, then off from the TERM trap" "$(calls)" "set md_write_method 1|set md_write_method 0|"
 check "restore file cleared" test ! -e "$(ST)"
+
+# --- move window (local time) ---------------------------------------------------
+setup window_logic
+win()  { MOVE_WINDOW="$1" SCRIPT="$SCRIPT" bash -c 'source "$SCRIPT"; in_window "$1"' harness "$2"; }
+nwin() { ! win "$@"; }
+check "22-06 at 22:00" win 22:00-06:00 2200
+check "22-06 at 23:30" win 22:00-06:00 2330
+check "22-06 at 05:59" win 22:00-06:00 0559
+check "22-06 not at 06:00" nwin 22:00-06:00 0600
+check "22-06 not at 14:00" nwin 22:00-06:00 1400
+check "01-05 at 03:00" win 01:00-05:00 0300
+check "01-05 not at 23:00" nwin 01:00-05:00 2300
+check "empty = any time" win "" 1400
+
+setup window_closed_at_start
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(EXTRA_OVR='local_hhmm() { echo 1400; }' ENVX="MOVE_WINDOW=22:00-06:00" run --apply)"; rc=$?
+eq "exit 0" "$rc" 0
+check "nothing moved" gone data/Media/a.mkv
+echo "$out" | grep -q 'outside the move window 22:00-06:00' && ok || bad "logs window: $out"
+grep -q 'stopped: outside 22:00-06:00' "$R/notify.log" && ok || bad "notify says window: $(cat "$R/notify.log")"
+
+setup window_closes_mid_run
+mkf disk2 data/Media/a.mkv 1000 100; mkf disk2 data/Media/b.mkv 1000 90; mkf disk3 data/Media/c.mkv 1000 80
+# calls: run start, unit a (05:30, inside), unit b (06:00, outside)
+out="$(EXTRA_OVR='local_hhmm() { local n; n=$(cat "$R/clk" 2>/dev/null || echo 0); echo $((n + 1)) >"$R/clk"; [ "$n" -lt 2 ] && echo 0530 || echo 0600; }' ENVX="MOVE_WINDOW=22:00-06:00" run --apply)"
+check "first unit moved" onglacier data/Media/a.mkv
+check "second waits" gone data/Media/b.mkv
+check "third waits" gone data/Media/c.mkv
+echo "$out" | grep -q 'STOP  outside the move window' && ok || bad "logs stop: $out"
+
+setup window_dry_run_still_plans
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(EXTRA_OVR='local_hhmm() { echo 1400; }' ENVX="MOVE_WINDOW=22:00-06:00" run)"
+echo "$out" | grep -q 'WOULD MOVE' && ok || bad "dry run plans outside the window: $out"
+
+setup window_bad_value
+out="$(ENVX="MOVE_WINDOW=10pm-6am" run --apply)"; rc=$?
+eq "bad window aborts" "$rc" 2
 
 echo
 echo "glacier tests: $PASS passed, $FAIL failed"

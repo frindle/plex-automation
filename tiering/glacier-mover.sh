@@ -31,6 +31,9 @@ EXCLUDE_NAMES="${EXCLUDE_NAMES:-Downloads Incomplete Frigate InfluxDB Docker Doc
 EXCLUDE_CONTAINS="${EXCLUDE_CONTAINS:-timemachine resell}"
 TARGET_PCT="${TARGET_PCT:-98}"                    # stop filling disk1 at this % used
 NIGHTLY_CAP_BYTES="${NIGHTLY_CAP_BYTES:-1500000000000}"   # 1.5 TB per run
+# A live run copies only inside this window, in the host's local time (the zone
+# Unraid's cron uses). It may wrap midnight. "" = any time. Dry runs ignore it.
+MOVE_WINDOW="${MOVE_WINDOW-22:00-06:00}"
 MIN_AGE_DAYS="${MIN_AGE_DAYS:-30}"                # never move a file modified in the last N days
 CHUNK_UNITS="${CHUNK_UNITS:-100}"                 # units per torrent-gate request
 MAX_MISFITS="${MAX_MISFITS:-200}"                 # stop after this many consecutive no-fit files
@@ -71,6 +74,18 @@ log() {
   printf '%s\n' "$line"
   [ -n "${LOG_FILE:-}" ] && printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null
   return 0
+}
+
+local_hhmm() { date +%H%M; }
+
+# in_window [HHMM] -> 0 inside MOVE_WINDOW (start inclusive, end exclusive) or when none is set
+in_window() {
+  [ -z "$MOVE_WINDOW" ] && return 0
+  local now s e
+  now="${1:-$(local_hhmm)}"; s="${MOVE_WINDOW%-*}"; e="${MOVE_WINDOW#*-}"
+  now=$((10#$now)); s=$((10#${s/:/})); e=$((10#${e/:/}))
+  if [ "$s" -le "$e" ]; then [ "$now" -ge "$s" ] && [ "$now" -lt "$e" ]
+  else [ "$now" -ge "$s" ] || [ "$now" -lt "$e" ]; fi
 }
 
 hr() { # bytes -> human
@@ -193,6 +208,9 @@ ere_escape() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g'; }  # no \/ : G
 preflight() {
   local d
   mkdir -p "$LOG_DIR" "$(dirname "$LOCK_FILE")" 2>/dev/null
+  if [ -n "$MOVE_WINDOW" ] && ! [[ "$MOVE_WINDOW" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+    log "ABORT: MOVE_WINDOW must look like 22:00-06:00 (got '$MOVE_WINDOW')"; return 2
+  fi
   local disks="$GLACIER $SRC_DISKS"
   case " $PHASES " in *" evict "*) case " $disks " in *" $EVICT_TO "*) ;; *) disks="$disks $EVICT_TO" ;; esac ;; esac
   for d in $disks; do
@@ -540,7 +558,7 @@ prune_dirs() {
 # --- planning loop ----------------------------------------------------------
 
 CH_AT=(); CH_SZ=(); CH_DK=(); CH_PATHS=()
-ROOM_LEFT=0; CAP_LEFT=0; MISFITS=0; STOP=0
+ROOM_LEFT=0; CAP_LEFT=0; MISFITS=0; STOP=0; WINDOW_CLOSED=0
 N_MOVED=0; B_MOVED=0; N_FAILED=0; N_SKIPPED=0; N_PAUSED=0; N_UNITS=0
 EV_RAN=0; EV_N=0; EV_B=0; EV_WAIT_N=0; EV_WAIT_B=0; EV_NOFIT=0   # evict-phase share of the above
 PAUSED_HASHES=()   # hashes this run paused and has not resumed yet (the exit trap resumes them)
@@ -589,6 +607,7 @@ count_moved() { # files bytes
 process_chunk() {
   local i j n=${#CH_AT[@]} p psz unitstat reason line st rs path
   [ "$n" -eq 0 ] && return 0
+  if [ "$WINDOW_CLOSED" = 1 ]; then CH_AT=(); CH_SZ=(); CH_DK=(); CH_PATHS=(); return 0; fi
   local -A G=()
   if [ "$NO_TORRENT_CHECK" != 1 ]; then
     local resp
@@ -630,6 +649,11 @@ process_chunk() {
       log "WOULD MOVE  ${CH_DK[$i]} -> $DEST  $(hr "${CH_SZ[$i]}")  ${#paths[@]} file(s)  ${paths[0]}$([ "$unitstat" = pause ] && echo '  [torrent: pause]')"
       count_moved "${#paths[@]}" "${CH_SZ[$i]}"
       continue
+    fi
+    if ! in_window; then
+      WINDOW_CLOSED=1; STOP=1
+      log "STOP  outside the move window $MOVE_WINDOW (local time now $(date '+%H:%M %Z')): the rest waits for the next run"
+      break
     fi
     SKIP_REASON=""; FAIL_REASON=""
     if [ "$unitstat" = pause ]; then
@@ -747,6 +771,7 @@ report() {
     local imp=normal; [ "$N_FAILED" -gt 0 ] && imp=warning
     local subj="Glacier: moved $N_MOVED, failed $N_FAILED, skipped $N_SKIPPED"
     [ "$APPLY" = 1 ] || subj="Glacier dry run: would move $N_MOVED, skipped $N_SKIPPED"
+    [ "$WINDOW_CLOSED" = 1 ] && subj="$subj, stopped: outside $MOVE_WINDOW"
     if [ -x "$NOTIFY_CMD" ]; then
       "$NOTIFY_CMD" -e "Glacier tiering" -s "$subj" \
         -d "$(hr "$((B_MOVED - EV_B))") to $GLACIER, $(hr "$EV_B") off it to $EVICT_TO; torrents paused and resumed $N_PAUSED. Log: $LOG_FILE" -i "$imp" >/dev/null 2>&1
@@ -818,8 +843,12 @@ main() {
   read -r total used <<<"$(fs_stats "$GLACIER")"
   if [ -z "${total:-}" ] || [ "${total:-0}" -le 0 ]; then log "ABORT: cannot read free space of $GLACIER"; return 2; fi
   CAP_LEFT=$NIGHTLY_CAP_BYTES
-  log "start mode=$([ "$APPLY" = 1 ] && echo apply || echo dry-run) phases=$PHASES $GLACIER used=$(hr "$used") of $(hr "$total") cap=$(hr "$CAP_LEFT")"
+  log "start mode=$([ "$APPLY" = 1 ] && echo apply || echo dry-run) phases=$PHASES $GLACIER used=$(hr "$used") of $(hr "$total") cap=$(hr "$CAP_LEFT") window=${MOVE_WINDOW:-any}"
+  if [ "$APPLY" = 1 ] && ! in_window; then
+    WINDOW_CLOSED=1; log "outside the move window $MOVE_WINDOW (local time now $(date '+%H:%M %Z')): nothing moves this run"
+  fi
   for ph in $PHASES; do
+    [ "$WINDOW_CLOSED" = 1 ] && break
     STOP=0; MISFITS=0
     case "$ph" in
       evict) phase_evict ;;
