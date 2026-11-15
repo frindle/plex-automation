@@ -395,6 +395,18 @@ _ARTICLES = frozenset(('the', 'a', 'an'))
 _LOOKALIKE = str.maketrans('013457', 'oieast')
 
 
+# Release names Penn confirmed are the matched title, for pairs no general rule can safely accept:
+# (release show name, matched title), both as _title_tokens joined by spaces.
+_CONFIRMED_ALIASES = frozenset((
+    ('apollo has fallen', 'has fallen'),  # Penn 2026-11-14: Sonarr's 'Has Fallen' is released as 'Apollo Has Fallen'
+))
+
+
+def confirmed_alias(queue_title, matched_title):
+    """True when Penn has confirmed this release name is the matched title."""
+    return (release_show_name(queue_title), ' '.join(_title_tokens(str(matched_title or '')))) in _CONFIRMED_ALIASES
+
+
 def _is_tail(short, longer):
     """`short` is the last words of `longer` and has 2+ real words: 'has fallen' / 'apollo has fallen'."""
     return len(short) < len(longer) and len(_core(short)) >= 2 and longer[-len(short):] == short
@@ -404,21 +416,23 @@ def _is_tail(short, longer):
 _POSSESSIVE_LEAD = re.compile(r"^[^:]{0,40}?\w['\u2019]s?\s+")
 
 
-def first_word_differs(queue_title, matched_title):
+def first_word_differs(queue_title, matched_title, allow_tail=False):
     """True when the release name and the matched title start with different words (articles skipped).
     Back-test: 0 of 150 real matches differ here, so a 'match' across different first words is never trusted.
-    Exceptions: digits standing in for letters ('PLUR1BUS' is 'Pluribus'); one name is the other's last
-    2+ real words ('Apollo Has Fallen' is 'Has Fallen', Penn 2026-11-14; 'Mandalorian and Grogu' is
-    'Star Wars: The Mandalorian and Grogu'); the release drops a possessive brand and the rest is the same
-    title of 2+ real words ('Without Remorse' is "Tom Clancy's Without Remorse"; a lone 'Anatomy' is not
-    "Grey's Anatomy", a lone 'Daredevil' is not "Marvel's Daredevil")."""
+    Exceptions: digits standing in for letters ('PLUR1BUS' is 'Pluribus'); with allow_tail (the caller has a
+    matching year), one name is the other's last 2+ real words ('Mandalorian and Grogu' 2026 is 'Star Wars:
+    The Mandalorian and Grogu' 2026; without a year it is not trusted, since a franchise name in front of an
+    older show's name is a spin-off: 'Fear the Walking Dead', 'Dexter New Blood', '9-1-1 Lone Star');
+    the release drops a possessive brand and the rest is the same title of 2+ real words ('Without Remorse'
+    is "Tom Clancy's Without Remorse"; a lone 'Anatomy' is not "Grey's Anatomy", a lone 'Daredevil' is not
+    "Marvel's Daredevil")."""
     rel = [w for w in release_show_name(queue_title).split() if w not in _ARTICLES]
     mt = [w for w in _title_tokens(str(matched_title or '')) if w not in _ARTICLES]
     if not (rel and mt and rel[0] != mt[0]):
         return False
     if rel[0].translate(_LOOKALIKE) == mt[0].translate(_LOOKALIKE):
         return False
-    if _is_tail(mt, rel) or _is_tail(rel, mt):
+    if allow_tail and (_is_tail(mt, rel) or _is_tail(rel, mt)):
         return False
     lead = _POSSESSIVE_LEAD.match(str(matched_title))
     if lead:
@@ -521,14 +535,14 @@ def apply_hard_rules(kind, action, facts):
             if ym is not None and not _flag(ym) and not _same_name_year_off_by_one(facts):
                 return 'unsure', 'year_mismatch'
             qt, mt = facts.get('queue_title'), facts.get('matched_title')
-            if isinstance(qt, str) and isinstance(mt, str):
+            if isinstance(qt, str) and isinstance(mt, str) and not confirmed_alias(qt, mt):
                 if facts.get('service') != 'Radarr' and spinoff_words(qt, mt):
                     return 'unsure', 'spinoff_title'
                 if facts.get('service') != 'Radarr' and reverse_spinoff_words(qt, mt):
                     return 'unsure', 'spinoff_title_reverse'
                 if facts.get('service') != 'Radarr' and country_differs(qt, mt):
                     return 'unsure', 'title_country'
-                if first_word_differs(qt, mt):
+                if first_word_differs(qt, mt, allow_tail=ym is not None and _flag(ym)):
                     return 'unsure', 'title_first_word'
                 if facts.get('service') != 'Radarr' and title_diverges(qt, mt):
                     return 'unsure', 'title_diverges'

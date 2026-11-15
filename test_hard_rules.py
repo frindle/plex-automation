@@ -175,15 +175,43 @@ def test_possessive_brand_left_out_of_the_release_still_matches():
     assert _spin('Anatomy.of.a.Scandal.S01E01.1080p.WEB.h264-GRP', "Grey's Anatomy") == ('unsure', 'title_first_word')
 
 
-def test_one_name_ending_the_other_is_the_same_title():
+def _tail(q, m, year_matches, service='Radarr'):
+    return ld.apply_hard_rules('import_identity', 'match', {
+        'service': service, 'queue_title': q, 'matched_title': m, 'year_matches': year_matches})
+
+
+def test_one_name_ending_the_other_needs_a_matching_year():
+    assert _tail('Mandalorian.and.Grogu.2026.2160p.WEB-DL.H.265-GRP', 'Star Wars: The Mandalorian and Grogu', True) == ('match', None)
+    assert _tail('Star.Wars.The.Mandalorian.and.Grogu.2026.2160p.WEB-DL-GRP', 'The Mandalorian and Grogu', True) == ('match', None)
+    # Without a year to back it, a franchise name in front of an older show's name is a spin-off (offload probe 2026-11-14).
+    for q, m in [('Fear.the.Walking.Dead.S01E01.1080p.WEB.h264-GRP', 'The Walking Dead'),
+                 ('The.Walking.Dead.S01E01.1080p.WEB.h264-GRP', 'Fear the Walking Dead'),
+                 ('Tales.of.the.Walking.Dead.S01E01.1080p.WEB.h264-GRP', 'The Walking Dead'),
+                 ('Dexter.New.Blood.S01E01.1080p.WEB.h264-GRP', 'New Blood'),
+                 ('9-1-1.Lone.Star.S01E01.1080p.WEB.h264-GRP', 'Lone Star'),
+                 ('Bel-Air.S01E01.1080p.WEB.h264-GRP', 'The Fresh Prince of Bel-Air'),
+                 ('The.Fresh.Prince.of.Bel-Air.S01E01.1080p.WEB.h264-GRP', 'Bel-Air'),
+                 ('Law.and.Order.Special.Victims.Unit.S01E01.1080p.WEB.h264-GRP', 'Special Victims Unit'),
+                 ('The.Real.Housewives.of.Beverly.Hills.S01E01.1080p.WEB.h264-GRP', 'Beverly Hills')]:
+        assert _spin(q, m) == ('unsure', 'title_first_word'), q
+        assert _tail(q, m, None, 'Sonarr') == ('unsure', 'title_first_word'), q
+        assert _tail(q, m, False, 'Sonarr')[0] == 'unsure', q
+    # One real word at the end is too little, and the shared words must end the name.
+    assert _tail('Apollo.Fallen.2024.1080p.WEB.h264-GRP', 'Fallen', True) == ('unsure', 'title_first_word')
+    assert _tail('Apollo.Has.Fallen.Again.2024.1080p.WEB.h264-GRP', 'Has Fallen', True) == ('unsure', 'title_first_word')
+
+
+def test_confirmed_alias_is_the_matched_show():
     # Penn 2026-11-14: Sonarr's 'Has Fallen' is the show released as 'Apollo Has Fallen'.
     assert _spin('Apollo.Has.Fallen.S02E04.1080p.WEB.h264-GRP', 'Has Fallen') == ('match', None)
-    assert _spin('Mandalorian.and.Grogu.S01E01.1080p.WEB.h264-GRP', 'Star Wars: The Mandalorian and Grogu') == ('match', None)
-    # One real word at the end is too little: 'Fallen' is not 'Apollo Has Fallen'.
-    assert _spin('Apollo.Fallen.S01E01.1080p.WEB.h264-GRP', 'Fallen') == ('unsure', 'title_first_word')
-    assert _spin('Fallen.S01E01.1080p.WEB.h264-GRP', 'Apollo Fallen') == ('unsure', 'title_first_word')
-    # The shared words must be the end of the name, not the middle.
+    assert ld.confirmed_alias('Apollo Has Fallen S01E01 1080p', 'Has Fallen')
+    # Only that exact pair: other names, or the alias against a different show, still go through the guards.
+    assert not ld.confirmed_alias('Apollo.Has.Fallen.S02E04.1080p', 'Fallen')
     assert _spin('Apollo.Has.Fallen.Again.S01E01.1080p.WEB.h264-GRP', 'Has Fallen') == ('unsure', 'title_first_word')
+    # The year check still applies to an alias.
+    assert ld.apply_hard_rules('import_identity', 'match', {
+        'service': 'Sonarr', 'queue_title': 'Apollo.Has.Fallen.S02E04.1080p.WEB.h264-GRP', 'matched_title': 'Has Fallen',
+        'year_matches': False}) == ('unsure', 'year_mismatch')
 
 
 def test_digits_for_letters_in_the_first_word():
