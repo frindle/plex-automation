@@ -98,5 +98,5 @@ def test_prompt_carries_comparison_only_for_upgrade_gate():
 def test_policy_scopes_rule_one_to_the_candidate_and_throttles_group_changes():
     pol = ld.POLICY['upgrade_gate']
     assert 'Only the candidate counts' in pol
-    assert '6. Throttle' in pol and 'different release group' in pol
+    assert '5. Throttle' in pol and 'different release group' in pol
     assert 'AV1' in pol and 'REPACK' in pol
