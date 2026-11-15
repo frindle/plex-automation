@@ -2,7 +2,7 @@
 
 Decision chain (each layer is skipped when its env is unset):
   0. Unraid Ollama (LAN)     UNRAID_OLLAMA_URL, model LLM_UNRAID_MODEL (default qwen3:14b), only for
-                             LLM_UNRAID_KINDS (default import_identity). Asked only when the GPU is free
+                             LLM_UNRAID_KINDS (default import_identity,dupe_confirm). Asked only when the GPU is free
                              (nothing loaded, or its own model loaded) and LLM_UNRAID_HOLD_URL isn't holding.
                              Its answer is kept only when, after hard rules, it is decisive (not unsure) at
                              confidence >= MIN_CONFIDENCE; anything else passes on to local Darkbloom.
@@ -13,8 +13,9 @@ Decision chain (each layer is skipped when its env is unset):
 While the local layer is unavailable the decision is PENDING for LLM_LOCAL_WAIT_MIN minutes (default 15)
 before a paid layer is used. A valid but low-confidence open-model answer escalates to Claude at once.
 Shadow mode only asks the free layers (Unraid, local): it changes nothing, so it never spends paid calls.
+dupe_confirm (FREE_ONLY_KINDS) only asks the free layers in every mode: duplicate cleanup is not time-sensitive.
 import_identity answers are cached by pending key for LLM_ANSWER_TTL_H hours (default 24), so a stuck import
-isn't re-asked every pass. Hard rules still run on the current facts.
+isn't re-asked every pass; dupe_confirm answers are kept 720 hours (LLM_ANSWER_TTL_H_DUPE_CONFIRM). Hard rules still run on the current facts.
 llm_decide stays the source of truth for the prompt, parsing, MIN_CONFIDENCE and hard rules.
 """
 
@@ -41,21 +42,28 @@ LOCAL_APPROVED = {'import_identity': ('qwen3.5-35b-a3b',), 'upgrade_gate': ('qwe
 UNRAID_TIMEOUT = 30.0
 UNRAID_COLD_TIMEOUT = 120.0
 # Kinds asked from a background poller, where waiting out a cold Unraid load is fine. Grab-time kinds keep 30 s.
-UNRAID_COLD_KINDS = frozenset({'import_identity'})
+UNRAID_COLD_KINDS = frozenset({'import_identity', 'dupe_confirm'})
 PENDING_MAX_AGE = 24 * 3600.0
 DEFAULT_WAIT_MIN = 15.0
 DEFAULT_ANSWER_TTL_H = 24.0
 ANSWER_CACHE_MAX = 2000
-CACHE_KINDS = frozenset({'import_identity'})
+CACHE_KINDS = frozenset({'import_identity', 'dupe_confirm'})
+# Per-kind answer lifetime in hours (LLM_ANSWER_TTL_H_<KIND> overrides). Two files' names don't change, so a
+# dupe answer holds for a month; the rest use LLM_ANSWER_TTL_H.
+ANSWER_TTL_H = {'dupe_confirm': 720.0}
+# Kinds that never use a paid layer, in any mode (Penn 11-15: paid services only for time-sensitive work such as
+# grab-time decisions and upgrades). They wait for the free layers, then fall back to the caller's rules action.
+FREE_ONLY_KINDS = frozenset({'dupe_confirm'})
 UNRAID_MODEL = 'qwen3:14b'
-UNRAID_KINDS = 'import_identity'
+UNRAID_KINDS = 'import_identity,dupe_confirm'
 # Actions an Unraid answer may settle on its own; unsure (or a hard rule turning an answer into unsure)
 # always passes on to local Darkbloom.
 UNRAID_DECISIVE = {'import_identity': frozenset({'match', 'mismatch'}),
+                   'dupe_confirm': frozenset({'same', 'different'}),
                    'upgrade_gate': frozenset({'allow', 'throttle', 'reject'})}
 
 # What a seam does while a decision is pending in enforce mode (shadow always keeps the rules action).
-PENDING_ACTION = {'import_identity': 'unsure'}
+PENDING_ACTION = {'import_identity': 'unsure', 'dupe_confirm': 'unsure'}
 
 
 def http_transport(url, model, timeout=20):
@@ -506,6 +514,19 @@ def get_answers(path, now=time.time):
     return st
 
 
+def answer_ttl_s(kind, env):
+    """Seconds an answer of this kind is reused: LLM_ANSWER_TTL_H_<KIND>, else ANSWER_TTL_H, else LLM_ANSWER_TTL_H."""
+    raw = env.get('LLM_ANSWER_TTL_H_' + str(kind).upper())
+    if raw is None or not str(raw).strip():
+        raw = ANSWER_TTL_H.get(kind)
+    if raw is None:
+        raw = env.get('LLM_ANSWER_TTL_H', DEFAULT_ANSWER_TTL_H)
+    try:
+        return float(raw) * 3600.0
+    except (TypeError, ValueError):
+        return DEFAULT_ANSWER_TTL_H * 3600.0
+
+
 def _answers_path(env):
     p = (env.get('LLM_ANSWERS_PATH') or '').strip()
     if p:
@@ -664,8 +685,9 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
             wait_min = DEFAULT_WAIT_MIN
         path = log_path or env.get('LLM_DECISIONS_LOG', DEFAULT_LOG)
         capped = False
-        if mode == 'shadow':
-            # Shadow changes nothing, so it never pays for an answer (Unraid and local are free).
+        if mode == 'shadow' or kind in FREE_ONLY_KINDS:
+            # Shadow changes nothing, so it never pays for an answer (Unraid and local are free); a free-only kind
+            # never pays at all.
             layers = {k: v for k, v in layers.items() if k not in ('paid', 'claude')}
         else:
             capped = paid_cap_reached(env, path, time.strftime('%Y-%m', time.gmtime(now())))
@@ -674,10 +696,7 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
 
         answers, akey, ttl_s = None, None, 0.0
         if kind in CACHE_KINDS:
-            try:
-                ttl_s = float(env.get('LLM_ANSWER_TTL_H', DEFAULT_ANSWER_TTL_H)) * 3600.0
-            except (TypeError, ValueError):
-                ttl_s = DEFAULT_ANSWER_TTL_H * 3600.0
+            ttl_s = answer_ttl_s(kind, env)
             if ttl_s > 0:
                 answers = get_answers(_answers_path(env), now)
                 akey = pending_key(kind, facts)

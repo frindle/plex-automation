@@ -7272,11 +7272,121 @@ def _find_torrent_by_filepath(torrents, filepath):
         return basename_hits[0]
     return None, None
 
+
+# Check before the duplicate cleanup removes a copy (Penn 11-15: have the model confirm correct matches).
+# Code guards (llm_decide.dupe_conflict: episodes, years, edition tags, running times) keep both files in every
+# mode. Then the model (kind dupe_confirm, free layers only) is asked whether the two files are the same media:
+# LLM_DUPE_CONFIRM = off | shadow (default: ask and log, change nothing) | enforce (remove a copy only on a
+# confident "same"; pending, unsure, different or no answer keeps both). LLM_DECISIONS caps it: off there is off
+# here, shadow there keeps this at shadow. It is asked on apply runs, on the daily run and with ?llm=1, at most
+# LLM_DUPE_CONFIRM_MAX new questions a run (default 40; cached answers are free and last 30 days).
+LLM_DUPE_CONFIRM_MAX_DEFAULT = 40
+
+
+def _dupe_confirm_mode():
+    own = (os.environ.get('LLM_DUPE_CONFIRM') or 'shadow').strip().lower()
+    if own not in ('off', 'shadow', 'enforce'):
+        own = 'shadow'
+    top = _llm_mode()
+    if top == 'off' or own == 'off':
+        return 'off'
+    return 'enforce' if own == 'enforce' and top == 'enforce' else 'shadow'
+
+
+def _dupe_confirm_max():
+    try:
+        return max(0, int(os.environ.get('LLM_DUPE_CONFIRM_MAX') or LLM_DUPE_CONFIRM_MAX_DEFAULT))
+    except ValueError:
+        return LLM_DUPE_CONFIRM_MAX_DEFAULT
+
+
+def _dupe_facts(entry, keeper, loser):
+    """dupe_confirm facts: file names (no folders), quality and running time of the keeper and the other copy."""
+    facts = {'media_type': 'movie' if 'year' in entry else 'episode', 'title': entry.get('title')}
+    if 'year' in entry:
+        facts['year'] = entry.get('year')
+    for side, m in (('keeper', keeper), ('loser', loser)):
+        facts[f'{side}_file'] = os.path.basename(m.get('file') or '')
+        for k in ('resolution', 'codec', 'size_gb', 'duration_min'):
+            facts[f'{side}_{k}'] = m.get(k)
+    return facts
+
+
+# Pairs a check kept, or (in shadow) the model doubted, listed in the report so Penn can look at each one
+# ("never keeping dupes of the exact same media": a kept pair is not left quietly). Capped per run.
+DUPE_REVIEW_MAX = 200
+
+
+def _dupe_review(state, entry, keeper, loser, why):
+    if len(state['review']) < DUPE_REVIEW_MAX:
+        state['review'].append({'title': entry.get('title'), 'keep': os.path.basename(keeper.get('file') or ''),
+                                'other': os.path.basename(loser.get('file') or ''), 'why': why})
+
+
+def _dupe_check(entry, keeper, loser, state):
+    """(keep_reason, check_info) for one copy the cleanup would remove. keep_reason is None when it may go."""
+    counts = state['counts']
+    facts = _dupe_facts(entry, keeper, loser)
+    if llm_decide is not None:
+        conflict = llm_decide.dupe_conflict(facts)
+        if conflict:
+            counts['rule_kept'] += 1
+            counts['rules'][conflict[0]] = counts['rules'].get(conflict[0], 0) + 1
+            _dupe_review(state, entry, keeper, loser, conflict[0])
+            return f'kept: {conflict[1]} (not the same media)', {'rule': conflict[0]}
+    mode = state['mode']
+    if mode == 'off':
+        return None, None
+    if not state['ask']:
+        return None, {'model': 'not asked (dry run: add llm=1)'}
+    if state['asked'] >= state['max'] or llm_advisor is None:
+        counts['not_asked'] += 1
+        why = 'per-run cap reached' if llm_advisor is not None else 'advisor not loaded'
+        return (f'kept: model check not asked ({why}), next run' if mode == 'enforce' else None), \
+            {'model': f'not asked ({why})'}
+    info = {}
+    rules = 'same' if mode == 'shadow' else 'unsure'
+    try:
+        action = llm_advisor.advise('dupe_confirm', facts, rules, mode=mode, record=_llm_record, info=info)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'[llm] dupe_confirm failed: {e}')
+        action = rules
+    if info.get('layer') != 'cache':
+        state['asked'] += 1
+    raw = info.get('llm_action')
+    check = {'model': raw or ('pending' if info.get('pending') else 'no answer'), 'layer': info.get('layer'),
+             'mode': mode}
+    if info.get('pending'):
+        counts['pending'] += 1
+    elif raw == 'same':
+        counts['model_same'] += 1
+    elif raw in ('different', 'unsure'):
+        counts[f'model_{raw}'] += 1
+    elif raw:
+        counts['model_other'] += 1
+    if raw and raw != 'same':
+        _dupe_review(state, entry, keeper, loser, f'model {raw} ({mode})')
+    if mode == 'enforce' and action != 'same':
+        counts['model_kept'] += 1
+        why = 'pending, next run' if info.get('pending') else f'says {raw}' if raw else 'no answer, next run'
+        return f'kept: model check {why}', check
+    return None, check
+
+
 @app.route('/plex-dupe-fix', methods=['POST', 'GET'])
 def plex_dupe_fix():
     if not PLEX_TOKEN:
         return jsonify({'ok': False, 'error': 'no PLEX_TOKEN'}), 400
     apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    check_state = {
+        'mode': _dupe_confirm_mode(),
+        'ask': apply or request.args.get('llm', '').lower() in ('1', 'true', 'yes'),
+        'asked': 0,
+        'max': _dupe_confirm_max(),
+        'counts': {'rule_kept': 0, 'rules': {}, 'model_same': 0, 'model_different': 0, 'model_unsure': 0,
+                   'model_other': 0, 'model_kept': 0, 'pending': 0, 'not_asked': 0},
+        'review': [],
+    }
     # Reuse the scan output rather than duplicating the walk.
     # Flask views return (response, status) tuples — unpack first.
     try:
@@ -7416,9 +7526,16 @@ def plex_dupe_fix():
                 'torrent_name': tinfo.get('name') if tinfo else None,
                 'torrent_label': tinfo.get('label') if tinfo else None,
             }
+            keep_reason = None
+            if not ambiguous:
+                keep_reason, check = _dupe_check(entry, keeper, loser, check_state)
+                if check:
+                    action['check'] = check
             if ambiguous:
                 action['result'] = ('skipped: a torrent seeds a file with this name but not this path; '
                                     'check by hand')
+            elif keep_reason:
+                action['result'] = keep_reason
             elif apply:
                 try:
                     if h and tinfo:
@@ -7461,6 +7578,8 @@ def plex_dupe_fix():
         'ok': True,
         'apply': apply,
         'counts': {k: len(v) for k, v in plan.items()},
+        'checks': dict(check_state['counts'], mode=check_state['mode'], asked=check_state['asked'],
+                       review=check_state['review']),
         'plan': plan,
     }), 200
 
@@ -7504,6 +7623,8 @@ def plex_dupe_fix_daily():
     if mode == 'off':
         return None
     qs = {'apply': '1'} if mode == 'apply' else {}
+    if _dupe_confirm_mode() != 'off':
+        qs['llm'] = '1'
     try:
         with app.test_request_context('/plex-dupe-fix', query_string=qs):
             res = plex_dupe_fix()
@@ -7519,6 +7640,7 @@ def plex_dupe_fix_daily():
         'ok': bool(body.get('ok')),
         'error': body.get('error'),
         'counts': body.get('counts') or {},
+        'checks': body.get('checks') or {},
         'failures': failures,
         'plan': body.get('plan') or {},
     }
@@ -7529,8 +7651,15 @@ def plex_dupe_fix_daily():
     c = report['counts']
     if report['ok']:
         n_sup = sum(len(i.get('supersede') or []) for i in report['plan'].get('quality_upgrade') or [])
+        ck = report['checks']
+        kept = (ck.get('rule_kept') or 0) + (ck.get('model_kept') or 0)
         summary = (f"{mode}: {c.get('quality_upgrade', 0)} titles, {n_sup} extra copies, "
                    f"{c.get('same_file_ghost', 0)} ghosts, {len(failures)} failed")
+        if kept:
+            summary += f', {kept} kept by checks'
+        doubts = [f'{ck[k]} {k[6:]}' for k in ('model_different', 'model_unsure', 'model_other') if ck.get(k)]
+        if ck.get('mode') == 'shadow' and doubts:
+            summary += f" (shadow: model says {', '.join(doubts)})"
     else:
         summary = f"{mode}: did not run ({report['error']})"
     record_activity('plex_dupe_fix', summary)
