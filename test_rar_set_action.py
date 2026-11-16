@@ -227,3 +227,13 @@ def test_sonarr_nxnn_name_deletes():
     aw.requests = _requests({(3, 1): True})
     d = aw.rar_set_action(_set(TV), {}, _ls('ncis.3x01.kill_ari_part_1.dvdrip_xvid-fov.avi'))
     assert d['action'] == 'delete', d
+
+
+def test_incomplete_set_is_parked_without_listing_it():
+    calls = []
+    rs = {'first': '/media/movies/Film (2001)/f.rar',
+          'volumes': ['/media/movies/Film (2001)/f.rar', '/media/movies/Film (2001)/f.r05'], 'extras': []}
+    d = aw.rar_set_action(rs, {}, lambda f: calls.append(f) or {'ok': True, 'files': ['Film.2001.mkv']})
+    assert d['action'] == 'skip'
+    assert d['reason'] == 'incomplete set: 5 volume(s) missing (first f.r00)'
+    assert calls == []
