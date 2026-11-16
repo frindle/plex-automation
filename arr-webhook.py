@@ -588,10 +588,13 @@ UPGRADE_STATE_PATH = os.environ.get('UPGRADE_STATE_PATH', '/data/upgrade_batch_s
 # (/run-stalled-seeds, dry-run by default) still works regardless of this
 # flag — this only gates the automatic weekly background removal.
 STALL_AUTOMATION_ENABLED = os.environ.get('STALL_AUTOMATION_ENABLED', 'false').lower() in ('1', 'true', 'yes')
-# Upgrade-lane backlog cap (Penn, 2026-11-15: "cap the backlog at 30 torrents").
-# Untouched upgrade torrents beyond this many are dropped from Deluge; anything
-# with progress is always kept. 0 turns the cap off. See deluge_trim.py.
-UPGRADE_LANE_MAX = int(os.environ.get('UPGRADE_LANE_MAX', '30'))
+# Upgrade-lane cap. Penn, 2026-11-15: first "cap the backlog at 30 torrents",
+# then "remove the standing queue in deluge and just add an upgrade when one
+# finishes". So the default is Deluge's 10 active-download slots: untouched
+# upgrade torrents beyond it are dropped (anything with progress is always
+# kept), and the upgrade search only fills the free slots (see
+# monthly_search_scheduler). 0 turns the cap off. See deluge_trim.py.
+UPGRADE_LANE_MAX = int(os.environ.get('UPGRADE_LANE_MAX', '10'))
 # Seed retirement (same day: "we also need to reduce seeding torrents"). Finished
 # torrents on these labels that have seeded SEED_RETIRE_DAYS, in a swarm with
 # more than SEED_RETIRE_MIN_SWARM other seeds, stop seeding (download copy
@@ -700,10 +703,10 @@ UPGRADE_BATCH_SIZE = int(os.environ.get('UPGRADE_BATCH_SIZE', '12'))
 WEEKLY_UPGRADE_QUOTA = int(os.environ.get('WEEKLY_UPGRADE_QUOTA', '10'))
 
 
-def advance_upgrade_cursor(cursor, total):
+def advance_upgrade_cursor(cursor, total, size=None):
     """Advance the yearly-upgrade batch cursor by one pass.
 
-    Returns (indices, next_cursor): up to UPGRADE_BATCH_SIZE consecutive
+    Returns (indices, next_cursor): up to `size` (default UPGRADE_BATCH_SIZE) consecutive
     indices starting at the clamped cursor, wrapping past the end back to 0,
     and where to resume on the next pass. A stale cursor from a larger catalog
     is clamped into range so it never indexes out of bounds; when total is
@@ -712,7 +715,7 @@ def advance_upgrade_cursor(cursor, total):
     if total <= 0:
         return [], 0
     clamped = max(0, min(cursor, total - 1))
-    count = min(UPGRADE_BATCH_SIZE, total)
+    count = min(UPGRADE_BATCH_SIZE if size is None else max(1, size), total)
     indices = [(clamped + i) % total for i in range(count)]
     next_cursor = (clamped + count) % total
     return indices, next_cursor
@@ -5181,6 +5184,12 @@ class _NoSearch(Exception):
     pass
 
 
+def _pass_size(limit):
+    """Items one bulk-search pass may search: UPGRADE_BATCH_SIZE, or fewer
+    when the caller passes the free upgrade-lane slots."""
+    return UPGRADE_BATCH_SIZE if limit is None else max(1, min(UPGRADE_BATCH_SIZE, limit))
+
+
 def radarr_lane_movie_ids():
     """Radarr movieIds that already have a torrent in the throttled upgrade
     lane (either lane label). Raises if Deluge or Radarr history cannot be
@@ -5198,8 +5207,10 @@ def radarr_lane_movie_ids():
     return ids
 
 
-def radarr_bulk_search():
+def radarr_bulk_search(limit=None):
     """Trigger a bounded yearly-upgrade pass over monitored Radarr movies.
+    `limit` (the free upgrade-lane slots) shrinks the pass below
+    UPGRADE_BATCH_SIZE so a search can't grab more than the lane can take.
 
     Instead of searching the ENTIRE catalog in one go (which makes Radarr push
     every accepted release to Deluge back-to-back and trips private-tracker
@@ -5226,7 +5237,8 @@ def radarr_bulk_search():
             return
         ordered = sort_ids_by_year_desc(monitored)
         movie_ids = [m['id'] for m in ordered]
-        indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(movie_ids))
+        indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(movie_ids),
+                                                      _pass_size(limit))
         batch = [movie_ids[i] for i in indices]
         # A movie whose upgrade is already in the throttled lane is invisible
         # to Radarr's own queue check (the relabel hides it), so searching it
@@ -5356,8 +5368,10 @@ def sonarr_lane_series_ids():
     return ids
 
 
-def sonarr_bulk_search():
+def sonarr_bulk_search(limit=None):
     """Sonarr counterpart of radarr_bulk_search: a bounded yearly-upgrade pass.
+    `limit` works the same way (one series can still grab several episodes;
+    the grab-time lane cap drops what doesn't fit).
 
     Each pass searches at most UPGRADE_BATCH_SIZE monitored series (sorted
     newest-first via sort_ids_by_year_desc, sliced by advance_upgrade_cursor
@@ -5384,7 +5398,8 @@ def sonarr_bulk_search():
             return
         ordered = sort_ids_by_year_desc(monitored)
         series_ids = [s['id'] for s in ordered]
-        indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(series_ids))
+        indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(series_ids),
+                                                      _pass_size(limit))
         batch = [series_ids[i] for i in indices]
         try:
             in_lane = sonarr_lane_series_ids()
@@ -5647,8 +5662,14 @@ def monthly_search_scheduler():
     Hourly poll, shared radarr+sonarr weekly upgrade quota: at most one
     service runs per poll (they alternate via the persisted 'next_service'
     key so neither starves), and no pass starts once WEEKLY_UPGRADE_QUOTA
-    confirmed upgrades have been queued in the rolling 7-day window. Each
-    run is the full monthly cycle for that service:
+    confirmed upgrades have been queued in the rolling 7-day window.
+
+    With the lane cap on, this is a refill, not a standing queue (Penn,
+    2026-11-15): a pass runs only while the lane has free slots, and it
+    searches at most that many items, so a finished upgrade frees a slot and
+    the next poll adds one. If Deluge can't report the lane, the poll is
+    skipped rather than searching blind. Each run is the full monthly cycle
+    for that service:
     1. Purge stalled <service>-upgrade torrents
     2. Wait 30 minutes
     3. Trigger bulk search
@@ -5662,10 +5683,13 @@ def monthly_search_scheduler():
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         state = _load_upgrade_state()
         quota_entry = weekly_quota_state(state, now)
-        lane = upgrade_lane_count() if UPGRADE_LANE_MAX > 0 else None
+        capped = UPGRADE_LANE_MAX > 0
+        lane = upgrade_lane_count() if capped else None
         if WEEKLY_UPGRADE_QUOTA - quota_entry['count'] <= 0:
             log.info(f'weekly upgrade quota exhausted ({quota_entry["count"]}/{WEEKLY_UPGRADE_QUOTA}); skipping this poll')
-        elif lane is not None and lane >= UPGRADE_LANE_MAX:
+        elif capped and lane is None:
+            log.warning('upgrade lane unreadable (Deluge); skipping this poll')
+        elif capped and lane >= UPGRADE_LANE_MAX:
             log.info(f'upgrade lane full ({lane}/{UPGRADE_LANE_MAX}); skipping this poll')
         else:
             # Services run one at a time rather than in parallel so the two
@@ -5674,8 +5698,11 @@ def monthly_search_scheduler():
             service = state.get('next_service') or 'radarr'
             if service not in ('radarr', 'sonarr'):
                 service = 'radarr'  # corrupted/stale value -> safe default, never pass through
-            log.info(f'{service}: weekly quota has room ({quota_entry["count"]}/{WEEKLY_UPGRADE_QUOTA}), starting monthly cycle')
-            monthly_upgrade_cycle(service)
+            free = UPGRADE_LANE_MAX - lane if capped else None
+            log.info(f'{service}: weekly quota has room ({quota_entry["count"]}/{WEEKLY_UPGRADE_QUOTA})'
+                     + (f', {free} free upgrade slot(s) ({lane}/{UPGRADE_LANE_MAX})' if capped else '')
+                     + ', starting monthly cycle')
+            monthly_upgrade_cycle(service, limit=free)
             # Reload: the cycle may have advanced the shared quota on disk.
             state = _load_upgrade_state()
             state['next_service'] = 'sonarr' if service == 'radarr' else 'radarr'
@@ -5683,8 +5710,9 @@ def monthly_search_scheduler():
         time.sleep(3600)  # check every hour
 
 
-def monthly_upgrade_cycle(service, wait_before_search=1800, wait_before_relabel=300):
-    """One service's monthly purge → bulk search → relabel pass.
+def monthly_upgrade_cycle(service, wait_before_search=1800, wait_before_relabel=300, limit=None):
+    """One service's monthly purge → bulk search → relabel pass. `limit`
+    (free upgrade-lane slots, from the scheduler) caps the search size.
 
     The shared weekly quota only advances on CONFIRMED queued upgrades: the
     integer count returned by the relabel step is recorded via
@@ -5697,7 +5725,10 @@ def monthly_upgrade_cycle(service, wait_before_search=1800, wait_before_relabel=
     purge_stalled_upgrade_torrents(label)
     log.info(f'{service}: waiting {wait_before_search}s before bulk search...')
     time.sleep(wait_before_search)
-    bulk_search()
+    if limit is None:
+        bulk_search()
+    else:
+        bulk_search(limit=limit)
     log.info(f'{service}: waiting {wait_before_relabel}s before relabeling upgrades...')
     time.sleep(wait_before_relabel)
     count = relabel()

@@ -237,3 +237,49 @@ def test_sonarr_lane_series_ids_maps_both_labels_and_fails_closed(monkeypatch):
     monkeypatch.setattr(target.requests, 'get', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('x')))
     with pytest.raises(RuntimeError):
         target.sonarr_lane_series_ids()
+
+
+# ── refill: a pass searches no more items than the lane has free slots ──────
+
+def test_advance_upgrade_cursor_size_override(monkeypatch):
+    monkeypatch.setattr(target, 'UPGRADE_BATCH_SIZE', 12)
+    assert target.advance_upgrade_cursor(5, 20, 1) == ([5], 6)
+    assert target.advance_upgrade_cursor(19, 20, 2) == ([19, 0], 1)
+    assert target.advance_upgrade_cursor(0, 20, 0) == ([0], 1)  # never an empty pass
+    assert target.advance_upgrade_cursor(0, 20)[1] == 12      # default unchanged
+
+
+def test_pass_size_clamps_to_batch_size(monkeypatch):
+    monkeypatch.setattr(target, 'UPGRADE_BATCH_SIZE', 12)
+    assert target._pass_size(None) == 12
+    assert target._pass_size(3) == 3
+    assert target._pass_size(50) == 12
+    assert target._pass_size(0) == 1
+
+
+def test_radarr_bulk_search_limit_shrinks_pass(monkeypatch):
+    posted, saved = _bulk_search_setup(monkeypatch, set())
+    target.radarr_bulk_search(limit=1)
+    assert len(posted) == 1 and len(posted[0]['movieIds']) == 1
+    assert saved[-1]['radarr']['cursor'] == 1
+
+
+def test_sonarr_bulk_search_limit_shrinks_pass(monkeypatch):
+    posted, saved = _sonarr_bulk_setup(monkeypatch, set())
+    target.sonarr_bulk_search(limit=2)
+    assert len(posted) == 2
+    assert saved[-1]['sonarr']['cursor'] == 2
+
+
+def test_monthly_upgrade_cycle_passes_limit(monkeypatch):
+    got = []
+    monkeypatch.setattr(target.time, 'sleep', lambda s: None)
+    monkeypatch.setattr(target, 'purge_stalled_upgrade_torrents', lambda label=None: None)
+    monkeypatch.setattr(target, 'radarr_bulk_search', lambda limit=None: got.append(limit))
+    monkeypatch.setattr(target, 'relabel_radarr_upgrades', lambda: 0)
+    monkeypatch.setattr(target, 'enforce_upgrade_lane_cap', lambda: {})
+    monkeypatch.setattr(target, '_load_upgrade_state', lambda: {})
+    monkeypatch.setattr(target, '_save_upgrade_state', lambda st: None)
+    target.monthly_upgrade_cycle('radarr', 0, 0, limit=3)
+    target.monthly_upgrade_cycle('radarr', 0, 0)
+    assert got == [3, None]

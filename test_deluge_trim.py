@@ -307,7 +307,7 @@ def test_monthly_scheduler_skips_when_lane_full(monkeypatch):
     monkeypatch.setattr(aw, '_load_upgrade_state', lambda: {})
     monkeypatch.setattr(aw, '_save_upgrade_state', lambda st: None)
     ran = []
-    monkeypatch.setattr(aw, 'monthly_upgrade_cycle', lambda svc: ran.append(svc))
+    monkeypatch.setattr(aw, 'monthly_upgrade_cycle', lambda svc, limit=None: ran.append((svc, limit)))
 
     class Stop(Exception):
         pass
@@ -315,17 +315,29 @@ def test_monthly_scheduler_skips_when_lane_full(monkeypatch):
     def stop(_):
         raise Stop
     monkeypatch.setattr(aw.time, 'sleep', stop)
-    try:
-        aw.monthly_search_scheduler()
-    except Stop:
-        pass
+
+    def poll():
+        try:
+            aw.monthly_search_scheduler()
+        except Stop:
+            pass
+    poll()
     assert ran == []
+    # Refill: one free slot -> the pass may search one item.
     monkeypatch.setattr(aw, 'upgrade_lane_count', lambda: 29)
-    try:
-        aw.monthly_search_scheduler()
-    except Stop:
-        pass
-    assert ran == ['radarr']
+    poll()
+    assert ran == [('radarr', 1)]
+    monkeypatch.setattr(aw, 'upgrade_lane_count', lambda: 0)
+    poll()
+    assert ran[-1] == ('radarr', 30)
+    # Deluge can't report the lane: skip, never search blind.
+    monkeypatch.setattr(aw, 'upgrade_lane_count', lambda: None)
+    poll()
+    assert len(ran) == 2
+    # Cap off: no lane read at all, full-size pass.
+    monkeypatch.setattr(aw, 'UPGRADE_LANE_MAX', 0)
+    poll()
+    assert ran[-1] == ('radarr', None)
 
 
 # ── schedulers across restarts ───────────────────────────────────────────────
