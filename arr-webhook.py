@@ -720,6 +720,143 @@ def advance_upgrade_cursor(cursor, total, size=None):
     next_cursor = (clamped + count) % total
     return indices, next_cursor
 
+
+def pick_upgrade_batch(ordered_ids, cursor, size, wanted, skip=()):
+    """Walk ordered_ids from the clamped cursor (wrapping), keeping ids in `wanted` and not in `skip`, until
+    `size` are kept or every id was looked at once. Returns (batch, next_cursor), next_cursor being the index
+    after the last id looked at. Ids not in `wanted` (already at cutoff) are passed over, so a pass is spent
+    only on items that can still upgrade."""
+    total = len(ordered_ids)
+    if total <= 0:
+        return [], 0
+    i = max(0, min(cursor, total - 1))
+    want = max(1, size)
+    batch, seen = [], 0
+    while seen < total and len(batch) < want:
+        item = ordered_ids[i]
+        if item in wanted and item not in skip:
+            batch.append(item)
+        i = (i + 1) % total
+        seen += 1
+    return batch, i
+
+
+# Before an upgrade search, refresh each item in the *arr (metadata plus a disk rescan) and wait for it, so the
+# search and the grab gate compare against the file really on disk. A refresh that fails or outlasts this
+# wait means nothing is searched that pass.
+UPGRADE_REFRESH_WAIT_S = int(os.environ.get('UPGRADE_REFRESH_WAIT_S', '600'))
+UPGRADE_REFRESH_POLL_S = 5
+_ARR_COMMAND_DONE = {'completed', 'failed', 'aborted', 'cancelled', 'orphaned'}
+
+
+def _arr_wait_command(url, key, cmd_id, wait_s=None):
+    """Poll an *arr command until it ends. Returns its final status, or None if it is still running after
+    wait_s (UPGRADE_REFRESH_WAIT_S) or cannot be read."""
+    wait_s = UPGRADE_REFRESH_WAIT_S if wait_s is None else wait_s
+    deadline = time.time() + wait_s
+    while True:
+        try:
+            r = requests.get(f'{url}/api/v3/command/{cmd_id}', headers={'X-Api-Key': key}, timeout=15)
+            r.raise_for_status()
+            status = (r.json() or {}).get('status')
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'command {cmd_id} status read failed: {e}')
+            return None
+        if status in _ARR_COMMAND_DONE:
+            return status
+        if time.time() >= deadline:
+            return None
+        time.sleep(UPGRADE_REFRESH_POLL_S)
+
+
+def radarr_wants_search(movie):
+    """A monitored movie worth an upgrade-pass search: its file is below the profile cutoff (quality or custom
+    format score, as Radarr computes qualityCutoffNotMet), or it has no file yet and is available."""
+    if not isinstance(movie, dict) or not movie.get('monitored'):
+        return False
+    mf = movie.get('movieFile') or {}
+    if movie.get('hasFile') or mf:
+        return bool(mf.get('qualityCutoffNotMet'))
+    return bool(movie.get('isAvailable'))
+
+
+def _sonarr_wanted_series_ids():
+    """Series with at least one monitored episode below cutoff or missing, from Sonarr's wanted lists."""
+    ids = set()
+    hdr = {'X-Api-Key': SONARR_API_KEY}
+    for kind in ('cutoff', 'missing'):
+        page = 1
+        while True:
+            r = requests.get(f'{SONARR_URL}/api/v3/wanted/{kind}', headers=hdr, timeout=60,
+                             params={'page': page, 'pageSize': 1000, 'monitored': 'true'})
+            r.raise_for_status()
+            body = r.json() or {}
+            recs = body.get('records') or []
+            ids.update(e.get('seriesId') for e in recs if isinstance(e, dict) and e.get('seriesId'))
+            if not recs or page * 1000 >= (body.get('totalRecords') or 0):
+                break
+            page += 1
+    return ids
+
+
+def _sonarr_series_wants_search(series_id):
+    """After a refresh: is this series still monitored with a file below cutoff or a missing episode?"""
+    hdr = {'X-Api-Key': SONARR_API_KEY}
+    r = requests.get(f'{SONARR_URL}/api/v3/series/{series_id}', headers=hdr, timeout=15)
+    r.raise_for_status()
+    series = r.json() or {}
+    if not series.get('monitored'):
+        return False
+    stats = series.get('statistics') or {}
+    if (stats.get('episodeFileCount') or 0) < (stats.get('episodeCount') or 0):
+        return True
+    r = requests.get(f'{SONARR_URL}/api/v3/episodefile', headers=hdr, params={'seriesId': series_id},
+                     timeout=30)
+    r.raise_for_status()
+    return any(isinstance(f, dict) and f.get('qualityCutoffNotMet') for f in (r.json() or []))
+
+
+def refresh_and_confirm(service, ids):
+    """Refresh `ids` in Radarr/Sonarr (metadata plus disk rescan), wait for it, then re-check each one.
+    Returns the ids that still want a search, or None when the refresh failed or ran past the wait (the
+    caller then searches nothing)."""
+    if not ids:
+        return []
+    if service == 'radarr':
+        url, key, body = RADARR_URL, RADARR_API_KEY, {'name': 'RefreshMovie', 'movieIds': list(ids)}
+    else:
+        url, key, body = SONARR_URL, SONARR_API_KEY, {'name': 'RefreshSeries', 'seriesIds': list(ids)}
+    try:
+        r = requests.post(f'{url}/api/v3/command', headers={'X-Api-Key': key}, json=body, timeout=30)
+        r.raise_for_status()
+        cmd_id = (r.json() or {}).get('id')
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'{service}: refresh before upgrade search failed to start: {e}')
+        return None
+    status = _arr_wait_command(url, key, cmd_id) if cmd_id else None
+    if status != 'completed':
+        log.warning(f'{service}: refresh before upgrade search ended {status or "unfinished"}; '
+                    f'searching nothing this pass')
+        return None
+    keep = []
+    for item in ids:
+        try:
+            if service == 'radarr':
+                r = requests.get(f'{RADARR_URL}/api/v3/movie/{item}', headers={'X-Api-Key': key}, timeout=15)
+                r.raise_for_status()
+                ok = radarr_wants_search(r.json())
+            else:
+                ok = _sonarr_series_wants_search(item)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'{service}: re-check of {item} after refresh failed ({e}); not searching it')
+            ok = False
+        if ok:
+            keep.append(item)
+    dropped = len(ids) - len(keep)
+    if dropped:
+        log.info(f'{service}: {dropped} of {len(ids)} no longer need an upgrade after refresh; not searching them')
+    return keep
+
 UPGRADE_BATCH_INTERVAL_DAYS = int(os.environ.get('UPGRADE_BATCH_INTERVAL_DAYS', '3'))
 # Sonarr batches are much smaller: one SeriesSearch fans out to every
 # monitored episode in that series, so 50 series is an order of magnitude
@@ -5216,8 +5353,9 @@ def radarr_bulk_search(limit=None):
     every accepted release to Deluge back-to-back and trips private-tracker
     announce rate limits), each pass searches at most UPGRADE_BATCH_SIZE
     movies: the monitored list is sorted newest-year-first via
-    sort_ids_by_year_desc, advance_upgrade_cursor picks this pass's slice from
-    the persisted cursor (wrapping to index 0 after the end), and the new
+    sort_ids_by_year_desc, pick_upgrade_batch walks it from the persisted
+    cursor keeping only movies below cutoff (or missing), refresh_and_confirm
+    refreshes those and drops any that no longer need it, and the new
     cursor plus a fresh last_run timestamp are persisted back through
     _save_upgrade_state so successive passes walk the whole catalog over time.
     """
@@ -5237,9 +5375,8 @@ def radarr_bulk_search(limit=None):
             return
         ordered = sort_ids_by_year_desc(monitored)
         movie_ids = [m['id'] for m in ordered]
-        indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(movie_ids),
-                                                      _pass_size(limit))
-        batch = [movie_ids[i] for i in indices]
+        # Only movies below cutoff (or missing) are worth a search: at cutoff Radarr rejects every release.
+        wanted = {m['id'] for m in monitored if radarr_wants_search(m)}
         # A movie whose upgrade is already in the throttled lane is invisible
         # to Radarr's own queue check (the relabel hides it), so searching it
         # makes Radarr re-grab the SAME release -- a fresh tracker snatch of a
@@ -5251,12 +5388,15 @@ def radarr_bulk_search(limit=None):
             log.error(f'Radarr bulk search: cannot read upgrade lane ({e}); '
                       f'skipping this pass without advancing the cursor')
             return
-        skipped = [mid for mid in batch if mid in in_lane]
-        if skipped:
-            log.info(f'Radarr bulk search: skipping {len(skipped)} movie(s) already '
-                     f'downloading in the upgrade lane')
-            batch = [mid for mid in batch if mid not in in_lane]
-        log.info(f'Radarr bulk search: {len(batch)} of {len(movie_ids)} movies this pass '
+        batch, next_cursor = pick_upgrade_batch(movie_ids, entry.get('cursor', 0), _pass_size(limit),
+                                                wanted, in_lane)
+        # Refresh + rescan first, then search only what still needs it after that.
+        confirmed = refresh_and_confirm('radarr', batch)
+        if confirmed is None:
+            log.warning('Radarr bulk search: refresh failed; skipping this pass without advancing the cursor')
+            return
+        batch = confirmed
+        log.info(f'Radarr bulk search: {len(batch)} of {len(wanted)} upgradable movies this pass '
                  f'(cursor -> {next_cursor})')
         try:
             if not batch:
@@ -5374,8 +5514,10 @@ def sonarr_bulk_search(limit=None):
     the grab-time lane cap drops what doesn't fit).
 
     Each pass searches at most UPGRADE_BATCH_SIZE monitored series (sorted
-    newest-first via sort_ids_by_year_desc, sliced by advance_upgrade_cursor
-    from the persisted cursor) instead of the entire catalog. Sonarr's
+    newest-first via sort_ids_by_year_desc, walked by pick_upgrade_batch from
+    the persisted cursor keeping series with an episode below cutoff or
+    missing, then refreshed and re-checked by refresh_and_confirm) instead of
+    the entire catalog. Sonarr's
     SeriesSearch takes a single seriesId (confirmed against Sonarr's
     SeriesSearchCommand: `public int SeriesId`), so each item in this pass is
     one separate command fired back-to-back -- same per-item call as before,
@@ -5398,21 +5540,26 @@ def sonarr_bulk_search(limit=None):
             return
         ordered = sort_ids_by_year_desc(monitored)
         series_ids = [s['id'] for s in ordered]
-        indices, next_cursor = advance_upgrade_cursor(entry.get('cursor', 0), len(series_ids),
-                                                      _pass_size(limit))
-        batch = [series_ids[i] for i in indices]
         try:
             in_lane = sonarr_lane_series_ids()
         except Exception as e:
             log.error(f'Sonarr bulk search: cannot read upgrade lane ({e}); '
                       f'skipping this pass without advancing the cursor')
             return
-        skipped = [sid for sid in batch if sid in in_lane]
-        if skipped:
-            log.info(f'Sonarr bulk search: skipping {len(skipped)} series already '
-                     f'downloading in the upgrade lane')
-            batch = [sid for sid in batch if sid not in in_lane]
-        log.info(f'Sonarr bulk search: {len(batch)} of {len(series_ids)} series this pass '
+        try:
+            wanted = _sonarr_wanted_series_ids()
+        except Exception as e:
+            log.error(f'Sonarr bulk search: cannot read wanted lists ({e}); '
+                      f'skipping this pass without advancing the cursor')
+            return
+        batch, next_cursor = pick_upgrade_batch(series_ids, entry.get('cursor', 0), _pass_size(limit),
+                                                wanted, in_lane)
+        confirmed = refresh_and_confirm('sonarr', batch)
+        if confirmed is None:
+            log.warning('Sonarr bulk search: refresh failed; skipping this pass without advancing the cursor')
+            return
+        batch = confirmed
+        log.info(f'Sonarr bulk search: {len(batch)} of {len(wanted)} series with upgrades or gaps this pass '
                  f'(cursor -> {next_cursor})')
         for series_id in batch:
             try:

@@ -91,9 +91,10 @@ def test_run_monthly_upgrade_invalid_service(monkeypatch):
     assert body['ok'] is False and 'error' in body
 
 
-def _bulk_search_setup(monkeypatch, lane_ids, movie_ids=(1, 2, 3, 4)):
+def _bulk_search_setup(monkeypatch, lane_ids, movie_ids=(1, 2, 3, 4), at_cutoff=(), refresh=None):
     posted = []
     saved = []
+    refreshed = []
 
     class Resp:
         def __init__(self, payload):
@@ -104,7 +105,12 @@ def _bulk_search_setup(monkeypatch, lane_ids, movie_ids=(1, 2, 3, 4)):
             return self._p
 
     def fake_get(url, **kw):
-        return Resp([{'id': i, 'monitored': True, 'year': 2020} for i in movie_ids])
+        return Resp([{'id': i, 'monitored': True, 'year': 2020, 'hasFile': True,
+                      'movieFile': {'qualityCutoffNotMet': i not in at_cutoff}} for i in movie_ids])
+
+    def fake_refresh(service, ids):
+        refreshed.append(list(ids))
+        return list(ids) if refresh is None else refresh(ids)
 
     def fake_post(url, **kw):
         posted.append(kw['json'])
@@ -112,6 +118,7 @@ def _bulk_search_setup(monkeypatch, lane_ids, movie_ids=(1, 2, 3, 4)):
 
     monkeypatch.setattr(target.requests, 'get', fake_get)
     monkeypatch.setattr(target.requests, 'post', fake_post)
+    monkeypatch.setattr(target, 'refresh_and_confirm', fake_refresh)
     monkeypatch.setattr(target, '_load_upgrade_state', lambda: {})
     monkeypatch.setattr(target, '_save_upgrade_state', lambda st: saved.append(st))
     monkeypatch.setattr(target, 'UPGRADE_BATCH_SIZE', 10)
@@ -121,6 +128,7 @@ def _bulk_search_setup(monkeypatch, lane_ids, movie_ids=(1, 2, 3, 4)):
         monkeypatch.setattr(target, 'radarr_lane_movie_ids', boom)
     else:
         monkeypatch.setattr(target, 'radarr_lane_movie_ids', lambda: set(lane_ids))
+    _bulk_search_setup.refreshed = refreshed
     return posted, saved
 
 
@@ -174,7 +182,7 @@ def test_radarr_lane_movie_ids_fails_closed_on_history_error(monkeypatch):
         target.radarr_lane_movie_ids()
 
 
-def _sonarr_bulk_setup(monkeypatch, lane_ids, series_ids=(1, 2, 3, 4)):
+def _sonarr_bulk_setup(monkeypatch, lane_ids, series_ids=(1, 2, 3, 4), at_cutoff=()):
     posted = []
     saved = []
 
@@ -189,6 +197,8 @@ def _sonarr_bulk_setup(monkeypatch, lane_ids, series_ids=(1, 2, 3, 4)):
     monkeypatch.setattr(target.requests, 'get',
                         lambda url, **kw: Resp([{'id': i, 'monitored': True, 'year': 2020} for i in series_ids]))
     monkeypatch.setattr(target.requests, 'post', lambda url, **kw: (posted.append(kw['json']), Resp({'id': 7}))[1])
+    monkeypatch.setattr(target, 'refresh_and_confirm', lambda service, ids: list(ids))
+    monkeypatch.setattr(target, '_sonarr_wanted_series_ids', lambda: set(series_ids) - set(at_cutoff))
     monkeypatch.setattr(target, '_load_upgrade_state', lambda: {})
     monkeypatch.setattr(target, '_save_upgrade_state', lambda st: saved.append(st))
     monkeypatch.setattr(target, 'UPGRADE_BATCH_SIZE', 10)
@@ -283,3 +293,152 @@ def test_monthly_upgrade_cycle_passes_limit(monkeypatch):
     target.monthly_upgrade_cycle('radarr', 0, 0, limit=3)
     target.monthly_upgrade_cycle('radarr', 0, 0)
     assert got == [3, None]
+
+
+# --- refresh and confirm before an upgrade search -----------------------------------------------------------
+
+def test_pick_upgrade_batch_passes_over_cutoff_met_and_lane():
+    ids = [10, 11, 12, 13, 14, 15]
+    batch, nxt = target.pick_upgrade_batch(ids, 1, 2, wanted={11, 13, 14, 15}, skip={13})
+    assert batch == [11, 14]
+    assert nxt == 5  # index after the last id looked at (14)
+
+
+def test_pick_upgrade_batch_wraps_and_looks_at_each_id_once():
+    batch, nxt = target.pick_upgrade_batch([1, 2, 3], 2, 5, wanted={1, 3})
+    assert batch == [3, 1]
+    assert nxt == 2
+    assert target.pick_upgrade_batch([], 0, 3, wanted={1}) == ([], 0)
+    assert target.pick_upgrade_batch([1, 2], 9, 1, wanted=set()) == ([], 1)  # stale cursor clamps
+
+
+def test_radarr_wants_search():
+    w = target.radarr_wants_search
+    assert w({'monitored': True, 'hasFile': True, 'movieFile': {'qualityCutoffNotMet': True}})
+    assert not w({'monitored': True, 'hasFile': True, 'movieFile': {'qualityCutoffNotMet': False}})
+    assert w({'monitored': True, 'hasFile': False, 'isAvailable': True})
+    assert not w({'monitored': True, 'hasFile': False, 'isAvailable': False})
+    assert not w({'monitored': False, 'hasFile': True, 'movieFile': {'qualityCutoffNotMet': True}})
+    assert not w(None)
+
+
+def test_radarr_bulk_search_only_searches_movies_below_cutoff(monkeypatch):
+    posted, saved = _bulk_search_setup(monkeypatch, set(), at_cutoff={2, 3})
+    target.radarr_bulk_search()
+    assert _bulk_search_setup.refreshed == [[1, 4]]
+    assert [p['movieIds'] for p in posted] == [[1, 4]]
+
+
+def test_radarr_bulk_search_drops_what_refresh_shows_is_done(monkeypatch):
+    posted, saved = _bulk_search_setup(monkeypatch, set(), refresh=lambda ids: [i for i in ids if i != 1])
+    target.radarr_bulk_search()
+    assert [p['movieIds'] for p in posted] == [[2, 3, 4]]
+    assert saved
+
+
+def test_radarr_bulk_search_refresh_failure_searches_nothing(monkeypatch):
+    posted, saved = _bulk_search_setup(monkeypatch, set(), refresh=lambda ids: None)
+    target.radarr_bulk_search()
+    assert posted == []
+    assert saved == []  # cursor not advanced, retried next pass
+
+
+def test_sonarr_bulk_search_only_searches_wanted_series(monkeypatch):
+    posted, saved = _sonarr_bulk_setup(monkeypatch, set(), at_cutoff={1, 3})
+    target.sonarr_bulk_search()
+    assert sorted(p['seriesId'] for p in posted) == [2, 4]
+
+
+def test_sonarr_bulk_search_refresh_failure_searches_nothing(monkeypatch):
+    posted, saved = _sonarr_bulk_setup(monkeypatch, set())
+    monkeypatch.setattr(target, 'refresh_and_confirm', lambda service, ids: None)
+    target.sonarr_bulk_search()
+    assert posted == [] and saved == []
+
+
+class _R:
+    def __init__(self, payload):
+        self._p = payload
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return self._p
+
+
+def _refresh_env(monkeypatch, status, movies):
+    posts, gets = [], []
+    monkeypatch.setattr(target.time, 'sleep', lambda s: None)
+
+    def fake_post(url, **kw):
+        posts.append((url, kw['json']))
+        return _R({'id': 42})
+
+    def fake_get(url, **kw):
+        gets.append(url)
+        if url.endswith('/api/v3/command/42'):
+            return _R({'status': status})
+        return _R(movies[int(url.rsplit('/', 1)[1])])
+
+    monkeypatch.setattr(target.requests, 'post', fake_post)
+    monkeypatch.setattr(target.requests, 'get', fake_get)
+    return posts, gets
+
+
+def test_refresh_and_confirm_radarr_rechecks_after_refresh(monkeypatch):
+    movies = {1: {'monitored': True, 'hasFile': True, 'movieFile': {'qualityCutoffNotMet': True}},
+              2: {'monitored': True, 'hasFile': True, 'movieFile': {'qualityCutoffNotMet': False}}}
+    posts, gets = _refresh_env(monkeypatch, 'completed', movies)
+    assert target.refresh_and_confirm('radarr', [1, 2]) == [1]
+    assert posts[0][1] == {'name': 'RefreshMovie', 'movieIds': [1, 2]}
+    assert gets[0].endswith('/api/v3/command/42')  # waited for the refresh before re-checking
+
+
+def test_refresh_and_confirm_failed_or_unfinished_refresh_is_none(monkeypatch):
+    movies = {1: {'monitored': True, 'hasFile': True, 'movieFile': {'qualityCutoffNotMet': True}}}
+    _refresh_env(monkeypatch, 'failed', movies)
+    assert target.refresh_and_confirm('radarr', [1]) is None
+    _refresh_env(monkeypatch, 'started', movies)
+    monkeypatch.setattr(target, 'UPGRADE_REFRESH_WAIT_S', 0)
+    assert target.refresh_and_confirm('radarr', [1]) is None
+    assert target.refresh_and_confirm('radarr', []) == []
+
+
+def test_refresh_and_confirm_sonarr_body(monkeypatch):
+    posts, _ = _refresh_env(monkeypatch, 'completed', {})
+    monkeypatch.setattr(target, '_sonarr_series_wants_search', lambda sid: sid == 5)
+    assert target.refresh_and_confirm('sonarr', [5, 6]) == [5]
+    assert posts[0][1] == {'name': 'RefreshSeries', 'seriesIds': [5, 6]}
+
+
+def test_sonarr_series_wants_search(monkeypatch):
+    def env(series, files):
+        def fake_get(url, **kw):
+            return _R(files if url.endswith('/episodefile') else series)
+        monkeypatch.setattr(target.requests, 'get', fake_get)
+    env({'monitored': True, 'statistics': {'episodeFileCount': 3, 'episodeCount': 4}}, [])
+    assert target._sonarr_series_wants_search(1)  # a monitored episode is missing
+    env({'monitored': True, 'statistics': {'episodeFileCount': 4, 'episodeCount': 4}},
+        [{'qualityCutoffNotMet': False}, {'qualityCutoffNotMet': True}])
+    assert target._sonarr_series_wants_search(1)
+    env({'monitored': True, 'statistics': {'episodeFileCount': 4, 'episodeCount': 4}},
+        [{'qualityCutoffNotMet': False}])
+    assert not target._sonarr_series_wants_search(1)
+    env({'monitored': False, 'statistics': {'episodeFileCount': 0, 'episodeCount': 4}}, [])
+    assert not target._sonarr_series_wants_search(1)
+
+
+def test_sonarr_wanted_series_ids_pages_both_lists(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kw):
+        kind = url.rsplit('/', 1)[1]
+        calls.append((kind, kw['params']['page']))
+        if kind == 'cutoff':
+            if kw['params']['page'] == 1:
+                return _R({'totalRecords': 1500, 'records': [{'seriesId': 1}, {'seriesId': 2}]})
+            return _R({'totalRecords': 1500, 'records': [{'seriesId': 3}]})
+        return _R({'totalRecords': 1, 'records': [{'seriesId': 9}]})
+
+    monkeypatch.setattr(target.requests, 'get', fake_get)
+    assert target._sonarr_wanted_series_ids() == {1, 2, 3, 9}
+    assert calls == [('cutoff', 1), ('cutoff', 2), ('missing', 1)]
