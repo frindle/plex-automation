@@ -86,6 +86,22 @@ State: `ARR_HEALTH_STATE` (`/data/arr_health_state.json`). Outages and broken fi
 
 Both record a `cleanup` line in the activity log when they remove anything.
 
+## Stuck downloads
+
+`stuck_plan.py` (pure planner), wired in `arr-webhook.py`. Every `STUCK_CHECK_INTERVAL` seconds (default 600) it looks at unfinished torrents with a normal `sonarr` or `radarr` label. Unlabeled torrents, `library-seed`, other labels and anything finished or seeding are never touched.
+
+A torrent is **stalled** when its state is Downloading, it moves under 1 KiB/s, and it has not downloaded for `STUCK_AFTER_MIN` minutes (default 20; a `time_since_download` of -1 counts only once the torrent has been active that long). The ladder, per stalled torrent:
+
+1. Force a reannounce and move it to the top of the queue.
+2. `STUCK_AFTER_MIN` later, if still stalled: pause, then resume.
+3. After `STUCK_GIVE_UP_HOURS` (default 6) still stalled: under 95% progress, remove it through the Sonarr/Radarr queue API (`removeFromClient=true`, `blocklist=true`) and run `EpisodeSearch` / `MoviesSearch` so another release is grabbed. At 95% or more it is never given up on: one notification is sent instead. A torrent that is in no arr queue is left alone.
+
+A torrent that moves again starts over. The ladder is kept in `STUCK_STATE_PATH` (`/data/stuck_state.json`) in `on` mode so a restart does not reset it.
+
+Upgrade-lane torrents are not on the ladder. Each one gets a per-torrent connection cap (`UPGRADE_MAX_CONNECTIONS`, default 10) so the 30 KiB/s upgrade torrents do not hold every peer slot; the cap is cleared when a superseded torrent is released.
+
+`STUCK_AUTOMATION` is `off`, `dry` (the default, also for any other value) or `on`. `off` does nothing on the timer. `dry` logs and writes `stuck-downloads` activity lines only: no call is made that changes Deluge or the arr apps (the connection cap included), and no state is saved. `on` carries the actions out. Preview: `GET /stuck-downloads` (read-only; each torrent, its step and what the next pass would do).
+
 ## Deployment
 
 Runs on Unraid at `/mnt/user/appdata/plex-automation`, on the `br0` macvlan network (external) at a static IP. `.env` lives only on the server and is gitignored — never commit real secrets.
@@ -97,6 +113,8 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `main`: syn
 ## Changelog
 
 ### Unreleased
+
+- Stuck downloads (`stuck_plan.py`, see **Stuck downloads**): stalled sonarr/radarr torrents go up a ladder (reannounce + queue top, pause + resume, then removal through the arr queue with blocklist and a new search; 95% or more only notifies). Upgrade-lane torrents get a per-torrent connection cap. `STUCK_AUTOMATION=off|dry|on`, default `dry`. Preview at `/stuck-downloads`.
 
 - Deluge trimming (`deluge_trim.py`, see **Deluge trimming**): the upgrade lane is capped at `UPGRADE_LANE_MAX` (10) unfinished torrents. Untouched overflow is removed hourly, after the monthly relabel and at grab time, and the monthly search skips while the lane is full; torrents with any progress are never dropped. This trim is deliberate, unlike the 2026-09-26 queue-wipe incident. Long-seeded torrents on managed labels retire after `SEED_RETIRE_DAYS` (180), idle ones (no upload in `SEED_IDLE_DAYS`, 14) after `SEED_DAYS` (21), in swarms with more than 5 other seeds, 100 a day, download copy deleted only when the library holds every video. Previews at `/upgrade-lane-cap` and `/retire-seeds`. New `test_deluge_trim.py`.
 - Sonarr/Radarr health automation (`arr_health.py`, see **Arr health**): Pushover for outages over 30 minutes (arrs, indexers, download clients, root folders, Deluge) and their recovery, and for items newly removed from TheTVDB/TMDb (first read baselines silently). Broken library files (media info unreadable) are rescanned, confirmed an hour later and listed in `/digest`; only with `ARR_HEALTH_APPLY=1` are they repaired (Deluge recheck of the source torrent, else delete through the arr + search; unmonitored never deleted, 3 per pass, more than 5 at once changes nothing). New `test_arr_health.py`.
