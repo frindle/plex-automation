@@ -187,3 +187,39 @@ if __name__ == '__main__':
         if n.startswith('test_') and callable(f):
             f()
             print('ok', n)
+
+
+# ── missing_volumes: a set with holes can never unpack ────────────────────
+
+def test_missing_volumes_old_style_gap():
+    vols = ['/m/x.rar'] + [f'/m/x.r{n:02d}' for n in range(41, 48)]
+    gone = rx.missing_volumes({'first': '/m/x.rar', 'volumes': vols, 'extras': []})
+    assert len(gone) == 41 and gone[0] == 'x.r00' and gone[-1] == 'x.r40'
+
+
+def test_missing_volumes_complete_sets():
+    assert rx.missing_volumes({'first': '/m/a.rar', 'volumes': ['/m/a.rar'], 'extras': []}) == []
+    old = {'first': '/m/b.rar', 'volumes': ['/m/b.rar', '/m/b.r00', '/m/b.r01'], 'extras': []}
+    assert rx.missing_volumes(old) == []
+    part = {'first': '/m/c.part01.rar', 'volumes': [f'/m/c.part{n:02d}.rar' for n in (1, 2, 3)], 'extras': []}
+    assert rx.missing_volumes(part) == []
+    big = {'first': '/m/d.rar', 'volumes': ['/m/d.rar'] + [f'/m/d.r{n:02d}' for n in range(100)] + ['/m/d.s00'], 'extras': []}
+    assert rx.missing_volumes(big) == []
+
+
+def test_missing_volumes_part_style_gap():
+    part = {'first': '/m/c.part1.rar', 'volumes': ['/m/c.part1.rar', '/m/c.part3.rar'], 'extras': []}
+    assert rx.missing_volumes(part) == ['c.part2.rar']
+
+
+def test_missing_volumes_sfv_catches_a_missing_last_volume():
+    sfv = '; made by a tool\nb.rar 1234ABCD\nb.r00 2345BCDE\nb.r01 3456CDEF\nb.r02 4567DEF0\nb.nfo 0000AAAA\n'
+    rs = {'first': '/m/b.rar', 'volumes': ['/m/b.rar', '/m/b.r00', '/m/b.r01'], 'extras': ['/m/b.sfv']}
+    assert rx.missing_volumes(rs, read=lambda p: sfv) == ['b.r02']
+    # Case differences and an unreadable .sfv don't count as missing.
+    rs_upper = dict(rs, volumes=['/m/B.RAR', '/m/B.R00', '/m/B.R01', '/m/B.R02'])
+    assert rx.missing_volumes(rs_upper, read=lambda p: sfv) == []
+
+    def boom(p):
+        raise OSError('gone')
+    assert rx.missing_volumes(rs, read=boom) == []

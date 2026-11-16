@@ -65,6 +65,67 @@ def rar_sets(paths):
     return out
 
 
+def _volume_index(base):
+    """Position of a volume in its set, or None: name.rar = -1, .r00-.r99 =
+    0-99, .s00.. = 100.., name.partNN.rar = NN."""
+    m = _PART.match(base)
+    if m:
+        return int(m.group('n'))
+    if _OLD_RAR.match(base):
+        return -1
+    m = re.match(r'^.+\.([rs])(\d{2,3})$', base, re.I)
+    if m:
+        return int(m.group(2)) + (100 if m.group(1).lower() == 's' else 0)
+    return None
+
+
+def _sfv_names(path, read=None):
+    """File names an .sfv lists (comments skipped). [] if it can't be read."""
+    try:
+        text = read(path) if read else open(path, encoding='utf-8', errors='replace').read()
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(';'):
+            continue
+        name = line.rsplit(None, 1)[0] if len(line.split()) > 1 else line
+        out.append(os.path.basename(name.replace('\\', '/')))
+    return out
+
+
+def missing_volumes(rset, read=None):
+    """Volumes a set needs but doesn't have, by name. A gap in the numbering
+    (b.rar + b.r41-b.r47 with b.r00-b.r40 gone) or a name its .sfv lists that
+    isn't among the volumes. Such a set can never unpack (unar reports a wrong
+    checksum), so retrying is pointless."""
+    have = {os.path.basename(v).lower() for v in rset.get('volumes') or []}
+    first = os.path.basename(rset.get('first') or '')
+    missing = []
+    idx = sorted(i for i in (_volume_index(os.path.basename(v)) for v in rset.get('volumes') or []) if i is not None)
+    m = _PART.match(first)
+    if m and idx:
+        width = len(m.group('n'))
+        stem = m.group('stem')
+        for n in range(idx[0], idx[-1] + 1):
+            if n not in idx:
+                missing.append(f'{stem}.part{n:0{width}d}.rar')
+    elif _OLD_RAR.match(first):
+        stem = first[:-4]
+        nums = [i for i in idx if i >= 0]
+        for n in range(0, (nums[-1] + 1) if nums else 0):
+            if n not in nums:
+                missing.append(f'{stem}.{"r" if n < 100 else "s"}{n % 100:02d}')
+    seen = {n.lower() for n in missing}
+    for sfv in rset.get('extras') or []:
+        for name in _sfv_names(sfv, read):
+            if _volume_index(name) is not None and name.lower() not in have | seen:
+                missing.append(name)
+                seen.add(name.lower())
+    return missing
+
+
 def has_rar_volumes(paths):
     """True if any path names a RAR volume (.rar, .partNN.rar, .rNN, .sNN)."""
     for p in paths:

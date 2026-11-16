@@ -1475,10 +1475,13 @@ def rar_set_action(rset, cache=None, contents=None):
     delete: the owning Sonarr series has a file for every episode in the set,
             or the owning Radarr movie has a file.
     unpack: the set holds a video the *arr has no file for.
-    skip:   a firm no (no video inside, no SxxEyy/NxNN in a name, an episode Sonarr
+    skip:   a firm no (volumes missing from the set, no video inside, no SxxEyy/NxNN in a name, an episode Sonarr
             doesn't list, no owning *arr item). Parked for a human; nothing touched.
     error:  lsar or an *arr API failed; retried like a failed unpack."""
     cache = {} if cache is None else cache
+    gone = rar_extract.missing_volumes(rset)
+    if gone:
+        return {'action': 'skip', 'reason': f'incomplete set: {len(gone)} volume(s) missing (first {gone[0]})'}
     lst = (contents or rar_extract.list_contents)(rset['first'])
     if not lst.get('ok'):
         return {'action': 'error', 'reason': lst.get('error') or 'lsar failed'}
