@@ -10,3 +10,6 @@ graphify-out/
 .venv/
 ANSWER.md
 plex-automation-debugcell/
+
+# update.sh: commit the image was last built from
+.last-built-sha
