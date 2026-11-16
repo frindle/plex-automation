@@ -44,7 +44,7 @@ mkf() {
 
 run() { # [extra extras] ; env: EXTRA_OVR (code), flags in $FLAGS
   env SCRIPT="$SCRIPT" ROOT="$R" CAP="$CAP" R="$R" M="$M" LOG_FILE="$R/glacier.log" LOG_DIR="$R" LOCK_FILE="$R/lock" \
-      NOTIFY_CMD="$R/bin/notify" MIN_AGE_DAYS="${MIN_AGE_DAYS:-0}" PAUSE_SETTLE_SEC=0 MOVE_WINDOW= FILL_START_PCT=0 ${ENVX:-} \
+      NOTIFY_CMD="$R/bin/notify" TIERING_API=http://127.0.0.1:9 MIN_AGE_DAYS="${MIN_AGE_DAYS:-0}" PAUSE_SETTLE_SEC=0 MOVE_WINDOW= FILL_START_PCT=0 ${ENVX:-} \
       bash -c 'source "$SCRIPT"; source "$R/ovr.sh"; eval "$EXTRA_OVR"; main "$@"' harness "$@" 2>&1
 }
 EXTRA_OVR=""; export EXTRA_OVR
