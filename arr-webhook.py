@@ -8136,6 +8136,15 @@ def llm_decisions():
         return jsonify({'ok': True, 'count': 0, 'entries': []}), 200
 
 
+@app.route('/llm-layers', methods=['GET'])
+def llm_layers():
+    """Which decision layers each kind uses, in order (no keys or URLs). Paid layers appear only behind a free one."""
+    try:
+        return jsonify(dict(llm_advisor.layer_status(os.environ), ok=True)), 200
+    except Exception as e:  # noqa: BLE001
+        return jsonify({'ok': False, 'error': type(e).__name__}), 500
+
+
 @app.route('/llm-spend', methods=['GET'])
 def llm_spend():
     month = request.args.get('month') or datetime.now().strftime('%Y-%m')
