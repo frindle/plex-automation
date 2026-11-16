@@ -117,12 +117,13 @@ check "rerun, no change: up -d still runs" "$(ups)" 1
 grep -q 'build skipped' "$WORK/out.txt" && ok "rerun prints the skip line" || bad "rerun prints the skip line"
 
 # 3. only files that never reach the image
+LAST_BUILT="$(marker)"
 for f in $NONINPUT_FILES; do
   upstream "$f" append
   run_update
   check "$f only: no build" "$(builds)" 0
   check "$f only: up -d still runs" "$(ups)" 1
-  check "$f only: marker follows origin" "$(marker)" "$(head_of_origin)"
+  check "$f only: marker stays at the last build" "$(marker)" "$LAST_BUILT"
 done
 
 # 4. an image input

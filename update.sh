@@ -24,7 +24,8 @@ esac
 # --- build only what changed -------------------------------------------------
 # $BUILD_MARKER holds the commit the image was last built from. It is
 # gitignored, so `git reset --hard` leaves it alone. It is written only after a
-# build succeeded (or after a range of commits that cannot change the image).
+# build succeeded; a skipped run leaves it, so the next diff still starts at the
+# last real build.
 BUILD_MARKER=.last-built-sha
 
 # is_build_input <path>: succeeds when a change to <path> can change the image.
@@ -80,11 +81,11 @@ if [ "$DO_BUILD" = 1 ]; then
   echo "=== building${EXTRA_BUILD_ARGS:+ (no cache)}: $BUILD_WHY ==="
   # shellcheck disable=SC2086
   docker-compose build $EXTRA_BUILD_ARGS
+  # Reached only when the build succeeded (set -e).
+  git rev-parse HEAD > "$BUILD_MARKER"
 else
   echo "=== build skipped: $BUILD_WHY ==="
 fi
-# Reached only when the build succeeded (set -e) or was not needed.
-git rev-parse HEAD > "$BUILD_MARKER"
 
 echo "=== restart ==="
 docker-compose up -d
