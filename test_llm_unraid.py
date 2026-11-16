@@ -153,11 +153,45 @@ def test_chat_timeout_error_and_garbage_pass_on(tmp_path):
 
 def test_only_configured_kinds_use_unraid(tmp_path):
     http = world(ollama('allow', 0.95), chat('allow', 0.9))
-    _, info, _ = run(fresh(tmp_path, 'a'), Clock(), http, env=UENV)
+    _, info, _ = run(fresh(tmp_path, 'a'), Clock(), http, env=dict(UENV, LLM_UNRAID_KINDS='import_identity'))
     assert http.n('unraid.invalid') == 0 and info['layer'] == 'local'
     http = world(ollama('allow', 0.95), chat('allow', 0.9))
     _, info, _ = run(fresh(tmp_path, 'b'), Clock(), http, env=dict(UENV, LLM_UNRAID_KINDS='import_identity, upgrade_gate'))
     assert info['layer'] == 'unraid'
+
+
+def test_upgrade_gate_uses_unraid_by_default(tmp_path):
+    http = world(ollama('allow', 0.95), chat('allow', 0.9))
+    _, info, _ = run(tmp_path, Clock(), http, env=UENV)
+    assert info['layer'] == 'unraid' and http.n('local.invalid') == 0
+
+
+UONLY = {'UNRAID_OLLAMA_URL': 'http://unraid.invalid:11434', 'DARKBLOOM_CLOUD_API_KEY': 'k-paid'}
+
+
+def test_unraid_only_failure_waits_before_paid(tmp_path):
+    clock = Clock()
+    http = world(Timeout('slow'))
+    kw = dict(env=UONLY, kind='import_identity', rules='match', facts=ID)
+    out, info, rows = run(tmp_path, clock, http, **kw)
+    assert info['pending'] is True and out == 'unsure' and http.n('api.darkbloom.dev') == 0
+    assert rows[-1]['unraid']['pass'] == 'timeout'
+    clock.minutes(10)
+    out, info, _ = run(tmp_path, clock, http, **kw)
+    assert info['pending'] is True and http.n('api.darkbloom.dev') == 0
+    clock.minutes(6)
+    out, info, _ = run(tmp_path, clock, http, **kw)
+    assert info['layer'] == 'paid' and http.n('api.darkbloom.dev') == 1
+
+
+def test_unraid_only_answer_after_a_miss_clears_the_clock(tmp_path):
+    clock = Clock()
+    kw = dict(env=UONLY, kind='import_identity', rules='match', facts=ID)
+    run(tmp_path, clock, world(Timeout('slow')), **kw)
+    clock.minutes(5)
+    out, info, _ = run(tmp_path, clock, world(ollama('mismatch', 0.95)), **kw)
+    assert info['layer'] == 'unraid' and out == 'mismatch'
+    assert json.loads((tmp_path / 'llm_pending.json').read_text()) == {}
 
 
 def test_model_is_fixed_default_14b_and_8b_only_when_set(tmp_path):

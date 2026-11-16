@@ -127,7 +127,9 @@ def test_after_wait_paid_is_called_and_logged_with_usage(tmp_path):
     call = row['paid_calls'][0]
     assert call['prompt_tokens'] == 100 and call['completion_tokens'] == 10 and call['request_id'] == 'req-1'
     paid_post = [c for c in http.calls if 'api.darkbloom.dev' in c[1]][0]
-    assert 'chat_template_kwargs' not in paid_post[2]['json']
+    # No thinking: with it on, the paid model spent the whole budget reasoning and never wrote the JSON.
+    assert paid_post[2]['json']['chat_template_kwargs'] == {'enable_thinking': False}
+    assert paid_post[2]['json']['max_tokens'] == 2048
     assert paid_post[2]['headers']['Authorization'] == 'Bearer ' + KEY
     assert KEY not in json.dumps(rows)
     assert json.loads((tmp_path / 'llm_pending.json').read_text()) == {}
@@ -175,10 +177,42 @@ def test_exhausted_chain_returns_rules(tmp_path):
     assert out == 'allow' and info['layer'] is None
 
 
-def test_no_local_env_goes_straight_to_paid(tmp_path):
+def test_no_free_layer_never_pays(tmp_path):
+    # Paid is only a backup for the free layers (Penn, 2026-11-16): with none configured the rules stand.
     http = FakeHttp({'api.darkbloom.dev': chat('reject')})
-    out, info, _ = run(tmp_path, Clock(), http, env={'DARKBLOOM_CLOUD_API_KEY': KEY})
+    claude = FakeClaude('reject')
+    out, info, rows = run(tmp_path, Clock(), http, env={'DARKBLOOM_CLOUD_API_KEY': KEY, 'ANTHROPIC_API_KEY': 'sk-fake'},
+                          claude=claude)
+    assert out == 'allow' and info['layer'] is None and info['pending'] is False
+    assert http.n('api.darkbloom.dev') == 0 and claude.calls == []
+    assert rows[-1]['error'] == 'no free layer configured' and 'paid_calls' not in rows[-1]
+
+
+def test_paid_retries_without_template_kwargs_when_rejected(tmp_path):
+    clock = Clock()
+    bodies = []
+
+    def paid():
+        body = http.calls[-1][2]['json']
+        bodies.append(dict(body))
+        return Resp(400, {'error': 'unknown field'}) if 'chat_template_kwargs' in body else chat('reject')
+
+    http = FakeHttp({'local.invalid': ConnectionError('down'), 'api.darkbloom.dev': paid})
+    run(tmp_path, clock, http)
+    clock.minutes(16)
+    out, info, _ = run(tmp_path, clock, http)
     assert out == 'reject' and info['layer'] == 'paid'
+    assert len(bodies) == 2 and 'chat_template_kwargs' not in bodies[1] and bodies[1]['max_tokens'] == 2048
+
+
+def test_paid_server_error_is_not_retried(tmp_path):
+    clock = Clock()
+    http = FakeHttp({'local.invalid': ConnectionError('down'), 'api.darkbloom.dev': Resp(500, {})})
+    env = {k: v for k, v in ENV.items() if k != 'ANTHROPIC_API_KEY'}
+    run(tmp_path, clock, http, env=env)
+    clock.minutes(16)
+    out, info, _ = run(tmp_path, clock, http, env=env)
+    assert out == 'allow' and info['layer'] is None and http.n('api.darkbloom.dev') == 1
 
 
 def test_restart_keeps_first_seen(tmp_path):
@@ -353,3 +387,17 @@ def test_spend_summary_sums_month_per_layer(tmp_path):
     assert got == {'paid': {'calls': 2, 'input_tokens': 150, 'output_tokens': 15},
                    'claude': {'calls': 1, 'input_tokens': 200, 'output_tokens': 20}}
     assert la.spend_summary(str(tmp_path / 'none'), '2026-11') == {}
+
+
+def test_layer_status_lists_free_first_and_hides_secrets():
+    env = dict(ENV, LLM_DECISIONS='enforce', UNRAID_OLLAMA_URL='http://unraid.invalid:11434')
+    st = la.layer_status(env)
+    assert st['mode'] == 'enforce'
+    assert st['kinds']['upgrade_gate'] == ['unraid', 'local', 'paid', 'claude']
+    assert st['kinds']['dupe_confirm'] == ['unraid', 'local']
+    assert KEY not in json.dumps(st) and 'unraid.invalid' not in json.dumps(st) and 'sk-fake' not in json.dumps(st)
+
+
+def test_layer_status_without_free_layers_shows_no_paid():
+    st = la.layer_status({'LLM_DECISIONS': 'enforce', 'DARKBLOOM_CLOUD_API_KEY': KEY})
+    assert all(v == [] for v in st['kinds'].values()) and st['paid_model'] == 'qwen3.5-35b-a3b'

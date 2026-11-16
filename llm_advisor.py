@@ -2,7 +2,7 @@
 
 Decision chain (each layer is skipped when its env is unset):
   0. Unraid Ollama (LAN)     UNRAID_OLLAMA_URL, model LLM_UNRAID_MODEL (default qwen3:14b), only for
-                             LLM_UNRAID_KINDS (default import_identity,dupe_confirm). Asked only when the GPU is free
+                             LLM_UNRAID_KINDS (default import_identity,dupe_confirm,upgrade_gate). Asked only when the GPU is free
                              (nothing loaded, or its own model loaded) and LLM_UNRAID_HOLD_URL isn't holding.
                              Its answer is kept only when, after hard rules, it is decisive (not unsure) at
                              confidence >= MIN_CONFIDENCE; anything else passes on to local Darkbloom.
@@ -10,8 +10,10 @@ Decision chain (each layer is skipped when its env is unset):
   2. paid Darkbloom          DARKBLOOM_CLOUD_API_KEY
   3. Claude                  ANTHROPIC_API_KEY (official SDK, structured output)
   4. rules                   the caller keeps rules_action
-While the local layer is unavailable the decision is PENDING for LLM_LOCAL_WAIT_MIN minutes (default 15)
-before a paid layer is used. A valid but low-confidence open-model answer escalates to Claude at once.
+Paid layers are only a backup for the free ones: while the free layers (local, or Unraid when it is the only one)
+can't answer, the decision is PENDING for LLM_LOCAL_WAIT_MIN minutes (default 15) before a paid layer is used, and
+with no free layer configured nothing paid is asked (the rules stand). A valid but low-confidence open-model
+answer escalates to Claude at once.
 Shadow mode only asks the free layers (Unraid, local): it changes nothing, so it never spends paid calls.
 dupe_confirm (FREE_ONLY_KINDS) only asks the free layers in every mode: duplicate cleanup is not time-sensitive.
 import_identity answers are cached by pending key for LLM_ANSWER_TTL_H hours (default 24), so a stuck import
@@ -33,6 +35,7 @@ DEFAULT_LOG = '/data/llm_decisions.jsonl'
 DEFAULT_PENDING = '/data/llm_pending.json'
 PAID_BASE = 'https://api.darkbloom.dev/v1'
 PAID_MODEL = 'qwen3.5-35b-a3b'
+PAID_EXTRA_BODY = {'chat_template_kwargs': {'enable_thinking': False}, 'max_tokens': 2048}
 CLAUDE_MODEL = 'claude-sonnet-5-5'
 MODELS_TTL = 15.0
 # Auto-picked local models a kind may use: only models whose back-test passed for that kind. Whatever Darkbloom
@@ -55,7 +58,7 @@ ANSWER_TTL_H = {'dupe_confirm': 720.0}
 # grab-time decisions and upgrades). They wait for the free layers, then fall back to the caller's rules action.
 FREE_ONLY_KINDS = frozenset({'dupe_confirm'})
 UNRAID_MODEL = 'qwen3:14b'
-UNRAID_KINDS = 'import_identity,dupe_confirm'
+UNRAID_KINDS = 'import_identity,dupe_confirm,upgrade_gate'
 # Actions an Unraid answer may settle on its own; unsure (or a hard rule turning an answer into unsure)
 # always passes on to local Darkbloom.
 UNRAID_DECISIVE = {'import_identity': frozenset({'match', 'mismatch'}),
@@ -171,6 +174,24 @@ def _chat_fn(url, model_fn, key, http, total, connect, extra_body=None):
             meta['request_id'] = str(rid)
         return Meta(data['choices'][0]['message']['content'], meta)
     return fn
+
+
+def _rejected_request(e):
+    """True for a 400/422: the server refused the request shape (an unknown field), not the model failing."""
+    code = getattr(getattr(e, 'response', None), 'status_code', None)
+    return code in (400, 422) or str(e).startswith(('http 400', 'http 422'))
+
+
+def _first_accepted(fn, plain):
+    """Ask with fn; if the server rejects that request shape, ask once more with plain."""
+    def go(prompt):
+        try:
+            return fn(prompt)
+        except Exception as e:  # noqa: BLE001
+            if not _rejected_request(e):
+                raise
+            return plain(prompt)
+    return go
 
 
 def _model_tag(name):
@@ -340,13 +361,44 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
     paid_key = (env.get('DARKBLOOM_CLOUD_API_KEY') or '').strip()
     if paid_key:
         pm = (env.get('DARKBLOOM_CLOUD_MODEL') or '').strip() or PAID_MODEL
-        layers['paid'] = Layer('paid', _chat_fn(_chat_url(PAID_BASE), lambda: pm, paid_key, http, 20.0, 5.0), pm)
+        # Same no-thinking request as local: with thinking on, the model spent the whole token budget
+        # reasoning and never wrote the JSON (every paid call 11-15..11-16 hit 1024 tokens, unparseable).
+        purl = _chat_url(PAID_BASE)
+        layers['paid'] = Layer('paid', _first_accepted(
+            _chat_fn(purl, lambda: pm, paid_key, http, 20.0, 5.0, PAID_EXTRA_BODY),
+            _chat_fn(purl, lambda: pm, paid_key, http, 20.0, 5.0, {'max_tokens': PAID_EXTRA_BODY['max_tokens']})), pm)
     ckey = (env.get('ANTHROPIC_API_KEY') or '').strip()
     if ckey or claude_client is not None:
         cm = (env.get('LLM_CLAUDE_MODEL') or '').strip() or CLAUDE_MODEL
         factory = (lambda: claude_client) if claude_client is not None else _real_claude_client(ckey)
         layers['claude'] = Layer('claude', _claude_fn(kind, cm, factory), cm)
     return layers
+
+
+def layer_status(env):
+    """Which layers each kind would use, from env alone (no calls, no keys or URLs): for /llm-layers."""
+    mode = (env.get('LLM_DECISIONS', 'off') or '').strip().lower()
+    mode = mode if mode in ('shadow', 'enforce') else 'off'
+    ukinds = {k.strip() for k in (env.get('LLM_UNRAID_KINDS') or UNRAID_KINDS).split(',') if k.strip()}
+    unraid = bool((env.get('UNRAID_OLLAMA_URL') or '').strip())
+    local = bool((env.get('DARKBLOOM_BASE_URL') or '').strip() or (env.get('LLM_DECIDE_URL') or '').strip())
+    paid = bool((env.get('DARKBLOOM_CLOUD_API_KEY') or '').strip())
+    claude = bool((env.get('ANTHROPIC_API_KEY') or '').strip())
+    kinds = {}
+    for kind in sorted(llm_decide.KINDS):
+        names = []
+        if unraid and kind in ukinds:
+            names.append('unraid')
+        if local:
+            names.append('local')
+        free = bool(names)
+        if free and mode == 'enforce' and kind not in FREE_ONLY_KINDS:
+            names += [n for n, on in (('paid', paid), ('claude', claude)) if on]
+        kinds[kind] = names
+    return {'mode': mode, 'kinds': kinds,
+            'unraid_model': ((env.get('LLM_UNRAID_MODEL') or '').strip() or UNRAID_MODEL) if unraid else None,
+            'local_model': ((env.get('LLM_LOCAL_MODEL') or '').strip() or 'auto') if local else None,
+            'paid_model': ((env.get('DARKBLOOM_CLOUD_MODEL') or '').strip() or PAID_MODEL) if paid else None}
 
 
 def hold_active(env, http=None, prefix='LLM_LOCAL_HOLD'):
@@ -639,6 +691,21 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
             if mins < wait_min:
                 res.update(pending=True, first_pending=ent['attempts'] == 1)
                 return res
+    if local is None and unraid is not None and res['decision'] is None:
+        # Unraid is the only free layer: it gets the same wait before anything paid is asked.
+        why = 'unraid ' + str(res['unraid'].get('pass') or 'failed')
+        res['error'] = why
+        ent = store.touch(key, kind, why)
+        mins = (now() - ent['first_seen']) / 60.0
+        res['pending_min'] = round(mins, 1)
+        if mins < wait_min:
+            res.update(pending=True, first_pending=ent['attempts'] == 1)
+            return res
+    if local is None and unraid is None:
+        # Paid layers are only a backup for the free ones (Penn, 2026-11-16). With no free layer configured,
+        # nothing is asked and the rules stand.
+        res['error'] = 'no free layer configured'
+        return res
     if res['decision'] is None:
         paid = layers.get('paid')
         if paid is not None:
