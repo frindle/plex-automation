@@ -34,6 +34,13 @@ Copy (`rsync -aHAXS`: times, perms, owner, ACLs, xattrs) -> verify (size, mtime,
 
 Fill stops when disk1 reaches `TARGET_PCT` (98), evict when disk2 reaches `EVICT_DEST_PCT` (95); both stop at `NIGHTLY_CAP_BYTES` (1.5 TB) together, evict first.
 
+Fill only starts on a source disk that is over `FILL_START_PCT` (85) used, and moves from it until it is down to `FILL_STOP_PCT` (75), so most nights fill moves nothing and a full disk gets one bigger move (spread over nights by the cap). `FILL_START_PCT=0` fills whenever disk1 has room (the old behavior). In a dry run, the source disk counts the bytes evict would put on it.
+
+## Plex yield and run status
+Both files live in `STATE_DIR` (default `/mnt/cache/appdata/ollama-queue/state/glacier`, which the ollama-queue container sees as `/home/queue/state/glacier`). The run creates only the last folder, and only when its parent exists; otherwise neither file is used. Dry runs use neither.
+- `plex-busy`: the queue's Plex watcher touches it while Plex is streaming. Before each unit, a live run that finds it less than `PLEX_BUSY_MAX_AGE` (600) seconds old logs `YIELD`, checks again every `YIELD_POLL_SEC` (60), and stops for the night if the move window closes while it waits. An older file is ignored, so a dead watcher never blocks moves. The notification says how long it waited.
+- `glacier-status`: one line `<epoch> <state> phase=evict|fill moved_bytes=N yielded_sec=N [reason=...]`, written atomically at start, before each unit, while waiting, and on exit. States: `start`, `moving`, `yield`, `done`, `stopped` (`reason=window` or `reason=signal`), `failed` (`reason=copy`, or no reason when the run died early).
+
 ## Ranking and access times
 Ranked by atime (`stat` only, file contents are never read for ranking). Today the disks are mounted `noatime`, so atime is roughly the date each file was added; the script warns and still works. After access times are turned on (`relatime,nodiratime`), ranking becomes real last-opened. `REQUIRE_ATIME=1` makes it abort on `noatime` instead.
 
@@ -60,7 +67,7 @@ Rebuild/redeploy the plex-automation container so the new endpoints exist (`tier
 4. When happy, change the script body to run `--apply` (or the wrapper: `exec bash .../glacier-mover.sh --apply`).
 5. Set `LOG_DIR=/mnt/cache/appdata/tiering` to keep the log across reboots (default is `/var/log/tiering`, which is RAM). One Unraid notification per run with moved/failed/skipped counts.
 
-Settings via env vars (defaults in the script header): `PHASES MEDIA_ROOTS GLACIER SRC_DISKS TARGET_PCT NIGHTLY_CAP_BYTES MIN_AGE_DAYS EXCLUDE_NAMES EXCLUDE_CONTAINS MAIN_EXT SIDE_EXT EVICT_TO EVICT_SHARE EVICT_HOT_ROOTS EVICT_DEST_PCT EVICT_NEVER_TOP SHARE_CFG TIERING_API PAUSE_SETTLE_SEC NOTIFY_ON_DRY LOG_DIR TURBO_WRITE`. `PHASES=fill` turns evict off.
+Settings via env vars (defaults in the script header): `PHASES MEDIA_ROOTS GLACIER SRC_DISKS TARGET_PCT FILL_START_PCT FILL_STOP_PCT NIGHTLY_CAP_BYTES MIN_AGE_DAYS EXCLUDE_NAMES EXCLUDE_CONTAINS MAIN_EXT SIDE_EXT EVICT_TO EVICT_SHARE EVICT_HOT_ROOTS EVICT_DEST_PCT EVICT_NEVER_TOP SHARE_CFG TIERING_API PAUSE_SETTLE_SEC NOTIFY_ON_DRY LOG_DIR TURBO_WRITE MOVE_WINDOW STATE_DIR PLEX_BUSY_MAX_AGE YIELD_POLL_SEC`. `PHASES=fill` turns evict off.
 
 ## Turbo write
 A live run turns Unraid's turbo write on (`mdcmd set md_write_method 1`, reconstruct write) just before its first copy and sets it back to read/modify/write (`0`) when it ends, including on INT/TERM. Copies to the array run much faster, but every array disk spins while the run copies. If the setting already reads `1` in `/var/local/emhttp/var.ini` (turned on by hand), the run leaves it alone both ways. The value to restore is kept in `/var/run/glacier-turbo-write.restore` until it is set back, so a run that was killed outright is undone by the next run (dry runs too). Dry runs and runs with nothing to move never touch it. `TURBO_WRITE=0` turns this off. Settings -> Disk Settings keeps showing the saved choice (Auto); a reboot applies the saved choice again.

@@ -30,11 +30,24 @@ EXCLUDE_NAMES="${EXCLUDE_NAMES:-Downloads Incomplete Frigate InfluxDB Docker Doc
 # ...or containing one of these (Time Machine shares, the reselling app).
 EXCLUDE_CONTAINS="${EXCLUDE_CONTAINS:-timemachine resell}"
 TARGET_PCT="${TARGET_PCT:-98}"                    # stop filling disk1 at this % used
+# Fill runs only for a source disk above FILL_START_PCT used, and moves from it
+# until it is down to FILL_STOP_PCT (or the cap or TARGET_PCT stops it first), so
+# most nights move nothing. FILL_START_PCT=0 = fill whenever GLACIER has room.
+FILL_START_PCT="${FILL_START_PCT:-85}"
+FILL_STOP_PCT="${FILL_STOP_PCT:-75}"
 NIGHTLY_CAP_BYTES="${NIGHTLY_CAP_BYTES:-1500000000000}"   # 1.5 TB per run
 # A live run copies only inside this window, in the host's local time (the zone
 # Unraid's cron uses). It may wrap midnight. "" = any time. Dry runs ignore it.
 MOVE_WINDOW="${MOVE_WINDOW-22:00-06:00}"
 MIN_AGE_DAYS="${MIN_AGE_DAYS:-30}"                # never move a file modified in the last N days
+# Shared with the ollama-queue container's Plex watcher (bind mount). plex-busy:
+# the watcher touches it while Plex streams; a live run waits before each unit
+# while it is under PLEX_BUSY_MAX_AGE seconds old (an older one is ignored).
+# glacier-status: one line "<epoch> <state> key=value...", state = start, moving,
+# yield, done, stopped or failed. Live runs only. "" = neither file is used.
+STATE_DIR="${STATE_DIR-$MNT/cache/appdata/ollama-queue/state/glacier}"   # the queue container mounts .../state
+PLEX_BUSY_MAX_AGE="${PLEX_BUSY_MAX_AGE:-600}"
+YIELD_POLL_SEC="${YIELD_POLL_SEC:-60}"
 CHUNK_UNITS="${CHUNK_UNITS:-100}"                 # units per torrent-gate request
 MAX_MISFITS="${MAX_MISFITS:-200}"                 # stop after this many consecutive no-fit files
 FOLDER_DEPTH="${FOLDER_DEPTH:-4}"                 # path parts (below /mnt/diskN) per "folder" in the report
@@ -86,6 +99,37 @@ in_window() {
   now=$((10#$now)); s=$((10#${s/:/})); e=$((10#${e/:/}))
   if [ "$s" -le "$e" ]; then [ "$now" -ge "$s" ] && [ "$now" -lt "$e" ]
   else [ "$now" -ge "$s" ] || [ "$now" -lt "$e" ]; fi
+}
+
+# --- Plex yield and run status (shared with the queue container) -------------
+
+STATE_OK=0; YIELD_SEC=0; EXIT_STATE=failed; EXIT_REASON=""
+
+# state_dir_ok -> 0 when STATE_DIR is set and exists (created if only it is missing)
+state_dir_ok() {
+  [ -n "$STATE_DIR" ] || return 1
+  [ -d "$STATE_DIR" ] && return 0
+  [ -d "${STATE_DIR%/*}" ] && mkdir "$STATE_DIR" 2>/dev/null
+  [ -d "$STATE_DIR" ]
+}
+
+status_detail() { printf 'phase=%s moved_bytes=%s yielded_sec=%s' "${PHASE:--}" "${B_MOVED:-0}" "$YIELD_SEC"; }
+
+# write_status STATE [EXTRA] -- atomic one-line status, live runs with a STATE_DIR only
+write_status() {
+  [ "$STATE_OK" = 1 ] || return 0
+  local f="$STATE_DIR/glacier-status"
+  printf '%s %s %s%s\n' "$(date +%s)" "$1" "$(status_detail)" "${2:+ $2}" >"$f.tmp" 2>/dev/null &&
+    mv -f "$f.tmp" "$f" 2>/dev/null
+  return 0
+}
+
+# plex_busy -> 0 while the watcher's plex-busy file is fresh
+plex_busy() {
+  [ "$STATE_OK" = 1 ] || return 1
+  local m
+  m="$(stat -c %Y "$STATE_DIR/plex-busy" 2>/dev/null)" || return 1
+  [ $(( $(date +%s) - m )) -lt "$PLEX_BUSY_MAX_AGE" ]
 }
 
 hr() { # bytes -> human
@@ -210,6 +254,10 @@ preflight() {
   mkdir -p "$LOG_DIR" "$(dirname "$LOCK_FILE")" 2>/dev/null
   if [ -n "$MOVE_WINDOW" ] && ! [[ "$MOVE_WINDOW" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
     log "ABORT: MOVE_WINDOW must look like 22:00-06:00 (got '$MOVE_WINDOW')"; return 2
+  fi
+  if ! [[ "$FILL_START_PCT" =~ ^[0-9]+$ && "$FILL_STOP_PCT" =~ ^[0-9]+$ ]] || [ "$FILL_START_PCT" -gt 100 ] \
+      || { [ "$FILL_START_PCT" -gt 0 ] && [ "$FILL_STOP_PCT" -gt "$FILL_START_PCT" ]; }; then
+    log "ABORT: FILL_START_PCT/FILL_STOP_PCT must be whole percents with stop <= start (got '$FILL_START_PCT'/'$FILL_STOP_PCT')"; return 2
   fi
   local disks="$GLACIER $SRC_DISKS"
   case " $PHASES " in *" evict "*) case " $disks " in *" $EVICT_TO "*) ;; *) disks="$disks $EVICT_TO" ;; esac ;; esac
@@ -559,6 +607,7 @@ prune_dirs() {
 
 CH_AT=(); CH_SZ=(); CH_DK=(); CH_PATHS=()
 ROOM_LEFT=0; CAP_LEFT=0; MISFITS=0; STOP=0; WINDOW_CLOSED=0
+declare -A SRC_LEFT=()   # fill: bytes each source disk may still give before FILL_STOP_PCT
 N_MOVED=0; B_MOVED=0; N_FAILED=0; N_SKIPPED=0; N_PAUSED=0; N_UNITS=0
 EV_RAN=0; EV_N=0; EV_B=0; EV_WAIT_N=0; EV_WAIT_B=0; EV_NOFIT=0   # evict-phase share of the above
 PAUSED_HASHES=()   # hashes this run paused and has not resumed yet (the exit trap resumes them)
@@ -604,6 +653,13 @@ count_moved() { # files bytes
   return 0
 }
 
+# refund I -- give chunk unit I's bytes back to the room, the cap and its source budget
+refund() {
+  ROOM_LEFT=$((ROOM_LEFT + CH_SZ[$1])); CAP_LEFT=$((CAP_LEFT + CH_SZ[$1]))
+  [ -n "${SRC_LEFT[${CH_DK[$1]}]+x}" ] && SRC_LEFT[${CH_DK[$1]}]=$((SRC_LEFT[${CH_DK[$1]}] + CH_SZ[$1]))
+  return 0
+}
+
 process_chunk() {
   local i j n=${#CH_AT[@]} p psz unitstat reason line st rs path
   [ "$n" -eq 0 ] && return 0
@@ -630,7 +686,7 @@ process_chunk() {
       done
     fi
     if [ "$unitstat" = wait ]; then
-      ROOM_LEFT=$((ROOM_LEFT + CH_SZ[i])); CAP_LEFT=$((CAP_LEFT + CH_SZ[i]))
+      refund "$i"
       if [ "$PHASE" = evict ]; then
         EV_WAIT_N=$((EV_WAIT_N + 1)); EV_WAIT_B=$((EV_WAIT_B + CH_SZ[i]))
         note_skip "evict: torrent: $reason" "${paths[@]}"; echo "evict: torrent busy (downloading, checking or erroring)" >>"$TMP/reject"
@@ -655,10 +711,25 @@ process_chunk() {
       log "STOP  outside the move window $MOVE_WINDOW (local time now $(date '+%H:%M %Z')): the rest waits for the next run"
       break
     fi
+    if plex_busy; then
+      local y0=$YIELD_SEC
+      log "YIELD  plex streaming: waiting before the next unit"
+      while plex_busy; do
+        write_status yield
+        sleep "$YIELD_POLL_SEC"; YIELD_SEC=$((YIELD_SEC + YIELD_POLL_SEC))
+        if ! in_window; then
+          WINDOW_CLOSED=1; STOP=1
+          log "STOP  outside the move window $MOVE_WINDOW while waiting for Plex (local time now $(date '+%H:%M %Z')): the rest waits for the next run"
+          break 2
+        fi
+      done
+      log "RESUME  plex idle after $((YIELD_SEC - y0))s"
+    fi
+    write_status moving
     SKIP_REASON=""; FAIL_REASON=""
     if [ "$unitstat" = pause ]; then
       if ! pause_unit "${paths[@]}"; then
-        ROOM_LEFT=$((ROOM_LEFT + CH_SZ[i])); CAP_LEFT=$((CAP_LEFT + CH_SZ[i]))
+        refund "$i"
         N_PAUSED=$((N_PAUSED - 1))
         note_skip "torrent: could not pause (no answer or refused)" "${paths[@]}"
         if [ "$PHASE" = evict ]; then
@@ -682,9 +753,9 @@ process_chunk() {
            psz=0
          done
          [ "$PHASE" = evict ] && prune_dirs "${CH_DK[$i]}" "$DEST" "${paths[@]}" ;;
-      3) ROOM_LEFT=$((ROOM_LEFT + CH_SZ[i])); CAP_LEFT=$((CAP_LEFT + CH_SZ[i]))
+      3) refund "$i"
          note_skip "$SKIP_REASON" "${paths[@]}" ;;
-      *) ROOM_LEFT=$((ROOM_LEFT + CH_SZ[i])); CAP_LEFT=$((CAP_LEFT + CH_SZ[i]))
+      *) refund "$i"
          N_FAILED=$((N_FAILED + 1)); log "FAILED  $FAIL_REASON  (source kept)  ${paths[*]}" ;;
     esac
   done
@@ -701,6 +772,7 @@ flush_unit() {
     [ "$MISFITS" -ge "$MAX_MISFITS" ] && STOP=1
     return 0
   fi
+  if [ -n "${SRC_LEFT[$dk]+x}" ] && [ "${SRC_LEFT[$dk]}" -le 0 ]; then return 0; fi   # source at FILL_STOP_PCT
   MISFITS=0
   # Evict skips this early check: Deluge holds seeding files open until the pause,
   # and move_unit checks again after it.
@@ -710,6 +782,11 @@ flush_unit() {
     done
   fi
   ROOM_LEFT=$((ROOM_LEFT - sz)); CAP_LEFT=$((CAP_LEFT - sz))
+  if [ -n "${SRC_LEFT[$dk]+x}" ]; then
+    SRC_LEFT[$dk]=$((SRC_LEFT[$dk] - sz))
+    local d left=0; for d in "${!SRC_LEFT[@]}"; do [ "${SRC_LEFT[$d]}" -gt 0 ] && left=1; done
+    [ "$left" = 0 ] && STOP=1   # every source is down to FILL_STOP_PCT
+  fi
   CH_AT+=("$at"); CH_SZ+=("$sz"); CH_DK+=("$dk")
   local joined="" ; for p in "$@"; do joined="${joined:+$joined$NL}$p"; done
   CH_PATHS+=("$joined")
@@ -757,6 +834,7 @@ report() {
     log "nothing to move"
   fi
   log "totals: moved=$N_MOVED ($(hr "$B_MOVED")) failed=$N_FAILED skipped=$N_SKIPPED torrents-paused=$N_PAUSED"
+  [ "$YIELD_SEC" -gt 0 ] && log "waited ${YIELD_SEC}s for Plex streams"
   if [ "$EV_RAN" = 1 ]; then
     log "evict $GLACIER -> $EVICT_TO: moved=$EV_N ($(hr "$EV_B")) waiting-on-torrent=$EV_WAIT_N unit(s) ($(hr "$EV_WAIT_B")) no-room-or-cap=$EV_NOFIT unit(s)"
     if [ -s "$TMP/evict-blocked" ]; then
@@ -772,6 +850,7 @@ report() {
     local subj="Glacier: moved $N_MOVED, failed $N_FAILED, skipped $N_SKIPPED"
     [ "$APPLY" = 1 ] || subj="Glacier dry run: would move $N_MOVED, skipped $N_SKIPPED"
     [ "$WINDOW_CLOSED" = 1 ] && subj="$subj, stopped: outside $MOVE_WINDOW"
+    [ "$YIELD_SEC" -gt 0 ] && subj="$subj, waited $(( (YIELD_SEC + 59) / 60 )) min for Plex"
     if [ -x "$NOTIFY_CMD" ]; then
       "$NOTIFY_CMD" -e "Glacier tiering" -s "$subj" \
         -d "$(hr "$((B_MOVED - EV_B))") to $GLACIER, $(hr "$EV_B") off it to $EVICT_TO; torrents paused and resumed $N_PAUSED. Log: $LOG_FILE" -i "$imp" >/dev/null 2>&1
@@ -784,7 +863,7 @@ report() {
 # phase_evict: move what keeps GLACIER awake to EVICT_TO
 phase_evict() {
   local total used
-  PHASE=evict; DEST="$EVICT_TO"; GATE_KEEP=""
+  PHASE=evict; DEST="$EVICT_TO"; GATE_KEEP=""; SRC_LEFT=()
   if [ "$EVICT_TO" = "$GLACIER" ]; then log "SKIP evict: EVICT_TO is the glacier disk"; return 0; fi
   if ! share_excludes_glacier; then
     if [ "$APPLY" = 1 ]; then
@@ -818,7 +897,24 @@ phase_fill() {
   log "fill -> $GLACIER: used=$(hr "$used") of $(hr "$total") target=${TARGET_PCT}% room=$(hr "$((ROOM_LEFT > 0 ? ROOM_LEFT : 0))") cap left=$(hr "$((CAP_LEFT > 0 ? CAP_LEFT : 0))")"
   if [ "$ROOM_LEFT" -le 0 ]; then log "$GLACIER is already at or above ${TARGET_PCT}%: nothing to do"; return 0; fi
   if [ "$CAP_LEFT" -le 0 ]; then log "fill: tonight's cap is used up"; return 0; fi
-  build_candidates "$TMP/cands"
+  local srcs="$SRC_DISKS" d dt du
+  SRC_LEFT=()
+  if [ "$FILL_START_PCT" -gt 0 ]; then
+    srcs=""
+    for d in $SRC_DISKS; do
+      read -r dt du <<<"$(fs_stats "$d")"
+      if [ -z "${dt:-}" ] || [ "${dt:-0}" -le 0 ]; then log "fill: cannot read free space of $d, left out"; continue; fi
+      [ "$APPLY" != 1 ] && [ "$d" = "$EVICT_TO" ] && du=$((du + EV_B))   # a dry run's evict would land here
+      if [ $((du * 100)) -gt $((dt * FILL_START_PCT)) ]; then
+        srcs="$srcs $d"; SRC_LEFT[$d]=$((du - dt * FILL_STOP_PCT / 100))
+        log "fill: $d is at $((du * 100 / dt))% (over the ${FILL_START_PCT}% start line): moving up to $(hr "${SRC_LEFT[$d]}") off it, down to ${FILL_STOP_PCT}%"
+      else
+        log "fill: $d is at $((du * 100 / dt))%, under the ${FILL_START_PCT}% start line: left as is"
+      fi
+    done
+    if [ -z "$srcs" ]; then log "fill: no source disk is over ${FILL_START_PCT}%: nothing to fill tonight"; return 0; fi
+  fi
+  SRC_DISKS="$srcs" build_candidates "$TMP/cands"
   plan_and_run
 }
 
@@ -836,9 +932,11 @@ main() {
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then log "ABORT: another glacier run holds the lock"; return 2; fi
   TMP="$(mktemp -d)"
-  trap 'resume_unit; turbo_off; rm -rf "$TMP"' EXIT
+  STATE_OK=0; [ "$APPLY" = 1 ] && state_dir_ok && STATE_OK=1
+  trap 'resume_unit; turbo_off; write_status "$EXIT_STATE" "${EXIT_REASON:+reason=$EXIT_REASON}"; rm -rf "$TMP"' EXIT
   turbo_restore_stale
-  trap 'exit 130' INT; trap 'exit 143' TERM
+  trap 'EXIT_STATE=stopped EXIT_REASON=signal; exit 130' INT; trap 'EXIT_STATE=stopped EXIT_REASON=signal; exit 143' TERM
+  write_status start
   : >"$TMP/plan"; : >"$TMP/reject"; : >"$TMP/skipped-groups"; : >"$TMP/evict-blocked"
   read -r total used <<<"$(fs_stats "$GLACIER")"
   if [ -z "${total:-}" ] || [ "${total:-0}" -le 0 ]; then log "ABORT: cannot read free space of $GLACIER"; return 2; fi
@@ -857,6 +955,9 @@ main() {
     esac
   done
   report
+  if [ "$N_FAILED" -gt 0 ]; then EXIT_STATE=failed; EXIT_REASON=copy
+  elif [ "$WINDOW_CLOSED" = 1 ]; then EXIT_STATE=stopped; EXIT_REASON=window
+  else EXIT_STATE=done; fi
   [ "$N_FAILED" -gt 0 ] && return 1
   return 0
 }

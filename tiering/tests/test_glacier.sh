@@ -44,7 +44,7 @@ mkf() {
 
 run() { # [extra extras] ; env: EXTRA_OVR (code), flags in $FLAGS
   env SCRIPT="$SCRIPT" ROOT="$R" CAP="$CAP" R="$R" M="$M" LOG_FILE="$R/glacier.log" LOG_DIR="$R" LOCK_FILE="$R/lock" \
-      NOTIFY_CMD="$R/bin/notify" MIN_AGE_DAYS="${MIN_AGE_DAYS:-0}" PAUSE_SETTLE_SEC=0 MOVE_WINDOW= ${ENVX:-} \
+      NOTIFY_CMD="$R/bin/notify" MIN_AGE_DAYS="${MIN_AGE_DAYS:-0}" PAUSE_SETTLE_SEC=0 MOVE_WINDOW= FILL_START_PCT=0 ${ENVX:-} \
       bash -c 'source "$SCRIPT"; source "$R/ovr.sh"; eval "$EXTRA_OVR"; main "$@"' harness "$@" 2>&1
 }
 EXTRA_OVR=""; export EXTRA_OVR
@@ -839,6 +839,100 @@ echo "$out" | grep -q 'WOULD MOVE' && ok || bad "dry run plans outside the windo
 setup window_bad_value
 out="$(ENVX="MOVE_WINDOW=10pm-6am" run --apply)"; rc=$?
 eq "bad window aborts" "$rc" 2
+
+# --- fill start/stop lines ----------------------------------------------------
+setup fill_start_line_not_reached
+mkf disk2 data/Media/a.mkv 3000 100; mkf disk3 data/Media/b.mkv 3000 90     # 30% each
+out="$(ENVX="FILL_START_PCT=85 FILL_STOP_PCT=75" run --apply)"; rc=$?
+eq "exit 0" "$rc" 0
+check "a stays" src disk2 data/Media/a.mkv
+check "b stays" src disk3 data/Media/b.mkv
+echo "$out" | grep -q 'no source disk is over 85%' && ok || bad "logs no fill: $out"
+
+setup fill_drains_to_stop_line
+for i in 1 2 3 4 5 6 7 8 9; do mkf disk2 "data/Media/a$i.mkv" 1000 $((200 - i)); done   # disk2 90%
+mkf disk3 data/Media/c.mkv 1000 300                                                     # disk3 10%, oldest
+out="$(ENVX="FILL_START_PCT=85 FILL_STOP_PCT=75" run --apply)"
+eq "disk2 down to 7 files (70%: stops once at or below 75%)" "$(find "$M/disk2" -type f | wc -l | tr -d ' ')" 7
+check "oldest disk2 file moved" onglacier data/Media/a1.mkv
+check "disk3 under the line stays" src disk3 data/Media/c.mkv
+echo "$out" | grep -q 'disk2 is at 90% (over the 85% start line)' && ok || bad "logs start: $out"
+
+setup fill_bad_thresholds
+out="$(ENVX="FILL_START_PCT=70 FILL_STOP_PCT=80" run --apply)"; rc=$?
+eq "stop above start aborts" "$rc" 2
+
+# --- Plex yield and status file -------------------------------------------------
+setup status_file_done
+mkdir -p "$R/state"
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(ENVX="STATE_DIR=$R/state/glacier" run --apply)"
+check "a moved" onglacier data/Media/a.mkv
+st="$(cat "$R/state/glacier/glacier-status" 2>/dev/null)"
+echo "$st" | grep -Eq '^[0-9]+ done phase=fill moved_bytes=1000 yielded_sec=0$' && ok || bad "status line: '$st'"
+check "no tmp left" test ! -e "$R/state/glacier/glacier-status.tmp"
+
+setup status_dir_parent_missing
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(ENVX="STATE_DIR=$R/nope/glacier" run --apply)"
+check "a moved" onglacier data/Media/a.mkv
+check "no dir made" test ! -e "$R/nope"
+
+setup status_dry_run_writes_nothing
+mkdir -p "$R/state"
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(ENVX="STATE_DIR=$R/state/glacier" run)"
+check "no status on a dry run" test ! -e "$R/state/glacier/glacier-status"
+
+setup status_window_stopped
+mkdir -p "$R/state"
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(EXTRA_OVR='local_hhmm() { echo 1400; }' ENVX="STATE_DIR=$R/state/glacier MOVE_WINDOW=22:00-06:00" run --apply)"
+st="$(cat "$R/state/glacier/glacier-status" 2>/dev/null)"
+echo "$st" | grep -Eq ' stopped .* reason=window$' && ok || bad "status line: '$st'"
+
+setup status_failed
+mkdir -p "$R/state"
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(EXTRA_OVR='rsync() { return 23; }' ENVX="STATE_DIR=$R/state/glacier" run --apply)"
+st="$(cat "$R/state/glacier/glacier-status" 2>/dev/null)"
+echo "$st" | grep -Eq ' failed .* reason=copy$' && ok || bad "status line: '$st'"
+
+setup plex_busy_yields_then_moves
+mkdir -p "$R/state/glacier"; : >"$R/state/glacier/plex-busy"
+mkf disk2 data/Media/a.mkv 1000 100
+( sleep 3; rm -f "$R/state/glacier/plex-busy" ) &
+out="$(ENVX="STATE_DIR=$R/state/glacier YIELD_POLL_SEC=1" run --apply)"; wait
+check "a moved after Plex went idle" onglacier data/Media/a.mkv
+echo "$out" | grep -q 'YIELD  plex streaming' && ok || bad "logs yield: $out"
+echo "$out" | grep -q 'RESUME  plex idle after' && ok || bad "logs resume: $out"
+st="$(cat "$R/state/glacier/glacier-status")"
+echo "$st" | grep -Eq ' done phase=fill moved_bytes=1000 yielded_sec=[1-9][0-9]*$' && ok || bad "status counts the wait: '$st'"
+grep -q 'waited [0-9]* min for Plex' "$R/notify.log" && ok || bad "notify mentions the wait: $(cat "$R/notify.log")"
+
+setup plex_busy_stale_ignored
+mkdir -p "$R/state/glacier"; touch -d "@$((NOW - 3600))" "$R/state/glacier/plex-busy"
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(ENVX="STATE_DIR=$R/state/glacier YIELD_POLL_SEC=1" run --apply)"
+check "a moved" onglacier data/Media/a.mkv
+echo "$out" | grep -q 'YIELD' && bad "stale file made it wait: $out" || ok
+
+setup plex_busy_until_window_closes
+mkdir -p "$R/state/glacier"; : >"$R/state/glacier/plex-busy"
+mkf disk2 data/Media/a.mkv 1000 100
+# clock: run start 05:58, unit check 05:58, first poll 06:00 (closed)
+out="$(EXTRA_OVR='local_hhmm() { local n; n=$(cat "$R/clk" 2>/dev/null || echo 0); echo $((n + 1)) >"$R/clk"; [ "$n" -lt 2 ] && echo 0558 || echo 0600; }' ENVX="STATE_DIR=$R/state/glacier YIELD_POLL_SEC=1 MOVE_WINDOW=22:00-06:00" run --apply)"
+check "a waits for the next night" gone data/Media/a.mkv
+echo "$out" | grep -q 'while waiting for Plex' && ok || bad "logs stop while waiting: $out"
+st="$(cat "$R/state/glacier/glacier-status")"
+echo "$st" | grep -Eq ' stopped .* reason=window$' && ok || bad "status line: '$st'"
+
+setup dry_run_ignores_plex_busy
+mkdir -p "$R/state/glacier"; : >"$R/state/glacier/plex-busy"
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(ENVX="STATE_DIR=$R/state/glacier YIELD_POLL_SEC=1" run)"
+echo "$out" | grep -q 'WOULD MOVE' && ok || bad "dry run plans: $out"
+echo "$out" | grep -q 'YIELD' && bad "dry run waited: $out" || ok
 
 echo
 echo "glacier tests: $PASS passed, $FAIL failed"
