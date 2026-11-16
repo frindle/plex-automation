@@ -116,7 +116,7 @@ def main():
         assert deleted == ['http://radarr/api/v3/queue/7']
         assert _removed(rec) == [], 'downloading loser must never be removed'
         assert (loser, SUP) in rec['label'], 'loser stays labeled superseded'
-        assert ([[loser], {'max_download_speed': -1}]) in [p for m, p in rec['rpc'] if m == 'core.set_torrent_options'], 'cap must be lifted so it can finish'
+        assert ([[loser], {'max_download_speed': -1, 'max_connections': -1}]) in [p for m, p in rec['rpc'] if m == 'core.set_torrent_options'], 'caps must be lifted so it can finish'
         assert not [1 for m, p in rec['rpc'] if m == 'core.queue_top' and keeper in p[0]], 'keeper must never get queue_top over normals'
         # Policy (user, 2026-10-29): an older-year upgrade keeper is never
         # promoted -- it stays at the back of the queue, throttled.
