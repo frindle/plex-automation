@@ -1001,6 +1001,13 @@ out="$(MDCMD="$R/bin/mdcmd" ENVX="TURBO_MIN_BYTES=lots" run --apply)"; rc=$?
 eq "aborts" "$rc" 2
 echo "$out" | grep -q 'ABORT: TURBO_MIN_BYTES' && ok || bad "says why: $out"
 
+setup tiering_api_is_required
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(ENVX="TIERING_API=" run --apply)"; rc=$?
+eq "aborts" "$rc" 2
+echo "$out" | grep -q 'ABORT: set TIERING_API' && ok || bad "says why: $out"
+check "nothing moved" src disk2 data/Media/a.mkv
+
 # --- the mover: a live run waits for it ------------------------------------------
 setup live_run_waits_for_the_mover
 echo 2 >"$R/mover.n"

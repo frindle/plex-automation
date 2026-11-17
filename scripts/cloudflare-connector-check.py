@@ -4,8 +4,8 @@
 WHY THIS EXISTS
 Cloudflare only emails when a tunnel has ZERO connectors. On 2026-08-21 the
 Firewalla connector was stopped and stayed down for 40 hours with no warning,
-because storagedemon was still serving -- the tunnel looked healthy. Then
-storagedemon rebooted at 02:07 on the 23rd, the count hit zero, and only then
+because the Unraid server was still serving -- the tunnel looked healthy. Then
+the Unraid server rebooted at 02:07 on the 23rd, the count hit zero, and only then
 did the email arrive. By that point all 31 hostnames were already down.
 
 Losing redundancy silently is worse than having none, because you believe you

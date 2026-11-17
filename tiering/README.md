@@ -54,7 +54,7 @@ Torrents are paused around each move and never removed. The path the torrent see
 4. Crash safety: the server keeps a ledger of paused hashes + time (`TIERING_PAUSE_STATE_PATH`, default `/data/tiering_paused.json`). Every gate/pause/resume call first resumes entries older than `TIERING_PAUSE_MAX_MIN` (default 360). The mover also resumes its own paused hashes from an EXIT/INT/TERM trap. If a user pauses a torrent by hand after the gate paused it, the stale auto-resume can resume it.
 5. Dry run never calls pause/resume; it prints `WOULD MOVE ... [torrent: pause]`.
 
-Rebuild/redeploy the plex-automation container so the new endpoints exist (`tiering_gate.py` is in the Dockerfile). `TIERING_API` defaults to the container address in the script header; on Unraid the host often cannot reach a br0 container IP, so set it to a reachable address. Keep `/data` persistent so the ledger survives a container restart.
+Rebuild/redeploy the plex-automation container so the new endpoints exist (`tiering_gate.py` is in the Dockerfile). `TIERING_API` has no default: set it to the container's URL (the User Script wrapper exports it). On Unraid the host often cannot reach a br0 container IP, so use an address the host can reach. Keep `/data` persistent so the ledger survives a container restart.
 
 ## Install (User Scripts plugin)
 1. Copy `glacier-mover.sh` to `/boot/config/plugins/user.scripts/scripts/glacier-mover/script`:

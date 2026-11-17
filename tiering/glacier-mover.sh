@@ -52,7 +52,7 @@ MOVER_PID_FILE="${MOVER_PID_FILE:-$ROOT/var/run/mover.pid}"   # written by Unrai
 CHUNK_UNITS="${CHUNK_UNITS:-100}"                 # units per torrent-gate request
 MAX_MISFITS="${MAX_MISFITS:-200}"                 # stop after this many consecutive no-fit files
 FOLDER_DEPTH="${FOLDER_DEPTH:-4}"                 # path parts (below /mnt/diskN) per "folder" in the report
-TIERING_API="${TIERING_API:-http://10.0.0.4:9876}"        # plex-automation container
+TIERING_API="${TIERING_API:-}"                    # plex-automation container URL, e.g. http://<host>:9876 (required)
 API_TIMEOUT="${API_TIMEOUT:-120}"
 NO_TORRENT_CHECK="${NO_TORRENT_CHECK:-0}"         # 1 = skip the Deluge gate (not for normal use)
 PAUSE_SETTLE_SEC="${PAUSE_SETTLE_SEC:-3}"         # wait after pausing so Deluge closes its file handles
@@ -333,6 +333,9 @@ preflight() {
   if ! [[ "$FILL_START_PCT" =~ ^[0-9]+$ && "$FILL_STOP_PCT" =~ ^[0-9]+$ ]] || [ "$FILL_START_PCT" -gt 100 ] \
       || { [ "$FILL_START_PCT" -gt 0 ] && [ "$FILL_STOP_PCT" -gt "$FILL_START_PCT" ]; }; then
     log "ABORT: FILL_START_PCT/FILL_STOP_PCT must be whole percents with stop <= start (got '$FILL_START_PCT'/'$FILL_STOP_PCT')"; return 2
+  fi
+  if [ -z "$TIERING_API" ] && [ "$NO_TORRENT_CHECK" != 1 ]; then
+    log "ABORT: set TIERING_API to the plex-automation container's URL, e.g. http://<host>:9876"; return 2
   fi
   if ! [[ "$TURBO_MIN_BYTES" =~ ^[0-9]+$ ]]; then log "ABORT: TURBO_MIN_BYTES must be a whole number of bytes (got '$TURBO_MIN_BYTES')"; return 2; fi
   local disks="$GLACIER $SRC_DISKS"
