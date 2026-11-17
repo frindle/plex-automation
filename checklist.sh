@@ -8,7 +8,7 @@
 # noted inline in the output file.
 set -u
 
-WEBHOOK="${WEBHOOK:-http://10.0.0.4:9876}"
+WEBHOOK="${WEBHOOK:?set WEBHOOK to the plex-automation container URL, e.g. http://<host>:9876}"
 OUT="${OUT:-/mnt/user/appdata/plex-automation/cleanup-checklist.txt}"
 
 section() {
