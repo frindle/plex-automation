@@ -44,7 +44,7 @@ mkf() {
 
 run() { # [extra extras] ; env: EXTRA_OVR (code), flags in $FLAGS
   env SCRIPT="$SCRIPT" ROOT="$R" CAP="$CAP" R="$R" M="$M" LOG_FILE="$R/glacier.log" LOG_DIR="$R" LOCK_FILE="$R/lock" \
-      NOTIFY_CMD="$R/bin/notify" TIERING_API=http://127.0.0.1:9 MIN_AGE_DAYS="${MIN_AGE_DAYS:-0}" PAUSE_SETTLE_SEC=0 MOVE_WINDOW= FILL_START_PCT=0 ${ENVX:-} \
+      NOTIFY_CMD="$R/bin/notify" TIERING_API=http://127.0.0.1:9 MIN_AGE_DAYS="${MIN_AGE_DAYS:-0}" PAUSE_SETTLE_SEC=0 MOVE_WINDOW= FILL_START_PCT=0 TURBO_MIN_BYTES=0 ${ENVX:-} \
       bash -c 'source "$SCRIPT"; source "$R/ovr.sh"; eval "$EXTRA_OVR"; main "$@"' harness "$@" 2>&1
 }
 EXTRA_OVR=""; export EXTRA_OVR
@@ -933,6 +933,73 @@ mkf disk2 data/Media/a.mkv 1000 100
 out="$(ENVX="STATE_DIR=$R/state/glacier YIELD_POLL_SEC=1" run)"
 echo "$out" | grep -q 'WOULD MOVE' && ok || bad "dry run plans: $out"
 echo "$out" | grep -q 'YIELD' && bad "dry run waited: $out" || ok
+
+# --- spindown: evict leaves a sleeping, unread disk1 alone --------------------
+# spin_files SPUNDOWN SECTORS_NOW [SECTORS_NOTED|-]: disks.ini (disk1 = sdb), diskstats, the noted counter
+spin_files() {
+  mkdir -p "$R/var/local/emhttp" "$R/var/run" "$R/proc"
+  printf '["parity"]\nname="parity"\ndevice="sda"\nspundown="0"\n["disk1"]\nname="disk1"\ndevice="sdb"\nspundown="%s"\n["disk2"]\nname="disk2"\ndevice="sdc"\nspundown="0"\n' "$1" >"$R/var/local/emhttp/disks.ini"
+  printf '   8      17 sdb1 10 0 7 0 0 0 0 0 0 0 0\n   8      16 sdb 10 0 %s 0 0 0 0 0 0 0 0\n   8       0 sda 10 0 999 0 0 0 0 0 0 0 0\n' "$2" >"$R/proc/diskstats"
+  [ "${3:--}" = - ] || printf 'sdb %s\n' "$3" >"$R/var/run/glacier-reads"
+}
+noted() { cat "$R/var/run/glacier-reads" 2>/dev/null; }
+spin_case() { # name spundown now noted [ENVX] [flag]
+  setup "$1"; evict_cfg
+  mkf disk1 "$D/Pack/e1.mkv" 300 5
+  printf 'seeding\t/%s/Pack\n' "$D" >"$R/active.tsv"
+  spin_files "$2" "$3" "$4"
+  EXTRA_OVR="$EVICT_GATE_OVR"; out="$(ENVX="${5:-}" run ${6---apply})"; rc=$?; EXTRA_OVR=""; export EXTRA_OVR
+}
+
+spin_case evict_idle_disk1_skipped 1 500 500
+eq "exit 0" "$rc" 0
+check "seeding data left on sleeping disk1" onglacier "$D/Pack/e1.mkv"
+check "no torrent paused" test ! -e "$R/pause.calls"
+echo "$out" | grep -q 'evict: disk1 is spun down and nothing read it since the last run' && ok || bad "logs idle skip: $out"
+eq "counter kept" "$(noted)" "sdb 500"
+
+spin_case evict_runs_when_disk1_was_read 1 900 500
+check "moved to disk2" src disk2 "$D/Pack/e1.mkv"
+eq "counter noted after the run" "$(noted)" "sdb 900"
+
+spin_case evict_runs_when_disk1_spinning 0 500 500
+check "moved to disk2" src disk2 "$D/Pack/e1.mkv"
+
+spin_case evict_runs_without_noted_counter 1 500 -
+check "moved to disk2" src disk2 "$D/Pack/e1.mkv"
+eq "counter noted" "$(noted)" "sdb 500"
+
+spin_case evict_idle_skip_off_by_env 1 500 500 EVICT_IDLE_SKIP=0
+check "moved to disk2" src disk2 "$D/Pack/e1.mkv"
+
+spin_case dry_run_never_notes_counter 1 900 500 "" ""
+check "dry run moves nothing" onglacier "$D/Pack/e1.mkv"
+eq "counter untouched" "$(noted)" "sdb 500"
+
+spin_case idle_skip_still_fills 1 500 500
+mkf disk2 data/Media/old.mkv 1000 100
+EXTRA_OVR="$EVICT_GATE_OVR"; out="$(run --apply)"; EXTRA_OVR=""; export EXTRA_OVR
+check "fill still runs" onglacier data/Media/old.mkv
+check "seeding data still on disk1" onglacier "$D/Pack/e1.mkv"
+
+# --- turbo only for big moves --------------------------------------------------
+turbo_setup turbo_small_move_left_off auto
+mkf disk2 data/Media/a.mkv 1000 100
+out="$(MDCMD="$R/bin/mdcmd" ENVX="TURBO_MIN_BYTES=5000" run --apply)"; rc=$?
+eq "exit 0" "$rc" 0
+check "moved" onglacier data/Media/a.mkv
+eq "never set" "$(calls)" ""
+echo "$out" | grep -q 'turbo write: left off for fill, about 1.00 KB planned is under 5.00 KB' && ok || bad "logs left off: $out"
+
+turbo_setup turbo_big_enough_turns_on auto
+mkf disk2 data/Media/a.mkv 1000 100; mkf disk3 data/Media/b.mkv 1000 100
+out="$(MDCMD="$R/bin/mdcmd" ENVX="TURBO_MIN_BYTES=1500" run --apply)"
+eq "on once, off once" "$(calls)" "set md_write_method 1|set md_write_method 0|"
+
+turbo_setup turbo_min_bytes_must_be_a_number auto
+out="$(MDCMD="$R/bin/mdcmd" ENVX="TURBO_MIN_BYTES=lots" run --apply)"; rc=$?
+eq "aborts" "$rc" 2
+echo "$out" | grep -q 'ABORT: TURBO_MIN_BYTES' && ok || bad "says why: $out"
 
 echo
 echo "glacier tests: $PASS passed, $FAIL failed"

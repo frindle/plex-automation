@@ -26,6 +26,7 @@ Hardlinked files move as a group (all links on that disk, copied with `rsync -H`
 - The gate runs without `keep_seeding`, so complete torrents are paused around the move and resumed after; downloading/checking/erroring ones wait. Deluge holds seeding files open, so the open-file check happens after the pause (it still skips a file that stays open).
 - Folders a move empties on disk1 are removed when the same folder exists on disk2 (never `data` or `data/Downloads`).
 - disk2 never goes past `EVICT_DEST_PCT` (95%).
+- Spindown: looking for torrent and hot data on disk1 would wake it, so evict skips the look when Unraid reports disk1 spun down (`/var/local/emhttp/disks.ini`) and its read counter (`/proc/diskstats`) has not moved since the last live run ended: nothing on it was read, so nothing on it is hot. The counter is noted in `/var/run/glacier-reads` (RAM, resets at reboot like the counter) after a live run whose evict finished. No note, a reboot, or an unreadable file means evict looks as before. `EVICT_IDLE_SKIP=0` looks every night.
 - A live evict needs disk1 excluded from the share (`shareExclude="disk1"` in `/boot/config/shares/data.cfg`, or an include list without disk1); otherwise new downloads land on disk1 again and the run skips evict. A dry run warns and plans anyway.
 - In a dry run, fill counts the room evict would free on disk1.
 
@@ -53,7 +54,7 @@ Torrents are paused around each move and never removed. The path the torrent see
 4. Crash safety: the server keeps a ledger of paused hashes + time (`TIERING_PAUSE_STATE_PATH`, default `/data/tiering_paused.json`). Every gate/pause/resume call first resumes entries older than `TIERING_PAUSE_MAX_MIN` (default 360). The mover also resumes its own paused hashes from an EXIT/INT/TERM trap. If a user pauses a torrent by hand after the gate paused it, the stale auto-resume can resume it.
 5. Dry run never calls pause/resume; it prints `WOULD MOVE ... [torrent: pause]`.
 
-Rebuild/redeploy the plex-automation container so the new endpoints exist (`tiering_gate.py` is in the Dockerfile). `TIERING_API` defaults to `http://10.0.0.4:9876`; on Unraid the host often cannot reach a br0 container IP, so set it to a reachable address. Keep `/data` persistent so the ledger survives a container restart.
+Rebuild/redeploy the plex-automation container so the new endpoints exist (`tiering_gate.py` is in the Dockerfile). `TIERING_API` defaults to the container address in the script header; on Unraid the host often cannot reach a br0 container IP, so set it to a reachable address. Keep `/data` persistent so the ledger survives a container restart.
 
 ## Install (User Scripts plugin)
 1. Copy `glacier-mover.sh` to `/boot/config/plugins/user.scripts/scripts/glacier-mover/script`:
@@ -67,14 +68,14 @@ Rebuild/redeploy the plex-automation container so the new endpoints exist (`tier
 4. When happy, change the script body to run `--apply` (or the wrapper: `exec bash .../glacier-mover.sh --apply`).
 5. Set `LOG_DIR=/mnt/cache/appdata/tiering` to keep the log across reboots (default is `/var/log/tiering`, which is RAM). One Unraid notification per run with moved/failed/skipped counts.
 
-Settings via env vars (defaults in the script header): `PHASES MEDIA_ROOTS GLACIER SRC_DISKS TARGET_PCT FILL_START_PCT FILL_STOP_PCT NIGHTLY_CAP_BYTES MIN_AGE_DAYS EXCLUDE_NAMES EXCLUDE_CONTAINS MAIN_EXT SIDE_EXT EVICT_TO EVICT_SHARE EVICT_HOT_ROOTS EVICT_DEST_PCT EVICT_NEVER_TOP SHARE_CFG TIERING_API PAUSE_SETTLE_SEC NOTIFY_ON_DRY LOG_DIR TURBO_WRITE MOVE_WINDOW STATE_DIR PLEX_BUSY_MAX_AGE YIELD_POLL_SEC`. `PHASES=fill` turns evict off.
+Settings via env vars (defaults in the script header): `PHASES MEDIA_ROOTS GLACIER SRC_DISKS TARGET_PCT FILL_START_PCT FILL_STOP_PCT NIGHTLY_CAP_BYTES MIN_AGE_DAYS EXCLUDE_NAMES EXCLUDE_CONTAINS MAIN_EXT SIDE_EXT EVICT_TO EVICT_SHARE EVICT_HOT_ROOTS EVICT_DEST_PCT EVICT_NEVER_TOP SHARE_CFG TIERING_API PAUSE_SETTLE_SEC NOTIFY_ON_DRY LOG_DIR TURBO_WRITE TURBO_MIN_BYTES EVICT_IDLE_SKIP MOVE_WINDOW STATE_DIR PLEX_BUSY_MAX_AGE YIELD_POLL_SEC`. `PHASES=fill` turns evict off.
 
 ## Turbo write
-A live run turns Unraid's turbo write on (`mdcmd set md_write_method 1`, reconstruct write) just before its first copy and sets it back to read/modify/write (`0`) when it ends, including on INT/TERM. Copies to the array run much faster, but every array disk spins while the run copies. If the setting already reads `1` in `/var/local/emhttp/var.ini` (turned on by hand), the run leaves it alone both ways. The value to restore is kept in `/var/run/glacier-turbo-write.restore` until it is set back, so a run that was killed outright is undone by the next run (dry runs too). Dry runs and runs with nothing to move never touch it. `TURBO_WRITE=0` turns this off. Settings -> Disk Settings keeps showing the saved choice (Auto); a reboot applies the saved choice again.
+A live run turns Unraid's turbo write on (`mdcmd set md_write_method 1`, reconstruct write) just before its first copy and sets it back to read/modify/write (`0`) when it ends, including on INT/TERM. Copies to the array run much faster, but every array disk spins while the run copies. If the setting already reads `1` in `/var/local/emhttp/var.ini` (turned on by hand), the run leaves it alone both ways. The value to restore is kept in `/var/run/glacier-turbo-write.restore` until it is set back, so a run that was killed outright is undone by the next run (dry runs too). Dry runs and runs with nothing to move never touch it. `TURBO_WRITE=0` turns this off. Turbo is only used for a phase that plans at least `TURBO_MIN_BYTES` (100 GB): a smaller move uses read/modify/write, so only the disks in the copy and parity spin up (`0` = any size). Settings -> Disk Settings keeps showing the saved choice (Auto); a reboot applies the saved choice again.
 
 The run aborts if the array is stopped, the mover is running, a parity check/rebuild is running, or another glacier run holds the lock.
 
-## Tests (run in claude-sandbox, never on the Mac)
+## Tests (run on a Linux test box)
 ```
 bash tiering/tests/test_glacier.sh        # fake /mnt tree, df and torrent gate stubbed
 python -m pytest test_tiering_gate.py     # the endpoint, Deluge mocked

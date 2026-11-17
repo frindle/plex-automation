@@ -64,6 +64,7 @@ LOCK_FILE="${LOCK_FILE:-$ROOT/var/run/glacier-mover.lock}"
 PROC_MOUNTS="${PROC_MOUNTS:-$ROOT/proc/mounts}"
 MDCMD="${MDCMD:-mdcmd}"
 TURBO_WRITE="${TURBO_WRITE:-1}"                   # 1 = turbo (reconstruct) write while a live run copies, set back at the end
+TURBO_MIN_BYTES="${TURBO_MIN_BYTES:-100000000000}" # turbo only for a phase that plans at least this much (100 GB): it spins every array disk
 VAR_INI="${VAR_INI:-$ROOT/var/local/emhttp/var.ini}"   # Unraid's live settings (md_write_method: auto, 0 or 1)
 TURBO_STATE="${TURBO_STATE:-$ROOT/var/run/glacier-turbo-write.restore}"   # RAM: a reboot resets the setting too
 PHASES="${PHASES:-evict fill}"                    # evict first (it frees room on disk1 for fill)
@@ -75,6 +76,13 @@ EVICT_DEST_PCT="${EVICT_DEST_PCT:-95}"            # never fill EVICT_TO past thi
 EVICT_NEVER_TOP="${EVICT_NEVER_TOP:-Sandbox Vault bloom-ledger Frigate InfluxDB Docker appdata system domains}"
 # A live evict needs GLACIER excluded from the share (else new files land on it again).
 SHARE_CFG="${SHARE_CFG:-$ROOT/boot/config/shares/$EVICT_SHARE.cfg}"
+# Spindown: evict looks up paths on GLACIER, and that wakes it. It skips the
+# look when Unraid reports GLACIER spun down AND its read counter has not moved
+# since the last live run ended: nothing on it was read, so nothing on it is hot.
+EVICT_IDLE_SKIP="${EVICT_IDLE_SKIP:-1}"           # 0 = evict looks every night
+DISKS_INI="${DISKS_INI:-$ROOT/var/local/emhttp/disks.ini}"   # Unraid's live disk state (spundown, device)
+DISKSTATS="${DISKSTATS:-$ROOT/proc/diskstats}"
+READS_STATE="${READS_STATE:-$ROOT/var/run/glacier-reads}"    # RAM: resets at reboot, like the kernel counter
 
 APPLY=0
 PHASE=fill; DEST="$GLACIER"; GATE_KEEP=1          # set per phase in main
@@ -210,6 +218,12 @@ write_method() { # -> auto | 0 | 1 | "" (unreadable)
 
 turbo_on() {
   [ "$APPLY" = 1 ] && [ "$TURBO_WRITE" = 1 ] && [ "$TURBO_TRIED" = 0 ] || return 0
+  if [ "$PLAN_BYTES" -lt "$TURBO_MIN_BYTES" ]; then   # small move: only the disks in the copy and parity spin
+    [ "$TURBO_SMALL_LOGGED" = "$PHASE" ] && return 0
+    TURBO_SMALL_LOGGED="$PHASE"
+    log "turbo write: left off for $PHASE, about $(hr "$PLAN_BYTES") planned is under $(hr "$TURBO_MIN_BYTES")"
+    return 0
+  fi
   TURBO_TRIED=1
   local was
   was="$(write_method)"
@@ -245,6 +259,37 @@ turbo_restore_stale() {
   TURBO_ON=1; turbo_off
 }
 
+# --- spindown ---------------------------------------------------------------
+# All of these read RAM only (emhttp's state file, the kernel's counters), never a disk.
+ini_disk_val() { # DISK KEY -> value from disks.ini
+  awk -v want="[\"$1\"]" -v key="$2" '$0 == want { d = 1; next } /^\[/ { d = 0 }
+    d && index($0, key "=") == 1 { v = substr($0, length(key) + 2); gsub(/"/, "", v); print v; exit }' "$DISKS_INI" 2>/dev/null
+}
+sectors_read() { # DEV -> sectors read since boot
+  awk -v dev="$1" '$3 == dev { print $6; exit }' "$DISKSTATS" 2>/dev/null
+}
+glacier_reads() { # -> "DEV SECTORS" for GLACIER, empty when unknown
+  local dev n
+  dev="$(ini_disk_val "$GLACIER" device)"; [ -n "$dev" ] || return 0
+  n="$(sectors_read "$dev")"; [ -n "$n" ] && printf '%s %s\n' "$dev" "$n"
+}
+# glacier_idle -> 0 when GLACIER is spun down and was not read since the last live run ended.
+# Unknown (no state file, a reboot since, unreadable) = not idle, so evict looks as before.
+glacier_idle() {
+  [ "$EVICT_IDLE_SKIP" = 1 ] || return 1
+  [ "$(ini_disk_val "$GLACIER" spundown)" = 1 ] || return 1
+  local now was
+  now="$(glacier_reads)"; was="$(cat "$READS_STATE" 2>/dev/null)"
+  [ -n "$now" ] && [ "$now" = "$was" ]
+}
+# note_reads: after a live run whose evict finished, remember GLACIER's read counter,
+# so the run's own reads (evict's look, fill's read/modify/write) never count as use.
+note_reads() {
+  [ "$APPLY" = 1 ] && [ "$EVICT_OK" = 1 ] || return 0
+  local now; now="$(glacier_reads)"
+  if [ -n "$now" ]; then printf '%s\n' "$now" >"$READS_STATE" 2>/dev/null; else rm -f "$READS_STATE"; fi
+}
+
 # --- helpers ---------------------------------------------------------------
 
 ere_escape() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g'; }  # no \/ : GNU grep 3.8+ warns on it
@@ -259,6 +304,7 @@ preflight() {
       || { [ "$FILL_START_PCT" -gt 0 ] && [ "$FILL_STOP_PCT" -gt "$FILL_START_PCT" ]; }; then
     log "ABORT: FILL_START_PCT/FILL_STOP_PCT must be whole percents with stop <= start (got '$FILL_START_PCT'/'$FILL_STOP_PCT')"; return 2
   fi
+  if ! [[ "$TURBO_MIN_BYTES" =~ ^[0-9]+$ ]]; then log "ABORT: TURBO_MIN_BYTES must be a whole number of bytes (got '$TURBO_MIN_BYTES')"; return 2; fi
   local disks="$GLACIER $SRC_DISKS"
   case " $PHASES " in *" evict "*) case " $disks " in *" $EVICT_TO "*) ;; *) disks="$disks $EVICT_TO" ;; esac ;; esac
   for d in $disks; do
@@ -609,6 +655,7 @@ CH_AT=(); CH_SZ=(); CH_DK=(); CH_PATHS=()
 ROOM_LEFT=0; CAP_LEFT=0; MISFITS=0; STOP=0; WINDOW_CLOSED=0
 declare -A SRC_LEFT=()   # fill: bytes each source disk may still give before FILL_STOP_PCT
 N_MOVED=0; B_MOVED=0; N_FAILED=0; N_SKIPPED=0; N_PAUSED=0; N_UNITS=0
+PLAN_BYTES=0; TURBO_SMALL_LOGGED=""; EVICT_OK=0
 EV_RAN=0; EV_N=0; EV_B=0; EV_WAIT_N=0; EV_WAIT_B=0; EV_NOFIT=0   # evict-phase share of the above
 PAUSED_HASHES=()   # hashes this run paused and has not resumed yet (the exit trap resumes them)
 
@@ -797,6 +844,9 @@ flush_unit() {
 plan_and_run() {
   local at sz key dk p ckey="" cdk="" cat="" csz=""
   local -a cps=()
+  # Rough size of this phase's move (for the turbo decision): candidates, capped by room and the nightly cap.
+  PLAN_BYTES="$(awk -F'\t' -v room="$ROOM_LEFT" -v cap="$CAP_LEFT" '{ s += $2 }
+    END { if (room < s) s = room; if (cap < s) s = cap; if (s < 0) s = 0; printf "%.0f\n", s }' "$TMP/cands")"
   while IFS="$TAB" read -r at sz key dk p; do
     [ "$STOP" = 1 ] && break
     if [ "$key" != "-" ] && [ "$key" = "$ckey" ]; then cps+=("$p"); continue; fi
@@ -865,6 +915,11 @@ phase_evict() {
   local total used
   PHASE=evict; DEST="$EVICT_TO"; GATE_KEEP=""; SRC_LEFT=()
   if [ "$EVICT_TO" = "$GLACIER" ]; then log "SKIP evict: EVICT_TO is the glacier disk"; return 0; fi
+  if glacier_idle; then
+    EVICT_OK=1
+    log "evict: $GLACIER is spun down and nothing read it since the last run: nothing on it is hot, skipped (looking would wake it)"
+    return 0
+  fi
   if ! share_excludes_glacier; then
     if [ "$APPLY" = 1 ]; then
       log "SKIP evict: $GLACIER is not excluded from the $EVICT_SHARE share ($SHARE_CFG), so new files would land on it again"
@@ -880,6 +935,7 @@ phase_evict() {
   if [ "$ROOM_LEFT" -le 0 ]; then log "evict: $EVICT_TO is at or above ${EVICT_DEST_PCT}%: nothing to evict"; return 0; fi
   build_evict_candidates "$TMP/cands"
   plan_and_run
+  [ "$STOP" = 1 ] || EVICT_OK=1
 }
 
 # phase_fill: move the coldest media from SRC_DISKS to GLACIER
@@ -954,6 +1010,7 @@ main() {
       *) log "WARN  unknown phase '$ph', ignored" ;;
     esac
   done
+  note_reads
   report
   if [ "$N_FAILED" -gt 0 ]; then EXIT_STATE=failed; EXIT_REASON=copy
   elif [ "$WINDOW_CLOSED" = 1 ]; then EXIT_STATE=stopped; EXIT_REASON=window
