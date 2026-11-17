@@ -1001,6 +1001,56 @@ out="$(MDCMD="$R/bin/mdcmd" ENVX="TURBO_MIN_BYTES=lots" run --apply)"; rc=$?
 eq "aborts" "$rc" 2
 echo "$out" | grep -q 'ABORT: TURBO_MIN_BYTES' && ok || bad "says why: $out"
 
+# --- the mover: a live run waits for it ------------------------------------------
+setup live_run_waits_for_the_mover
+echo 2 >"$R/mover.n"
+mkf disk2 data/Media/a.mkv 1000 100
+EXTRA_OVR='mover_running() { local n; n="$(cat "$R/mover.n")"; [ "$n" -gt 0 ] || return 1; echo $((n - 1)) >"$R/mover.n"; }'
+out="$(ENVX="YIELD_POLL_SEC=0" run --apply)"; rc=$?; EXTRA_OVR=""
+eq "exit 0" "$rc" 0
+check "moved after the mover" onglacier data/Media/a.mkv
+echo "$out" | grep -q 'WAIT  the mover is running' && ok || bad "logs wait: $out"
+echo "$out" | grep -q 'RESUME  the mover finished' && ok || bad "logs resume: $out"
+
+setup mover_past_the_window_moves_nothing
+mkf disk2 data/Media/a.mkv 1000 100
+EXTRA_OVR='mover_running() { : >"$R/closed"; return 0; }
+in_window() { [ ! -e "$R/closed" ]; }'
+out="$(ENVX="YIELD_POLL_SEC=0" run --apply)"; rc=$?; EXTRA_OVR=""
+eq "exit 0" "$rc" 0
+check "nothing moved" src disk2 data/Media/a.mkv
+echo "$out" | grep -q 'STOP  the mover was still running at the end of the move window' && ok || bad "logs stop: $out"
+
+setup dry_run_goes_ahead_while_the_mover_runs
+mkf disk2 data/Media/a.mkv 1000 100
+EXTRA_OVR='mover_running() { return 0; }'
+out="$(run)"; rc=$?; EXTRA_OVR=""
+eq "exit 0" "$rc" 0
+echo "$out" | grep -q 'WOULD MOVE' && ok || bad "dry run plans: $out"
+echo "$out" | grep -q 'WARN: the mover is running: the dry run goes ahead' && ok || bad "warns: $out"
+
+setup mover_starting_mid_run_is_waited_for
+mkf disk2 data/Media/a.mkv 1000 200; mkf disk3 data/Media/b.mkv 1000 100
+EXTRA_OVR='mover_running() { [ -f "$M/disk1/data/Media/a.mkv" ] && [ ! -e "$R/mid" ] && { : >"$R/mid"; return 0; }; return 1; }'
+out="$(ENVX="YIELD_POLL_SEC=0" run --apply)"; EXTRA_OVR=""
+check "a moved" onglacier data/Media/a.mkv
+check "b moved after the wait" onglacier data/Media/b.mkv
+echo "$out" | grep -q 'WAIT  the mover is running' && ok || bad "waited mid-run: $out"
+
+setup mover_running_reads_the_pid_file
+mkdir -p "$R/var/run"
+bash -c 'exec -a mover sleep 30' & mpid=$!
+sleep 0.2
+probe() { SCRIPT="$SCRIPT" ROOT="$R" bash -c 'source "$SCRIPT"; mover_running' >/dev/null 2>&1; }
+echo "$mpid" >"$R/var/run/mover.pid"
+probe && ok || bad "live mover pid seen"
+kill "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null
+probe && bad "dead pid counted as running" || ok
+echo "$$" >"$R/var/run/mover.pid"
+probe && bad "a pid that is not a mover counted" || ok
+rm -f "$R/var/run/mover.pid"
+probe && bad "no pid file counted" || ok
+
 echo
 echo "glacier tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

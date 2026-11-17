@@ -48,6 +48,7 @@ MIN_AGE_DAYS="${MIN_AGE_DAYS:-30}"                # never move a file modified i
 STATE_DIR="${STATE_DIR-$MNT/cache/appdata/ollama-queue/state/glacier}"   # the queue container mounts .../state
 PLEX_BUSY_MAX_AGE="${PLEX_BUSY_MAX_AGE:-600}"
 YIELD_POLL_SEC="${YIELD_POLL_SEC:-60}"
+MOVER_PID_FILE="${MOVER_PID_FILE:-$ROOT/var/run/mover.pid}"   # written by Unraid's mover and Mover Tuning's age_mover
 CHUNK_UNITS="${CHUNK_UNITS:-100}"                 # units per torrent-gate request
 MAX_MISFITS="${MAX_MISFITS:-200}"                 # stop after this many consecutive no-fit files
 FOLDER_DEPTH="${FOLDER_DEPTH:-4}"                 # path parts (below /mnt/diskN) per "folder" in the report
@@ -130,6 +131,35 @@ write_status() {
   printf '%s %s %s%s\n' "$(date +%s)" "$1" "$(status_detail)" "${2:+ $2}" >"$f.tmp" 2>/dev/null &&
     mv -f "$f.tmp" "$f" 2>/dev/null
   return 0
+}
+
+# mover_running -> 0 while Unraid's mover (or Mover Tuning's) runs: the pid in its pid
+# file is alive and is a mover (the same test Mover Tuning uses), or a process is named mover.
+mover_running() {
+  local pid
+  pid="$(cat "$MOVER_PID_FILE" 2>/dev/null)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && ps -p "$pid" -o args= 2>/dev/null | grep -q mover; then return 0; fi
+  command -v pgrep >/dev/null 2>&1 && pgrep -x mover >/dev/null 2>&1
+}
+
+# wait_mover: a live run waits for the mover instead of copying alongside it, so the
+# disks wake once for both. Gives up when the move window ends (WINDOW_CLOSED=1).
+# A dry run only lists files, so it goes ahead with a warning.
+wait_mover() {
+  mover_running || return 0
+  if [ "$APPLY" != 1 ]; then log "WARN: the mover is running: the dry run goes ahead (a live run would wait)"; return 0; fi
+  local w=0
+  log "WAIT  the mover is running: waiting for it to finish"
+  while mover_running; do
+    write_status yield reason=mover
+    sleep "$YIELD_POLL_SEC"; w=$((w + YIELD_POLL_SEC))
+    if ! in_window; then
+      WINDOW_CLOSED=1
+      log "STOP  the mover was still running at the end of the move window $MOVE_WINDOW (local time now $(date '+%H:%M %Z')): the rest waits for the next run"
+      return 0
+    fi
+  done
+  log "RESUME  the mover finished after ${w}s"
 }
 
 # plex_busy -> 0 while the watcher's plex-busy file is fresh
@@ -320,9 +350,6 @@ preflight() {
   if [ "$APPLY" = 1 ] && ! command -v fuser >/dev/null 2>&1 && ! command -v lsof >/dev/null 2>&1 \
       && [ "${OPEN_CHECK_OPTIONAL:-0}" != 1 ]; then
     log "ABORT: neither fuser nor lsof exists, cannot skip open files"; return 2
-  fi
-  if command -v pgrep >/dev/null 2>&1 && pgrep -x mover >/dev/null 2>&1; then
-    log "ABORT: the mover is running"; return 2
   fi
   if command -v "$MDCMD" >/dev/null 2>&1 && "$MDCMD" status 2>/dev/null | grep -Eq '^mdResync=[1-9]'; then
     # A dry run only lists files (metadata reads), so it may run; a live move waits.
@@ -772,6 +799,8 @@ process_chunk() {
       done
       log "RESUME  plex idle after $((YIELD_SEC - y0))s"
     fi
+    wait_mover                      # a mover that started mid-run: let it finish first
+    if [ "$WINDOW_CLOSED" = 1 ]; then STOP=1; break; fi
     write_status moving
     SKIP_REASON=""; FAIL_REASON=""
     if [ "$unitstat" = pause ]; then
@@ -1001,6 +1030,7 @@ main() {
   if [ "$APPLY" = 1 ] && ! in_window; then
     WINDOW_CLOSED=1; log "outside the move window $MOVE_WINDOW (local time now $(date '+%H:%M %Z')): nothing moves this run"
   fi
+  [ "$WINDOW_CLOSED" = 1 ] || wait_mover
   for ph in $PHASES; do
     [ "$WINDOW_CLOSED" = 1 ] && break
     STOP=0; MISFITS=0

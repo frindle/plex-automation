@@ -73,7 +73,7 @@ Settings via env vars (defaults in the script header): `PHASES MEDIA_ROOTS GLACI
 ## Turbo write
 A live run turns Unraid's turbo write on (`mdcmd set md_write_method 1`, reconstruct write) just before its first copy and sets it back to read/modify/write (`0`) when it ends, including on INT/TERM. Copies to the array run much faster, but every array disk spins while the run copies. If the setting already reads `1` in `/var/local/emhttp/var.ini` (turned on by hand), the run leaves it alone both ways. The value to restore is kept in `/var/run/glacier-turbo-write.restore` until it is set back, so a run that was killed outright is undone by the next run (dry runs too). Dry runs and runs with nothing to move never touch it. `TURBO_WRITE=0` turns this off. Turbo is only used for a phase that plans at least `TURBO_MIN_BYTES` (100 GB): a smaller move uses read/modify/write, so only the disks in the copy and parity spin up (`0` = any size). Settings -> Disk Settings keeps showing the saved choice (Auto); a reboot applies the saved choice again.
 
-The run aborts if the array is stopped, the mover is running, a parity check/rebuild is running, or another glacier run holds the lock.
+The run aborts if the array is stopped, a parity check/rebuild is running, or another glacier run holds the lock. If the mover is running (its pid file `/var/run/mover.pid`, which Mover Tuning also writes, or a process named `mover`), a live run waits for it to finish, at the start and before each unit, so both share one spin-up; if the move window ends first, the rest waits for the next night. A dry run goes ahead with a warning.
 
 ## Tests (run on a Linux test box)
 ```
