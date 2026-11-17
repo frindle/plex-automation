@@ -145,7 +145,9 @@ def test_ps_failure_and_timeout_skip(tmp_path):
 def test_chat_timeout_error_and_garbage_pass_on(tmp_path):
     cases = ((Timeout('slow'), 'timeout'), (ConnectionError('reset'), 'error'),
              (Resp(200, {'message': {'content': 'no json here'}}), 'unparseable'))
+    import llm_advisor as la
     for answer, reason in cases:
+        la._UNRAID_HEALTH.clear()  # a timeout starts the back-off; each case starts clean
         http = world(answer, chat('match', 0.9))
         out, info, rows = go(fresh(tmp_path, reason), http)
         assert out == 'match' and info['layer'] == 'local' and rows[-1]['unraid']['pass'] == reason
@@ -186,9 +188,9 @@ def test_unraid_only_failure_waits_before_paid(tmp_path):
 
 def test_unraid_only_answer_after_a_miss_clears_the_clock(tmp_path):
     clock = Clock()
-    kw = dict(env=UONLY, kind='import_identity', rules='match', facts=ID)
+    kw = dict(env=dict(UONLY, LLM_UNRAID_BACKOFF_MIN='4'), kind='import_identity', rules='match', facts=ID)
     run(tmp_path, clock, world(Timeout('slow')), **kw)
-    clock.minutes(5)
+    clock.minutes(5)  # past the timeout's back-off
     out, info, _ = run(tmp_path, clock, world(ollama('mismatch', 0.95)), **kw)
     assert info['layer'] == 'unraid' and out == 'mismatch'
     assert json.loads((tmp_path / 'llm_pending.json').read_text()) == {}
@@ -242,16 +244,75 @@ def _chat_timeout(http):
     return kw['timeout']
 
 
+def ask(tmp_path, name, clock, http, env=UENV):
+    return run(fresh(tmp_path, name), clock, http, env=env, kind='import_identity', rules='match', facts=ID)
+
+
 def test_cold_load_gets_the_long_timeout_warm_keeps_30s(tmp_path):
+    clock = Clock()
     http = world(ollama('match', 0.95))
-    go(fresh(tmp_path, 'cold'), http)
+    ask(tmp_path, 'cold', clock, http)
     assert _chat_timeout(http) == (2.0, 120.0)
+    # Listed and answered a minute ago: warm.
+    clock.minutes(1)
     http = world(ollama('match', 0.95), loaded=('qwen3:14b',))
-    go(fresh(tmp_path, 'warm'), http)
+    ask(tmp_path, 'warm', clock, http)
     assert _chat_timeout(http) == (2.0, 30.0)
+    # Listed, but its last answer is past Ollama's keep-alive: the listing may be a load in progress.
+    clock.minutes(6)
+    http = world(ollama('match', 0.95), loaded=('qwen3:14b',))
+    ask(tmp_path, 'stale', clock, http)
+    assert _chat_timeout(http) == (2.0, 120.0)
     http = world(ollama('match', 0.95))
     go(fresh(tmp_path, 'env'), http, env=dict(UENV, LLM_UNRAID_COLD_TIMEOUT='200'))
     assert _chat_timeout(http) == (2.0, 200.0)
+
+
+def test_listed_but_never_answered_is_cold(tmp_path):
+    # 11-16/17: a timed-out load stays listed in /api/ps; the next ask got 30 s and aborted the load again.
+    http = world(ollama('match', 0.95), loaded=('qwen3:14b',))
+    go(tmp_path, http)
+    assert _chat_timeout(http) == (2.0, 120.0)
+
+
+def test_timeout_backs_off_doubling_until_an_answer(tmp_path):
+    clock = Clock()
+    for i, wait_min in enumerate((15, 30, 60, 60)):
+        http = world(Timeout('slow'), chat('match', 0.9), loaded=('qwen3:14b',))
+        _, _, rows = ask(tmp_path, 'to%d' % i, clock, http)
+        assert rows[-1]['unraid']['pass'] == 'timeout'
+        # Inside the back-off: no /api/ps, no /api/chat (no model load started), passed on to local.
+        clock.minutes(wait_min - 1)
+        http = world(ollama('match', 0.95), chat('match', 0.9))
+        _, info, rows = ask(tmp_path, 'in%d' % i, clock, http)
+        assert http.n('unraid.invalid') == 0 and info['layer'] == 'local' and rows[-1]['unraid']['pass'] == 'backoff'
+        clock.minutes(1)
+    # Back-off over: asked again; the answer clears the count, so the next timeout backs off 15 min again.
+    http = world(ollama('match', 0.95))
+    _, info, _ = ask(tmp_path, 'ok', clock, http)
+    assert info['layer'] == 'unraid'
+    ask(tmp_path, 'to-again', clock, world(Timeout('slow'), chat('match', 0.9)))
+    clock.minutes(15)
+    http = world(ollama('match', 0.95))
+    _, info, _ = ask(tmp_path, 'after', clock, http)
+    assert info['layer'] == 'unraid'
+
+
+def test_backoff_is_shared_by_kinds_and_can_be_turned_off(tmp_path):
+    clock = Clock()
+    env = dict(UENV, LLM_UNRAID_KINDS='import_identity,upgrade_gate')
+    ask(tmp_path, 'to', clock, world(Timeout('slow'), chat('match', 0.9)), env=env)
+    http = world(ollama('allow', 0.95), chat('allow', 0.9))
+    _, _, rows = run(fresh(tmp_path, 'ug'), clock, http, env=env, kind='upgrade_gate', rules='allow',
+                     facts={'title': 'T', 'seeders': 50})
+    assert http.n('unraid.invalid') == 0 and rows[-1]['unraid']['pass'] == 'backoff'
+    import llm_advisor as la
+    la._UNRAID_HEALTH.clear()
+    off = dict(UENV, LLM_UNRAID_BACKOFF_MIN='0')
+    ask(tmp_path, 'to-off', clock, world(Timeout('slow'), chat('match', 0.9)), env=off)
+    http = world(ollama('match', 0.95))
+    _, info, _ = ask(tmp_path, 'off', clock, http, env=off)
+    assert info['layer'] == 'unraid'
 
 
 def test_grab_time_kind_keeps_30s_even_cold(tmp_path):
