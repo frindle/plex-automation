@@ -320,3 +320,32 @@ def test_grab_time_kind_keeps_30s_even_cold(tmp_path):
     run(tmp_path, Clock(), http, env=dict(UENV, LLM_UNRAID_KINDS='import_identity,upgrade_gate'), kind='upgrade_gate',
         rules='allow', facts={'title': 'T', 'seeders': 50})
     assert _chat_timeout(http) == (2.0, 30.0)
+
+
+def test_plex_hold_waits_without_running_the_paid_clock(tmp_path):
+    clock = Clock()
+    env = dict(UONLY, LLM_UNRAID_HOLD_URL='http://hold.invalid/u', LLM_UNRAID_HOLD_TOKEN='tok')
+    kw = dict(env=env, kind='import_identity', rules='match', facts=ID)
+    held = world(ollama('match', 0.95), extra={'hold.invalid/u': Resp(200, {'hold': True, 'cause': 'plex', 'lane': 'unraid'})})
+    for _ in range(4):  # an hour of playback
+        out, info, rows = run(tmp_path, clock, held, **kw)
+        assert info['pending'] is True and out == 'unsure'
+        clock.minutes(20)
+    assert len(rows) == 1 and rows[0]['unraid']['pass'] == 'hold' and rows[0]['unraid']['hold_cause'] == 'plex'
+    assert held.n('/api/chat') == 0 and held.n('api.darkbloom.dev') == 0 and 'tok' not in json.dumps(rows)
+    # Playback over: Unraid is asked and settles it.
+    free = world(ollama('match', 0.95), extra={'hold.invalid/u': Resp(200, {'hold': False, 'lane': 'unraid'})})
+    out, info, _ = run(tmp_path, clock, free, **kw)
+    assert info['layer'] == 'unraid' and out == 'match'
+
+
+def test_other_holds_still_run_the_paid_clock(tmp_path):
+    clock = Clock()
+    env = dict(UONLY, LLM_UNRAID_HOLD_URL='http://hold.invalid/u')
+    kw = dict(env=env, kind='import_identity', rules='match', facts=ID)
+    http = world(ollama('match', 0.95), extra={'hold.invalid/u': Resp(200, {'hold': True, 'cause': 'gpu-exclusive', 'job': 7})})
+    _, info, rows = run(tmp_path, clock, http, **kw)
+    assert info['pending'] is True and rows[-1]['unraid']['hold_cause'] == 'gpu-exclusive'
+    clock.minutes(16)
+    _, info, _ = run(tmp_path, clock, http, **kw)
+    assert info['layer'] == 'paid' and http.n('/api/chat') == 0

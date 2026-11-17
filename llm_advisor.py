@@ -253,7 +253,8 @@ def _ollama_chat_fn(base, model, http, total=UNRAID_TIMEOUT, connect=2.0, state=
 
 def _unraid_gate(base, model, env, http, state=None, now=time.time):
     """Skip reason, or None when the Unraid GPU is free for this model. The queue shares that GPU: asking
-    while it has another model loaded would evict it, so a different resident model means skip. 'backoff' while
+    while it has another model loaded would evict it, so a different resident model means skip. A hold returns
+    ('hold', cause) when the hold names one (the queue's GPU hold says 'plex' or 'gpu-exclusive'). 'backoff' while
     a recent timeout's back-off runs. Sets state['cold'] unless this model is listed and answered within
     UNRAID_WARM_S (the ask may include a model load)."""
     health = _unraid_health(base, model)
@@ -263,9 +264,9 @@ def _unraid_gate(base, model, env, http, state=None, now=time.time):
             state['cold'] = False
         if now() < health['until']:
             return 'backoff'
-        held, _ = hold_active(env, http, 'LLM_UNRAID_HOLD')
+        held, cause = hold_active(env, http, 'LLM_UNRAID_HOLD')
         if held:
-            return 'hold'
+            return ('hold', cause) if cause else 'hold'
         try:
             r = http.get(base.rstrip('/') + '/api/ps', timeout=1)
             r.raise_for_status()
@@ -683,6 +684,8 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
             skip = unraid.gate() if unraid.gate is not None else None
         except Exception:  # noqa: BLE001
             skip = 'error'
+        if isinstance(skip, tuple):
+            skip, step['hold_cause'] = skip
         if skip:
             step['pass'] = skip
         else:
@@ -736,7 +739,10 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
         ent = store.touch(key, kind, why)
         mins = (now() - ent['first_seen']) / 60.0
         res['pending_min'] = round(mins, 1)
-        if mins < wait_min:
+        # Plex has the GPU: playback ending frees it, so a Plex hold keeps waiting past the paid clock;
+        # the next run asks Unraid again.
+        plex = res['unraid'].get('pass') == 'hold' and res['unraid'].get('hold_cause') == 'plex'
+        if mins < wait_min or plex:
             res.update(pending=True, first_pending=ent['attempts'] == 1)
             return res
     if local is None and unraid is None:
