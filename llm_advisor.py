@@ -44,6 +44,15 @@ MODELS_TTL = 15.0
 LOCAL_APPROVED = {'import_identity': ('qwen3.5-35b-a3b',), 'upgrade_gate': ('qwen3.5-35b-a3b',)}
 UNRAID_TIMEOUT = 30.0
 UNRAID_COLD_TIMEOUT = 120.0
+# A listed model counts as warm only if it answered this process within this long (Ollama's default keep-alive):
+# /api/ps also lists a model whose load is still running or was just aborted, and a 30 s ask then aborts it again.
+UNRAID_WARM_S = 300.0
+# After an Unraid timeout the layer is skipped for this long, doubling per timeout in a row up to 4x (an answer
+# resets it). Each timed-out ask had started a model load that the hang-up aborted (11-16/17: about 40 in a loop).
+UNRAID_BACKOFF_MIN = 15.0
+UNRAID_BACKOFF_MAX_X = 4
+# Per (base, model): last answer time, timeouts in a row, skip-until. Per process; a restart starts clean.
+_UNRAID_HEALTH = {}
 # Kinds asked from a background poller, where waiting out a cold Unraid load is fine. Grab-time kinds keep 30 s.
 UNRAID_COLD_KINDS = frozenset({'import_identity', 'dupe_confirm'})
 PENDING_MAX_AGE = 24 * 3600.0
@@ -200,18 +209,40 @@ def _model_tag(name):
     return n if ':' in n.rsplit('/', 1)[-1] else n + ':latest'
 
 
-def _ollama_chat_fn(base, model, http, total=UNRAID_TIMEOUT, connect=2.0, state=None, cold_total=None):
+def _unraid_health(base, model):
+    return _UNRAID_HEALTH.setdefault((base.rstrip('/'), _model_tag(model)), {'ok_at': None, 'fails': 0, 'until': 0.0})
+
+
+def _unraid_backoff_s(env, fails):
+    try:
+        base = float(env.get('LLM_UNRAID_BACKOFF_MIN') or UNRAID_BACKOFF_MIN)
+    except (TypeError, ValueError):
+        base = UNRAID_BACKOFF_MIN
+    return max(0.0, base) * 60.0 * min(2 ** max(0, fails - 1), UNRAID_BACKOFF_MAX_X)
+
+
+def _ollama_chat_fn(base, model, http, total=UNRAID_TIMEOUT, connect=2.0, state=None, cold_total=None, env=None,
+                    now=time.time):
     """Native Ollama /api/chat, the shape the back-test ran: no stream, no thinking, temperature 0.2.
-    When the gate saw nothing loaded (state['cold']), the read timeout is cold_total so the model load fits."""
+    When the gate judged the model cold (state['cold']), the read timeout is cold_total so the model load fits.
+    A timeout starts the layer's back-off; an answer marks the model warm and clears it."""
     url = base.rstrip('/') + '/api/chat'
+    health = _unraid_health(base, model)
 
     def fn(prompt):
         body = {'model': model, 'messages': [{'role': 'user', 'content': prompt}], 'stream': False, 'think': False,
                 'options': {'temperature': 0.2, 'num_predict': 1024}}
         t = cold_total if cold_total and state is not None and state.get('cold') else total
-        r = http.post(url, json=body, headers={'Content-Type': 'application/json'}, timeout=(connect, t))
+        try:
+            r = http.post(url, json=body, headers={'Content-Type': 'application/json'}, timeout=(connect, t))
+        except Exception as e:  # noqa: BLE001
+            if 'timeout' in type(e).__name__.lower():
+                health['fails'] += 1
+                health['until'] = now() + _unraid_backoff_s(env or {}, health['fails'])
+            raise
         r.raise_for_status()
         data = r.json()
+        health.update(ok_at=now(), fails=0, until=0.0)
         meta = {}
         if isinstance(data, dict):
             meta['prompt_tokens'] = data.get('prompt_eval_count')
@@ -220,13 +251,18 @@ def _ollama_chat_fn(base, model, http, total=UNRAID_TIMEOUT, connect=2.0, state=
     return fn
 
 
-def _unraid_gate(base, model, env, http, state=None):
+def _unraid_gate(base, model, env, http, state=None, now=time.time):
     """Skip reason, or None when the Unraid GPU is free for this model. The queue shares that GPU: asking
-    while it has another model loaded would evict it, so a different resident model means skip.
-    Sets state['cold'] when nothing is loaded (the ask will include a model load)."""
+    while it has another model loaded would evict it, so a different resident model means skip. 'backoff' while
+    a recent timeout's back-off runs. Sets state['cold'] unless this model is listed and answered within
+    UNRAID_WARM_S (the ask may include a model load)."""
+    health = _unraid_health(base, model)
+
     def gate():
         if state is not None:
             state['cold'] = False
+        if now() < health['until']:
+            return 'backoff'
         held, _ = hold_active(env, http, 'LLM_UNRAID_HOLD')
         if held:
             return 'hold'
@@ -240,7 +276,8 @@ def _unraid_gate(base, model, env, http, state=None):
         if loaded and _model_tag(model) not in loaded:
             return 'other-model-resident'
         if state is not None:
-            state['cold'] = not loaded
+            ok_at = health['ok_at']
+            state['cold'] = not loaded or ok_at is None or now() - ok_at > UNRAID_WARM_S
         return None
     return gate
 
@@ -339,8 +376,9 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
         um = (env.get('LLM_UNRAID_MODEL') or '').strip() or UNRAID_MODEL
         state = {}
         cold = float(env.get('LLM_UNRAID_COLD_TIMEOUT') or UNRAID_COLD_TIMEOUT) if kind in UNRAID_COLD_KINDS else None
-        layers['unraid'] = Layer('unraid', _ollama_chat_fn(ubase, um, http, state=state, cold_total=cold), um,
-                                 _unraid_gate(ubase, um, env, http, state))
+        layers['unraid'] = Layer('unraid', _ollama_chat_fn(ubase, um, http, state=state, cold_total=cold, env=env,
+                                                           now=now), um,
+                                 _unraid_gate(ubase, um, env, http, state, now))
     total = float(env.get('LLM_DECIDE_TIMEOUT') or 20)
     base = (env.get('DARKBLOOM_BASE_URL') or '').strip()
     legacy = (env.get('LLM_DECIDE_URL') or '').strip()
