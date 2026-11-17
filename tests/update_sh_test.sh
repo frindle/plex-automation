@@ -187,6 +187,29 @@ echo "0123456789abcdef0123456789abcdef01234567" > "$DEPLOY/.last-built-sha"
 run_update
 check "marker is an unknown commit (history rewritten): builds" "$(builds)" 1
 
+# 12. inputs come from the Dockerfile: a newly COPYed file builds with no edit to update.sh
+run_update > /dev/null 2>&1
+echo "# new module" > "$DEV/zz_new_module.py"
+git -C "$DEV" add -A; git -C "$DEV" commit -q -m "add module, not copied yet"; git -C "$DEV" push -q origin main
+run_update
+check "new .py not COPYed yet: no build" "$(builds)" 0
+echo "COPY zz_new_module.py ." >> "$DEV/$DOCKERFILE"
+upstream "$DOCKERFILE" none
+run_update
+check "COPY line added: builds" "$(builds)" 1
+upstream zz_new_module.py append
+run_update
+check "newly COPYed file changed: builds" "$(builds)" 1
+
+# 13. COPY . copies the whole context, so any change builds
+echo "COPY . ./ctx/" >> "$DEV/$DOCKERFILE"
+upstream "$DOCKERFILE" none
+run_update > /dev/null 2>&1
+set -- $NONINPUT_FILES
+upstream "$1" append
+run_update
+check "with COPY . in the Dockerfile, a doc change builds" "$(builds)" 1
+
 # 11. the marker survives git reset --hard and is ignored by git
 git -C "$DEPLOY" status --porcelain | grep -q 'last-built-sha' && bad "marker is gitignored" || ok "marker is gitignored"
 

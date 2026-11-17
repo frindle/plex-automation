@@ -28,17 +28,36 @@ esac
 # last real build.
 BUILD_MARKER=.last-built-sha
 
-# is_build_input <path>: succeeds when a change to <path> can change the image.
-# These are the files Dockerfile COPYs (plus the Dockerfile, the compose file and
-# .dockerignore). Keep in step with the Dockerfile. A path not listed here
-# cannot reach the image.
+# build_inputs: the build-context paths the Dockerfile COPYs or ADDs, one per
+# line. Read from the Dockerfile itself, so a new COPY line needs no edit here.
+# COPY --from=<stage> copies from another stage, not the context, so it is skipped.
+build_inputs() {
+  awk 'toupper($1) == "COPY" || toupper($1) == "ADD" {
+         from = 0; prev = ""; out = ""
+         for (i = 2; i <= NF; i++) {
+           if ($i ~ /^--from=/) { from = 1; continue }
+           if ($i ~ /^--/) continue
+           if (prev != "") out = out prev "\n"
+           prev = $i                      # the last word is the destination
+         }
+         if (!from) printf "%s", out
+       }' Dockerfile 2>/dev/null
+}
+
+# is_build_input <path>: succeeds when a change to <path> can change the image:
+# the Dockerfile, the compose file, .dockerignore, or anything a COPY/ADD line
+# takes from the context (a file, a directory, `.`, or a glob such as *.py).
 is_build_input() {
-  case "$1" in
-    Dockerfile|docker-compose.yml|.dockerignore|requirements.txt) return 0 ;;
-    arr-webhook.py|monthly_upgrade.py|media_share.py|llm_decide.py|llm_advisor.py) return 0 ;;
-    library_audit.py|downloads_audit.py|arr_health.py|deluge_trim.py) return 0 ;;
-    episode_retention.py|rar_extract.py|torrent_breakdown.py|tiering_gate.py|speed_cap.py) return 0 ;;
-  esac
+  local f="$1" src
+  case "$f" in Dockerfile|docker-compose.yml|.dockerignore) return 0 ;; esac
+  while IFS= read -r src; do
+    src="${src#./}"; src="${src%/}"
+    [ -n "$src" ] && [ "$src" != . ] || return 0      # COPY . copies the whole context
+    [ "$f" = "$src" ] && return 0
+    case "$f" in "$src"/*) return 0 ;; esac            # inside a copied directory
+    # shellcheck disable=SC2254
+    case "$f" in $src) return 0 ;; esac                # a glob source (may over-match: that only builds more)
+  done <<< "$(build_inputs)"
   return 1
 }
 
@@ -53,6 +72,7 @@ decide_build() {
   if [ -z "$old" ]; then BUILD_WHY="no build marker yet (first run)"; return; fi
   if ! git cat-file -e "${old}^{commit}" 2>/dev/null; then BUILD_WHY="build marker is not a known commit"; return; fi
   if [ "$old" = "$new" ]; then DO_BUILD=0; BUILD_WHY="no new commits since the last build (${new:0:7})"; return; fi
+  if [ -z "$(build_inputs)" ]; then BUILD_WHY="no COPY or ADD lines found in the Dockerfile"; return; fi
   if ! changed="$(git diff --relative --no-renames --name-only "$old" "$new" -- 2>/dev/null)"; then
     BUILD_WHY="cannot diff ${old:0:7}..${new:0:7}"; return
   fi
