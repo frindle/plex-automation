@@ -6296,6 +6296,17 @@ def _digest_state():
     except (OSError, ValueError):
         return {}
 
+def _llm_below_target_lines():
+    """Digest lines for LLM kinds below target over the last 7 days; empty when all are on target."""
+    try:
+        stats = llm_advisor.llm_stats(llm_advisor.read_decision_rows(LLM_DECISIONS_LOG))
+        lines = llm_advisor.llm_stats_lines(stats)
+        return [ln + ' [' + '; '.join(stats[ln.split(':', 1)[0]]['below_target']) + ']'
+                for ln in lines if stats[ln.split(':', 1)[0]]['below_target']]
+    except Exception:
+        return []
+
+
 def _digest_entries(since_iso=None):
     entries = []
     try:
@@ -6324,7 +6335,8 @@ def digest():
     entries.reverse()  # newest first
     if request.args.get('format') == 'json':
         return jsonify({'ok': True, 'since': since, 'count': len(entries), 'entries': entries,
-                        'unregistered': _unregistered_report, 'arr_health': _arr_health_load()})
+                        'unregistered': _unregistered_report, 'arr_health': _arr_health_load(),
+                        'llm_below_target': _llm_below_target_lines()})
 
     counts = {}
     for e in entries:
@@ -6359,6 +6371,7 @@ a {{ color:#78dce8; }}
 <table>{rows or "<tr><td>Nothing to review 🎉</td></tr>"}</table>
 {_digest_unregistered_html()}
 {_digest_arr_health_html()}
+{_digest_llm_html()}
 </body></html>'''
 
 @app.route('/digest/reviewed', methods=['POST'])
@@ -8210,6 +8223,20 @@ def removal_log():
         return jsonify({'ok': False, 'error': 'limit must be an integer'}), 400
     rows = read_removal_log(request.args.get('since') or None, min(limit, 1000))
     return jsonify({'ok': True, 'count': len(rows), 'entries': rows}), 200
+
+
+@app.route('/llm-stats', methods=['GET'])
+def llm_stats_route():
+    try:
+        try:
+            days = int(request.args.get('days', '7'))
+        except (TypeError, ValueError):
+            days = 7
+        days = max(1, min(90, days))
+        stats = llm_advisor.llm_stats(llm_advisor.read_decision_rows(LLM_DECISIONS_LOG), days=days)
+        return jsonify({'ok': True, 'days': days, 'kinds': stats, 'lines': llm_advisor.llm_stats_lines(stats)}), 200
+    except Exception as e:
+        return jsonify({'ok': False, 'error': type(e).__name__}), 200
 
 
 @app.route('/llm-decisions', methods=['GET'])
@@ -10794,6 +10821,14 @@ def unregistered_sweep_tick(now=None):
         return None
     _unregistered_last[0] = now
     return unregistered_sweep(now=now)
+
+
+def _digest_llm_html():
+    lines = _llm_below_target_lines()
+    if not lines:
+        return ''
+    return '<h2>LLM advisor below target (7 days)</h2><ul>' + ''.join(
+        '<li>' + ln.replace('&', '&amp;').replace('<', '&lt;') + '</li>' for ln in lines) + '</ul>'
 
 
 def _digest_unregistered_html():
