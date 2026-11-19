@@ -12,6 +12,9 @@ os.environ['ACTIVITY_LOG'] = os.path.join(_TMP, 'activity.jsonl')
 os.environ['REMOVAL_LOG'] = os.path.join(_TMP, 'removal-audit.jsonl')
 os.environ['UNPACK_STATE_PATH'] = os.path.join(_TMP, 'unpack.json')
 os.environ['SEED_STATE_PATH'] = os.path.join(_TMP, 'seed.json')
+# fake_get tells Sonarr from Radarr by address; conftest gives both the same dead one, so split them (still dead).
+os.environ['SONARR_URL'] = 'http://127.0.0.1:9/sonarr'
+os.environ['RADARR_URL'] = 'http://127.0.0.1:9/radarr'
 aw = __import__('arr-webhook')   # alias assigned only here
 
 DAY = 86400

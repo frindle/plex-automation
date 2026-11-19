@@ -74,8 +74,12 @@ def removed_hashes():
     return [p[0] for m, p in RPC if m == 'core.remove_torrent']
 
 
+# _keep_data_cleanup_plan reads the file list before a keep-data removal; that is not a seed-info fetch.
+CLEANUP_LOOKUP = ['name', 'save_path', 'files']
+
+
 def status_calls():
-    return [p for m, p in RPC if m == 'core.get_torrent_status']
+    return [p for m, p in RPC if m == 'core.get_torrent_status' and p[1] != CLEANUP_LOOKUP]
 
 
 def summaries():
