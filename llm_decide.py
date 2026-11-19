@@ -13,6 +13,7 @@ KINDS = {
     'dupe_confirm': ('same', 'different', 'unsure'),
     'torrent_error': ('recheck', 'resume', 'relink', 'wait', 'remove_and_research', 'ask'),
     'unregistered_triage': ('keep', 'remove_keep_library', 'remove_and_research', 'ask'),
+    'stuck_import': ('wait', 'retry_import', 'ask'),
 }
 MIN_CONFIDENCE = 0.75
 MIN_SEEDERS = 10
@@ -98,6 +99,16 @@ POLICY = {
         'remove_and_research = no library copy exists, remove it and ask Sonarr or Radarr to search again; '
         'ask = the facts do not settle it, a person decides. Never remove below the seed floor, and never '
         'when the rules_action fact is keep. When unsure, answer ask.'),
+    'stuck_import': (
+        'Sonarr or Radarr has a finished download it will not import by itself, and the automatic import rescue '
+        'could not fix it, so it would normally notify a person. Facts only: service, reason_class (what the '
+        'arr says: unknown_media, sample, not_upgrade, quality, no_video, disk, archive, other), rescue_class '
+        '(why the rescue gave up: lookup_failed, no_clean_candidate, not_needed, identity_refused, '
+        'import_failed, other), age_hours since it was grabbed, rules_action. Pick one action: wait (it may clear '
+        'by itself, for example a young download or a transient failure), retry_import (the cause looks fixed '
+        'or temporary and another import attempt is reasonable) or ask (a person should look). You can never '
+        'import, delete or remove anything; the choice is advice only. Use ask when the facts do not settle it, '
+        'and for unknown_media, sample, archive or not_upgrade older than a day.'),
 }
 
 
@@ -817,7 +828,7 @@ def dupe_comparison(facts):
 
 
 _SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure',
-                'torrent_error': 'ask', 'unregistered_triage': 'ask'}
+                'torrent_error': 'ask', 'unregistered_triage': 'ask', 'stuck_import': 'ask'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
 
@@ -893,6 +904,10 @@ def apply_hard_rules(kind, action, facts):
                 return 'ask', 'invalid_action'
             if action == 'remove_and_research' and facts.get('rules_action') != 'remove_and_research':
                 return 'ask', 'no_model_delete'
+        elif kind == 'stuck_import':
+            # Advice only (nothing here deletes or imports); anything off the menu is ask.
+            if action not in KINDS['stuck_import']:
+                return 'ask', 'invalid_action'
         elif kind == 'unregistered_triage' and action in ('remove_keep_library', 'remove_and_research'):
             # The model may never cause a delete the rules would not make (missing rules_action fails closed).
             if facts.get('rules_action') != 'remove':

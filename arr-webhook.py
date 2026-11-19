@@ -4581,8 +4581,76 @@ def _try_sonarr_manual_import(record):
     except Exception as e:
         return False, f'ManualImport POST failed: {e}'
 
+# stuck_import (SHADOW ONLY, free layers only): after the rescue gave up and the person was notified, the model picks
+# wait / retry_import / ask from classes and an age, and the answer is only logged. STUCK_IMPORT_LLM_MAX new
+# questions a pass (default 10; answers are cached 24 h). Nothing here imports, deletes or changes the notification.
+STUCK_IMPORT_LLM_MAX_DEFAULT = 10
+
+
+def _stuck_import_llm_max():
+    try:
+        return max(0, int(os.environ.get('STUCK_IMPORT_LLM_MAX') or STUCK_IMPORT_LLM_MAX_DEFAULT))
+    except ValueError:
+        return STUCK_IMPORT_LLM_MAX_DEFAULT
+
+
+def _import_reason_class(reason):
+    s = (reason or '').lower()
+    for cls, keys in (('unknown_media', ('unknown series', 'unknown movie', 'not found', 'matched to', 'no match')),
+                      ('sample', ('sample',)),
+                      ('not_upgrade', ('not an upgrade', 'not a quality upgrade', 'already', 'existing file')),
+                      ('quality', ('quality', 'cutoff', 'custom format')),
+                      ('no_video', ('no video', 'no files', 'no eligible')),
+                      ('disk', ('disk', 'space', 'permission')),
+                      ('archive', ('rar', 'archive', 'unpack', 'extract'))):
+        if any(k in s for k in keys):
+            return cls
+    return 'other'
+
+
+def _import_rescue_class(detail):
+    s = (detail or '').lower()
+    return ('lookup_failed' if 'lookup failed' in s else 'no_clean_candidate' if 'no clean candidate' in s
+            else 'not_needed' if IMPORT_NOT_NEEDED.lower() in s else 'import_failed' if 'post failed' in s
+            else 'identity_refused' if ('refus' in s or 'mismatch' in s or 'unsure' in s) else 'other')
+
+
+def _stuck_import_facts(service, rec, reason, detail):
+    """Classes and an age only: no titles, paths, hashes or ids."""
+    age = None
+    added = rec.get('added')
+    if isinstance(added, str) and added:
+        try:
+            import datetime as _dt
+            t = _dt.datetime.fromisoformat(added.replace('Z', '+00:00'))
+            age = round((_dt.datetime.now(_dt.timezone.utc) - t).total_seconds() / 3600.0, 1)
+        except (ValueError, TypeError):
+            age = None
+    return {'service': service, 'reason_class': _import_reason_class(reason),
+            'rescue_class': _import_rescue_class(detail), 'age_hours': age, 'rules_action': 'ask'}
+
+
+def _stuck_import_shadow(asks):
+    """Ask the model about each import that is still stuck; log only. Run off-thread, after the notification."""
+    if not asks or _llm_mode('stuck_import') == 'off':
+        return
+    cap, asked = _stuck_import_llm_max(), 0
+    for facts in asks:
+        if asked >= cap:
+            break
+        qinfo = {}
+        try:
+            _llm_advise('stuck_import', facts, 'ask', qinfo)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'[llm] stuck_import failed: {e}')
+            continue
+        if qinfo.get('layer') != 'cache':
+            asked += 1
+
+
 def check_import_blocked():
     """Poll Radarr + Sonarr queues for importBlocked records. Auto-resolve or notify."""
+    asks = []
     for label, url, key, resolver in [
         ('Radarr', RADARR_URL, RADARR_API_KEY, _try_radarr_manual_import),
         ('Sonarr', SONARR_URL, SONARR_API_KEY, _try_sonarr_manual_import),
@@ -4631,6 +4699,10 @@ def check_import_blocked():
                 message=f'{title}\nReason: {reason}\nDetail: {detail}',
                 url=f'{url}/activity/queue',
             )
+            if _llm_mode('stuck_import') != 'off':
+                asks.append(_stuck_import_facts(label, rec, reason, detail))
+    if asks:
+        _run_llm_shadow('stuck_import', functools.partial(_stuck_import_shadow, asks))
 
 def import_blocked_scheduler():
     # Small warm-up delay so we don't hammer *arr the moment the app boots.

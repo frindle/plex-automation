@@ -64,6 +64,8 @@ services:
       TORRENT_ERROR_LLM_MAX: "${TORRENT_ERROR_LLM_MAX:-10}"
       LLM_MODE_UNREGISTERED_TRIAGE: "${LLM_MODE_UNREGISTERED_TRIAGE:-}"
       UNREGISTERED_LLM_MAX: "${UNREGISTERED_LLM_MAX:-10}"
+      LLM_MODE_STUCK_IMPORT: "${LLM_MODE_STUCK_IMPORT:-}"
+      STUCK_IMPORT_LLM_MAX: "${STUCK_IMPORT_LLM_MAX:-10}"
       GRAB_IDENTITY_CHECK: "${GRAB_IDENTITY_CHECK:-1}"
       # Sonarr/Radarr health: outage + removed-from-TVDB pushes always; broken library files are
       # report-only (/digest) unless ARR_HEALTH_APPLY=1 (Deluge recheck, else delete + search).
