@@ -4,11 +4,21 @@ import os
 import tempfile
 import time
 
+import threading
+
+import pytest
+
 import backtest_torrent_error as bt
 import llm_advisor as la
 import llm_decide as ld
 
 aw = __import__('arr-webhook')
+
+
+@pytest.fixture(autouse=True)
+def inline_shadow(monkeypatch):
+    # The repair hands its questions to a background thread; run that batch inline so tests see the calls.
+    monkeypatch.setattr(aw, '_run_llm_shadow', lambda name, fn: fn())
 
 ASK = '{"action": "ask", "confidence": 0.9, "reason": "r"}'
 WAIT = '{"action": "wait", "confidence": 0.9, "reason": "r"}'
@@ -193,6 +203,59 @@ def test_repair_result_unchanged_by_shadow(monkeypatch):
     off = run('off', 'ask')
     assert off[1] and off[2]
     assert off == run('shadow', 'remove_and_research')
+
+
+def test_repair_asks_after_its_loop_with_facts_only(monkeypatch):
+    """The five hand-offs are queued during the loop and asked once it is done (dry runs never ask)."""
+    torrents = {'E1': {'name': 'Gone.Synthetic', 'state': 'Error', 'message': 'x', 'save_path': '/data/dl',
+                       'label': 'l', 'progress': 0.0}}
+
+    class Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {'result': torrents}
+    spy = Spy()
+    monkeypatch.setattr(aw, 'deluge_login', lambda: None)
+    monkeypatch.setattr(aw.session, 'post', lambda *a, **k: Resp())
+    monkeypatch.setattr(aw, 'deluge_pause_torrent', lambda h: None)
+    monkeypatch.setattr(aw, 'restore_moved_files', lambda **k: {})
+    monkeypatch.setattr(aw, 'is_library_path', lambda p: False)
+    monkeypatch.setattr(aw, '_deluge_path_exists', lambda p: False)
+    monkeypatch.setattr(aw, '_find_torrent_data', lambda n, r: None)
+    monkeypatch.setattr(aw, 'record_activity', lambda cat, summ: None)
+    monkeypatch.setattr(aw, '_reported_deluge_errors', set())
+    monkeypatch.setattr(aw, '_llm_mode', lambda kind=None: 'shadow')
+    monkeypatch.setattr(aw, '_llm_advise', spy)
+    aw.deluge_error_repair()
+    (kind, f, rules), = spy.calls
+    assert kind == 'torrent_error' and f['case'] == 'missing' and rules == 'ask'
+    assert 'Gone.Synthetic' not in json.dumps(f) and '/data' not in json.dumps(f)
+    monkeypatch.setattr(aw, '_reported_deluge_errors', set())
+    aw.deluge_error_repair(dry_run=True)
+    assert len(spy.calls) == 1
+
+
+def test_run_llm_shadow_is_off_thread_and_one_batch_at_a_time(monkeypatch):
+    monkeypatch.undo()   # the real helper, not the inline stand-in
+    go, done, ran = threading.Event(), threading.Event(), []
+
+    def slow():
+        ran.append(threading.current_thread().name)
+        go.wait(5)
+        done.set()
+    t = aw._run_llm_shadow('test-batch', slow)
+    assert t is not None and t.daemon
+    assert aw._run_llm_shadow('test-batch', lambda: ran.append('second')) is None   # still asking: dropped
+    go.set()
+    t.join(5)
+    assert done.is_set() and ran == ['llm-test-batch']
+    t2 = aw._run_llm_shadow('test-batch', lambda: 1 / 0)    # lock released; a failing batch is swallowed
+    t2.join(5)
+    t3 = aw._run_llm_shadow('test-batch', lambda: ran.append('third'))
+    t3.join(5)
+    assert ran[-1] == 'third'
 
 
 # ---- backtest CLI ----
