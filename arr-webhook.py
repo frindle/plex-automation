@@ -9688,6 +9688,50 @@ def restore_moved_scheduler():
         time.sleep(RESTORE_MOVED_INTERVAL)
 
 
+# torrent_error (SHADOW ONLY): after deluge_error_repair has done its rules action and filed its hand-off report,
+# the model picks from a fixed menu and the answer is only logged. TORRENT_ERROR_LLM_MAX new questions a run
+# (default 10; answers are cached 24 h, so the hourly run does not re-ask the same torrent).
+TORRENT_ERROR_LLM_MAX_DEFAULT = 10
+
+
+def _torrent_error_llm_max():
+    try:
+        return max(0, int(os.environ.get('TORRENT_ERROR_LLM_MAX') or TORRENT_ERROR_LLM_MAX_DEFAULT))
+    except ValueError:
+        return TORRENT_ERROR_LLM_MAX_DEFAULT
+
+
+def _torrent_error_facts(case, info, rules_action='ask', **extra):
+    """Facts only, no names or paths. Unknown values stay None."""
+    def num(v, div=1.0):
+        return round(v / div, 1) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    added = info.get('time_added')
+    age = (time.time() - added) / 86400.0 if isinstance(added, (int, float)) and added > 0 else None
+    facts = {'case': case, 'rules_action': rules_action, 'state': info.get('state'),
+             'progress': num(info.get('progress')), 'seeded_days': num(info.get('seeding_time'), 86400.0),
+             'age_days': num(age), 'tracker_status': (str(info.get('tracker_status') or '')[:80] or None)}
+    facts.update(extra)
+    return facts
+
+
+def _torrent_error_shadow(llm_state, dry_run, case, info, **extra):
+    """Ask the model what to do with a torrent the rules handed to a person; log only, never act on it.
+    Call it AFTER the rules action and its report. Never raises."""
+    try:
+        if dry_run or llm_state is None or _llm_mode('torrent_error') == 'off':
+            return
+        if llm_state['asked'] >= _torrent_error_llm_max():
+            return
+        llm_state['asked'] += 1
+        qinfo = {}
+        # TODO(enforce): wiring the answer into the repair is out of scope. In enforce mode this still only logs.
+        _llm_advise('torrent_error', _torrent_error_facts(case, info, **extra), 'ask', qinfo)
+        if qinfo.get('layer') == 'cache':
+            llm_state['asked'] -= 1  # a cached answer is not a new question
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'[llm] torrent_error shadow failed: {e}')
+
+
 def deluge_error_repair(dry_run=False, relink=None):
     """Scan Deluge for errored torrents and self-heal what's safe to heal."""
     if relink is None:
@@ -9695,13 +9739,15 @@ def deluge_error_repair(dry_run=False, relink=None):
     result = {'ok': True, 'dry_run': dry_run, 'relink': relink,
               'rechecked': [], 'relink_candidates': [], 'missing': [], 'errors': [],
               'library': [], 'resumed': [], 'library_match': []}
+    llm_state = {'asked': 0}
     try:
         deluge_login()
         resp = session.post(
             f'{DELUGE_URL}/json',
             json={
                 'method': 'core.get_torrents_status',
-                'params': [{}, ['name', 'state', 'message', 'save_path', 'label', 'progress']],
+                'params': [{}, ['name', 'state', 'message', 'save_path', 'label', 'progress',
+                            'time_added', 'seeding_time', 'tracker_status']],
                 'id': 60,
             },
             timeout=30,
@@ -9745,6 +9791,7 @@ def deluge_error_repair(dry_run=False, relink=None):
             if not dry_run:
                 _report_once((h, 'partial'), 'deluge-error',
                              f'Errored torrent "{name}" rechecked to {progress}% -- left paused, needs a human')
+                _torrent_error_shadow(llm_state, dry_run, 'partial', info)
                 _repair_rechecked.discard(h)
             # else dry_run: keep in set
         else:
@@ -9787,6 +9834,7 @@ def deluge_error_repair(dry_run=False, relink=None):
             _report_once((h, 'library-error'), 'library-error',
                          f'Errored torrent "{name}" seeds from the library ({save_path}) -- paused, not rechecked or resumed; needs a human',
                          dry_run=dry_run)
+            _torrent_error_shadow(llm_state, dry_run, 'library_error', info, library_file_exists=True)
             result['library'].append(entry)
             continue
         present = _deluge_path_exists(os.path.join(save_path, name)) if save_path and name else None
@@ -9823,6 +9871,7 @@ def deluge_error_repair(dry_run=False, relink=None):
                          f'Errored torrent "{name}" — data missing from {save_path} and not found in '
                          f'{", ".join(roots) or "(no roots mounted)"} ({info.get("message") or "no message"})',
                          dry_run=dry_run)
+            _torrent_error_shadow(llm_state, dry_run, 'missing', info, library_file_exists=False)
             continue
         # Everything below crosses the container/Deluge namespace boundary:
         # found_local is this container's path, Deluge needs its own.
@@ -9837,6 +9886,7 @@ def deluge_error_repair(dry_run=False, relink=None):
             _report_once((h, 'library-match'), 'deluge-error',
                          f'Errored torrent "{name}" -- library-match at {found_local}; not relinked, needs a human',
                          dry_run=dry_run)
+            _torrent_error_shadow(llm_state, dry_run, 'library_match', info, library_file_exists=True)
             continue
         # Never hand Deluge a path it can't see. This re-verifies the
         # translation against Deluge's own filesystem instead of trusting
@@ -9865,6 +9915,7 @@ def deluge_error_repair(dry_run=False, relink=None):
             _report_once((h, 'relink-candidate'), 'deluge-error',
                          f'Errored torrent "{name}" — data found at {found_local}, relink not applied',
                          dry_run=dry_run)
+            _torrent_error_shadow(llm_state, dry_run, 'relink_candidate', info, library_file_exists=False)
         result['relink_candidates'].append(entry)
 
     counts = {k: len(v) for k, v in result.items() if isinstance(v, list)}

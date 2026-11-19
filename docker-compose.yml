@@ -60,6 +60,8 @@ services:
       LLM_MODE_IMPORT_IDENTITY: "${LLM_MODE_IMPORT_IDENTITY:-}"
       LLM_MODE_DUPE_CONFIRM: "${LLM_MODE_DUPE_CONFIRM:-}"
       LLM_MODE_UPGRADE_GATE: "${LLM_MODE_UPGRADE_GATE:-}"
+      LLM_MODE_TORRENT_ERROR: "${LLM_MODE_TORRENT_ERROR:-}"
+      TORRENT_ERROR_LLM_MAX: "${TORRENT_ERROR_LLM_MAX:-10}"
       GRAB_IDENTITY_CHECK: "${GRAB_IDENTITY_CHECK:-1}"
       # Sonarr/Radarr health: outage + removed-from-TVDB pushes always; broken library files are
       # report-only (/digest) unless ARR_HEALTH_APPLY=1 (Deluge recheck, else delete + search).

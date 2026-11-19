@@ -11,6 +11,7 @@ KINDS = {
     'upgrade_gate': ('allow', 'throttle', 'reject'),
     'import_identity': ('match', 'mismatch', 'unsure'),
     'dupe_confirm': ('same', 'different', 'unsure'),
+    'torrent_error': ('recheck', 'resume', 'relink', 'wait', 'remove_and_research', 'ask'),
 }
 MIN_CONFIDENCE = 0.75
 MIN_SEEDERS = 10
@@ -73,6 +74,19 @@ POLICY = {
         "Director's Cut, Theatrical, Unrated, IMAX and the like). A file holding more episodes than the other "
         '(S01E01E02 vs S01E01) is different. Use unsure whenever the names do not settle it; unsure keeps both '
         'files. When a Comparison line follows the Context, use it: it is computed from these facts.'),
+    'torrent_error': (
+        'A torrent in the download client is in an error state and the automatic repair has no safe fix for it, so '
+        'it would normally be handed to a person. Facts: case is why it was handed over (partial: a recheck ended '
+        'below 100%; library_error: it seeds from the media library; missing: its data is gone and was not found '
+        'anywhere; library_match: its data was found inside the media library; relink_candidate: its data was '
+        'found in another download folder and was not re-pointed). rules_action is what the automation did or '
+        'will do. Pick one action: recheck (verify the data again), resume (start it again), relink (re-point it '
+        'at data found elsewhere), wait (nothing to do yet; look again later), remove_and_research (delete the '
+        'torrent and search for a new copy) or ask (a person should look). remove_and_research is only allowed '
+        'when the data is unrecoverable (missing, no library copy) and the torrent is not seeding for a ratio '
+        'goal; otherwise it is turned into ask. Never choose resume or relink for a library_error case. '
+        'A null fact means unknown: prefer wait or ask over a destructive action when the facts that matter are '
+        'unknown. Use ask whenever the facts do not settle it.'),
 }
 
 
@@ -789,7 +803,8 @@ def dupe_comparison(facts):
             '. Quality differences (resolution, codec, size, group) do not make the media different.')
 
 
-_SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure'}
+_SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure',
+                'torrent_error': 'ask'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
 
@@ -858,6 +873,13 @@ def apply_hard_rules(kind, action, facts):
             conflict = dupe_conflict(facts)
             if conflict:
                 return 'different', conflict[0]
+        elif kind == 'torrent_error':
+            # The model may never cause a delete the rules would not: removal stands only when the rules action
+            # for this case is itself a removal. Anything unrecognised becomes ask.
+            if action not in KINDS['torrent_error']:
+                return 'ask', 'invalid_action'
+            if action == 'remove_and_research' and facts.get('rules_action') != 'remove_and_research':
+                return 'ask', 'no_model_delete'
         return action, None
     except Exception:
         if isinstance(kind, str) and kind in _SAFE_ACTION and action != _SAFE_ACTION[kind]:
