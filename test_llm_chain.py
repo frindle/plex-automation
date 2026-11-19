@@ -60,6 +60,9 @@ class FakeHttp:
         raise AssertionError('unrouted ' + url)
 
     def get(self, url, **kw):
+        if url.endswith('/v1/models') and not any('/v1/models' in f for f in self.routes):
+            # a pin must be listed: the default listing (not recorded in calls) holds the test pin
+            return Resp(200, {'data': [{'id': 'm-local'}, {'id': 'gemma-4-26b'}]})
         return self._go('GET', url, **kw)
 
     def post(self, url, **kw):
@@ -316,10 +319,15 @@ def test_approved_list_is_per_kind(tmp_path):
     assert http.n('/v1/chat/completions') == 0
 
 
-def test_pinned_model_bypasses_the_approved_list(tmp_path):
+def test_pinned_model_bypasses_the_approved_list_but_must_be_listed(tmp_path):
+    la._MODELS_CACHE.clear()
     http = FakeHttp({'local.invalid': chat('allow')})
     out, info, _ = run(tmp_path, Clock(), http, env=dict(ENV, LLM_LOCAL_MODEL='gemma-4-26b'), rules='reject')
-    assert out == 'allow' and info['layer'] == 'local' and http.n('/v1/models') == 0
+    assert out == 'allow' and info['layer'] == 'local' and http.n('/v1/chat/completions') == 1
+    la._MODELS_CACHE.clear()
+    http = FakeHttp({'local.invalid': chat('allow')})
+    out, info, rows = run(tmp_path, Clock(), http, env=dict(ENV, LLM_LOCAL_MODEL='not-loaded'), rules='reject')
+    assert http.n('/v1/chat/completions') == 0 and rows[-1]['local_skip'] == 'model-not-loaded'
 
 
 def test_models_endpoint_down_is_model_unknown(tmp_path):

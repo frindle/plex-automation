@@ -137,18 +137,36 @@ class Layer:
 _MODELS_CACHE = {}
 
 
-def pick_local_model(base, key, http, now=time.time, timeout=(2, 5)):
-    """LLM_LOCAL_MODEL is handled by the caller; otherwise the first id from GET {base}/v1/models, cached
-    MODELS_TTL seconds (short, so a model Darkbloom swaps in is seen on the next decision)."""
+_NOT_LOADED = frozenset({'unloaded', 'not_loaded', 'not-loaded', 'available', 'downloaded', 'offline', 'stopped'})
+
+
+def _entry_loaded(e):
+    """Darkbloom's /v1/models entries carry no loaded/status field today (the list is what is loaded), so every
+    entry counts. Should one appear, an entry marked not loaded is dropped: listing is never a reason to load."""
+    if e.get('loaded') is False:
+        return False
+    st = e.get('status', e.get('state'))
+    return not (isinstance(st, str) and st.strip().lower() in _NOT_LOADED)
+
+
+def local_models(base, key, http, now=time.time, timeout=(2, 5)):
+    """Every loaded model id from GET {base}/v1/models, in listed order, cached MODELS_TTL seconds (short, so a
+    model Darkbloom swaps in is seen on the next decision). Raises when the list can't be read."""
     hit = _MODELS_CACHE.get(base)
     if hit and now() - hit[0] < MODELS_TTL:
         return hit[1]
     headers = {'Authorization': 'Bearer ' + key} if key else {}
     r = http.get(base.rstrip('/') + '/v1/models', headers=headers, timeout=timeout)
     r.raise_for_status()
-    model = r.json()['data'][0]['id']
-    _MODELS_CACHE[base] = (now(), model)
-    return model
+    models = [e['id'] for e in r.json()['data']
+              if isinstance(e, dict) and isinstance(e.get('id'), str) and e['id'].strip() and _entry_loaded(e)]
+    _MODELS_CACHE[base] = (now(), models)
+    return models
+
+
+def pick_local_model(base, key, http, now=time.time, timeout=(2, 5)):
+    """First loaded id from /v1/models (no approval check)."""
+    return local_models(base, key, http, now, timeout)[0]
 
 
 def _chat_url(base):
@@ -305,18 +323,31 @@ def local_approved(kind, env):
     return {_model_key(n) for n in names if n}
 
 
-def _local_gate(kind, env, model_fn):
-    """Skip reason for the auto-picked local model: 'model-not-approved' when its back-test hasn't passed for
-    this kind, 'model-unknown' when /v1/models can't be read. None to go ahead."""
-    approved = local_approved(kind, env)
-    if approved is None:
-        return None
+def pick_approved(models, approved):
+    """First listed id approved for the kind (approved None = any), else None."""
+    for m in models:
+        if approved is None or _model_key(m) in approved:
+            return m
+    return None
 
+
+def local_model_state(kind, env, models, pin=None):
+    """(model, skip) the local layer would use now for kind, given the loaded ids (None = list unreadable).
+    skip is None, 'model-unknown', 'model-not-loaded' (pin not listed) or 'model-not-approved'. Never loads or
+    switches anything: a pin must already be listed, and an unapproved list means the layer sits out."""
+    if not models:
+        return None, 'model-unknown'
+    if pin:
+        listed = next((m for m in models if _model_key(m) == _model_key(pin)), None)
+        return (listed, None) if listed else (None, 'model-not-loaded')
+    pick = pick_approved(models, local_approved(kind, env))
+    return (pick, None) if pick else (None, 'model-not-approved')
+
+
+def _local_gate(kind, env, models_fn, pin=None):
+    """Skip reason for the local layer, or None to go ahead (see local_model_state)."""
     def gate():
-        name = model_fn()
-        if not name:
-            return 'model-unknown'
-        return None if _model_key(name) in approved else 'model-not-approved'
+        return local_model_state(kind, env, models_fn(), pin)[1]
     return gate
 
 
@@ -396,12 +427,19 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
         gate = None
         if base:
             fixed = (env.get('LLM_LOCAL_MODEL') or '').strip()
-            model_fn = (lambda: fixed) if fixed else (lambda: pick_local_model(base, key, http, now))
-            if not fixed:
-                gate = _local_gate(kind, env, model_fn)
+
+            def models_fn():
+                return local_models(base, key, http, now)
+
+            def model_fn():
+                models = models_fn()
+                return local_model_state(kind, env, models, fixed)[0] or (fixed or (models[0] if models else None))
+            gate = _local_gate(kind, env, models_fn, fixed)
             url = _chat_url(base)
         else:
-            model_fn = (lambda: env.get('LLM_DECIDE_MODEL') or DEFAULT_MODEL)
+
+            def model_fn():
+                return env.get('LLM_DECIDE_MODEL') or DEFAULT_MODEL
             url = legacy
         layers['local'] = Layer('local', _chat_fn(url, model_fn, key, http, total, 2.0,
                                                   {'chat_template_kwargs': {'enable_thinking': False}}), model_fn, gate)
@@ -468,6 +506,26 @@ def layer_status(env):
             'unraid_model': ((env.get('LLM_UNRAID_MODEL') or '').strip() or UNRAID_MODEL) if unraid else None,
             'local_model': ((env.get('LLM_LOCAL_MODEL') or '').strip() or 'auto') if local else None,
             'paid_model': ((env.get('DARKBLOOM_CLOUD_MODEL') or '').strip() or PAID_MODEL) if paid else None}
+
+
+def local_now(env, http=None, now=time.time):
+    """What the local layer would do for each kind right now, for /llm-layers: the loaded ids and, per kind, the
+    model it would use or why it sits out. One cached GET of /v1/models; None when local isn't configured."""
+    base = (env.get('DARKBLOOM_BASE_URL') or '').strip()
+    if not base:
+        return None
+    if http is None:
+        import requests as http
+    pin = (env.get('LLM_LOCAL_MODEL') or '').strip()
+    try:
+        models = local_models(base, env.get('DARKBLOOM_API_KEY'), http, now)
+    except Exception:  # noqa: BLE001
+        models = None
+    kinds = {}
+    for kind in sorted(llm_decide.KINDS):
+        model, skip = local_model_state(kind, env, models, pin)
+        kinds[kind] = {'model': model, 'skip': skip}
+    return {'loaded': models, 'pin': pin or None, 'kinds': kinds}
 
 
 def hold_active(env, http=None, prefix='LLM_LOCAL_HOLD'):
