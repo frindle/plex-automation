@@ -15,6 +15,7 @@ KINDS = {
     'unregistered_triage': ('keep', 'remove_keep_library', 'remove_and_research', 'ask'),
     'stuck_import': ('wait', 'retry_import', 'ask'),
     'stuck_upgrade_tag': ('wait', 'run_sweep', 'ask'),
+    'duplicate_folder': ('leave', 'merge', 'ask'),
 }
 MIN_CONFIDENCE = 0.75
 MIN_SEEDERS = 10
@@ -120,6 +121,16 @@ POLICY = {
         'run_sweep (a stale upgrade label is likely and the existing stuck-tag sweep should be run) or ask (a '
         'person should look). You can never change a label, delete or remove anything; the choice is advice '
         'only. Use ask when the facts do not settle it, for example no download id at all.'),
+    'duplicate_folder': (
+        'The library scan found sibling folders whose names differ only by a collision suffix, such as a number in '
+        'brackets, copy or an underscore number, which usually means an import landed beside an existing folder '
+        'instead of in it. It is only reported today. Facts only: media (movies or tv), level (library_root or '
+        'nested, nested meaning a show folder holding season folders), folder_count, suffixes (one class per '
+        'folder: none, paren_number, copy, underscore_number), sizes_gb (largest first), empty_folders (how many '
+        'hold nothing), rules_action. Pick one action: leave (looks intentional or harmless and needs no '
+        'follow-up), merge (one folder should be folded into the other; a person does it) or ask (a person '
+        'should look). You can never move or delete anything; the choice is advice only. merge needs at least '
+        'two folders and at least one that is not empty. Use ask when the facts do not settle it.'),
 }
 
 
@@ -839,7 +850,7 @@ def dupe_comparison(facts):
 
 
 _SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure',
-                'torrent_error': 'ask', 'unregistered_triage': 'ask', 'stuck_import': 'ask', 'stuck_upgrade_tag': 'ask'}
+                'torrent_error': 'ask', 'unregistered_triage': 'ask', 'stuck_import': 'ask', 'stuck_upgrade_tag': 'ask', 'duplicate_folder': 'ask'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
 
@@ -923,6 +934,14 @@ def apply_hard_rules(kind, action, facts):
             # Advice only (nothing here relabels or deletes); anything off the menu is ask.
             if action not in KINDS['stuck_upgrade_tag']:
                 return 'ask', 'invalid_action'
+        elif kind == 'duplicate_folder':
+            # Advice only (nothing here moves or deletes). A merge needs two folders and some content.
+            if action not in KINDS['duplicate_folder']:
+                return 'ask', 'invalid_action'
+            if action == 'merge':
+                n, e = facts.get('folder_count'), facts.get('empty_folders')
+                if not isinstance(n, int) or isinstance(n, bool) or n < 2 or not isinstance(e, int) or e >= n:
+                    return 'ask', 'merge_needs_content'
         elif kind == 'unregistered_triage' and action in ('remove_keep_library', 'remove_and_research'):
             # The model may never cause a delete the rules would not make (missing rules_action fails closed).
             if facts.get('rules_action') != 'remove':
