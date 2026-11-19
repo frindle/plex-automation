@@ -58,6 +58,10 @@ def acts():                   # categories recorded so far, in order
         return [json.loads(l)['category'] for l in f if l.strip()]
 
 
+# _keep_data_cleanup_plan reads the file list before a keep-data removal; that is not a seed-info fetch.
+CLEANUP_LOOKUP = ['name', 'save_path', 'files']
+
+
 def called(method):           # params of every call to one Deluge method, in order
     return [p for m, p in FAKE.calls if m == method]
 
@@ -140,7 +144,7 @@ def test_remove_library_seed_info_none():
     removes = called('core.remove_torrent')
     assert removes == [['H', False]]
     assert acts() == ['library-guard']
-    get_cs = called('core.get_torrent_status')
+    get_cs = [p for p in called('core.get_torrent_status') if p[1] != CLEANUP_LOOKUP]
     assert len(get_cs) == 1 and get_cs[0][0] == 'H' and {'seeding_time', 'save_path', 'progress', 'total_uploaded', 'is_finished'} <= set(get_cs[0][1]), get_cs
 
 def test_remove_library_seed_caller_info_no_save_path():
@@ -168,7 +172,7 @@ def test_remove_library_seed_caller_info_has_save_path():
     aw.remove_torrent('H', info=caller_info)
     removes = called('core.remove_torrent')
     assert removes == [['H', False]]
-    get_cs = called('core.get_torrent_status')
+    get_cs = [p for p in called('core.get_torrent_status') if p[1] != CLEANUP_LOOKUP]
     assert get_cs == []
     get_ts = called('core.get_torrents_status')
     assert get_ts == []

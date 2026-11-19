@@ -48,7 +48,7 @@ def _install(aw, status):
     d = FakeDeluge(status)
     aw.session = d
     aw.deluge_login = lambda: None
-    aw.get_all_torrents = lambda: status
+    aw.get_all_torrents = lambda *a, **kw: status
     return d
 
 
