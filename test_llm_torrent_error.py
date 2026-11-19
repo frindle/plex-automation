@@ -67,7 +67,8 @@ def _advise(f, reply, d):
     def local(prompt):
         calls.append(1)
         return reply
-    env = {'LLM_DECISIONS': 'shadow', 'LLM_LOCAL_WAIT_MIN': '0', 'LLM_PENDING_PATH': os.path.join(d, 'p.json'),
+    env = {'LLM_DECISIONS': 'shadow', 'LLM_MODE_TORRENT_ERROR': 'shadow',
+           'LLM_LOCAL_WAIT_MIN': '0', 'LLM_PENDING_PATH': os.path.join(d, 'p.json'),
            'LLM_ANSWERS_PATH': os.path.join(d, 'a.json')}
     out = la.advise('torrent_error', f, 'ask', log_path=os.path.join(d, 'log.jsonl'), env=env,
                     layers={'local': la.Layer('local', local, 'm')}, now=time.time)
