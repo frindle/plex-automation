@@ -986,7 +986,8 @@ def _timeout_cause(lat):
     # An ask past the warm timeout was given the cold budget (model load); no latency = the /api/ps gate timed out.
     if not isinstance(lat, (int, float)):
         return 'layer_down'
-    return 'cold_load_timeout' if lat > UNRAID_TIMEOUT * 1000 else 'warm_timeout'
+    # A warm timeout logs just over UNRAID_TIMEOUT (e.g. 30012 ms), so the cut sits halfway to the cold budget's floor.
+    return 'cold_load_timeout' if lat > UNRAID_TIMEOUT * 1500 else 'warm_timeout'
 
 
 def _unanswered_cause(row):

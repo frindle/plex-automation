@@ -46,6 +46,7 @@ def test_answered_and_layers_including_cache():
 @pytest.mark.parametrize('kw,cause', [
     ({'unraid': {'pass': 'timeout', 'latency_ms': 240000}}, 'cold_load_timeout'),
     ({'unraid': {'pass': 'timeout', 'latency_ms': 30000 - 1}}, 'warm_timeout'),
+    ({'unraid': {'pass': 'timeout', 'latency_ms': 30012}}, 'warm_timeout'),
     ({'unraid': {'pass': 'timeout', 'latency_ms': None}}, 'layer_down'),
     ({'unraid': {'pass': 'other-model-resident'}}, 'other_model_loaded'),
     ({'unraid': {'pass': 'hold', 'hold_cause': 'plex'}}, 'plex_holding_gpu'),
