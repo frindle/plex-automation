@@ -61,6 +61,20 @@ def test_advise_kind_shadow_under_global_enforce_keeps_rules():
     assert rows[-1]['mode'] == 'shadow'
 
 
+@pytest.mark.parametrize('env,want', [
+    ({'LLM_DECISIONS': 'shadow'}, 'off'),                                    # new kinds wait for their back-test
+    ({'LLM_DECISIONS': 'enforce'}, 'off'),
+    ({'LLM_DECISIONS': 'shadow', 'LLM_MODE_TORRENT_ERROR': 'shadow'}, 'shadow'),
+    ({'LLM_DECISIONS': 'shadow', 'LLM_MODE_TORRENT_ERROR': 'bogus'}, 'off'),
+    ({'LLM_DECISIONS': 'off', 'LLM_MODE_TORRENT_ERROR': 'shadow'}, 'off'),   # the kill switch still wins
+])
+def test_opt_in_kinds_stay_off_until_set(env, want):
+    assert la.kind_mode('torrent_error', env) == want
+    env2 = {k.replace('TORRENT_ERROR', 'UNREGISTERED_TRIAGE'): v for k, v in env.items()}
+    assert la.kind_mode('unregistered_triage', env2) == want
+    assert la.kind_mode('dupe_confirm', {'LLM_DECISIONS': 'shadow'}) == 'shadow'   # the first three follow
+
+
 def test_advise_global_off_never_asks():
     d = tempfile.mkdtemp(prefix='kindmode-')
     calls = []
@@ -74,7 +88,8 @@ def test_layer_status_reports_modes_and_pays_only_for_enforcing_kinds():
     st = la.layer_status({'LLM_DECISIONS': 'shadow', 'LLM_MODE_UPGRADE_GATE': 'enforce',
                           'DARKBLOOM_BASE_URL': 'http://local.invalid', 'DARKBLOOM_CLOUD_API_KEY': 'k'})
     assert st['mode'] == 'shadow'
-    assert st['modes'] == {'dupe_confirm': 'shadow', 'import_identity': 'shadow', 'upgrade_gate': 'enforce'}
+    assert st['modes'] == {'dupe_confirm': 'shadow', 'import_identity': 'shadow', 'torrent_error': 'off',
+                           'unregistered_triage': 'off', 'upgrade_gate': 'enforce'}
     assert st['kinds']['upgrade_gate'] == ['local', 'paid']
     assert st['kinds']['import_identity'] == ['local']
     assert st['kinds']['dupe_confirm'] == ['local']

@@ -1,4 +1,5 @@
 import collections
+import functools
 import glob
 import os
 import posixpath
@@ -150,6 +151,32 @@ def _llm_mode(kind=None):
         return llm_advisor.kind_mode(kind)
     mode = (os.environ.get('LLM_DECISIONS', 'off') or '').strip().lower()
     return mode if mode in ('shadow', 'enforce') else 'off'
+
+
+_LLM_SHADOW_LOCKS = {}
+_LLM_SHADOW_GUARD = threading.Lock()
+
+
+def _run_llm_shadow(name, fn):
+    """Run a log-only batch of model questions on a daemon thread, so a cold or slow model (up to the 240 s
+    cold-load timeout per question) never holds up the rules pass that queued them. One batch per name at a
+    time: while the last one is still asking, a new batch is dropped (the next run queues it again)."""
+    with _LLM_SHADOW_GUARD:
+        lock = _LLM_SHADOW_LOCKS.setdefault(name, threading.Lock())
+    if not lock.acquire(blocking=False):
+        log.info(f'[llm] {name}: previous batch still asking, this one skipped')
+        return None
+
+    def run():
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'[llm] {name} batch failed: {e}')
+        finally:
+            lock.release()
+    t = threading.Thread(target=run, name=f'llm-{name}', daemon=True)
+    t.start()
+    return t
 
 
 LLM_SEEDERS_POLLS = 4
@@ -9688,6 +9715,56 @@ def restore_moved_scheduler():
         time.sleep(RESTORE_MOVED_INTERVAL)
 
 
+# torrent_error (SHADOW ONLY): after deluge_error_repair has done its rules action and filed its hand-off report,
+# the model picks from a fixed menu and the answer is only logged. TORRENT_ERROR_LLM_MAX new questions a run
+# (default 10; answers are cached 24 h, so the hourly run does not re-ask the same torrent).
+TORRENT_ERROR_LLM_MAX_DEFAULT = 10
+
+
+def _torrent_error_llm_max():
+    try:
+        return max(0, int(os.environ.get('TORRENT_ERROR_LLM_MAX') or TORRENT_ERROR_LLM_MAX_DEFAULT))
+    except ValueError:
+        return TORRENT_ERROR_LLM_MAX_DEFAULT
+
+
+def _torrent_error_facts(case, info, rules_action='ask', **extra):
+    """Facts only, no names or paths. Unknown values stay None."""
+    def num(v, div=1.0):
+        return round(v / div, 1) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    added = info.get('time_added')
+    age = (time.time() - added) / 86400.0 if isinstance(added, (int, float)) and added > 0 else None
+    facts = {'case': case, 'rules_action': rules_action, 'state': info.get('state'),
+             'progress': num(info.get('progress')), 'seeded_days': num(info.get('seeding_time'), 86400.0),
+             'age_days': num(age), 'tracker_status': (str(info.get('tracker_status') or '')[:80] or None)}
+    facts.update(extra)
+    return facts
+
+
+def _torrent_error_queue(llm_state, dry_run, case, info, **extra):
+    """Note a hand-off for the model; deluge_error_repair asks them all after its loop, off its own thread."""
+    if not dry_run and llm_state is not None and _llm_mode('torrent_error') != 'off':
+        llm_state.setdefault('queue', []).append((case, dict(info), extra))
+
+
+def _torrent_error_shadow(llm_state, dry_run, case, info, **extra):
+    """Ask the model what to do with a torrent the rules handed to a person; log only, never act on it.
+    Call it AFTER the rules action and its report. Never raises."""
+    try:
+        if dry_run or llm_state is None or _llm_mode('torrent_error') == 'off':
+            return
+        if llm_state['asked'] >= _torrent_error_llm_max():
+            return
+        llm_state['asked'] += 1
+        qinfo = {}
+        # TODO(enforce): wiring the answer into the repair is out of scope. In enforce mode this still only logs.
+        _llm_advise('torrent_error', _torrent_error_facts(case, info, **extra), 'ask', qinfo)
+        if qinfo.get('layer') == 'cache':
+            llm_state['asked'] -= 1  # a cached answer is not a new question
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'[llm] torrent_error shadow failed: {e}')
+
+
 def deluge_error_repair(dry_run=False, relink=None):
     """Scan Deluge for errored torrents and self-heal what's safe to heal."""
     if relink is None:
@@ -9695,13 +9772,15 @@ def deluge_error_repair(dry_run=False, relink=None):
     result = {'ok': True, 'dry_run': dry_run, 'relink': relink,
               'rechecked': [], 'relink_candidates': [], 'missing': [], 'errors': [],
               'library': [], 'resumed': [], 'library_match': []}
+    llm_state = {'asked': 0, 'queue': []}
     try:
         deluge_login()
         resp = session.post(
             f'{DELUGE_URL}/json',
             json={
                 'method': 'core.get_torrents_status',
-                'params': [{}, ['name', 'state', 'message', 'save_path', 'label', 'progress']],
+                'params': [{}, ['name', 'state', 'message', 'save_path', 'label', 'progress',
+                            'time_added', 'seeding_time', 'tracker_status']],
                 'id': 60,
             },
             timeout=30,
@@ -9745,6 +9824,7 @@ def deluge_error_repair(dry_run=False, relink=None):
             if not dry_run:
                 _report_once((h, 'partial'), 'deluge-error',
                              f'Errored torrent "{name}" rechecked to {progress}% -- left paused, needs a human')
+                _torrent_error_queue(llm_state, dry_run, 'partial', info)
                 _repair_rechecked.discard(h)
             # else dry_run: keep in set
         else:
@@ -9787,6 +9867,7 @@ def deluge_error_repair(dry_run=False, relink=None):
             _report_once((h, 'library-error'), 'library-error',
                          f'Errored torrent "{name}" seeds from the library ({save_path}) -- paused, not rechecked or resumed; needs a human',
                          dry_run=dry_run)
+            _torrent_error_queue(llm_state, dry_run, 'library_error', info, library_file_exists=True)
             result['library'].append(entry)
             continue
         present = _deluge_path_exists(os.path.join(save_path, name)) if save_path and name else None
@@ -9823,6 +9904,7 @@ def deluge_error_repair(dry_run=False, relink=None):
                          f'Errored torrent "{name}" — data missing from {save_path} and not found in '
                          f'{", ".join(roots) or "(no roots mounted)"} ({info.get("message") or "no message"})',
                          dry_run=dry_run)
+            _torrent_error_queue(llm_state, dry_run, 'missing', info, library_file_exists=False)
             continue
         # Everything below crosses the container/Deluge namespace boundary:
         # found_local is this container's path, Deluge needs its own.
@@ -9837,6 +9919,7 @@ def deluge_error_repair(dry_run=False, relink=None):
             _report_once((h, 'library-match'), 'deluge-error',
                          f'Errored torrent "{name}" -- library-match at {found_local}; not relinked, needs a human',
                          dry_run=dry_run)
+            _torrent_error_queue(llm_state, dry_run, 'library_match', info, library_file_exists=True)
             continue
         # Never hand Deluge a path it can't see. This re-verifies the
         # translation against Deluge's own filesystem instead of trusting
@@ -9865,8 +9948,12 @@ def deluge_error_repair(dry_run=False, relink=None):
             _report_once((h, 'relink-candidate'), 'deluge-error',
                          f'Errored torrent "{name}" — data found at {found_local}, relink not applied',
                          dry_run=dry_run)
+            _torrent_error_queue(llm_state, dry_run, 'relink_candidate', info, library_file_exists=False)
         result['relink_candidates'].append(entry)
 
+    if llm_state['queue']:
+        q = llm_state.pop('queue')
+        _run_llm_shadow('torrent_error', lambda: [_torrent_error_shadow(llm_state, False, c, i, **e) for c, i, e in q])
     counts = {k: len(v) for k, v in result.items() if isinstance(v, list)}
     result['counts'] = counts
     if any(counts.values()):
@@ -10515,6 +10602,59 @@ SWEEP_TORRENT_FIELDS = ['name', 'label', 'save_path', 'seeding_time', 'is_finish
 UNREGISTERED_MASS_MIN = 5
 UNREGISTERED_MASS_SHARE = 0.8
 UNREGISTERED_MAX_PER_PASS = 25
+# Model triage (kind unregistered_triage, free layers only): per dead torrent the model picks keep / remove_keep_library
+# / remove_and_research / ask. LLM_MODE_UNREGISTERED_TRIAGE (else LLM_DECISIONS) off = never asked. It is only LOGGED:
+# the rules above decide, at most UNREGISTERED_LLM_MAX new questions per sweep (cached answers last 24 h), and the
+# blast-radius guard above is never put to the model.
+UNREGISTERED_LLM_MAX_DEFAULT = 10
+
+
+def _unregistered_llm_max():
+    try:
+        return max(0, int(os.environ.get('UNREGISTERED_LLM_MAX') or UNREGISTERED_LLM_MAX_DEFAULT))
+    except ValueError:
+        return UNREGISTERED_LLM_MAX_DEFAULT
+
+
+def _tracker_message_class(status):
+    s = (status or '').lower()
+    return 'deleted' if 'deleted' in s else 'not_found' if 'not found' in s or 'does not exist' in s \
+        else 'unregistered' if 'regist' in s else 'other'
+
+
+def _unregistered_facts(h, info, row, host, per_host, dead_per_host, now, rules_action):
+    """unregistered_triage facts: counts and classes only, no names, paths or hashes."""
+    seeded = info.get('seeding_time')
+    imported = _arr_imported(h)
+    return {'tracker_message_class': _tracker_message_class(info.get('tracker_status')),
+            'tracker_unregistered': dead_per_host[host], 'tracker_total': per_host[host],
+            'seed_days': int(seeded // 86400) if isinstance(seeded, (int, float)) else None,
+            'seed_floor_days': SEED_DAYS,
+            'library_copy': 'yes' if imported is True else 'no' if imported is False else 'unknown',
+            'library_hardlinked': None,   # not checked here (needs a file listing); unknown
+            'age_days': int(row['age_days']) if row['age_days'] is not None else None,
+            'label': (info.get('label') or '')[:20], 'in_arr_queue': row['in_queue'],
+            'rules_action': rules_action}
+
+
+def _unregistered_triage(asks):
+    """Shadow-only: ask the model about each dead torrent (after the sweep, so it never delays the rules) and log.
+    TODO: enforce wiring is out of scope; in enforce mode the answer is still only logged."""
+    if not asks or _llm_mode('unregistered_triage') == 'off':
+        return
+    cap, asked = _unregistered_llm_max(), 0
+    for make_facts, rules_action in asks:
+        if asked >= cap:
+            break
+        info = {}
+        try:
+            facts = make_facts()   # built lazily: the library lookup is a network call
+            _llm_advise('unregistered_triage', facts, rules_action, info=info)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'[llm] unregistered_triage failed: {e}')
+            continue
+        if info.get('layer') != 'cache':
+            asked += 1
 
 
 def _arr_queue_by_hash():
@@ -10576,6 +10716,7 @@ def unregistered_sweep(apply=None, now=None):
             record_activity('unregistered', f'{dead_per_host[host]} of {per_host[host]} torrents on {host or "one tracker"} '
                             'say unregistered at once: looks like a tracker or account problem, nothing removed')
     applied = 0
+    asks = []
     if dead:
         queue, failed = _arr_queue_by_hash()
         for h, info in sorted(dead.items(), key=lambda kv: kv[1].get('time_added') or 0):
@@ -10605,8 +10746,19 @@ def unregistered_sweep(apply=None, now=None):
                     applied += 1
                     row['outcome'] = _unregistered_apply_one(h, info, q, owner)
             rows.append(row)
+            if host_of(info) not in mass:   # the mass-outage guard stays a rule: never put to the model
+                seeded = info.get('seeding_time') or 0
+                keep_rule = bool(skip) or seeded < SEED_DAYS * 86400 or \
+                    str(row['outcome']).startswith(('refused', 'waiting', 'error'))
+                asks.append(((h, info, row, host_of(info)), 'keep' if keep_rule else 'remove'))
     _unregistered_report.update(ts=datetime.now().isoformat(timespec='seconds'), apply=bool(apply), rows=rows)
     log.info(f'[unregistered] sweep: {len(rows)} dead torrent(s), {"apply" if apply else "dry run"}')
+    try:
+        if asks and _llm_mode('unregistered_triage') != 'off':
+            _run_llm_shadow('unregistered_triage', functools.partial(_unregistered_triage, [
+                (functools.partial(_unregistered_facts, *a, per_host, dead_per_host, now, r), r) for a, r in asks]))
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'[llm] unregistered_triage skipped: {e}')
     return rows
 
 

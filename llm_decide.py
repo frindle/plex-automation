@@ -11,6 +11,8 @@ KINDS = {
     'upgrade_gate': ('allow', 'throttle', 'reject'),
     'import_identity': ('match', 'mismatch', 'unsure'),
     'dupe_confirm': ('same', 'different', 'unsure'),
+    'torrent_error': ('recheck', 'resume', 'relink', 'wait', 'remove_and_research', 'ask'),
+    'unregistered_triage': ('keep', 'remove_keep_library', 'remove_and_research', 'ask'),
 }
 MIN_CONFIDENCE = 0.75
 MIN_SEEDERS = 10
@@ -73,6 +75,29 @@ POLICY = {
         "Director's Cut, Theatrical, Unrated, IMAX and the like). A file holding more episodes than the other "
         '(S01E01E02 vs S01E01) is different. Use unsure whenever the names do not settle it; unsure keeps both '
         'files. When a Comparison line follows the Context, use it: it is computed from these facts.'),
+    'torrent_error': (
+        'A torrent in the download client is in an error state and the automatic repair has no safe fix for it, so '
+        'it would normally be handed to a person. Facts: case is why it was handed over (partial: a recheck ended '
+        'below 100%; library_error: it seeds from the media library; missing: its data is gone and was not found '
+        'anywhere; library_match: its data was found inside the media library; relink_candidate: its data was '
+        'found in another download folder and was not re-pointed). rules_action is what the automation did or '
+        'will do. Pick one action: recheck (verify the data again), resume (start it again), relink (re-point it '
+        'at data found elsewhere), wait (nothing to do yet; look again later), remove_and_research (delete the '
+        'torrent and search for a new copy) or ask (a person should look). remove_and_research is only allowed '
+        'when the data is unrecoverable (missing, no library copy) and the torrent is not seeding for a ratio '
+        'goal; otherwise it is turned into ask. Never choose resume or relink for a library_error case. '
+        'A null fact means unknown: prefer wait or ask over a destructive action when the facts that matter are '
+        'unknown. Use ask whenever the facts do not settle it.'),
+    'unregistered_triage': (
+        'The tracker says it no longer knows this torrent. Facts only: tracker_message_class (unregistered, '
+        'not_found, deleted or other), tracker_unregistered and tracker_total (how many of that tracker\'s '
+        'torrents say so right now), seed_days against seed_floor_days, library_copy (yes, no or unknown) with '
+        'library_hardlinked, age_days and label. Actions: keep = looks like a tracker outage or something '
+        'temporary (many of the tracker\'s torrents at once, a very young torrent); remove_keep_library = '
+        'remove the torrent and its download data, the library copy stays (needs library_copy yes); '
+        'remove_and_research = no library copy exists, remove it and ask Sonarr or Radarr to search again; '
+        'ask = the facts do not settle it, a person decides. Never remove below the seed floor, and never '
+        'when the rules_action fact is keep. When unsure, answer ask.'),
 }
 
 
@@ -432,6 +457,8 @@ def resolve_action(kind, rules_action, decision, mode='shadow'):
         # Likewise a dupe answer other than same keeps both files.
         if kind == 'dupe_confirm' and action in ('unsure', 'different'):
             return action
+        if kind == 'unregistered_triage' and action in ('keep', 'ask'):
+            return action   # the safe side, whatever the confidence
         if conf < MIN_CONFIDENCE:
             return rules_action
         return action
@@ -789,7 +816,8 @@ def dupe_comparison(facts):
             '. Quality differences (resolution, codec, size, group) do not make the media different.')
 
 
-_SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure'}
+_SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure',
+                'torrent_error': 'ask', 'unregistered_triage': 'ask'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
 
@@ -858,6 +886,19 @@ def apply_hard_rules(kind, action, facts):
             conflict = dupe_conflict(facts)
             if conflict:
                 return 'different', conflict[0]
+        elif kind == 'torrent_error':
+            # The model may never cause a delete the rules would not: removal stands only when the rules action
+            # for this case is itself a removal. Anything unrecognised becomes ask.
+            if action not in KINDS['torrent_error']:
+                return 'ask', 'invalid_action'
+            if action == 'remove_and_research' and facts.get('rules_action') != 'remove_and_research':
+                return 'ask', 'no_model_delete'
+        elif kind == 'unregistered_triage' and action in ('remove_keep_library', 'remove_and_research'):
+            # The model may never cause a delete the rules would not make (missing rules_action fails closed).
+            if facts.get('rules_action') != 'remove':
+                return 'keep', 'rules_keep'
+            if action == 'remove_keep_library' and facts.get('library_copy') != 'yes':
+                return 'ask', 'no_library_copy'
         return action, None
     except Exception:
         if isinstance(kind, str) and kind in _SAFE_ACTION and action != _SAFE_ACTION[kind]:
