@@ -48,7 +48,7 @@ def test_confident_match_settles_on_unraid_with_the_tested_request_shape(tmp_pat
     assert out == 'match' and info['layer'] == 'unraid' and info['pending'] is False
     assert http.n('local.invalid') == 0
     (_, url, kw), = [c for c in http.calls if c[1].endswith('/api/chat')]
-    assert url == 'http://unraid.invalid:11434/api/chat' and kw['timeout'] == (2.0, 120.0)  # nothing loaded: cold
+    assert url == 'http://unraid.invalid:11434/api/chat' and kw['timeout'] == (2.0, 240.0)  # nothing loaded: cold
     body = kw['json']
     assert body['model'] == 'qwen3:14b' and body['stream'] is False and body['think'] is False
     assert body['options'] == {'temperature': 0.2, 'num_predict': 1024}
@@ -252,7 +252,7 @@ def test_cold_load_gets_the_long_timeout_warm_keeps_30s(tmp_path):
     clock = Clock()
     http = world(ollama('match', 0.95))
     ask(tmp_path, 'cold', clock, http)
-    assert _chat_timeout(http) == (2.0, 120.0)
+    assert _chat_timeout(http) == (2.0, 240.0)
     # Listed and answered a minute ago: warm.
     clock.minutes(1)
     http = world(ollama('match', 0.95), loaded=('qwen3:14b',))
@@ -262,7 +262,7 @@ def test_cold_load_gets_the_long_timeout_warm_keeps_30s(tmp_path):
     clock.minutes(6)
     http = world(ollama('match', 0.95), loaded=('qwen3:14b',))
     ask(tmp_path, 'stale', clock, http)
-    assert _chat_timeout(http) == (2.0, 120.0)
+    assert _chat_timeout(http) == (2.0, 240.0)
     http = world(ollama('match', 0.95))
     go(fresh(tmp_path, 'env'), http, env=dict(UENV, LLM_UNRAID_COLD_TIMEOUT='200'))
     assert _chat_timeout(http) == (2.0, 200.0)
@@ -272,7 +272,7 @@ def test_listed_but_never_answered_is_cold(tmp_path):
     # 11-16/17: a timed-out load stays listed in /api/ps; the next ask got 30 s and aborted the load again.
     http = world(ollama('match', 0.95), loaded=('qwen3:14b',))
     go(tmp_path, http)
-    assert _chat_timeout(http) == (2.0, 120.0)
+    assert _chat_timeout(http) == (2.0, 240.0)
 
 
 def test_timeout_backs_off_doubling_until_an_answer(tmp_path):

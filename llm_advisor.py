@@ -43,7 +43,9 @@ MODELS_TTL = 15.0
 # with LLM_LOCAL_APPROVED_<KIND> (comma-separated, '*' = any). An LLM_LOCAL_MODEL pin bypasses this.
 LOCAL_APPROVED = {'import_identity': ('qwen3.5-35b-a3b',), 'upgrade_gate': ('qwen3.5-35b-a3b',)}
 UNRAID_TIMEOUT = 30.0
-UNRAID_COLD_TIMEOUT = 120.0
+# Cold asks that answered took up to 1 min 30 s (11-17..19), and 7 hit 2 min and aborted their load. The cold kinds
+# are background pollers, so waiting longer costs nothing, while each abort throws a model load away.
+UNRAID_COLD_TIMEOUT = 240.0
 # A listed model counts as warm only if it answered this process within this long (Ollama's default keep-alive):
 # /api/ps also lists a model whose load is still running or was just aborted, and a 30 s ask then aborts it again.
 UNRAID_WARM_S = 300.0
