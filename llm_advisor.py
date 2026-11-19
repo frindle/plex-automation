@@ -427,7 +427,9 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
         gate = None
         if base:
             fixed = (env.get('LLM_LOCAL_MODEL') or '').strip()
-            models_fn = lambda: local_models(base, key, http, now)  # noqa: E731
+
+            def models_fn():
+                return local_models(base, key, http, now)
 
             def model_fn():
                 models = models_fn()
@@ -435,7 +437,9 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
             gate = _local_gate(kind, env, models_fn, fixed)
             url = _chat_url(base)
         else:
-            model_fn = (lambda: env.get('LLM_DECIDE_MODEL') or DEFAULT_MODEL)
+
+            def model_fn():
+                return env.get('LLM_DECIDE_MODEL') or DEFAULT_MODEL
             url = legacy
         layers['local'] = Layer('local', _chat_fn(url, model_fn, key, http, total, 2.0,
                                                   {'chat_template_kwargs': {'enable_thinking': False}}), model_fn, gate)
