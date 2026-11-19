@@ -76,7 +76,8 @@ def test_kind_is_free_only_cached_unraid_pending_keep():
 
 def test_advise_caches_answer_and_never_pays():
     d = tempfile.mkdtemp(prefix='unreg-')
-    env = {'LLM_DECISIONS': 'shadow', 'LLM_LOCAL_WAIT_MIN': '0', 'LLM_PENDING_PATH': os.path.join(d, 'p.json'),
+    env = {'LLM_DECISIONS': 'shadow', 'LLM_MODE_UNREGISTERED_TRIAGE': 'shadow',
+           'LLM_LOCAL_WAIT_MIN': '0', 'LLM_PENDING_PATH': os.path.join(d, 'p.json'),
            'LLM_ANSWERS_PATH': os.path.join(d, 'a.json'), 'DARKBLOOM_CLOUD_API_KEY': 'k'}
     calls = []
     layers = {'local': la.Layer('local', lambda p: calls.append(1) or reply('remove_keep_library'), 'm'),
