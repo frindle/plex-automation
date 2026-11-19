@@ -14,6 +14,7 @@ KINDS = {
     'torrent_error': ('recheck', 'resume', 'relink', 'wait', 'remove_and_research', 'ask'),
     'unregistered_triage': ('keep', 'remove_keep_library', 'remove_and_research', 'ask'),
     'stuck_import': ('wait', 'retry_import', 'ask'),
+    'stuck_upgrade_tag': ('wait', 'run_sweep', 'ask'),
 }
 MIN_CONFIDENCE = 0.75
 MIN_SEEDERS = 10
@@ -109,6 +110,16 @@ POLICY = {
         'or temporary and another import attempt is reasonable) or ask (a person should look). You can never '
         'import, delete or remove anything; the choice is advice only. Use ask when the facts do not settle it, '
         'and for unknown_media, sample, archive or not_upgrade older than a day.'),
+    'stuck_upgrade_tag': (
+        'An upgrade finished importing in Sonarr or Radarr, but no download-client torrent matched its download id, '
+        'so the upgrade label could not be flipped back to the base label and the old copy was not superseded; it '
+        'would normally notify a person. Facts only: service, season_pack (true or false), has_download_id (the '
+        'import event carried one), proper_repack, upgrade_labeled (how many torrents currently wear an upgrade '
+        'label), torrents_known (how many torrents the client lists), flip_result, rules_action. Pick one '
+        'action: wait (it should resolve by itself, for example the client has no torrents loaded yet), '
+        'run_sweep (a stale upgrade label is likely and the existing stuck-tag sweep should be run) or ask (a '
+        'person should look). You can never change a label, delete or remove anything; the choice is advice '
+        'only. Use ask when the facts do not settle it, for example no download id at all.'),
 }
 
 
@@ -828,7 +839,7 @@ def dupe_comparison(facts):
 
 
 _SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure',
-                'torrent_error': 'ask', 'unregistered_triage': 'ask', 'stuck_import': 'ask'}
+                'torrent_error': 'ask', 'unregistered_triage': 'ask', 'stuck_import': 'ask', 'stuck_upgrade_tag': 'ask'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
 
@@ -907,6 +918,10 @@ def apply_hard_rules(kind, action, facts):
         elif kind == 'stuck_import':
             # Advice only (nothing here deletes or imports); anything off the menu is ask.
             if action not in KINDS['stuck_import']:
+                return 'ask', 'invalid_action'
+        elif kind == 'stuck_upgrade_tag':
+            # Advice only (nothing here relabels or deletes); anything off the menu is ask.
+            if action not in KINDS['stuck_upgrade_tag']:
                 return 'ask', 'invalid_action'
         elif kind == 'unregistered_triage' and action in ('remove_keep_library', 'remove_and_research'):
             # The model may never cause a delete the rules would not make (missing rules_action fails closed).
