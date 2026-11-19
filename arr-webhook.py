@@ -8370,7 +8370,12 @@ def llm_decisions():
 def llm_layers():
     """Which decision layers each kind uses, in order (no keys or URLs). Paid layers appear only behind a free one."""
     try:
-        return jsonify(dict(llm_advisor.layer_status(os.environ), ok=True)), 200
+        out = dict(llm_advisor.layer_status(os.environ), ok=True)
+        try:
+            out['local_now'] = llm_advisor.local_now(os.environ)
+        except Exception:  # noqa: BLE001
+            out['local_now'] = None
+        return jsonify(out), 200
     except Exception as e:  # noqa: BLE001
         return jsonify({'ok': False, 'error': type(e).__name__}), 500
 
