@@ -40,7 +40,7 @@ Background schedulers (run inside the same process):
 
 ## LLM decisions
 
-Advisory decisions for upgrade grabs, import identity and duplicate keepers (`llm_decide.py`, `llm_advisor.py`). `LLM_DECISIONS=off` (default) never calls a model; `shadow` logs what the chain would do next to what the rules did; `enforce` lets a confident answer (>= 0.75) override the rules. Hard rules always win. Set values in `.env`; compose passes them through with empty defaults.
+Advisory decisions for upgrade grabs, import identity and duplicate keepers (`llm_decide.py`, `llm_advisor.py`). `LLM_DECISIONS=off` (default) never calls a model; `shadow` logs what the chain would do next to what the rules did; `enforce` lets a confident answer (>= 0.75) override the rules. Hard rules always win. `LLM_MODE_<KIND>` (`LLM_MODE_IMPORT_IDENTITY`, `LLM_MODE_DUPE_CONFIRM`, `LLM_MODE_UPGRADE_GATE`) sets one kind on its own, so one kind can enforce while the others stay in shadow; empty follows `LLM_DECISIONS`, and `LLM_DECISIONS=off` turns every kind off. `/llm-layers` shows each kind's mode under `modes`. Set values in `.env`; compose passes them through with empty defaults.
 
 Layers, each skipped when its env is unset:
 

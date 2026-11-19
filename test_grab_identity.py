@@ -13,7 +13,7 @@ class World:
         self.pushes, self.acts, self.asked = [], [], []
         mp.delenv('GRAB_IDENTITY_CHECK', raising=False)
         mp.setattr(aw, '_ib_seen', {})
-        mp.setattr(aw, '_llm_mode', lambda: 'off' if model == 'off' else 'shadow')
+        mp.setattr(aw, '_llm_mode', lambda kind=None: 'off' if model == 'off' else 'shadow')
         mp.setattr(aw, 'send_pushover', lambda t, m, url=None: self.pushes.append((t, m)))
         mp.setattr(aw, 'record_activity', lambda c, s: self.acts.append((c, s)))
         mp.setattr(aw, '_grab_alt_titles', lambda source, item_id: list(alts or []))

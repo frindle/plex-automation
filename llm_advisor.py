@@ -416,27 +416,43 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
     return layers
 
 
+MODES = ('off', 'shadow', 'enforce')
+
+
+def kind_mode(kind, env=None):
+    """Effective mode for one kind. LLM_DECISIONS is the default for every kind and the kill switch (off there is
+    off everywhere); LLM_MODE_<KIND> (off|shadow|enforce) sets one kind on its own, so one kind can enforce while
+    the rest stay in shadow. A missing or unknown per-kind value follows LLM_DECISIONS."""
+    env = os.environ if env is None else env
+    top = (env.get('LLM_DECISIONS', 'off') or '').strip().lower()
+    top = top if top in ('shadow', 'enforce') else 'off'
+    if top == 'off' or not isinstance(kind, str) or not kind:
+        return top
+    own = (env.get('LLM_MODE_' + kind.upper()) or '').strip().lower()
+    return own if own in MODES else top
+
+
 def layer_status(env):
     """Which layers each kind would use, from env alone (no calls, no keys or URLs): for /llm-layers."""
-    mode = (env.get('LLM_DECISIONS', 'off') or '').strip().lower()
-    mode = mode if mode in ('shadow', 'enforce') else 'off'
+    mode = kind_mode(None, env)
     ukinds = {k.strip() for k in (env.get('LLM_UNRAID_KINDS') or UNRAID_KINDS).split(',') if k.strip()}
     unraid = bool((env.get('UNRAID_OLLAMA_URL') or '').strip())
     local = bool((env.get('DARKBLOOM_BASE_URL') or '').strip() or (env.get('LLM_DECIDE_URL') or '').strip())
     paid = bool((env.get('DARKBLOOM_CLOUD_API_KEY') or '').strip())
     claude = bool((env.get('ANTHROPIC_API_KEY') or '').strip())
-    kinds = {}
+    kinds, modes = {}, {}
     for kind in sorted(llm_decide.KINDS):
+        kmode = modes[kind] = kind_mode(kind, env)
         names = []
         if unraid and kind in ukinds:
             names.append('unraid')
         if local:
             names.append('local')
         free = bool(names)
-        if free and mode == 'enforce' and kind not in FREE_ONLY_KINDS:
+        if free and kmode == 'enforce' and kind not in FREE_ONLY_KINDS:
             names += [n for n, on in (('paid', paid), ('claude', claude)) if on]
         kinds[kind] = names
-    return {'mode': mode, 'kinds': kinds,
+    return {'mode': mode, 'modes': modes, 'kinds': kinds,
             'unraid_model': ((env.get('LLM_UNRAID_MODEL') or '').strip() or UNRAID_MODEL) if unraid else None,
             'local_model': ((env.get('LLM_LOCAL_MODEL') or '').strip() or 'auto') if local else None,
             'paid_model': ((env.get('DARKBLOOM_CLOUD_MODEL') or '').strip() or PAID_MODEL) if paid else None}
@@ -781,7 +797,7 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
             env = os.environ
 
         if mode is None:
-            mode = (env.get('LLM_DECISIONS', 'off') or '').strip().lower()
+            mode = kind_mode(kind, env)
         if mode not in ('shadow', 'enforce'):
             mode = 'off'
         if mode == 'off':
