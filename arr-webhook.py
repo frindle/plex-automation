@@ -44,7 +44,7 @@ def record_activity(category, summary):
     except OSError as e:
         log.debug(f'activity log write failed: {e}')
 
-# ── LLM advisor (env-gated: LLM_DECISIONS=off|shadow|enforce, default off) ──
+# ── LLM advisor (env-gated: LLM_DECISIONS=off|shadow|enforce, default off; LLM_MODE_<KIND> per kind) ──
 # llm_advisor.advise() returns rules_action untouched when off. A missing or
 # broken module must never break startup, so the import is guarded.
 try:
@@ -97,8 +97,7 @@ def _late_gate(source, download_id, title, facts, rules_action, upgrade_label, p
             action = _llm_advise('upgrade_gate', facts, rules_action, info)
             if info.get('pending'):
                 continue
-            mode = (os.environ.get('LLM_DECISIONS', 'off') or '').strip().lower()
-            if mode != 'enforce' or action == rules_action:
+            if _llm_mode('upgrade_gate') != 'enforce' or action == rules_action:
                 return
             if action == 'reject':
                 log.warning(f"{source}: late LLM reject of upgrade grab {download_id} ({title})")
@@ -145,7 +144,10 @@ def _audio_channels(n):
     return max(hits) if hits else None
 
 
-def _llm_mode():
+def _llm_mode(kind=None):
+    """off|shadow|enforce: LLM_DECISIONS, or for a kind its LLM_MODE_<KIND> override (llm_advisor.kind_mode)."""
+    if llm_advisor is not None:
+        return llm_advisor.kind_mode(kind)
     mode = (os.environ.get('LLM_DECISIONS', 'off') or '').strip().lower()
     return mode if mode in ('shadow', 'enforce') else 'off'
 
@@ -4321,7 +4323,7 @@ def _ib_seen_recently(download_id, ttl_hours=24):
 # ── Grab-time identity check (alert-only) ────────────────────────────────────
 # Every grab is compared with the series/movie it was grabbed for, so a wrong
 # match that auto-imports (no importBlocked stop) still gets noticed. Hard rules
-# first, then the model in whatever LLM_DECISIONS mode is set. Never removes,
+# first, then the model in import_identity's mode (LLM_MODE_IMPORT_IDENTITY, else LLM_DECISIONS). Never removes,
 # blocks or relabels anything. GRAB_IDENTITY_CHECK=0 disables it.
 
 def _grab_identity_enabled():
@@ -4387,7 +4389,7 @@ def _grab_identity_check(data, source):
                     return
         flagged = action != 'match'
         model = None
-        if _llm_mode() != 'off':
+        if _llm_mode('import_identity') != 'off':
             info = {}
             ret = _llm_advise('import_identity', facts, 'match', info)
             # shadow returns the rules action; the advisor reports the model's own raw answer in info
@@ -5215,7 +5217,7 @@ def handle_grab(data, source):
         'candidate_dv_web': tags['dv'] and tags['web'],
         'seed_days': SEED_DAYS,
     }
-    if _llm_mode() != 'off':
+    if _llm_mode('upgrade_gate') != 'off':
         # Only paid for when the advisor will read them (extra *arr/Deluge calls, a short seeders poll).
         facts.update(_upgrade_gate_extra(source, data, download_id, facts))
     llm_info = {}
@@ -7618,8 +7620,8 @@ def _find_torrent_by_filepath(torrents, filepath):
 # Code guards (llm_decide.dupe_conflict: episodes, years, edition tags, running times) keep both files in every
 # mode. Then the model (kind dupe_confirm, free layers only) is asked whether the two files are the same media:
 # LLM_DUPE_CONFIRM = off | shadow (default: ask and log, change nothing) | enforce (remove a copy only on a
-# confident "same"; pending, unsure, different or no answer keeps both). LLM_DECISIONS caps it: off there is off
-# here, shadow there keeps this at shadow. It is asked on apply runs, on the daily run and with ?llm=1, at most
+# confident "same"; pending, unsure, different or no answer keeps both). The kind's mode caps it (LLM_MODE_DUPE_CONFIRM,
+# else LLM_DECISIONS): off there is off here, shadow there keeps this at shadow. It is asked on apply runs, on the daily run and with ?llm=1, at most
 # LLM_DUPE_CONFIRM_MAX new questions a run (default 40; cached answers are free and last 30 days).
 LLM_DUPE_CONFIRM_MAX_DEFAULT = 40
 
@@ -7628,7 +7630,7 @@ def _dupe_confirm_mode():
     own = (os.environ.get('LLM_DUPE_CONFIRM') or 'shadow').strip().lower()
     if own not in ('off', 'shadow', 'enforce'):
         own = 'shadow'
-    top = _llm_mode()
+    top = _llm_mode('dupe_confirm')
     if top == 'off' or own == 'off':
         return 'off'
     return 'enforce' if own == 'enforce' and top == 'enforce' else 'shadow'
