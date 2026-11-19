@@ -944,3 +944,178 @@ def paid_cap_reached(env, path, month):
         return count >= cap
     except Exception:
         return False
+
+
+# ── failure-rate report (read-only; never touches decisions) ─────────────────
+STATS_MIN_ANSWERED_PCT = 90.0
+STATS_MAX_CAUSE_PCT = 5.0
+STATS_MIN_AGREE_PCT = 95.0
+STATS_CAUSES = ('cold_load_timeout', 'warm_timeout', 'other_model_loaded', 'plex_holding_gpu', 'backoff',
+                'layer_down', 'no_layer', 'unparseable', 'other')
+
+
+def read_decision_rows(path):
+    """Rows of the decisions JSONL (dicts only; unreadable lines and a missing file are skipped)."""
+    rows = []
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(rec, dict):
+                    rows.append(rec)
+    except OSError:
+        pass
+    return rows
+
+
+def _row_epoch(row):
+    import datetime
+    try:
+        d = datetime.datetime.fromisoformat(str(row.get('ts')).replace('Z', '+00:00'))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _timeout_cause(lat):
+    # An ask past the warm timeout was given the cold budget (model load); no latency = the /api/ps gate timed out.
+    if not isinstance(lat, (int, float)):
+        return 'layer_down'
+    return 'cold_load_timeout' if lat > UNRAID_TIMEOUT * 1000 else 'warm_timeout'
+
+
+def _unanswered_cause(row):
+    """Normalised name for why a question got no answer, from the logged error / unraid step / local_skip."""
+    err = str(row.get('error') or '')
+    skip = row.get('local_skip')
+    un = row.get('unraid') if isinstance(row.get('unraid'), dict) else None
+    if err == 'no free layer configured':
+        return 'no_layer'
+    if un is not None and un.get('pass') and (not err or err.startswith('unraid ')):
+        p = un['pass']
+        if p == 'timeout':
+            return _timeout_cause(un.get('latency_ms'))
+        if p == 'backoff':
+            return 'backoff'
+        if p == 'other-model-resident':
+            return 'other_model_loaded'
+        if p == 'hold':
+            return 'plex_holding_gpu' if un.get('hold_cause') == 'plex' else 'other'
+        if p == 'unparseable':
+            return 'unparseable'
+        if p == 'error':
+            return 'layer_down'
+        return 'other'
+    if skip == 'model-not-approved' or err == 'model-not-approved':
+        return 'other_model_loaded'
+    if skip == 'model-unknown' or err == 'model-unknown':
+        return 'layer_down'
+    if err == 'hold':
+        return 'plex_holding_gpu' if row.get('hold_cause') == 'plex' else 'other'
+    if err.startswith('unparseable'):
+        return 'unparseable'
+    head = err.split(':', 1)[0]
+    if 'timeout' in head.lower():
+        return 'warm_timeout'
+    if head.endswith(('Error', 'Exception')):
+        return 'layer_down'
+    return 'other'
+
+
+def _pct(n, d):
+    return round(100.0 * n / d, 1) if d else None
+
+
+def llm_stats(rows, days=7, now=None):
+    """Per decision kind over the last `days`: asked / answered, layers, unanswered causes, hard-rule vetoes,
+    agreement, median latency, below_target flags. Late answers: a question logged pending is answered later as
+    another row for the same kind and context_summary; those rows are counted once (answered if any answered).
+    Rows without a pending sibling count one question each. Output holds counts only, never context_summary."""
+    now = time.time() if now is None else now
+    cutoff = now - days * 86400.0
+    by_kind = {k: [] for k in llm_decide.KINDS}
+    for r in rows or []:
+        if not isinstance(r, dict) or r.get('kind') not in by_kind:
+            continue
+        t = _row_epoch(r)
+        if t is None or t < cutoff:
+            continue
+        by_kind[r['kind']].append((t, r))
+    out = {}
+    for kind, items in by_kind.items():
+        items.sort(key=lambda x: x[0])
+        pend_keys = {r.get('context_summary') for _, r in items if r.get('layer') == 'pending'}
+        pend_keys.discard(None)
+        questions, groups = [], {}
+        for _, r in items:
+            ck = r.get('context_summary')
+            if ck in pend_keys:
+                groups.setdefault(ck, []).append(r)
+            else:
+                questions.append([r])
+        questions.extend(groups.values())
+        by_layer, causes, lats = {}, {}, []
+        answered = veto = agree = disagree = 0
+        for grp in questions:
+            ans = [r for r in grp if r.get('llm_action') is not None]
+            if not ans:
+                c = _unanswered_cause(grp[-1])
+                causes[c] = causes.get(c, 0) + 1
+                continue
+            r = ans[-1]
+            answered += 1
+            lay = str(r.get('layer') or 'unknown')
+            by_layer[lay] = by_layer.get(lay, 0) + 1
+            if str(r.get('reason') or '').startswith('[hard rule'):
+                veto += 1
+            if r.get('agree') is True:
+                agree += 1
+            elif r.get('agree') is False:
+                disagree += 1
+            lat = r.get('latency_ms')
+            if isinstance(lat, (int, float)) and not isinstance(lat, bool):
+                lats.append(lat)
+        asked = len(questions)
+        ans_pct = _pct(answered, asked)
+        agree_pct = _pct(agree, agree + disagree)
+        lats.sort()
+        mid = len(lats) // 2
+        med = None if not lats else (lats[mid] if len(lats) % 2 else (lats[mid - 1] + lats[mid]) / 2)
+        below = []
+        if asked:
+            if ans_pct < STATS_MIN_ANSWERED_PCT:
+                below.append('answered %.0f%% < %.0f%%' % (ans_pct, STATS_MIN_ANSWERED_PCT))
+            for c, n in sorted(causes.items(), key=lambda x: -x[1]):
+                if 100.0 * n / asked > STATS_MAX_CAUSE_PCT:
+                    below.append('%s %d of %d (> %.0f%%)' % (c, n, asked, STATS_MAX_CAUSE_PCT))
+            if agree_pct is not None and agree_pct < STATS_MIN_AGREE_PCT:
+                below.append('agree %.0f%% < %.0f%%' % (agree_pct, STATS_MIN_AGREE_PCT))
+            if veto:
+                below.append('%d hard-rule veto' % veto)
+        out[kind] = {'asked': asked, 'answered': answered, 'answered_pct': ans_pct, 'by_layer': by_layer,
+                     'causes': causes, 'hard_rule_veto': veto, 'agree': agree, 'disagree': disagree,
+                     'agree_pct': agree_pct, 'median_latency_ms': med, 'below_target': below}
+    return out
+
+
+def llm_stats_lines(stats):
+    """One short line per kind that was asked anything. No titles."""
+    lines = []
+    for kind, s in (stats or {}).items():
+        if not s.get('asked'):
+            continue
+        line = '%s: %d/%d answered (%.0f%%)' % (kind, s['answered'], s['asked'], s['answered_pct'])
+        if s['causes']:
+            c, n = max(s['causes'].items(), key=lambda x: x[1])
+            line += ', top cause %s %d' % (c, n)
+        if s['agree_pct'] is not None:
+            line += ', agree %.0f%%' % s['agree_pct']
+        if s['hard_rule_veto']:
+            line += ', veto %d' % s['hard_rule_veto']
+        lines.append(line)
+    return lines
