@@ -10669,6 +10669,52 @@ def find_duplicate_media_folders():
 # has decided to leave alone doesn't re-post every 6 hours forever.
 _reported_dupe_folders = set()
 
+def _duplicate_folder_llm_max():
+    try:
+        return max(0, int(os.environ.get('DUPLICATE_FOLDER_LLM_MAX') or 10))
+    except ValueError:
+        return 10
+
+
+def _dup_suffix_class(name):
+    s = name.strip()
+    m = _DUP_SUFFIX_RE.search(s)
+    if not m:
+        return 'none'
+    t = m.group(0).strip().lower()
+    return 'copy' if 'copy' in t else 'underscore_number' if t.startswith('_') else 'paren_number'
+
+
+def _duplicate_folder_facts(finding):
+    """duplicate_folder facts: counts, sizes and suffix classes only, no folder names or paths."""
+    parent = finding.get('parent') or ''
+    root = next((r for r in MEDIA_ROOTS if parent == r or parent.startswith(r.rstrip('/') + '/')), '')
+    folders = finding.get('folders') or []
+    sizes = sorted((float(f.get('size_gb') or 0) for f in folders), reverse=True)
+    return {'media': 'tv' if 'tv' in os.path.basename(root.rstrip('/')).lower() else 'movies' if root else 'unknown',
+            'level': 'library_root' if parent == root else 'nested', 'folder_count': len(folders),
+            'suffixes': sorted(_dup_suffix_class(os.path.basename(f.get('path') or '')) for f in folders),
+            'sizes_gb': sizes, 'empty_folders': sum(1 for s in sizes if s <= 0), 'rules_action': 'ask'}
+
+
+def _duplicate_folder_shadow(findings):
+    """Ask the model about each new finding; log only. Runs off-thread after the digest lines are written."""
+    if not findings or _llm_mode('duplicate_folder') == 'off':
+        return
+    cap, asked = _duplicate_folder_llm_max(), 0
+    for f in findings:
+        if asked >= cap:
+            break
+        qinfo = {}
+        try:
+            _llm_advise('duplicate_folder', _duplicate_folder_facts(f), 'ask', qinfo)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'[llm] duplicate_folder failed: {e}')
+            continue
+        if qinfo.get('layer') != 'cache':
+            asked += 1
+
+
 def duplicate_folder_scan():
     try:
         findings = find_duplicate_media_folders()
@@ -10681,6 +10727,8 @@ def duplicate_folder_scan():
         detail = ', '.join(f'{os.path.basename(x["path"])} ({x["size_gb"]}GB)' for x in f['folders'])
         record_activity('dupe-folder', f'Duplicate folders in {f["parent"]}: {detail}')
     log.info(f'Duplicate folder scan: {len(findings)} group(s), {len(new)} new')
+    if new and _llm_mode('duplicate_folder') != 'off':
+        _run_llm_shadow('duplicate_folder', functools.partial(_duplicate_folder_shadow, new))
 
 @app.route('/duplicate-folders', methods=['GET'])
 def duplicate_folders():
