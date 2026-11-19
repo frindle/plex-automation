@@ -79,9 +79,9 @@ def test_unregistered_remove_variants_agree_and_facts_dict_form():
 
 
 def test_latency_percentiles_use_clock():
-    ticks = iter(i * 0.1 for i in range(100))
+    ticks = iter(i * 0.125 for i in range(100))
     res = bl.score('upgrade_gate', rows(10), fake([reply('allow')] * 10), clock=lambda: next(ticks))
-    assert bl.percentile(res['lat_ms'], 50) == bl.percentile(res['lat_ms'], 95) == 100
+    assert bl.percentile(res['lat_ms'], 50) == bl.percentile(res['lat_ms'], 95) == 125
     assert bl.percentile([], 50) is None and bl.percentile([1, 2, 3, 4], 95) == 4
 
 
