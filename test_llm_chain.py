@@ -61,7 +61,7 @@ class FakeHttp:
 
     def get(self, url, **kw):
         if url.endswith('/v1/models') and not any('/v1/models' in f for f in self.routes):
-            self.calls.append(('GET', url, kw))  # a pin must be listed: default listing is the test pin
+            # a pin must be listed: the default listing (not recorded in calls) holds the test pin
             return Resp(200, {'data': [{'id': 'm-local'}, {'id': 'gemma-4-26b'}]})
         return self._go('GET', url, **kw)
 
@@ -323,7 +323,7 @@ def test_pinned_model_bypasses_the_approved_list_but_must_be_listed(tmp_path):
     la._MODELS_CACHE.clear()
     http = FakeHttp({'local.invalid': chat('allow')})
     out, info, _ = run(tmp_path, Clock(), http, env=dict(ENV, LLM_LOCAL_MODEL='gemma-4-26b'), rules='reject')
-    assert out == 'allow' and info['layer'] == 'local' and http.n('/v1/models') == 1
+    assert out == 'allow' and info['layer'] == 'local' and http.n('/v1/chat/completions') == 1
     la._MODELS_CACHE.clear()
     http = FakeHttp({'local.invalid': chat('allow')})
     out, info, rows = run(tmp_path, Clock(), http, env=dict(ENV, LLM_LOCAL_MODEL='not-loaded'), rules='reject')
