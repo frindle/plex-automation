@@ -1,4 +1,5 @@
 import collections
+import functools
 import glob
 import os
 import posixpath
@@ -10515,6 +10516,59 @@ SWEEP_TORRENT_FIELDS = ['name', 'label', 'save_path', 'seeding_time', 'is_finish
 UNREGISTERED_MASS_MIN = 5
 UNREGISTERED_MASS_SHARE = 0.8
 UNREGISTERED_MAX_PER_PASS = 25
+# Model triage (kind unregistered_triage, free layers only): per dead torrent the model picks keep / remove_keep_library
+# / remove_and_research / ask. LLM_MODE_UNREGISTERED_TRIAGE (else LLM_DECISIONS) off = never asked. It is only LOGGED:
+# the rules above decide, at most UNREGISTERED_LLM_MAX new questions per sweep (cached answers last 24 h), and the
+# blast-radius guard above is never put to the model.
+UNREGISTERED_LLM_MAX_DEFAULT = 10
+
+
+def _unregistered_llm_max():
+    try:
+        return max(0, int(os.environ.get('UNREGISTERED_LLM_MAX') or UNREGISTERED_LLM_MAX_DEFAULT))
+    except ValueError:
+        return UNREGISTERED_LLM_MAX_DEFAULT
+
+
+def _tracker_message_class(status):
+    s = (status or '').lower()
+    return 'deleted' if 'deleted' in s else 'not_found' if 'not found' in s or 'does not exist' in s \
+        else 'unregistered' if 'regist' in s else 'other'
+
+
+def _unregistered_facts(h, info, row, host, per_host, dead_per_host, now, rules_action):
+    """unregistered_triage facts: counts and classes only, no names, paths or hashes."""
+    seeded = info.get('seeding_time')
+    imported = _arr_imported(h)
+    return {'tracker_message_class': _tracker_message_class(info.get('tracker_status')),
+            'tracker_unregistered': dead_per_host[host], 'tracker_total': per_host[host],
+            'seed_days': int(seeded // 86400) if isinstance(seeded, (int, float)) else None,
+            'seed_floor_days': SEED_DAYS,
+            'library_copy': 'yes' if imported is True else 'no' if imported is False else 'unknown',
+            'library_hardlinked': None,   # not checked here (needs a file listing); unknown
+            'age_days': int(row['age_days']) if row['age_days'] is not None else None,
+            'label': (info.get('label') or '')[:20], 'in_arr_queue': row['in_queue'],
+            'rules_action': rules_action}
+
+
+def _unregistered_triage(asks):
+    """Shadow-only: ask the model about each dead torrent (after the sweep, so it never delays the rules) and log.
+    TODO: enforce wiring is out of scope; in enforce mode the answer is still only logged."""
+    if not asks or _llm_mode('unregistered_triage') == 'off':
+        return
+    cap, asked = _unregistered_llm_max(), 0
+    for make_facts, rules_action in asks:
+        if asked >= cap:
+            break
+        info = {}
+        try:
+            facts = make_facts()   # built lazily: the library lookup is a network call
+            _llm_advise('unregistered_triage', facts, rules_action, info=info)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'[llm] unregistered_triage failed: {e}')
+            continue
+        if info.get('layer') != 'cache':
+            asked += 1
 
 
 def _arr_queue_by_hash():
@@ -10576,6 +10630,7 @@ def unregistered_sweep(apply=None, now=None):
             record_activity('unregistered', f'{dead_per_host[host]} of {per_host[host]} torrents on {host or "one tracker"} '
                             'say unregistered at once: looks like a tracker or account problem, nothing removed')
     applied = 0
+    asks = []
     if dead:
         queue, failed = _arr_queue_by_hash()
         for h, info in sorted(dead.items(), key=lambda kv: kv[1].get('time_added') or 0):
@@ -10605,8 +10660,19 @@ def unregistered_sweep(apply=None, now=None):
                     applied += 1
                     row['outcome'] = _unregistered_apply_one(h, info, q, owner)
             rows.append(row)
+            if host_of(info) not in mass:   # the mass-outage guard stays a rule: never put to the model
+                seeded = info.get('seeding_time') or 0
+                keep_rule = bool(skip) or seeded < SEED_DAYS * 86400 or \
+                    str(row['outcome']).startswith(('refused', 'waiting', 'error'))
+                asks.append(((h, info, row, host_of(info)), 'keep' if keep_rule else 'remove'))
     _unregistered_report.update(ts=datetime.now().isoformat(timespec='seconds'), apply=bool(apply), rows=rows)
     log.info(f'[unregistered] sweep: {len(rows)} dead torrent(s), {"apply" if apply else "dry run"}')
+    try:
+        if asks and _llm_mode('unregistered_triage') != 'off':
+            _unregistered_triage([(functools.partial(_unregistered_facts, *a, per_host, dead_per_host, now, r), r)
+                                  for a, r in asks])
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'[llm] unregistered_triage skipped: {e}')
     return rows
 
 

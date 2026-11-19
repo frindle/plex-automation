@@ -11,6 +11,7 @@ KINDS = {
     'upgrade_gate': ('allow', 'throttle', 'reject'),
     'import_identity': ('match', 'mismatch', 'unsure'),
     'dupe_confirm': ('same', 'different', 'unsure'),
+    'unregistered_triage': ('keep', 'remove_keep_library', 'remove_and_research', 'ask'),
 }
 MIN_CONFIDENCE = 0.75
 MIN_SEEDERS = 10
@@ -73,6 +74,16 @@ POLICY = {
         "Director's Cut, Theatrical, Unrated, IMAX and the like). A file holding more episodes than the other "
         '(S01E01E02 vs S01E01) is different. Use unsure whenever the names do not settle it; unsure keeps both '
         'files. When a Comparison line follows the Context, use it: it is computed from these facts.'),
+    'unregistered_triage': (
+        'The tracker says it no longer knows this torrent. Facts only: tracker_message_class (unregistered, '
+        'not_found, deleted or other), tracker_unregistered and tracker_total (how many of that tracker\'s '
+        'torrents say so right now), seed_days against seed_floor_days, library_copy (yes, no or unknown) with '
+        'library_hardlinked, age_days and label. Actions: keep = looks like a tracker outage or something '
+        'temporary (many of the tracker\'s torrents at once, a very young torrent); remove_keep_library = '
+        'remove the torrent and its download data, the library copy stays (needs library_copy yes); '
+        'remove_and_research = no library copy exists, remove it and ask Sonarr or Radarr to search again; '
+        'ask = the facts do not settle it, a person decides. Never remove below the seed floor, and never '
+        'when the rules_action fact is keep. When unsure, answer ask.'),
 }
 
 
@@ -432,6 +443,8 @@ def resolve_action(kind, rules_action, decision, mode='shadow'):
         # Likewise a dupe answer other than same keeps both files.
         if kind == 'dupe_confirm' and action in ('unsure', 'different'):
             return action
+        if kind == 'unregistered_triage' and action in ('keep', 'ask'):
+            return action   # the safe side, whatever the confidence
         if conf < MIN_CONFIDENCE:
             return rules_action
         return action
@@ -789,7 +802,8 @@ def dupe_comparison(facts):
             '. Quality differences (resolution, codec, size, group) do not make the media different.')
 
 
-_SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure'}
+_SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure',
+                'unregistered_triage': 'ask'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
 
@@ -858,6 +872,12 @@ def apply_hard_rules(kind, action, facts):
             conflict = dupe_conflict(facts)
             if conflict:
                 return 'different', conflict[0]
+        elif kind == 'unregistered_triage' and action in ('remove_keep_library', 'remove_and_research'):
+            # The model may never cause a delete the rules would not make (missing rules_action fails closed).
+            if facts.get('rules_action') != 'remove':
+                return 'keep', 'rules_keep'
+            if action == 'remove_keep_library' and facts.get('library_copy') != 'yes':
+                return 'ask', 'no_library_copy'
         return action, None
     except Exception:
         if isinstance(kind, str) and kind in _SAFE_ACTION and action != _SAFE_ACTION[kind]:

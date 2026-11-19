@@ -61,23 +61,24 @@ PENDING_MAX_AGE = 24 * 3600.0
 DEFAULT_WAIT_MIN = 15.0
 DEFAULT_ANSWER_TTL_H = 24.0
 ANSWER_CACHE_MAX = 2000
-CACHE_KINDS = frozenset({'import_identity', 'dupe_confirm'})
+CACHE_KINDS = frozenset({'import_identity', 'dupe_confirm', 'unregistered_triage'})
 # Per-kind answer lifetime in hours (LLM_ANSWER_TTL_H_<KIND> overrides). Two files' names don't change, so a
 # dupe answer holds for a month; the rest use LLM_ANSWER_TTL_H.
-ANSWER_TTL_H = {'dupe_confirm': 720.0}
+ANSWER_TTL_H = {'dupe_confirm': 720.0, 'unregistered_triage': 24.0}
 # Kinds that never use a paid layer, in any mode (Penn 11-15: paid services only for time-sensitive work such as
 # grab-time decisions and upgrades). They wait for the free layers, then fall back to the caller's rules action.
-FREE_ONLY_KINDS = frozenset({'dupe_confirm'})
+FREE_ONLY_KINDS = frozenset({'dupe_confirm', 'unregistered_triage'})
 UNRAID_MODEL = 'qwen3:14b'
-UNRAID_KINDS = 'import_identity,dupe_confirm,upgrade_gate'
+UNRAID_KINDS = 'import_identity,dupe_confirm,upgrade_gate,unregistered_triage'
 # Actions an Unraid answer may settle on its own; unsure (or a hard rule turning an answer into unsure)
 # always passes on to local Darkbloom.
 UNRAID_DECISIVE = {'import_identity': frozenset({'match', 'mismatch'}),
                    'dupe_confirm': frozenset({'same', 'different'}),
-                   'upgrade_gate': frozenset({'allow', 'throttle', 'reject'})}
+                   'upgrade_gate': frozenset({'allow', 'throttle', 'reject'}),
+                   'unregistered_triage': frozenset({'keep', 'remove_keep_library', 'remove_and_research'})}
 
 # What a seam does while a decision is pending in enforce mode (shadow always keeps the rules action).
-PENDING_ACTION = {'import_identity': 'unsure', 'dupe_confirm': 'unsure'}
+PENDING_ACTION = {'import_identity': 'unsure', 'dupe_confirm': 'unsure', 'unregistered_triage': 'keep'}
 
 
 def http_transport(url, model, timeout=20):
