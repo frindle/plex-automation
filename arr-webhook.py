@@ -4264,6 +4264,50 @@ def _identity_refusal(facts):
     return 'LLM advisor did not confirm the match; needs manual review'
 
 
+IMPORT_NOT_NEEDED = 'nothing to import'
+_NOT_NEEDED_RE = re.compile(r'not (?:an? )?(?:custom format )?upgrade|already imported|equal or higher preference'
+                            r'|NotQualityUpgrade|NotCustomFormatUpgrade|AlreadyImported', re.I)
+_SAMPLE_RE = re.compile(r'sample', re.I)
+
+
+def _manual_import_candidates(base_url, api_key, record):
+    """(candidates, from_folder). By download id first; when the *arr no longer tracks the download (empty answer),
+    by the torrent's folder (record['folder']) instead, the way the Manual Import page does. Raises on HTTP errors."""
+    r = requests.get(
+        f'{base_url}/api/v3/manualimport',
+        headers={'X-Api-Key': api_key},
+        params={'downloadId': record.get('downloadId'), 'filterExistingFiles': 'true'},
+        timeout=20,
+    )
+    r.raise_for_status()
+    candidates = r.json() or []
+    if candidates or not record.get('folder'):
+        return candidates, False
+    r = requests.get(
+        f'{base_url}/api/v3/manualimport',
+        headers={'X-Api-Key': api_key},
+        params={'folder': record['folder'], 'filterExistingFiles': 'true'},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json() or [], True
+
+
+def _rejection_texts(candidate):
+    return [' '.join(str(x.get(k) or '') for k in ('reason', 'message')) if isinstance(x, dict) else str(x)
+            for x in (candidate.get('rejections') or [])]
+
+
+def _not_needed_detail(candidates, key, target_id):
+    """An IMPORT_NOT_NEEDED detail when every non-sample file for the target is refused only because the library
+    already has it (not an upgrade, already imported). None otherwise."""
+    mine = [_rejection_texts(c) for c in candidates if (c.get(key) or {}).get('id') == target_id]
+    mine = [r for r in mine if not (r and all(_SAMPLE_RE.search(t) for t in r))]
+    if mine and all(r and all(_NOT_NEEDED_RE.search(t) for t in r) for r in mine):
+        return f'{IMPORT_NOT_NEEDED}: the library already has it ({len(mine)} file(s) not an upgrade or already imported)'
+    return None
+
+
 def _ib_seen_recently(download_id, ttl_hours=24):
     now = time.time()
     for k, ts in list(_ib_seen.items()):
@@ -4420,19 +4464,13 @@ def _try_radarr_manual_import(record):
     if not (download_id and movie_id):
         return False, 'no downloadId or movieId'
     try:
-        r = requests.get(
-            f'{RADARR_URL}/api/v3/manualimport',
-            headers={'X-Api-Key': RADARR_API_KEY},
-            params={'downloadId': download_id, 'filterExistingFiles': 'true'},
-            timeout=20,
-        )
-        r.raise_for_status()
-        candidates = r.json() or []
+        candidates, from_folder = _manual_import_candidates(RADARR_URL, RADARR_API_KEY, record)
     except Exception as e:
         return False, f'manualimport lookup failed: {e}'
     good = [c for c in candidates if (c.get('movie') or {}).get('id') == movie_id and c.get('rejections') in (None, [])]
     if not good:
-        return False, f'no clean candidate ({len(candidates)} total, none matched movieId {movie_id})'
+        return False, (_not_needed_detail(candidates, 'movie', movie_id)
+                       or f'no clean candidate ({len(candidates)} total, none matched movieId {movie_id})')
     files = []
     for c in good:
         files.append({
@@ -4442,7 +4480,8 @@ def _try_radarr_manual_import(record):
             'languages': c.get('languages'),
             'releaseGroup': c.get('releaseGroup'),
             'indexerFlags': _manual_import_flags(c, RADARR_URL, RADARR_API_KEY, download_id, _RADARR_INDEXER_FLAGS),
-            'downloadId': download_id,
+            # An untracked download (folder lookup) has no download id the *arr can resolve, so it is left off.
+            **({} if from_folder else {'downloadId': download_id}),
         })
     # LLM identity check before ManualImport
     queue_title = record.get('title') or ''
@@ -4472,19 +4511,13 @@ def _try_sonarr_manual_import(record):
     if not (download_id and series_id):
         return False, 'no downloadId or seriesId'
     try:
-        r = requests.get(
-            f'{SONARR_URL}/api/v3/manualimport',
-            headers={'X-Api-Key': SONARR_API_KEY},
-            params={'downloadId': download_id, 'filterExistingFiles': 'true'},
-            timeout=20,
-        )
-        r.raise_for_status()
-        candidates = r.json() or []
+        candidates, from_folder = _manual_import_candidates(SONARR_URL, SONARR_API_KEY, record)
     except Exception as e:
         return False, f'manualimport lookup failed: {e}'
     good = [c for c in candidates if (c.get('series') or {}).get('id') == series_id and c.get('rejections') in (None, [])]
     if not good:
-        return False, f'no clean candidate ({len(candidates)} total, none matched seriesId {series_id})'
+        return False, (_not_needed_detail(candidates, 'series', series_id)
+                       or f'no clean candidate ({len(candidates)} total, none matched seriesId {series_id})')
     files = []
     for c in good:
         files.append({
@@ -4495,7 +4528,7 @@ def _try_sonarr_manual_import(record):
             'languages': c.get('languages'),
             'releaseGroup': c.get('releaseGroup'),
             'indexerFlags': _manual_import_flags(c, SONARR_URL, SONARR_API_KEY, download_id, _SONARR_INDEXER_FLAGS),
-            'downloadId': download_id,
+            **({} if from_folder else {'downloadId': download_id}),
         })
     # LLM identity check before ManualImport
     queue_title = record.get('title') or ''
@@ -6720,6 +6753,7 @@ def deluge_lookup():
     return jsonify({'ok': True, 'count': len(hits), 'hits': hits}), 200
 
 AUTO_RESCUE_MAX_ATTEMPTS = 6  # ~90 min at 15-min intervals
+AUTO_RESCUE_AI_TRIES = 2      # then up to 2 LLM-checked ManualImports, one per pass, before asking a person
 RESCUE_STATE_PATH = os.environ.get('RESCUE_STATE_PATH', '/data/rescue_attempts.json')
 
 def _load_rescue_state():
@@ -6761,6 +6795,32 @@ def _save_rescue_state():
 # no matching downloadFolderImported / downloadFolderImported after
 # it, we call DownloadedMoviesScan / DownloadedEpisodesScan against
 # the save_path so Radarr/Sonarr re-attempts the import.
+def _rescue_ai_import(service, h, info, records):
+    """After the scans failed: the same LLM-checked ManualImport the importBlocked path uses, built from the last grab.
+    ('imported'|'pending'|'not_needed'|'refused', detail)."""
+    grabs = sorted((r for r in records if r.get('eventType') == 'grabbed'), key=lambda r: r.get('date') or '')
+    if not grabs:
+        return 'refused', 'no grab record'
+    last = grabs[-1]
+    record = {
+        'downloadId': h.upper(),
+        'title': last.get('sourceTitle') or info.get('name') or '',
+        'folder': os.path.join(info.get('save_path') or '', info.get('name') or '') if info.get('save_path') else '',
+    }
+    if service == 'sonarr':
+        record.update(seriesId=last.get('seriesId'), episodeId=last.get('episodeId'))
+        ok, detail = _try_sonarr_manual_import(record)
+    else:
+        record['movieId'] = last.get('movieId')
+        ok, detail = _try_radarr_manual_import(record)
+    if ok:
+        return 'imported', detail
+    if detail == IMPORT_LLM_PENDING:
+        return 'pending', detail
+    if detail.startswith(IMPORT_NOT_NEEDED):
+        return 'not_needed', detail
+    return 'refused', detail
+
 def _auto_rescue(service, dry_run=False):
     if service == 'radarr':
         url, key = RADARR_URL, RADARR_API_KEY
@@ -6862,10 +6922,27 @@ def _auto_rescue(service, dry_run=False):
         attempts = _rescue_attempts.get(h, 0)
         if attempts >= AUTO_RESCUE_MAX_ATTEMPTS:
             skipped_reasons['max_attempts'] += 1
-            if h not in _rescue_gave_up and not dry_run:
-                log.warning(f'auto-rescue {service}: giving up on "{info.get("name")}" after {attempts} attempts -- needs manual import')
-                record_activity('rescue-gave-up', f'auto-rescue {service}: gave up on "{info.get("name")}" after {attempts} attempts -- needs manual import')
-                _rescue_gave_up.add(h)
+            if h in _rescue_gave_up or dry_run:
+                continue
+            name = info.get('name')
+            detail = f'ManualImport queued {AUTO_RESCUE_AI_TRIES}x but no import was recorded'
+            if attempts - AUTO_RESCUE_MAX_ATTEMPTS < AUTO_RESCUE_AI_TRIES:
+                outcome, detail = _rescue_ai_import(service, h, info, records)
+                if outcome == 'pending':
+                    continue  # the local model is still loading; ask again next pass
+                if outcome == 'imported':
+                    _rescue_attempts[h] = attempts + 1
+                    log.info(f'auto-rescue {service}: scans failed, LLM-checked ManualImport queued for "{name}" -- {detail}')
+                    record_activity('import-rescue', f'auto-rescue {service}: LLM-checked manual import of "{name}"')
+                    continue
+                if outcome == 'not_needed':
+                    log.info(f'auto-rescue {service}: "{name}" -- {detail}; done, nothing for a person to do')
+                    record_activity('rescue-not-needed', f'auto-rescue {service}: "{name}" -- {detail}')
+                    _rescue_gave_up.add(h)
+                    continue
+            log.warning(f'auto-rescue {service}: giving up on "{name}" after {attempts} attempts ({detail}) -- needs manual import')
+            record_activity('rescue-gave-up', f'auto-rescue {service}: gave up on "{name}" after {attempts} attempts ({detail}) -- needs manual import')
+            _rescue_gave_up.add(h)
             continue
         entry = {
             'hash': h,
@@ -6939,6 +7016,14 @@ def auto_rescue_endpoint():
         _rescue_gave_up.clear()
         _save_rescue_state()
         log.info('auto-rescue: retry counters reset')
+    if request.args.get('retry_gave_up', '').lower() in ('1', 'true', 'yes') and not dry_run:
+        # Items that gave up before the LLM step existed: skip the scans (they already failed) and go straight to it.
+        n = len(_rescue_gave_up)
+        for h in _rescue_gave_up:
+            _rescue_attempts[h] = AUTO_RESCUE_MAX_ATTEMPTS
+        _rescue_gave_up.clear()
+        _save_rescue_state()
+        log.info(f'auto-rescue: {n} given-up item(s) handed to the LLM-checked import')
     if service == 'both':
         return jsonify({
             'ok': True,
