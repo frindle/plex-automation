@@ -88,7 +88,7 @@ def test_layer_status_reports_modes_and_pays_only_for_enforcing_kinds():
     st = la.layer_status({'LLM_DECISIONS': 'shadow', 'LLM_MODE_UPGRADE_GATE': 'enforce',
                           'DARKBLOOM_BASE_URL': 'http://local.invalid', 'DARKBLOOM_CLOUD_API_KEY': 'k'})
     assert st['mode'] == 'shadow'
-    assert st['modes'] == {'dupe_confirm': 'shadow', 'import_identity': 'shadow', 'torrent_error': 'off',
+    assert st['modes'] == {'dupe_confirm': 'shadow', 'import_identity': 'shadow', 'torrent_error': 'off', 'stuck_import': 'off',
                            'unregistered_triage': 'off', 'upgrade_gate': 'enforce'}
     assert st['kinds']['upgrade_gate'] == ['local', 'paid']
     assert st['kinds']['import_identity'] == ['local']

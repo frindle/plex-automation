@@ -2,7 +2,7 @@
 
 Decision chain (each layer is skipped when its env is unset):
   0. Unraid Ollama (LAN)     UNRAID_OLLAMA_URL, model LLM_UNRAID_MODEL (default qwen3:14b), only for
-                             LLM_UNRAID_KINDS (default import_identity,dupe_confirm,upgrade_gate,torrent_error). Asked only when the GPU is free
+                             LLM_UNRAID_KINDS (default import_identity,dupe_confirm,upgrade_gate,torrent_error,unregistered_triage,stuck_import). Asked only when the GPU is free
                              (nothing loaded, or its own model loaded) and LLM_UNRAID_HOLD_URL isn't holding.
                              Its answer is kept only when, after hard rules, it is decisive (not unsure) at
                              confidence >= MIN_CONFIDENCE; anything else passes on to local Darkbloom.
@@ -56,31 +56,32 @@ UNRAID_BACKOFF_MAX_X = 4
 # Per (base, model): last answer time, timeouts in a row, skip-until. Per process; a restart starts clean.
 _UNRAID_HEALTH = {}
 # Kinds asked from a background poller, where waiting out a cold Unraid load is fine. Grab-time kinds keep 30 s.
-UNRAID_COLD_KINDS = frozenset({'import_identity', 'dupe_confirm', 'torrent_error', 'unregistered_triage'})
+UNRAID_COLD_KINDS = frozenset({'import_identity', 'dupe_confirm', 'torrent_error', 'unregistered_triage', 'stuck_import'})
 PENDING_MAX_AGE = 24 * 3600.0
 DEFAULT_WAIT_MIN = 15.0
 DEFAULT_ANSWER_TTL_H = 24.0
 ANSWER_CACHE_MAX = 2000
-CACHE_KINDS = frozenset({'import_identity', 'dupe_confirm', 'torrent_error', 'unregistered_triage'})
+CACHE_KINDS = frozenset({'import_identity', 'dupe_confirm', 'torrent_error', 'unregistered_triage', 'stuck_import'})
 # Per-kind answer lifetime in hours (LLM_ANSWER_TTL_H_<KIND> overrides). Two files' names don't change, so a
 # dupe answer holds for a month; the rest use LLM_ANSWER_TTL_H.
-ANSWER_TTL_H = {'dupe_confirm': 720.0, 'torrent_error': 24.0, 'unregistered_triage': 24.0}
+ANSWER_TTL_H = {'dupe_confirm': 720.0, 'torrent_error': 24.0, 'unregistered_triage': 24.0, 'stuck_import': 24.0}
 # Kinds that never use a paid layer, in any mode (Penn 11-15: paid services only for time-sensitive work such as
 # grab-time decisions and upgrades). They wait for the free layers, then fall back to the caller's rules action.
-FREE_ONLY_KINDS = frozenset({'dupe_confirm', 'torrent_error', 'unregistered_triage'})
+FREE_ONLY_KINDS = frozenset({'dupe_confirm', 'torrent_error', 'unregistered_triage', 'stuck_import'})
 UNRAID_MODEL = 'qwen3:14b'
-UNRAID_KINDS = 'import_identity,dupe_confirm,upgrade_gate,torrent_error,unregistered_triage'
+UNRAID_KINDS = 'import_identity,dupe_confirm,upgrade_gate,torrent_error,unregistered_triage,stuck_import'
 # Actions an Unraid answer may settle on its own; unsure (or a hard rule turning an answer into unsure)
 # always passes on to local Darkbloom.
 UNRAID_DECISIVE = {'import_identity': frozenset({'match', 'mismatch'}),
                    'dupe_confirm': frozenset({'same', 'different'}),
                    'upgrade_gate': frozenset({'allow', 'throttle', 'reject'}),
                    'torrent_error': frozenset({'recheck', 'resume', 'relink', 'wait', 'remove_and_research'}),
-                   'unregistered_triage': frozenset({'keep', 'remove_keep_library', 'remove_and_research'})}
+                   'unregistered_triage': frozenset({'keep', 'remove_keep_library', 'remove_and_research'}),
+                   'stuck_import': frozenset({'wait', 'retry_import'})}
 
 # What a seam does while a decision is pending in enforce mode (shadow always keeps the rules action).
 PENDING_ACTION = {'import_identity': 'unsure', 'dupe_confirm': 'unsure', 'torrent_error': 'wait',
-                  'unregistered_triage': 'keep'}
+                  'unregistered_triage': 'keep', 'stuck_import': 'ask'}
 
 
 def http_transport(url, model, timeout=20):
@@ -422,7 +423,7 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
 MODES = ('off', 'shadow', 'enforce')
 # Kinds added after the first three: off unless LLM_MODE_<KIND> is set, so a deploy never starts them before
 # their back-test (Penn 11-19: back-test first).
-OPT_IN_KINDS = frozenset({'torrent_error', 'unregistered_triage'})
+OPT_IN_KINDS = frozenset({'torrent_error', 'unregistered_triage', 'stuck_import'})
 
 
 def kind_mode(kind, env=None):
@@ -494,7 +495,7 @@ def hold_active(env, http=None, prefix='LLM_LOCAL_HOLD'):
 
 # Facts that drift while a decision waits (swarm size, seeding age). They stay in the prompt but are left out of
 # the pending and answer-cache keys, so the wait-for-local clock isn't restarted each time one ticks over.
-VOLATILE_FACTS = frozenset({'seeded_days', 'seeders', 'age_days'})
+VOLATILE_FACTS = frozenset({'seeded_days', 'seeders', 'age_days', 'age_hours'})
 
 
 def _stable(v):
