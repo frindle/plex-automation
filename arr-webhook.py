@@ -4858,6 +4858,22 @@ def incoming_release_names(data, source):
     return result
 
 
+def _stuck_upgrade_tag_ask(source, is_season_pack, download_id, proper_repack, flip_result, torrents):
+    """stuck_upgrade_tag (SHADOW ONLY, free layers only): after the 'tag may be stuck' notification the model picks
+    wait / run_sweep / ask; the answer is only logged. Counts and flags, no names or ids. Never raises, never acts."""
+    try:
+        if _llm_mode('stuck_upgrade_tag') == 'off':
+            return
+        labels = {SONARR_UPG_LABEL, RADARR_UPG_LABEL}
+        facts = {'service': source, 'season_pack': bool(is_season_pack), 'has_download_id': bool(download_id),
+                 'proper_repack': bool(proper_repack), 'flip_result': flip_result,
+                 'upgrade_labeled': sum(1 for t in (torrents or {}).values() if (t.get('label') or '') in labels),
+                 'torrents_known': len(torrents or {}), 'rules_action': 'ask'}
+        _run_llm_shadow('stuck_upgrade_tag', lambda: _llm_advise('stuck_upgrade_tag', facts, 'ask', {}))
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'[llm] stuck_upgrade_tag failed: {e}')
+
+
 def handle_upgrade_import(data, source):
     _dedup_id = (data.get('downloadId') or '').lower()
     if _dedup_id:
@@ -4964,6 +4980,7 @@ def handle_upgrade_import(data, source):
                          f'"{download_id or "(none)"}", so the "{upgrade_label}" tag could not be '
                          f'flipped back. Check Deluge for a torrent still tagged {upgrade_label}.'),
             )
+            _stuck_upgrade_tag_ask(source, is_season_pack, download_id, proper_repack, flip_result, torrents)
         return
 
     incoming_name = (torrents.get(new_torrent_hash) or {}).get('name') or (incoming_release_names(data, source) or [new_filename])[0]
