@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.15-slim
 WORKDIR /app
 # unar: unpacks library RAR sets (rar_extract.py); Plex can't play .rar
 RUN apt-get update && apt-get install -y --no-install-recommends unar && rm -rf /var/lib/apt/lists/*
