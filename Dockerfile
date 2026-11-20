@@ -12,6 +12,7 @@ COPY llm_decide.py .
 COPY llm_advisor.py .
 COPY library_audit.py .
 COPY downloads_audit.py .
+COPY abandoned_audit.py .
 COPY arr_health.py .
 COPY deluge_trim.py .
 COPY episode_retention.py .
