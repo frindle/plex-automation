@@ -149,12 +149,13 @@ def test_wait_budget_is_shared_across_rows():
 
 
 def test_keep_rule():
-    res, _, _ = score(rows(6), [reply('allow'),                  # decisive, confident: kept
+    res, _, _ = score(rows(6), [reply('match'),                  # decisive, confident: kept
                                 reply('unsure'),                 # unsure: passed on
-                                reply('allow', 0.5),             # weak: passed on
+                                reply('match', 0.5),             # weak: passed on
                                 'not json',                      # invalid
                                 ValueError('boom'),              # error
-                                ReadTimeout('slow')])            # timeout
+                                ReadTimeout('slow')],            # timeout
+                 kind='import_identity')
     assert res['kept'] == 1 and res['total'] == 6 and res['blocks'] == []
     assert res['passed'] == {'unsure': 1, 'weak': 1, 'invalid': 1, 'error': 1, 'timeout': 1}
 
