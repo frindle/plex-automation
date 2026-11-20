@@ -149,17 +149,21 @@ def test_wait_budget_is_shared_across_rows():
 
 
 def test_keep_rule():
-    data = rows(6) + rows(1, LOW, rules='reject')
-    res, _, _ = score(data, [reply('allow'),                  # decisive, confident: kept
-                             reply('unsure'),                 # unsure: passed on
-                             reply('allow', 0.5),             # weak: passed on
-                             'not json',                      # invalid
-                             ValueError('boom'),              # error
-                             ReadTimeout('slow'),             # timeout
-                             reply('allow')])                 # hard rule min_seeders turns it into unsure
-    assert res['kept'] == 1 and res['total'] == 7
-    assert res['passed'] == {'unsure': 2, 'weak': 1, 'invalid': 1, 'error': 1, 'timeout': 1}
-    assert len(res['blocks']) == 1 and res['blocks'][0].endswith('min_seeders')
+    res, _, _ = score(rows(6), [reply('allow'),                  # decisive, confident: kept
+                                reply('unsure'),                 # unsure: passed on
+                                reply('allow', 0.5),             # weak: passed on
+                                'not json',                      # invalid
+                                ValueError('boom'),              # error
+                                ReadTimeout('slow')])            # timeout
+    assert res['kept'] == 1 and res['total'] == 6 and res['blocks'] == []
+    assert res['passed'] == {'unsure': 1, 'weak': 1, 'invalid': 1, 'error': 1, 'timeout': 1}
+
+
+def test_hard_rule_turning_answer_into_unsure_is_passed_on():
+    data = rows(1, {'year_matches': False}, rules='unsure')
+    res, _, _ = score(data, [reply('match')], kind='import_identity')
+    assert res['kept'] == 0 and res['passed']['unsure'] == 1
+    assert res['blocks'] == ['#1/r0:match->unsure:year_mismatch']
 
 
 def test_hard_rule_to_decisive_answer_is_kept_as_the_ruled_action():
