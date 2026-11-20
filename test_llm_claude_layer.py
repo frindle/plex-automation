@@ -296,3 +296,38 @@ def test_backtest_budget_is_shared_across_kinds(tmp_path, capsys):
 
 def test_backtest_unknown_kind_refused(capsys):
     assert bl.main(['--kind', 'nope'], env={}) == 2
+
+
+def test_300_claude_calls_leave_paid_available_and_claude_answering(tmp_path):
+    clock, http, claude = Clock(), down_http(), FakeClaude('reject', 0.9)
+    env = spend_env(tmp_path)
+    log = tmp_path / 'l.jsonl'
+    month = time.strftime('%Y-%m', time.gmtime(clock()))
+    log.write_text(json.dumps({'ts': month + '-01T00:00:00+00:00', 'kind': 'upgrade_gate',
+                               'paid_calls': [{'layer': 'claude'}] * 300}) + '\n')
+    assert la.paid_cap_reached(dict(env, LLM_PAID_MONTHLY_MAX_CALLS='300'), str(log), month) is False
+    out, info, rows = go_after_wait(tmp_path, clock, http, env, claude)
+    assert info['layer'] == 'claude' and 'paid_cap' not in rows[-1]          # claude keeps answering
+    # claude down this time: paid Darkbloom is still available
+    out, info, rows = go_after_wait(tmp_path, clock, down_http_paid(), spend_env(tmp_path, LLM_CLAUDE_MONTHLY_USD='0'),
+                                    FakeClaude('allow', 0.9))
+    assert info['layer'] == 'paid' and 'paid_cap' not in rows[-1]
+    # and a real 300 paid calls still switch paid off
+    log.write_text(json.dumps({'ts': month + '-01T00:00:00+00:00', 'kind': 'upgrade_gate',
+                               'paid_calls': [{'layer': 'paid'}] * 300}) + '\n')
+    assert la.paid_cap_reached(env, str(log), month) is True
+
+
+def down_http_paid():
+    return down_http()
+
+
+def test_layer_status_shows_both_counters(tmp_path):
+    env = dict(ENV, LLM_DECISIONS='enforce', LLM_CLAUDE_SPEND_PATH=str(tmp_path / 's.json'),
+               LLM_DECISIONS_LOG=str(tmp_path / 'l.jsonl'), LLM_PAID_MONTHLY_MAX_CALLS='50')
+    month = time.strftime('%Y-%m', time.gmtime())
+    (tmp_path / 'l.jsonl').write_text(json.dumps({'ts': month + '-02T00:00:00+00:00', 'paid_calls': [
+        {'layer': 'paid'}, {'layer': 'paid'}, {'layer': 'claude'}]}) + '\n')
+    st = la.layer_status(env)
+    assert st['paid_month'] == {'month': month, 'calls': 2, 'cap_calls': 50, 'capped': False}
+    assert 'usd' in st['claude_month'] and 'cap_usd' in st['claude_month']

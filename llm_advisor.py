@@ -690,7 +690,21 @@ def layer_status(env):
             'local_model': ((env.get('LLM_LOCAL_MODEL') or '').strip() or 'auto') if local else None,
             'paid_model': ((env.get('DARKBLOOM_CLOUD_MODEL') or '').strip() or PAID_MODEL) if paid else None,
             'claude_model': ((env.get('LLM_CLAUDE_MODEL') or '').strip() or CLAUDE_MODEL) if claude else None,
-            'claude_month': claude_month(env) if claude else None}
+            'claude_month': claude_month(env) if claude else None,
+            'paid_month': paid_month(env) if paid else None}
+
+
+def paid_month(env, now=time.time):
+    """Paid Darkbloom calls this UTC month against LLM_PAID_MONTHLY_MAX_CALLS (claude calls are not counted)."""
+    month = _utc_month(now())
+    path = env.get('LLM_DECISIONS_LOG', DEFAULT_LOG)
+    try:
+        cap = int(str(env.get('LLM_PAID_MONTHLY_MAX_CALLS')).strip())
+        cap = 300 if cap < 0 else cap
+    except (ValueError, TypeError):
+        cap = 300
+    calls = spend_summary(path, month).get('paid', {}).get('calls', 0)
+    return {'month': month, 'calls': calls, 'cap_calls': cap, 'capped': calls >= cap}
 
 
 def claude_month(env, now=time.time):
@@ -1102,7 +1116,8 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
         else:
             capped = paid_cap_reached(env, path, time.strftime('%Y-%m', time.gmtime(now())))
             if capped:
-                layers = {k: v for k, v in layers.items() if k not in ('paid', 'claude')}
+                # LLM_PAID_MONTHLY_MAX_CALLS counts paid Darkbloom calls only; claude stays on (its own USD cap).
+                layers = {k: v for k, v in layers.items() if k != 'paid'}
 
         answers, akey, ttl_s = None, None, 0.0
         if kind in CACHE_KINDS:
@@ -1214,7 +1229,7 @@ def paid_cap_reached(env, path, month):
         except (ValueError, TypeError):
             cap = 300
         summary = spend_summary(path, month)
-        count = sum(v['calls'] for v in summary.values())
+        count = summary.get('paid', {}).get('calls', 0)   # paid Darkbloom only: claude has its own dollar cap
         return count >= cap
     except Exception:
         return False
