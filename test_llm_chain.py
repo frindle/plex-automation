@@ -93,7 +93,11 @@ ENV = {'DARKBLOOM_BASE_URL': 'http://local.invalid', 'DARKBLOOM_API_KEY': 'k', '
 def run(tmp_path, clock, http, env=None, claude=None, kind='upgrade_gate', rules='allow', mode='enforce', facts=None, **kw):
     log = tmp_path / 'l.jsonl'
     info = {}
-    out = la.advise(kind, facts or FACTS, rules, mode=mode, log_path=str(log), env=dict(env or ENV, LLM_PENDING_PATH=str(tmp_path / 'llm_pending.json')), now=clock, http=http,
+    env = dict(env or ENV, LLM_PENDING_PATH=str(tmp_path / 'llm_pending.json'),
+               LLM_CLAUDE_SPEND_PATH=str(tmp_path / 'claude_spend.json'))
+    if claude is None:
+        env.pop('ANTHROPIC_API_KEY', None)  # claude now precedes paid: never let a test build the real client
+    out = la.advise(kind, facts or FACTS, rules, mode=mode, log_path=str(log), env=env, now=clock, http=http,
                     hold_http=http, claude_client=claude, info=info, **kw)
     rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
     return out, info, rows
@@ -159,7 +163,7 @@ def test_low_confidence_local_goes_to_claude_immediately(tmp_path):
     assert out == 'reject' and info['layer'] == 'claude'
     assert http.n('darkbloom.dev') == 0
     kw = claude.calls[0]
-    assert kw['model'] == 'claude-sonnet-5-5' and 'thinking' not in kw
+    assert kw['model'] == 'claude-haiku-5-5' and 'thinking' not in kw
     assert kw['output_config']['format']['schema']['additionalProperties'] is False
     assert kw['output_config']['effort'] == 'low'
     assert rows[0]['paid_calls'][0]['input_tokens'] == 200 and rows[0]['paid_calls'][0]['request_id'] == 'req_c1'
@@ -401,7 +405,7 @@ def test_layer_status_lists_free_first_and_hides_secrets():
     env = dict(ENV, LLM_DECISIONS='enforce', UNRAID_OLLAMA_URL='http://unraid.invalid:11434')
     st = la.layer_status(env)
     assert st['mode'] == 'enforce'
-    assert st['kinds']['upgrade_gate'] == ['unraid', 'local', 'paid', 'claude']
+    assert st['kinds']['upgrade_gate'] == ['unraid', 'local', 'claude', 'paid']
     assert st['kinds']['dupe_confirm'] == ['unraid', 'local']
     assert KEY not in json.dumps(st) and 'unraid.invalid' not in json.dumps(st) and 'sk-fake' not in json.dumps(st)
 

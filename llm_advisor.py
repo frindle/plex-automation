@@ -7,8 +7,9 @@ Decision chain (each layer is skipped when its env is unset):
                              Its answer is kept only when, after hard rules, it is decisive (not unsure) at
                              confidence >= MIN_CONFIDENCE; anything else passes on to local Darkbloom.
   1. local Darkbloom (LAN)   DARKBLOOM_BASE_URL + DARKBLOOM_API_KEY  (alias: LLM_DECIDE_URL/_MODEL/_KEY)
-  2. paid Darkbloom          DARKBLOOM_CLOUD_API_KEY
-  3. Claude                  ANTHROPIC_API_KEY (official SDK, structured output)
+  2. Claude (Haiku)          ANTHROPIC_API_KEY (official SDK, structured output), capped per UTC calendar month
+                             at LLM_CLAUDE_MONTHLY_USD (default 100); asked before the paid layer
+  3. paid Darkbloom          DARKBLOOM_CLOUD_API_KEY
   4. rules                   the caller keeps rules_action
 Paid layers are only a backup for the free ones: while the free layers (local, or Unraid when it is the only one)
 can't answer, the decision is PENDING for LLM_LOCAL_WAIT_MIN minutes (default 15) before a paid layer is used, and
@@ -23,6 +24,7 @@ llm_decide stays the source of truth for the prompt, parsing, MIN_CONFIDENCE and
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -36,7 +38,18 @@ DEFAULT_PENDING = '/data/llm_pending.json'
 PAID_BASE = 'https://api.darkbloom.dev/v1'
 PAID_MODEL = 'qwen3.5-35b-a3b'
 PAID_EXTRA_BODY = {'chat_template_kwargs': {'enable_thinking': False}, 'max_tokens': 2048}
-CLAUDE_MODEL = 'claude-sonnet-5-5'
+CLAUDE_MODEL = 'claude-haiku-5-5'
+DEFAULT_CLAUDE_SPEND = '/data/llm_claude_spend.json'
+DEFAULT_CLAUDE_MONTHLY_USD = 100.0
+CLAUDE_BACKOFF_MIN = 15.0
+# USD per million tokens (input, output), Anthropic API list prices as of 2026-11 (claude-api skill model table /
+# https://platform.claude.com/docs/en/about-claude/pricing). Haiku 5.5 costs more above 100K input tokens
+# (HAIKU_LONG_PRICE); our prompts are far below that. A model that is not listed (an LLM_CLAUDE_MODEL override) is
+# priced at the dearest entry, so the cap errs on the safe side.
+CLAUDE_PRICES = {'claude-haiku-5-5': (0.10, 0.50), 'claude-sonnet-5-5': (2.00, 10.00)}
+HAIKU_LONG_PRICE = (0.50, 2.50)
+HAIKU_LONG_AT = 100_000
+_LOG = logging.getLogger('llm_advisor')
 MODELS_TTL = 15.0
 # Auto-picked local models a kind may use: only models whose back-test passed for that kind. Whatever Darkbloom
 # has loaded is used as is; one that isn't listed skips the local layer (never a model swap). Override per kind
@@ -366,26 +379,191 @@ def claude_schema(kind):
     }
 
 
+def claude_cost_usd(model, input_tokens, output_tokens):
+    """Dollars for one Claude call: input tokens x input price + output tokens x output price (per model)."""
+    ti, to = int(input_tokens or 0), int(output_tokens or 0)
+    price = CLAUDE_PRICES.get(str(model or '').strip())
+    if price is None:
+        price = max(CLAUDE_PRICES.values())
+    elif model == 'claude-haiku-5-5' and ti > HAIKU_LONG_AT:
+        price = HAIKU_LONG_PRICE
+    return (ti * price[0] + to * price[1]) / 1_000_000.0
+
+
+def _utc_month(t):
+    return time.strftime('%Y-%m', time.gmtime(t))
+
+
+def claude_monthly_cap(env):
+    try:
+        cap = float(str(env.get('LLM_CLAUDE_MONTHLY_USD', DEFAULT_CLAUDE_MONTHLY_USD)).strip())
+        return cap if cap >= 0 else DEFAULT_CLAUDE_MONTHLY_USD
+    except (TypeError, ValueError):
+        return DEFAULT_CLAUDE_MONTHLY_USD
+
+
+class ClaudeSpend:
+    """Month-to-date cost of the claude layer. Persisted (atomic tmp+rename under a lock), reset on the UTC calendar
+    month. Also holds the layer's in-memory timeout/5xx back-off and the 'API spend limit reached' flag (which
+    lasts the rest of the month)."""
+
+    def __init__(self, path, now=time.time):
+        self.path = path
+        self.now = now
+        self.lock = threading.Lock()
+        self.data = {'month': None, 'usd': 0.0, 'calls': 0, 'limit_hit': False}
+        self.fails = 0
+        self.until = 0.0
+        try:
+            with open(path, encoding='utf-8') as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict) and isinstance(loaded.get('month'), str):
+                self.data = {'month': loaded['month'], 'usd': float(loaded.get('usd') or 0.0),
+                             'calls': int(loaded.get('calls') or 0), 'limit_hit': bool(loaded.get('limit_hit'))}
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _roll(self):
+        m = _utc_month(self.now())
+        if self.data['month'] != m:
+            self.data = {'month': m, 'usd': 0.0, 'calls': 0, 'limit_hit': False}
+
+    def _save(self):
+        try:
+            tmp = '%s.%d.tmp' % (self.path, os.getpid())
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(self.data, fh)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass  # the memory copy still counts
+
+    def snapshot(self):
+        with self.lock:
+            self._roll()
+            return dict(self.data)
+
+    def add(self, model, input_tokens, output_tokens):
+        """Count one call; returns its cost in dollars."""
+        cost = claude_cost_usd(model, input_tokens, output_tokens)
+        with self.lock:
+            self._roll()
+            self.data['usd'] = round(self.data['usd'] + cost, 8)
+            self.data['calls'] += 1
+            self._save()
+        return cost
+
+    def mark_limit_hit(self):
+        with self.lock:
+            self._roll()
+            first = not self.data['limit_hit']
+            self.data['limit_hit'] = True
+            self._save()
+        if first:
+            _LOG.warning('claude layer: API spend/credit limit reached, skipping claude for the rest of %s', self.data['month'])
+
+    def note_failure(self, backoff_s_fn):
+        with self.lock:
+            self.fails += 1
+            self.until = self.now() + backoff_s_fn(self.fails)
+
+    def note_ok(self):
+        with self.lock:
+            self.fails, self.until = 0, 0.0
+
+    def skip_reason(self, cap_usd):
+        """None to go ahead, else why the claude layer sits out this time."""
+        with self.lock:
+            self._roll()
+            if self.data['limit_hit']:
+                return 'claude spend limit'
+            if self.data['usd'] >= cap_usd:
+                return 'claude month cap'
+            if self.now() < self.until:
+                return 'backoff'
+            return None
+
+
+def get_claude_spend(path, now=time.time):
+    st = _STORES.get(('claude_spend', path))
+    if st is None:
+        st = _STORES[('claude_spend', path)] = ClaudeSpend(path, now)
+    st.now = now
+    return st
+
+
+def _claude_spend_path(env):
+    return (env.get('LLM_CLAUDE_SPEND_PATH') or '').strip() or DEFAULT_CLAUDE_SPEND
+
+
+_SPEND_PHRASES = ('credit balance', 'usage limit', 'spend limit', 'spending limit', 'billing', 'insufficient credit',
+                  'out of credit')
+
+
+def _status_of(e):
+    code = getattr(e, 'status_code', None)
+    if code is None:
+        code = getattr(getattr(e, 'response', None), 'status_code', None)
+    return code if isinstance(code, int) else None
+
+
+def claude_spend_limit_error(e):
+    """True when the API says a spend/credit limit was reached (a 400/402/403/429 whose message says so). A plain
+    rate limit (429 without that wording) is not one."""
+    return _status_of(e) in (400, 402, 403, 429) and any(p in str(e).lower() for p in _SPEND_PHRASES)
+
+
+def claude_transient_error(e):
+    """Timeouts, dropped connections and 5xx (incl. 529 overloaded): back the layer off."""
+    name = type(e).__name__.lower()
+    code = _status_of(e)
+    return 'timeout' in name or 'connection' in name or (code is not None and code >= 500)
+
+
+def _claude_backoff_s(env):
+    def f(fails):
+        try:
+            base = float(env.get('LLM_CLAUDE_BACKOFF_MIN') or CLAUDE_BACKOFF_MIN)
+        except (TypeError, ValueError):
+            base = CLAUDE_BACKOFF_MIN
+        return max(0.0, base) * 60.0 * min(2 ** max(0, fails - 1), UNRAID_BACKOFF_MAX_X)
+    return f
+
+
 class ClaudeFailure(RuntimeError):
     def __init__(self, msg, meta):
         super().__init__(msg)
         self.meta = meta
 
 
-def _claude_fn(kind, model, client_factory):
+def _claude_fn(kind, model, client_factory, spend=None, env=None):
+    """spend (a ClaudeSpend), when given, is charged for every answered call and learns from failures: a spend or
+    credit limit error ends the layer for the UTC month, a timeout/5xx starts its back-off."""
     def fn(prompt):
-        client = client_factory()
-        resp = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            messages=[{'role': 'user', 'content': prompt}],
-            output_config={'effort': 'low', 'format': {'type': 'json_schema', 'schema': claude_schema(kind)}},
-        )
+        try:
+            client = client_factory()
+            resp = client.messages.create(
+                model=model,
+                max_tokens=2048,
+                messages=[{'role': 'user', 'content': prompt}],
+                output_config={'effort': 'low', 'format': {'type': 'json_schema', 'schema': claude_schema(kind)}},
+            )
+        except Exception as e:  # noqa: BLE001
+            if spend is not None:
+                if claude_spend_limit_error(e):
+                    spend.mark_limit_hit()
+                elif claude_transient_error(e):
+                    spend.note_failure(_claude_backoff_s(env or {}))
+            raise
         meta = {}
         usage = getattr(resp, 'usage', None)
         if usage is not None:
             meta['input_tokens'] = getattr(usage, 'input_tokens', None)
             meta['output_tokens'] = getattr(usage, 'output_tokens', None)
+            meta['cost_usd'] = round(claude_cost_usd(model, meta['input_tokens'], meta['output_tokens']), 8)
+            if spend is not None:
+                spend.add(model, meta['input_tokens'], meta['output_tokens'])
+        if spend is not None:
+            spend.note_ok()
         rid = getattr(resp, '_request_id', None) or getattr(resp, 'id', None)
         if isinstance(rid, str):
             meta['request_id'] = rid
@@ -458,7 +636,10 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
     if ckey or claude_client is not None:
         cm = (env.get('LLM_CLAUDE_MODEL') or '').strip() or CLAUDE_MODEL
         factory = (lambda: claude_client) if claude_client is not None else _real_claude_client(ckey)
-        layers['claude'] = Layer('claude', _claude_fn(kind, cm, factory), cm)
+        spend = get_claude_spend(_claude_spend_path(env), now)
+        cap = claude_monthly_cap(env)
+        layers['claude'] = Layer('claude', _claude_fn(kind, cm, factory, spend, env), cm,
+                                 lambda: spend.skip_reason(cap))
     return layers
 
 
@@ -502,12 +683,22 @@ def layer_status(env):
             names.append('local')
         free = bool(names)
         if free and kmode == 'enforce' and kind not in FREE_ONLY_KINDS:
-            names += [n for n, on in (('paid', paid), ('claude', claude)) if on]
+            names += [n for n, on in (('claude', claude), ('paid', paid)) if on]
         kinds[kind] = names
     return {'mode': mode, 'modes': modes, 'kinds': kinds,
             'unraid_model': ((env.get('LLM_UNRAID_MODEL') or '').strip() or UNRAID_MODEL) if unraid else None,
             'local_model': ((env.get('LLM_LOCAL_MODEL') or '').strip() or 'auto') if local else None,
-            'paid_model': ((env.get('DARKBLOOM_CLOUD_MODEL') or '').strip() or PAID_MODEL) if paid else None}
+            'paid_model': ((env.get('DARKBLOOM_CLOUD_MODEL') or '').strip() or PAID_MODEL) if paid else None,
+            'claude_model': ((env.get('LLM_CLAUDE_MODEL') or '').strip() or CLAUDE_MODEL) if claude else None,
+            'claude_month': claude_month(env) if claude else None}
+
+
+def claude_month(env, now=time.time):
+    """Month-to-date claude spend for /llm-layers: dollars, cap, calls, whether the API's limit was hit. No key."""
+    snap = get_claude_spend(_claude_spend_path(env), now).snapshot()
+    cap = claude_monthly_cap(env)
+    return {'month': snap['month'], 'usd': round(snap['usd'], 4), 'cap_usd': cap, 'calls': snap['calls'],
+            'capped': snap['usd'] >= cap, 'api_limit_hit': snap['limit_hit']}
 
 
 def local_now(env, http=None, now=time.time):
@@ -755,7 +946,7 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
     key = pending_key(kind, facts)
     res = {'decision': None, 'layer': None, 'model': None, 'latency_ms': None, 'pending': False,
            'pending_min': None, 'escalations': [], 'calls': [], 'hold_cause': None, 'error': None, 'first_pending': False,
-           'unraid': None, 'local_skip': None}
+           'unraid': None, 'local_skip': None, 'claude_skip': None}
 
     def answered(layer, dec, lat):
         store.remove(key)
@@ -840,6 +1031,32 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
         # nothing is asked and the rules stand.
         res['error'] = 'no free layer configured'
         return res
+    def try_claude(why):
+        """Ask claude unless its gate says to sit out (month cap, API spend limit, back-off)."""
+        claude = layers.get('claude')
+        if claude is None:
+            return
+        skip = None
+        if claude.gate is not None:
+            try:
+                skip = claude.gate()
+            except Exception:  # noqa: BLE001
+                skip = 'error'
+        if skip:
+            res['claude_skip'] = skip
+            return
+        res['escalations'].append(('claude', why))
+        dec, err, lat = _ask(kind, prompt, claude, res['calls'])
+        if dec is not None:
+            answered(claude, dec, lat)
+        else:
+            res['error'] = err
+
+    if res['decision'] is None:
+        # Claude is the first backup, ahead of paid Darkbloom.
+        try_claude('open models failed')
+    elif weak(res['decision']):
+        try_claude('low confidence')
     if res['decision'] is None:
         paid = layers.get('paid')
         if paid is not None:
@@ -849,14 +1066,6 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
                 answered(paid, dec, lat)
             else:
                 res['error'] = err
-    claude = layers.get('claude')
-    if claude is not None and (res['decision'] is None or weak(res['decision'])):
-        res['escalations'].append(('claude', 'low confidence' if res['decision'] is not None else 'open models failed'))
-        dec, err, lat = _ask(kind, prompt, claude, res['calls'])
-        if dec is not None:
-            answered(claude, dec, lat)
-        else:
-            res['error'] = err
     return res
 
 
@@ -939,6 +1148,8 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
             extra['unraid'] = res['unraid']
         if res.get('local_skip'):
             extra['local_skip'] = res['local_skip']
+        if res.get('claude_skip'):
+            extra['claude_skip'] = res['claude_skip']
         if not res['pending'] or res['first_pending']:
             llm_decide.log_decision(path, kind, json.dumps(facts, default=str, sort_keys=True)[:500],
                                     rules_action, decision, mode, extra)
