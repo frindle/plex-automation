@@ -2,3 +2,4 @@ requests
 flask
 paramiko
 anthropic==2.8.0
+cryptography

@@ -18,7 +18,7 @@ Background schedulers (run inside the same process):
 `monthly_upgrade.py` is a standalone script duplicating the monthly cycle (purge → bulk search → wait 90 min → relabel/requeue), kept for manual or cron-triggered runs independent of the long-running webhook process.
 
 `media_share.py` adds a friend-facing media upload portal (Flask blueprint, registered into the same app/port) at `/share`:
-- Friends authenticate via Cloudflare Access (the app trusts the `Cf-Access-Authenticated-User-Email` header, so it must only be reachable through the Cloudflare Tunnel — never expose this port directly to the internet).
+- Friends authenticate via Cloudflare Access. The app takes the identity from the email in the validated `Cf-Access-Jwt-Assertion` JWT (see **Access control**); the plain email header is ignored, so a spoofed header gets nothing. `/share/admin*` needs the `ADMIN_EMAIL` identity, and `/share/status/<id>` shows an upload only to its owner (or the admin).
 - Browse the read-only-mounted Movies/TV Shows/Music libraries and upload a file or whole folder to that friend's own SFTP server, looked up by their authenticated email in `FRIENDS_CONFIG`.
 - Uploads run in a background thread, throttled to `UPLOAD_RATE_LIMIT_MBIT` (default 5 Mbit/s) so a large upload doesn't saturate the connection.
 - Every upload is logged to a SQLite DB (`/data/share_uploads.db`); `/share/usage` shows each friend their own bandwidth usage over the last 7/30/60/90/182/365 days.
@@ -37,6 +37,34 @@ Background schedulers (run inside the same process):
    ```
 4. Point Sonarr/Radarr's webhook connections (Settings → Connect) at `http://<container-ip>:9876/webhook/sonarr` and `/webhook/radarr`, enabling the **On Grab** and **On Import** (upgrade) triggers.
 5. If using the media share portal, point a Cloudflare Tunnel + Access application at `http://<container-ip>:9876/share` and restrict ingress so the container is only reachable through the tunnel.
+
+## Access control
+
+One `before_request` gate (`app_auth.py`) covers every route, including `/share`.
+
+| Variable | Meaning |
+| --- | --- |
+| `APP_AUTH_MODE` | `off`, `log` (default) or `enforce`. Anything else is treated as `enforce`. |
+| `CF_ACCESS_TEAM_DOMAIN` | The Access team domain. Signing keys come from `https://<domain>/cdn-cgi/access/certs` (cached 1 h, refetched on an unknown key id). |
+| `CF_ACCESS_AUDS` | Comma-separated AUD tags of the Access applications that may reach this app. |
+| `APP_AUTH_TOKEN_FILE` | File of bearer tokens, one per line (`#` comments). For scripts and the glacier mover. |
+| `APP_AUTH_BASIC_FILE` | File of `user:password` lines. Accepted on `/webhook/*` only, for Sonarr/Radarr. |
+| `ADMIN_EMAIL` | The identity allowed into `/share/admin*`. |
+
+Modes: `off` checks nothing. `log` allows every request but logs each one that `enforce` would refuse (route class, method, path, which credential was missing; never a secret). `enforce` answers 403.
+
+A request passes with any of: a valid Access JWT (signature, expiry, issuer and one of the AUDs checked), `Authorization: Bearer <token>`, or HTTP Basic on `/webhook/*`. `/health` is always open; a `GET` report from loopback (the socket peer, never `X-Forwarded-For`) passes without a credential, so a job running inside the container still works under `enforce` (action routes, POSTs and `/share` never qualify); `/share/dl/<token>` link downloads are open at the gate because the link token is their credential.
+
+`/share` pages need a validated JWT in every mode, so set `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUDS` before deploying this version or friends lose access.
+
+Action routes change things, so a request that would change something must be a `POST` with `Content-Type: application/json` (a body-less or form/text POST is refused 415, a GET 405): `/verify-labels`, `/purge-non-radarr`, `/delete-paths` (body `{"paths": [...]}`), `/torrent-move`, and `/plex-dupe-fix?apply=1`, `/orphan-scan?delete=1`, `/retire-seeds?apply=1`, `/upgrade-lane-cap?apply=1`, `/relabel-by-plex?apply=1`, `/unlabel-library-seeds?apply=1`, `/fix-stuck-upgrade-tags?apply=1`. Their dry-run reports stay on `GET`. Example: `curl -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" -d '{}' '<base>/retire-seeds?apply=1'`.
+
+The Plex token is sent as the `X-Plex-Token` header and scrubbed from any error text.
+
+Rollout order:
+1. Deploy with `APP_AUTH_MODE=log` and the Access variables set. Nothing is refused; read the log for `app-auth: would refuse` lines to find callers without a credential.
+2. Put a Basic user in Sonarr and Radarr's webhook connections (and the credential file named by `APP_AUTH_BASIC_FILE`), put a token in each script or mover that calls the app (and in `APP_AUTH_TOKEN_FILE`), and change any caller that used GET or a non-JSON POST on an action route.
+3. When the log is quiet, set `APP_AUTH_MODE=enforce`. Roll back by setting it to `log`.
 
 ## LLM decisions
 

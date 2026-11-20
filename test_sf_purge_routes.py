@@ -139,7 +139,7 @@ def test_non_radarr_deferred():
     setup()
     STATE['all'] = {h: {'name': h, 'label': 'tv', 'progress': 100, 'state': 'Seeding', 'total_size': 1} for h in ('a', 'b', 'c')}
     STATE['one'] = {'a': full(30 * DAY), 'b': young(), 'c': young()}
-    resp = aw.app.test_client().post('/purge-non-radarr?apply=1')
+    resp = aw.app.test_client().post('/purge-non-radarr?apply=1', json={})
     body = resp.get_json()
     assert resp.status_code == 200 and body['removed'] == 1 and body['deferred'] == 2, body
     assert body['error_count'] == 0 and removed_hashes() == ['a'], (body, RPC)

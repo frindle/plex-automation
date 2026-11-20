@@ -46,6 +46,13 @@ services:
       # only after checking a dry-run's candidate list.
       STALL_AUTOMATION_ENABLED: "false"
       ADMIN_EMAIL: ${ADMIN_EMAIL}
+      # Request gate (see README, Access control). log = allow but log what would be refused; roll out log -> enforce.
+      APP_AUTH_MODE: "${APP_AUTH_MODE:-log}"
+      CF_ACCESS_TEAM_DOMAIN: "${CF_ACCESS_TEAM_DOMAIN:-}"
+      CF_ACCESS_AUDS: "${CF_ACCESS_AUDS:-}"
+      # One secret per line, files under the mounted /data. Empty = that credential type is off.
+      APP_AUTH_TOKEN_FILE: "${APP_AUTH_TOKEN_FILE:-}"
+      APP_AUTH_BASIC_FILE: "${APP_AUTH_BASIC_FILE:-}"
       UPLOAD_RATE_LIMIT_MBIT: "5"
       PLEX_URL: "http://10.0.0.6:32400"
       PLEX_TOKEN: ${PLEX_TOKEN}
