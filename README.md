@@ -148,6 +148,30 @@ Upgrade-lane torrents are not on the ladder. Each one gets a per-torrent connect
 
 `STUCK_AUTOMATION` is `off`, `dry` (the default, also for any other value) or `on`. `off` does nothing on the timer. `dry` logs and writes `stuck-downloads` activity lines only: no call is made that changes Deluge or the arr apps (the connection cap included), and no state is saved. `on` carries the actions out. Preview: `GET /stuck-downloads` (read-only; each torrent, its step and what the next pass would do).
 
+## Abandoned files audit
+
+`abandoned_audit.py` (pure) is wired in `arr-webhook.py`. Once a week (`ABANDONED_AUDIT_INTERVAL` seconds, default 604800, `0` = off; checked on the 6h maintenance tick, measured from the saved report so a restart does not rerun it) it compares what is on disk (Downloads and the library roots) with Deluge, Plex and Radarr/Sonarr and lists what nobody owns. **Report only**: it never deletes, moves, relabels or removes a torrent. Logs carry counts and GB, never paths; the paths appear on `/digest` and `/abandoned-audit`.
+
+A file is known when its path, or its (basename, size), appears in Deluge's file lists, Plex's media parts or the arrs' file records (the basename+size rule covers a different mount prefix per container). Anything newer than 24 h, or in a torrent under 100%, is skipped.
+
+| Bucket | What it lists | Needs |
+| --- | --- | --- |
+| `downloads_orphan` | a Downloads file no torrent owns (same rule as the Downloads audit) | Deluge |
+| `library_untracked` | a video under a library root unknown to Plex, the arrs and Deluge | Deluge, Plex, arrs |
+| `library_no_video_dir` | a library folder with no video anywhere below it (leftover subtitles, nfo, art); size is the folder total | none |
+| `torrent_not_in_library` | a finished `sonarr*`/`radarr*` torrent seeded 21+ days whose videos neither Plex nor the arrs know and that all have a single link | Deluge, Plex, arrs |
+| `plex_missing_file` | a Plex part whose file is not on disk (listed, no bytes, not in the totals) | Plex |
+
+**Reading the report.** `size` is the row's bytes; `reclaim_bytes` is what deleting it would actually free. A hardlinked file frees space only when every link of it was found in the scan and every one of them is listed; otherwise it is 0, and one inode is counted once in the totals. If a source could not be read (`sources` shows `failed`), every bucket that needs it is `incomplete` with no rows: a file is never called abandoned because a source failed. Each bucket keeps its 500 largest rows but counts all of them. A library root that does not exist is listed under `missing_root`. `walk_errors` counts folders that could not be read.
+
+`GET /abandoned-audit` returns the saved report; `?run=1` runs now and saves it; `?run=1&dry_run=1` runs now and saves nothing. The `/digest` page shows the last run, source status, one line per bucket and the 20 largest rows of each.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `ABANDONED_AUDIT_INTERVAL` | `604800` | seconds between runs, `0` = off |
+| `ABANDONED_AUDIT_STATE` | `/data/abandoned_audit.json` | the latest report (safe to delete) |
+| `ABANDONED_AUDIT_ROOTS` | the library roots | comma-separated library roots to scan |
+
 ## Deployment
 
 Runs on Unraid at `/mnt/user/appdata/plex-automation`, on the `br0` macvlan network (external) at a static IP. `.env` lives only on the server and is gitignored — never commit real secrets.

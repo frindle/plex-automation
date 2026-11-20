@@ -22,6 +22,8 @@ import move_list
 import tiering_gate
 import library_audit
 import downloads_audit
+import abandoned_audit
+from html import escape as _html_escape
 import arr_health
 import deluge_trim
 import stuck_plan
@@ -6805,6 +6807,7 @@ a {{ color:#78dce8; }}
 <table>{rows or "<tr><td>Nothing to review 🎉</td></tr>"}</table>
 {_digest_unregistered_html()}
 {_digest_arr_health_html()}
+{_digest_abandoned_html()}
 {_digest_llm_html()}
 </body></html>'''
 
@@ -7512,14 +7515,14 @@ def auto_rescue_endpoint():
 #     Fix: NOT automatic; requires user to split in Plex UI.
 #
 # Read-only for now — reports the list. Add ?apply=1 once we trust it.
-def _plex_get(path, params=None):
+def _plex_get(path, params=None, timeout=30):
     if not PLEX_TOKEN:
         raise RuntimeError('no PLEX_TOKEN set')
     # The token goes in a header: a query-string token ends up in the URL that
     # requests puts in its error text, which routes return to the caller.
     try:
         r = requests.get(f'{PLEX_URL}{path}', params=dict(params or {}),
-                         headers={'Accept': 'application/json', 'X-Plex-Token': PLEX_TOKEN}, timeout=30)
+                         headers={'Accept': 'application/json', 'X-Plex-Token': PLEX_TOKEN}, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -10542,6 +10545,159 @@ def downloads_audit_tick(now=None):
     return r
 
 
+# ── Abandoned-files audit (abandoned_audit.py): report only. Compares the disk (Downloads + library roots) with
+# Deluge, Plex, Radarr and Sonarr and lists what nobody owns. Deletes, moves and relabels nothing.
+ABANDONED_AUDIT_INTERVAL = int(os.environ.get('ABANDONED_AUDIT_INTERVAL', '604800'))  # weekly; 0 = off
+ABANDONED_AUDIT_STATE = os.environ.get('ABANDONED_AUDIT_STATE', '/data/abandoned_audit.json')
+ABANDONED_AUDIT_ROOTS = [r.strip() for r in os.environ.get('ABANDONED_AUDIT_ROOTS', ','.join(LIBRARY_ROOTS)).split(',')
+                         if r.strip()]
+ABANDONED_AUDIT_TIMEOUT = 60      # per request: Plex, Radarr, Sonarr
+ABANDONED_PLEX_PAGE = 500
+_abandoned_audit_lock = threading.Lock()
+
+
+def _abandoned_fetch_deluge():
+    """Torrents with files, save_path mapped to local paths; None when Deluge cannot be read."""
+    try:
+        deluge_login()
+        resp = session.post(f'{DELUGE_URL}/json',
+                            json={'method': 'core.get_torrents_status', 'params': [{}, downloads_audit.FIELDS],
+                                  'id': 92},
+                            timeout=DOWNLOADS_AUDIT_TIMEOUT)
+        resp.raise_for_status()
+        torrents = resp.json().get('result')
+        if not isinstance(torrents, dict):
+            raise ValueError('no result')
+        return {h: dict(t or {}, save_path=_deluge_to_local((t or {}).get('save_path') or '')) for h, t in torrents.items()}
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'Abandoned audit: deluge source failed ({type(e).__name__})')
+        return None
+
+
+def _abandoned_fetch_plex():
+    """Every Plex media part of the movie and show libraries as {path, size}, paths mapped to local; None on error."""
+    try:
+        sections = (_plex_get('/library/sections', timeout=ABANDONED_AUDIT_TIMEOUT).get('MediaContainer') or {}
+                    ).get('Directory') or []
+        parts = []
+        for sec in sections:
+            if (sec.get('title') or '').lower() in PLEX_SKIP_LIBRARIES:
+                continue
+            kind = {'movie': 1, 'show': 4}.get(sec.get('type'))
+            if kind is None:
+                continue
+            start = 0
+            while True:
+                mc = _plex_get(f"/library/sections/{sec['key']}/all",
+                               {'type': kind, 'X-Plex-Container-Start': start,
+                                'X-Plex-Container-Size': ABANDONED_PLEX_PAGE},
+                               timeout=ABANDONED_AUDIT_TIMEOUT).get('MediaContainer') or {}
+                items = mc.get('Metadata') or []
+                for it in items:
+                    for media in it.get('Media') or []:
+                        for part in media.get('Part') or []:
+                            if part.get('file'):
+                                parts.append({'path': _translate_plex_path(part['file']), 'size': part.get('size') or 0})
+                if len(items) < ABANDONED_PLEX_PAGE:
+                    break
+                start += ABANDONED_PLEX_PAGE
+        return parts
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'Abandoned audit: plex source failed ({type(e).__name__})')
+        return None
+
+
+def _abandoned_arr_get(base, key, path, params=None):
+    r = requests.get(f'{base}{path}', headers={'X-Api-Key': key}, params=params, timeout=ABANDONED_AUDIT_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def _abandoned_fetch_radarr():
+    try:
+        out = []
+        for m in _abandoned_arr_get(RADARR_URL, RADARR_API_KEY, '/api/v3/movie'):
+            mf = m.get('movieFile') or {}
+            if mf.get('path'):
+                out.append({'path': _deluge_to_local(mf['path']), 'size': mf.get('size') or 0})
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'Abandoned audit: radarr source failed ({type(e).__name__})')
+        return None
+
+
+def _abandoned_fetch_sonarr():
+    try:
+        out = []
+        for sr in _abandoned_arr_get(SONARR_URL, SONARR_API_KEY, '/api/v3/series'):
+            for ef in _abandoned_arr_get(SONARR_URL, SONARR_API_KEY, '/api/v3/episodefile', {'seriesId': sr['id']}):
+                if ef.get('path'):
+                    out.append({'path': _deluge_to_local(ef['path']), 'size': ef.get('size') or 0})
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'Abandoned audit: sonarr source failed ({type(e).__name__})')
+        return None
+
+
+def abandoned_audit_load():
+    try:
+        with open(ABANDONED_AUDIT_STATE) as f:
+            data = _json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def abandoned_audit_save(report):
+    """Atomic write; never raises."""
+    try:
+        tmp = ABANDONED_AUDIT_STATE + '.tmp'
+        with open(tmp, 'w') as f:
+            _json.dump(report, f)
+        os.replace(tmp, ABANDONED_AUDIT_STATE)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f'Abandoned audit: could not save the report ({type(e).__name__})')
+
+
+def abandoned_audit_run(dry_run=False):
+    with _abandoned_audit_lock:
+        downloads_root = _deluge_to_local(downloads_audit.DOWNLOADS_ROOT)
+        roots = [_deluge_to_local(r) for r in ABANDONED_AUDIT_ROOTS]
+        missing = [r for r in roots if not os.path.isdir(r)]
+        roots = [r for r in roots if r not in missing]
+        torrents = _abandoned_fetch_deluge()
+        plex = _abandoned_fetch_plex()
+        radarr = _abandoned_fetch_radarr()
+        sonarr = _abandoned_fetch_sonarr()
+        arr = None if radarr is None or sonarr is None else radarr + sonarr
+        rows, walk_errors = abandoned_audit.walk([downloads_root] + roots)
+        report = abandoned_audit.audit(
+            rows, torrents, plex, arr, time.time(), downloads_root=downloads_root, library_roots=roots,
+            walk_errors=walk_errors,
+            arr_status={'radarr': 'ok' if radarr is not None else 'failed',
+                        'sonarr': 'ok' if sonarr is not None else 'failed'})
+        report['missing_root'] = missing
+        report['dry_run'] = dry_run
+        if not dry_run:
+            abandoned_audit_save(report)
+        return report
+
+
+def abandoned_audit_tick(now=None):
+    """Runs on the 6h maintenance tick but only once per ABANDONED_AUDIT_INTERVAL, measured from the finished_at in
+    the saved report so a restart does not rerun it. 0 turns it off."""
+    if ABANDONED_AUDIT_INTERVAL <= 0:
+        return None
+    now = time.time() if now is None else now
+    prev = abandoned_audit_load() or {}
+    done = prev.get('finished_at')
+    if isinstance(done, (int, float)) and now - done < ABANDONED_AUDIT_INTERVAL:
+        return None
+    r = abandoned_audit_run()
+    log.info(abandoned_audit.summary_line(r))
+    return r
+
+
 ARR_EXTRAS_TTL = 3600
 _arr_extras_cache = {}  # who -> (fetched_at, set of extensions the *arr imports as extra files)
 
@@ -10773,6 +10929,18 @@ def run_rar_extract_route():
 def downloads_audit_route():
     # Report only: a GET never sends Pushover or records anything; the daily tick does.
     return jsonify(downloads_audit_run(dry_run=True)), 200
+
+
+@app.route('/abandoned-audit', methods=['GET'])
+def abandoned_audit_route():
+    # Report only. GET returns the stored report; ?run=1 runs now and saves it; ?run=1&dry_run=1 saves nothing.
+    if request.args.get('run', '').lower() in ('1', 'true', 'yes'):
+        dry = request.args.get('dry_run', '').lower() in ('1', 'true', 'yes')
+        return jsonify(abandoned_audit_run(dry_run=dry)), 200
+    rep = abandoned_audit_load()
+    if rep is None:
+        return jsonify({'ok': False, 'error': 'no audit yet'}), 404
+    return jsonify(rep), 200
 
 
 TIERING_PAUSE_STATE_PATH = os.environ.get('TIERING_PAUSE_STATE_PATH', '/data/tiering_paused.json')
@@ -11386,6 +11554,30 @@ def _digest_llm_html():
         '<li>' + ln.replace('&', '&amp;').replace('<', '&lt;') + '</li>' for ln in lines) + '</ul>'
 
 
+def _digest_abandoned_html():
+    rep = abandoned_audit_load()
+    h = lambda v: _html_escape(str('' if v is None else v))   # noqa: E731
+    if not rep:
+        return '<h2>Abandoned files</h2><div class="sub">no audit yet</div>'
+    gb = lambda n: f'{(n or 0) / 1e9:.1f} GB'   # noqa: E731
+    when = datetime.fromtimestamp(rep.get('finished_at') or 0, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    src = ' · '.join(f'{h(k)} {h(v)}' for k, v in (rep.get('sources') or {}).items())
+    out = [f'<h2>Abandoned files (report only)</h2><div class="sub">last run {h(when)} · {src} · '
+           f'<a href="/abandoned-audit">json</a></div>']
+    for name, b in (rep.get('buckets') or {}).items():
+        out.append(f"<h3>{h(name)}: {h(b.get('count'))} · {gb(b.get('bytes'))} · "
+                   f"{gb(b.get('reclaim_bytes'))} reclaimable</h3>")
+        if b.get('status') == 'incomplete':
+            out.append(f"<div class='sub'>incomplete: {h(b.get('note') or 'a source failed')}</div>")
+            continue
+        rows = (b.get('rows') or [])[:20]
+        if rows:
+            out.append('<table>' + ''.join(
+                f"<tr><td>{h(r.get('path'))}</td><td>{gb(r.get('size'))}</td><td>{h(r.get('reason'))}</td></tr>"
+                for r in rows) + '</table>')
+    return ''.join(out)
+
+
 def _digest_unregistered_html():
     rep = _unregistered_report
     if not rep['ts']:
@@ -11568,6 +11760,10 @@ def maintenance_scheduler():
             downloads_audit_tick()
         except Exception as e:
             log.error(f'Downloads audit failed: {e}')
+        try:
+            abandoned_audit_tick()
+        except Exception as e:
+            log.error(f'Abandoned audit failed ({type(e).__name__})')
         try:
             unregistered_sweep_tick()
         except Exception as e:
