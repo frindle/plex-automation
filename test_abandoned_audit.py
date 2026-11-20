@@ -276,3 +276,9 @@ def test_torrent_reason_says_copy_or_failed_import(tmp_path):
     reasons = {r['path']: r['reason'] for r in rep['buckets']['torrent_not_in_library']['rows']}
     assert 'imported as a copy' in reasons[str(dl / 'A')]
     assert 'failed import' in reasons[str(dl / 'B')]
+
+
+def test_no_video_dir_in_root_without_any_video(tmp_path):
+    put(tmp_path / 'lib' / 'Only (1990)' / 'a.srt', 5)
+    rep = run(tmp_path, plex=[], arr=[])
+    assert paths(rep, 'library_no_video_dir') == {str(tmp_path / 'lib' / 'Only (1990)')}

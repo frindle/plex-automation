@@ -125,14 +125,17 @@ def walk(roots):
         if has_video:
             rows.extend(dir_rows)
             return True, size, newest, files, []
-        # no video here: the parent decides whether this folder is the topmost one to report
-        return False, size, newest, files, []
+        # no video here: the parent decides whether this folder is the topmost one to report; a root has no parent,
+        # so its video-free children are handed back for the caller to report
+        return False, size, newest, files, dir_rows
 
     for root in roots:
         if not os.path.isdir(root):
             errors[0] += 1
             continue
-        scan(root)
+        root_video, _s, _n, _f, pending = scan(root)
+        if not root_video:
+            rows.extend(pending)
     return rows, errors[0]
 
 
