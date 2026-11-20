@@ -15,11 +15,11 @@ import media_share as ms
 
 aw = __import__('arr-webhook')
 
-TEAM = 'example-team.invalid'
+TEAM = 'team-a'
 AUD = 'aud-one'
-ADMIN = 'admin@example.invalid'
-FRIEND = 'friend-a@example.invalid'
-OTHER = 'friend-b@example.invalid'
+ADMIN = 'admin-user'
+FRIEND = 'friend-a'
+OTHER = 'friend-b'
 PROTECTED = '/llm-stats'
 
 KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -145,7 +145,7 @@ def test_second_configured_aud_passes(env):
 @pytest.mark.parametrize('bad', [
     dict(aud='someone-else'),
     dict(exp=time.time() - 3600),
-    dict(iss='https://other.invalid'),
+    dict(iss='https://other-team'),
     dict(key=OTHER_KEY),
     dict(kid='unknown'),
 ])
@@ -226,7 +226,7 @@ def share(env, monkeypatch, tmp_path):
     con = sqlite3.connect(db)
     for email in (FRIEND, OTHER):
         con.execute("INSERT INTO friends (email, sftp_host, libraries, allowed_titles, created_at) "
-                    "VALUES (?, 'host.invalid', '[\"movies\"]', ?, 'now')",
+                    "VALUES (?, 'sftp-host', '[\"movies\"]', ?, 'now')",
                     (email, json.dumps({'movies': ['Allowed One']})))
     con.execute("INSERT INTO uploads (friend_email, library, rel_path, status, created_at) "
                 "VALUES (?, 'movies', 'Allowed One', 'done', 'now')", (FRIEND,))
@@ -293,7 +293,7 @@ def test_friend_test_connection_is_admin_only(share, monkeypatch):
     calls = []
     monkeypatch.setattr(ms, '_test_connection', lambda *a: calls.append(a) or (True, ''))
     c = aw.app.test_client()
-    form = {'protocol': 'sftp', 'sftp_host': 'host.invalid', 'sftp_user': 'u', 'sftp_password': 'p'}
+    form = {'protocol': 'sftp', 'sftp_host': 'sftp-host', 'sftp_user': 'u', 'sftp_password': 'p'}
     r = c.post('/share/test-connection', data=form, headers=as_jwt(FRIEND))
     assert r.status_code == 403 and calls == []
     r = c.post('/share/test-connection', data=form, headers=as_jwt(ADMIN))
