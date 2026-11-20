@@ -94,7 +94,7 @@ A torrent is **stalled** when its state is Downloading, it moves under 1 KiB/s, 
 
 1. Force a reannounce and move it to the top of the queue.
 2. `STUCK_AFTER_MIN` later, if still stalled: pause, then resume.
-3. After `STUCK_GIVE_UP_HOURS` (default 6) still stalled: under 95% progress, remove it through the Sonarr/Radarr queue API (`removeFromClient=true`, `blocklist=true`) and run `EpisodeSearch` / `MoviesSearch` so another release is grabbed. At 95% or more it is never given up on: one notification is sent instead. A torrent that is in no arr queue is left alone.
+3. After `STUCK_GIVE_UP_HOURS` (default 6) still stalled: under 95% progress, blocklist it through the Sonarr/Radarr queue API (`removeFromClient=false`, `blocklist=true`), remove the torrent through the same guarded path as every other removal (seed floor and library guard apply; a torrent they refuse is kept) and run `EpisodeSearch` / `MoviesSearch` so another release is grabbed. At 95% or more it is never given up on: one notification is sent instead. A torrent that is in no arr queue is left alone.
 
 A torrent that moves again starts over. The ladder is kept in `STUCK_STATE_PATH` (`/data/stuck_state.json`) in `on` mode so a restart does not reset it.
 

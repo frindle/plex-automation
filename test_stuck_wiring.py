@@ -12,6 +12,7 @@ spec.loader.exec_module(aw)
 MIN = 60
 HOUR = 3600
 T0 = 5_000_000.0
+_REAL_REMOVE = aw.remove_torrent
 H1, H2, H3 = '1' * 40, '2' * 40, '3' * 40
 
 
@@ -63,7 +64,7 @@ class FakeRequests:
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
-    rec = {'activity': [], 'rpc': [], 'pause': [], 'resume': [], 'push': []}
+    rec = {'activity': [], 'rpc': [], 'pause': [], 'resume': [], 'push': [], 'removed': []}
     monkeypatch.setattr(aw, 'SONARR_URL', 'http://sonarr.example.com')
     monkeypatch.setattr(aw, 'RADARR_URL', 'http://radarr.example.com')
     monkeypatch.setattr(aw, 'SONARR_API_KEY', 'k')
@@ -76,6 +77,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(aw, 'deluge_resume_torrent', lambda h: rec['resume'].append(h))
     monkeypatch.setattr(aw, 'send_pushover', lambda t, m, url=None: rec['push'].append((t, m)))
     monkeypatch.setattr(aw, 'requests', FakeRequests())
+    monkeypatch.setattr(aw, 'remove_torrent', lambda h, remove_data=True, info=None: rec['removed'].append((h, remove_data)) or True)
     monkeypatch.setattr(aw, '_stuck_state', {})
     monkeypatch.setattr(aw, '_stuck_state_loaded', [False])
     monkeypatch.setattr(aw, '_stuck_logged', set())
@@ -115,8 +117,8 @@ def test_dry_changes_nothing_anywhere_and_records_lines(env):
     assert changes(env) == [] and env['push'] == [] and aw.requests.calls == []
     text = ' | '.join(t for _, t in env['activity'])
     assert '[dry] would have reannounced' in text and '[dry] would have queued to top' in text
-    assert '[dry] would cap 1 upgrade-lane torrent(s) at 10 connections' in text
-    assert '[dry] pass:' in text
+    assert '[dry] would cap upgrade-lane torrent "Example Movie (2020)" at 10 connections' in text
+    assert 'pass:' not in text, 'the per-pass summary is log-only'
     # a later dry pass walks the ladder in memory only, still changing nothing
     aw.stuck_pass(now=T0 + 25 * MIN)
     assert changes(env) == [] and aw.requests.calls == []
@@ -136,10 +138,25 @@ def test_dry_give_up_and_notify_are_only_recorded(env):
     assert 'would have notified about' in text
 
 
-def test_every_pass_writes_a_line_even_when_nothing_is_stuck(env):
+def test_every_pass_logs_a_summary_but_adds_no_activity_line(env, caplog):
     env['set_torrents']({H1: tor(download_payload_rate=500_000, time_since_download=0)})
+    with caplog.at_level('INFO'):
+        aw.stuck_pass(now=T0)
+    assert any('[stuck] dry pass:' in r.getMessage() for r in caplog.records)
+    assert env['activity'] == []
+
+
+def test_dry_repeated_passes_do_not_add_repeated_digest_lines(env):
+    env['set_torrents']({H1: tor(), H2: tor(label='radarr-upgrade')})
     aw.stuck_pass(now=T0)
-    assert any('pass:' in t for _, t in env['activity'])
+    aw.stuck_pass(now=T0 + 25 * MIN)
+    aw.stuck_pass(now=T0 + 7 * HOUR)
+    first = list(env['activity'])
+    assert sum('would have given up' in t for _, t in first) == 1
+    aw.stuck_pass(now=T0 + 7 * HOUR + 10 * MIN)       # same state again: the give-up is re-planned
+    aw.stuck_pass(now=T0 + 7 * HOUR + 20 * MIN)
+    assert env['activity'] == first, 'two more passes in the same state add no digest line'
+    assert sum('would cap' in t for _, t in first) == 1
 
 
 # ── on: the ladder ──────────────────────────────────────────────────────────
@@ -189,11 +206,12 @@ def test_on_give_up_radarr_uses_the_arr_api_with_blocklist_and_searches(env, mon
     aw.stuck_pass(now=T0 + 6 * HOUR + MIN)
     deletes = [c for c in fake.calls if c[0] == 'DELETE']
     assert len(deletes) == 1 and deletes[0][1] == 'http://radarr.example.com/api/v3/queue/77'
-    assert deletes[0][2]['params'] == {'removeFromClient': True, 'blocklist': True}
+    assert deletes[0][2]['params'] == {'removeFromClient': False, 'blocklist': True}, 'the arr never deletes from the client'
+    assert env['removed'] == [(H1, True)], 'the removal goes through remove_torrent()'
     posts = [c for c in fake.calls if c[0] == 'POST']
     assert posts[0][1] == 'http://radarr.example.com/api/v3/command'
     assert posts[0][2]['json'] == {'name': 'MoviesSearch', 'movieIds': [12]}
-    assert env['rpc'] == [], 'no Deluge call: the arr removes the download'
+    assert env['rpc'] == [], 'no direct Deluge call'
     assert any('Gave up on stuck' in t for _, t in env['activity'])
 
 
@@ -209,7 +227,7 @@ def test_on_give_up_sonarr_bulk_delete_and_episode_search(env, monkeypatch):
     delete = [c for c in fake.calls if c[0] == 'DELETE'][0]
     assert delete[1] == 'http://sonarr.example.com/api/v3/queue/bulk'
     assert delete[2]['json'] == {'ids': [5, 6]}
-    assert delete[2]['params'] == {'removeFromClient': True, 'blocklist': True}
+    assert delete[2]['params'] == {'removeFromClient': False, 'blocklist': True}
     post = [c for c in fake.calls if c[0] == 'POST'][0]
     assert post[2]['json'] == {'name': 'EpisodeSearch', 'episodeIds': [31, 32]}
 
@@ -286,6 +304,54 @@ def test_relabel_release_resets_the_connection_cap_too(env, monkeypatch):
     aw.release_inflight_superseded(H1, 'Downloading', 40.0)
     opts = [p['params'] for p in posts if p['method'] == 'core.set_torrent_options']
     assert opts == [[[H1], {'max_download_speed': -1, 'max_connections': -1}]]
+
+
+def test_relabel_to_base_lifts_the_connection_cap(env, monkeypatch):
+    status = {'label': 'radarr-upgrade', 'name': 'Example Movie (2020)', 'max_connections': 10}
+
+    class S:
+        def post(self, url, json=None, timeout=None, **kw):
+            return _Resp({'result': dict(status)})
+
+    labels = []
+    monkeypatch.setattr(aw, 'session', S())
+    monkeypatch.setattr(aw, 'set_torrent_label', lambda h, lab: labels.append((h, lab)))
+    assert aw.relabel_download_to_base(H1, 'Radarr')[0] == 'flipped'
+    assert labels == [(H1, 'radarr')]
+    assert env['rpc'] == [('core.set_torrent_options', [[H1], {'max_connections': -1}])]
+    # a cap this feature did not set (any other value) is left alone
+    del env['rpc'][:]
+    status['max_connections'] = 40
+    aw.relabel_download_to_base(H1, 'Radarr')
+    assert env['rpc'] == []
+
+
+def test_give_up_never_deletes_a_stalled_partial_that_uploaded_under_the_seed_floor(env, monkeypatch):
+    """The real remove_torrent() runs: a stalled partial with uploaded bytes is kept, and the arr is never
+    asked to delete from the client."""
+    monkeypatch.setattr(aw, 'remove_torrent', _REAL_REMOVE)
+    monkeypatch.setenv('STUCK_AUTOMATION', 'on')
+    deluge = []
+
+    class S:
+        def post(self, url, json=None, timeout=None, **kw):
+            deluge.append(json['method'])
+            if json['method'] == 'core.get_torrent_status':
+                return _Resp({'result': {'name': 'Example Movie (2020)', 'seeding_time': 0, 'total_uploaded': 5_000_000,
+                                         'is_finished': False, 'progress': 50.0, 'save_path': '/downloads/x',
+                                         'tracker_status': 'ok'}})
+            return _Resp({'result': True})
+
+    monkeypatch.setattr(aw, 'session', S())
+    fake = FakeRequests(queue={'Radarr': [{'id': 77, 'downloadId': H1, 'movieId': 12}]})
+    env['set_requests'](fake)
+    env['set_torrents']({H1: tor(progress=50)})
+    aw.stuck_pass(now=T0)
+    aw.stuck_pass(now=T0 + 25 * MIN)
+    aw.stuck_pass(now=T0 + 6 * HOUR + MIN)
+    assert 'core.remove_torrent' not in deluge, 'seed floor: the torrent is not deleted'
+    assert all(c[2].get('params', {}).get('removeFromClient') is False for c in fake.calls if c[0] == 'DELETE')
+    assert any('seed floor refused' in t for _, t in env['activity'])
 
 
 # ── settings ────────────────────────────────────────────────────────────────
