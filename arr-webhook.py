@@ -22,6 +22,7 @@ import library_audit
 import downloads_audit
 import arr_health
 import deluge_trim
+import stuck_plan
 import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -1188,12 +1189,13 @@ def release_inflight_superseded(torrent_hash, state, progress):
     SEED_DAYS). The radarr-upgrade/sonarr-upgrade lanes carry a per-torrent
     max_download_speed that PERSISTS after relabel (the `superseded` label has
     apply_max False), so a 30 KB/s cap would otherwise crawl forever. Clear the
-    cap and resume a paused torrent. Best-effort: never raises."""
+    cap (and the per-torrent connection cap stuck_plan puts on the upgrade lane)
+    and resume a paused torrent. Best-effort: never raises."""
     try:
         session.post(
             f'{DELUGE_URL}/json',
             json={'method': 'core.set_torrent_options',
-                  'params': [[torrent_hash], {'max_download_speed': -1}], 'id': 13},
+                  'params': [[torrent_hash], {'max_download_speed': -1, 'max_connections': -1}], 'id': 13},
             timeout=10,
         ).raise_for_status()
         if state == 'Paused':
@@ -4785,6 +4787,289 @@ def tracker_stall_scheduler():
             log.error(f'[trackerStall] scheduler tick failed: {e}')
         time.sleep(TRACKER_STALL_INTERVAL)
 
+# ── Stuck downloads (stuck_plan.py holds the logic) ─────────────────────────
+# check_tracker_stalls above only looks at torrents in their first 15 minutes. This pass
+# looks at every unfinished torrent with a normal sonarr/radarr label that has stopped
+# moving, and works up a ladder: reannounce + queue to top, then pause + resume, then
+# (STUCK_GIVE_UP_HOURS, under 95%) remove it through the arr queue API with blocklist and
+# search again. At 95% or more it only notifies. It also caps the connections of each
+# upgrade-lane torrent so the normal lane can get peers.
+#   STUCK_AUTOMATION=off  does nothing on the timer (the preview still answers)
+#   STUCK_AUTOMATION=dry  (default, and anything unrecognised) logs and records only; no call is
+#                         made that changes Deluge or the arr apps, the connection cap included
+#   STUCK_AUTOMATION=on   carries the actions out
+STUCK_CHECK_INTERVAL = max(60, int(os.environ.get('STUCK_CHECK_INTERVAL', '600')))
+STUCK_STATE_PATH = os.environ.get('STUCK_STATE_PATH', '/data/stuck_state.json')
+STUCK_FIELDS = ['name', 'label', 'state', 'progress', 'is_finished', 'download_payload_rate',
+                'time_since_download', 'active_time', 'max_connections', 'tracker_status', 'tracker_host', 'total_seeds']
+_stuck_state = {}          # hash -> ladder entry (stuck_plan); in memory in dry, saved to STUCK_STATE_PATH in on
+_stuck_state_loaded = [False]
+_stuck_tracker_notified = set()   # tracker hosts already reported as failing (cleared when the host recovers)
+_stuck_lock = threading.Lock()
+_stuck_logged = set()      # (hash, what) already written to the activity log, so a repeat is not spammed
+
+
+def stuck_mode(env=None):
+    env = os.environ if env is None else env
+    mode = (env.get('STUCK_AUTOMATION') or 'dry').strip().lower()
+    return mode if mode in ('off', 'dry', 'on') else 'dry'
+
+
+def _stuck_int(env, name, default, low):
+    try:
+        return max(low, int(env.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def stuck_config(env=None):
+    env = os.environ if env is None else env
+    return stuck_plan.Config(
+        stuck_after_min=_stuck_int(env, 'STUCK_AFTER_MIN', 20, 1),
+        give_up_hours=_stuck_int(env, 'STUCK_GIVE_UP_HOURS', 6, 1),
+        upgrade_max_connections=_stuck_int(env, 'UPGRADE_MAX_CONNECTIONS', 10, 2),
+        normal_labels=('sonarr', 'radarr'),
+        upgrade_labels=UPGRADE_LANE_LABELS)
+
+
+def _stuck_load():
+    if _stuck_state_loaded[0]:
+        return
+    _stuck_state_loaded[0] = True
+    try:
+        with open(STUCK_STATE_PATH) as f:
+            data = _json.load(f)
+        if isinstance(data, dict):
+            _stuck_state.update({h: e for h, e in data.items() if isinstance(e, dict)
+                                 and {'step', 'step_at', 'stalled_since'} <= set(e)})
+    except (OSError, ValueError):
+        pass
+
+
+def _stuck_save():
+    try:
+        with open(STUCK_STATE_PATH, 'w') as f:
+            _json.dump(_stuck_state, f)
+    except OSError as e:
+        log.warning(f'[stuck] could not save {STUCK_STATE_PATH}: {e}')
+
+
+def _stuck_arr_queue():
+    """({hash: {'who', 'ids', 'movieIds', 'episodeIds'}}, {who that could not be read})."""
+    out, failed = {}, set()
+    for who, url, key, size in (('Sonarr', SONARR_URL, SONARR_API_KEY, 1000), ('Radarr', RADARR_URL, RADARR_API_KEY, 500)):
+        if not key:
+            continue
+        try:
+            r = requests.get(f'{url}/api/v3/queue', headers={'X-Api-Key': key}, params={'pageSize': size}, timeout=15)
+            r.raise_for_status()
+            for item in r.json().get('records') or []:
+                h = (item.get('downloadId') or '').lower()
+                if not h or item.get('id') is None:
+                    continue
+                entry = out.setdefault(h, {'who': who, 'ids': [], 'movieIds': [], 'episodeIds': []})
+                entry['ids'].append(item['id'])
+                if item.get('movieId') is not None:
+                    entry['movieIds'].append(item['movieId'])
+                if item.get('episodeId') is not None:
+                    entry['episodeIds'].append(item['episodeId'])
+        except Exception as e:
+            log.warning(f'[stuck] {who} queue read failed ({type(e).__name__}); its torrents are left alone')
+            failed.add(who)
+    return out, failed
+
+
+def _stuck_search(who, entry):
+    base, key = (SONARR_URL, SONARR_API_KEY) if who == 'Sonarr' else (RADARR_URL, RADARR_API_KEY)
+    if who == 'Sonarr':
+        body = {'name': 'EpisodeSearch', 'episodeIds': sorted(set(entry['episodeIds']))}
+        wanted = body['episodeIds']
+    else:
+        body = {'name': 'MoviesSearch', 'movieIds': sorted(set(entry['movieIds']))}
+        wanted = body['movieIds']
+    if not wanted:
+        return False
+    r = requests.post(f'{base}/api/v3/command', headers={'X-Api-Key': key}, json=body, timeout=30)
+    r.raise_for_status()
+    return True
+
+
+def _stuck_say(h, what, text):
+    """Write an activity line once per (torrent, what)."""
+    if (h, what) not in _stuck_logged:
+        _stuck_logged.add((h, what))
+        record_activity('stuck-downloads', text)
+
+
+def _stuck_give_up(action, queue, failed):
+    """Step 3 through the arr API. Returns a short outcome string."""
+    h, name = action['hash'], action['name']
+    q = queue.get(h.lower())
+    if not q:
+        who = 'Sonarr' if action['label'].startswith('sonarr') else 'Radarr'
+        if who in failed:
+            return f'skipped: {who} queue unreadable'
+        _stuck_say(h, 'noqueue', f'Stuck "{name}" is not in a {who} queue; left in place')
+        return 'skipped: not in an arr queue'
+    who = q['who']
+    # Never ask the arr to delete from the client (removeFromClient=True): that bypasses remove_torrent()'s
+    # seed floor and library guard. Blocklist the release (client untouched), then remove through remove_torrent().
+    _arr_blocklist_queue_items(who, q['ids'])
+    kept = remove_torrent(h, remove_data=True) == DEFERRED
+    if kept:
+        record_activity('stuck-downloads', f'Gave up on stuck "{name}" at {action["progress"]:.1f}%: blocklisted in the {who} '
+                                           'queue; the torrent is kept because the seed floor refused the removal')
+    else:
+        record_activity('stuck-downloads', f'Gave up on stuck "{name}" at {action["progress"]:.1f}% ({action["diagnosis"]}): '
+                                           f'blocklisted in the {who} queue, download removed through the seed-floor and library guards')
+    try:
+        searched = _stuck_search(who, q)
+    except Exception as e:
+        log.error(f'[stuck] {who} search after removal failed: {type(e).__name__}: {e}')
+        record_activity('stuck-downloads', f'{who} search after giving up on "{name}" failed; {who} will find it on its next search')
+        return 'kept; search failed' if kept else 'removed; search failed'
+    if kept:
+        return 'blocklisted, kept by seed floor' + (' and searching' if searched else '')
+    return 'removed and searching' if searched else 'removed; nothing to search'
+
+
+def _stuck_do(action, mode, queue, failed):
+    """Carry out (on) or only describe (dry) one planned action. Returns the outcome string."""
+    kind, h, name = action['action'], action['hash'], action['name']
+    if mode != 'on':
+        return 'dry'
+    try:
+        if kind == stuck_plan.REANNOUNCE:
+            _deluge_rpc('core.force_reannounce', [[h]])
+        elif kind == stuck_plan.QUEUE_TOP:
+            _deluge_rpc('core.queue_top', [[h]])
+        elif kind == stuck_plan.PAUSE:
+            deluge_pause_torrent(h)
+        elif kind == stuck_plan.RESUME:
+            deluge_resume_torrent(h)
+        elif kind == stuck_plan.CAP_CONNECTIONS:
+            _deluge_rpc('core.set_torrent_options', [[h], {'max_connections': action['max_connections']}])
+        elif kind == stuck_plan.UNCAP:
+            _deluge_rpc('core.set_torrent_options', [[h], {'max_connections': -1}])
+        elif kind == stuck_plan.NOTIFY:
+            send_pushover('Download stuck near the end',
+                          f'"{name}" is at {action["progress"]:.1f}% and has not moved for {action["stalled_hours"]} h. '
+                          f'Diagnosis: {action["diagnosis"]}. '
+                          'Left in place; the automation never gives up at 95% or more.')
+        elif kind == stuck_plan.NOTIFY_LOCAL:
+            send_pushover('Download stuck: local problem',
+                          f'"{name}" is at {action["progress"]:.1f}% and has not moved for {action["stalled_hours"]} h. '
+                          f'Diagnosis: {action["diagnosis"]}. Uncapping, reannouncing and a restart did not help; '
+                          'check the port, queue limits and the client. The release is not blocklisted.')
+        elif kind == stuck_plan.NOTIFY_TRACKER:
+            if action['host'] in _stuck_tracker_notified:
+                return 'already reported'
+            _stuck_tracker_notified.add(action['host'])
+            send_pushover('Tracker failing',
+                          f'tracker {action["host"]} failing for {action["count"]} torrent(s). '
+                          'Nothing is blocklisted or removed; reannouncing.')
+        elif kind == stuck_plan.GIVE_UP:
+            return _stuck_give_up(action, queue, failed)
+        return 'done'
+    except Exception as e:
+        log.error(f'[stuck] {kind} "{name}" failed: {type(e).__name__}: {e}')
+        if kind == stuck_plan.PAUSE:
+            # never leave a torrent paused by us
+            try:
+                deluge_resume_torrent(h)
+            except Exception:
+                pass
+        return f'error: {type(e).__name__}'
+
+
+def stuck_pass(now=None, mode=None):
+    """One pass. Returns {'mode', 'rows', 'results'} or None when off."""
+    mode = stuck_mode() if mode is None else mode
+    if mode == 'off':
+        return None
+    now = time.time() if now is None else now
+    cfg = stuck_config()
+    deluge_login()
+    torrents = get_all_torrents(STUCK_FIELDS, force=True)
+    with _stuck_lock:
+        if mode == 'on':
+            _stuck_load()
+        actions, new_state, rows = stuck_plan.plan(torrents, _stuck_state, now, cfg, torrent_is_unregistered)
+        _stuck_state.clear()
+        _stuck_state.update(new_state)
+        if mode == 'on':
+            _stuck_save()
+    failing = {a['host'] for a in actions if a['action'] == stuck_plan.NOTIFY_TRACKER}
+    _stuck_tracker_notified.intersection_update(failing)      # a recovered tracker can be reported again later
+    ladder = [a for a in actions if a['action'] != stuck_plan.CAP_CONNECTIONS]
+    caps = [a for a in actions if a['action'] == stuck_plan.CAP_CONNECTIONS]
+    queue, failed = ({}, set())
+    if mode == 'on' and any(a['action'] == stuck_plan.GIVE_UP for a in ladder):
+        queue, failed = _stuck_arr_queue()
+    results = []
+    for a in ladder:
+        outcome = _stuck_do(a, mode, queue, failed)
+        results.append({'hash': a['hash'], 'action': a['action'], 'outcome': outcome})
+        what = {'reannounce': 'reannounced', 'queue_top': 'queued to top', 'pause': 'paused', 'resume': 'resumed',
+                'give_up': 'given up on', 'notify': 'notified about', 'uncap_connections': 'uncapped',
+                'notify_local': 'notified about a local problem with',
+                'notify_tracker': 'reported the failing tracker for'}[a['action']]
+        prefix = '[dry] would have ' if mode != 'on' else ''
+        if a['action'] != stuck_plan.GIVE_UP or mode != 'on':     # a real give-up writes its own lines
+            line = f'{prefix}{what} stuck "{a["name"]}" (step {a.get("step", "-")}; diagnosis: {a["diagnosis"]})'
+            if mode != 'on':      # a dry pass re-plans the same action every pass: say it once per torrent and step
+                _stuck_say(a['hash'], f'dry:{a["action"]}:{a.get("step", "-")}', line)
+            else:
+                record_activity('stuck-downloads', line)
+    if caps:
+        if mode == 'on':
+            done = 0
+            for a in caps:
+                if _stuck_do(a, mode, queue, failed) == 'done':
+                    done += 1
+            record_activity('stuck-downloads', f'Capped {done} of {len(caps)} upgrade-lane torrent(s) at '
+                                               f'{cfg.upgrade_max_connections} connections')
+        else:
+            for a in caps:
+                _stuck_say(a['hash'], 'dry:cap', f'[dry] would cap upgrade-lane torrent "{a["name"]}" at '
+                                                 f'{cfg.upgrade_max_connections} connections')
+    stalled = sum(1 for r in rows if r['stalled'])
+    # The per-pass summary is log-only: one activity line per pass would bury /digest.
+    log.info(f'[stuck] {mode} pass: {sum(1 for r in rows if r["label"] in cfg.normal_labels)} unfinished normal '
+             f'torrent(s), {stalled} stalled, {len(ladder)} ladder action(s), {len(caps)} cap(s)')
+    return {'mode': mode, 'rows': rows, 'results': results}
+
+
+def stuck_downloads_scheduler():
+    time.sleep(90)
+    while True:
+        try:
+            stuck_pass()
+        except Exception as e:
+            log.error(f'[stuck] scheduler tick failed: {e}')
+        time.sleep(STUCK_CHECK_INTERVAL)
+
+
+@app.route('/stuck-downloads', methods=['GET'])
+def stuck_downloads_preview():
+    """Read-only. Each unfinished normal torrent, its ladder step and what the next pass would do."""
+    cfg = stuck_config()
+    try:
+        deluge_login()
+        torrents = get_all_torrents(STUCK_FIELDS, force=True)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Deluge unreadable: {type(e).__name__}'}), 502
+    with _stuck_lock:
+        state = {h: dict(e) for h, e in _stuck_state.items()}
+    _, _, rows = stuck_plan.plan(torrents, state, time.time(), cfg, torrent_is_unregistered)
+    return jsonify({
+        'ok': True, 'mode': stuck_mode(),
+        'config': {'stuck_after_min': cfg.stuck_after_min, 'give_up_hours': cfg.give_up_hours,
+                   'upgrade_max_connections': cfg.upgrade_max_connections, 'check_interval_s': STUCK_CHECK_INTERVAL},
+        'count': len(rows), 'rows': rows,
+        'note': 'preview only; nothing is changed here',
+    }), 200
+
 # ── Core upgrade handler ─────────────────────────────────────────────────────
 
 def relabel_download_to_base(download_id, source):
@@ -4810,7 +5095,7 @@ def relabel_download_to_base(download_id, source):
         f'{DELUGE_URL}/json',
         json={
             'method': 'core.get_torrent_status',
-            'params': [download_id, ['label', 'name']],
+            'params': [download_id, ['label', 'name', 'max_connections']],
             'id': 93,
         },
         timeout=10,
@@ -4825,6 +5110,14 @@ def relabel_download_to_base(download_id, source):
         return 'already', name
     set_torrent_label(download_id, base_label)
     log.info(f'{source}: relabeled {download_id} ({name}) {upgrade_label} → {base_label}')
+    # Stuck downloads capped this torrent's connections while it was unfinished; Deluge keeps
+    # per-torrent options across a relabel, so lift exactly that cap (-1 = unlimited).
+    try:
+        if status.get('max_connections') == stuck_config().upgrade_max_connections:
+            _deluge_rpc('core.set_torrent_options', [[download_id], {'max_connections': -1}])
+            log.info(f'{source}: lifted the connection cap on {download_id} ({name})')
+    except Exception as e:
+        log.warning(f'{source}: could not lift the connection cap on {download_id}: {type(e).__name__}')
     return 'flipped', name
 
 
@@ -11277,4 +11570,6 @@ if __name__ == '__main__':
     t13.start()
     t14 = threading.Thread(target=seed_retire_scheduler, daemon=True)
     t14.start()
+    t15 = threading.Thread(target=stuck_downloads_scheduler, daemon=True)
+    t15.start()
     app.run(host='0.0.0.0', port=port, threaded=True)

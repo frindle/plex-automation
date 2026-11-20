@@ -18,4 +18,5 @@ COPY rar_extract.py .
 COPY torrent_breakdown.py .
 COPY tiering_gate.py .
 COPY speed_cap.py .
+COPY stuck_plan.py .
 CMD ["python", "-u", "arr-webhook.py"]
