@@ -84,8 +84,13 @@ def env(monkeypatch, tmp_path):
     app_auth.reset_key_cache()
 
 
+def client():
+    # The test client's peer is loopback by default; real callers are not.
+    return aw.app.test_client(environ_base={'REMOTE_ADDR': 'remote-peer'})
+
+
 def get(path='/llm-stats', **headers):
-    return aw.app.test_client().get(path, headers=headers)
+    return client().get(path, headers=headers)
 
 
 def basic(user, pw):
@@ -195,7 +200,7 @@ def test_token_file_changes_are_picked_up(env, tmp_path):
 
 
 def test_basic_works_on_webhook_only(env):
-    c = aw.app.test_client()
+    c = client()
     ok = c.post('/webhook/radarr', json={}, headers=basic('arr', 'pw-one'))
     assert ok.status_code == 200
     assert c.post('/webhook/radarr', json={}, headers=basic('arr', 'nope')).status_code == 403
@@ -205,7 +210,7 @@ def test_basic_works_on_webhook_only(env):
 
 
 def test_bearer_and_jwt_work_on_webhook(env):
-    c = aw.app.test_client()
+    c = client()
     assert c.post('/webhook/radarr', json={}, headers={'Authorization': 'Bearer token-aaaa'}).status_code == 200
     assert c.post('/webhook/radarr', json={}, headers={'Cf-Access-Jwt-Assertion': make_jwt()}).status_code == 200
 
@@ -292,7 +297,7 @@ def test_status_has_owner_check(share):
 def test_friend_test_connection_is_admin_only(share, monkeypatch):
     calls = []
     monkeypatch.setattr(ms, '_test_connection', lambda *a: calls.append(a) or (True, ''))
-    c = aw.app.test_client()
+    c = client()
     form = {'protocol': 'sftp', 'sftp_host': 'sftp-host', 'sftp_user': 'u', 'sftp_password': 'p'}
     r = c.post('/share/test-connection', data=form, headers=as_jwt(FRIEND))
     assert r.status_code == 403 and calls == []
@@ -319,7 +324,7 @@ def test_converted_route_rejects_get(env, monkeypatch, path):
 @pytest.mark.parametrize('path', MUTATING_GET)
 def test_converted_route_rejects_non_json_post(env, monkeypatch, path):
     monkeypatch.setenv('APP_AUTH_MODE', 'off')
-    c = aw.app.test_client()
+    c = client()
     for ctype in ('text/plain', 'application/x-www-form-urlencoded'):
         r = c.post(path, data='{"moves": []}', content_type=ctype)
         assert r.status_code == 415, (path, ctype, r.status_code)
@@ -341,18 +346,18 @@ def test_dry_run_reports_stay_on_get(env, path):
 
 
 def test_action_rules_apply_with_valid_credentials_too(env):
-    r = aw.app.test_client().get('/verify-labels', headers={'Authorization': 'Bearer token-aaaa'})
+    r = client().get('/verify-labels', headers={'Authorization': 'Bearer token-aaaa'})
     assert r.status_code == 405
 
 
 def test_unauthenticated_post_is_refused_before_the_action_rule(env):
-    r = aw.app.test_client().post('/torrent-move', json={'moves': []})
+    r = client().post('/torrent-move', json={'moves': []})
     assert r.status_code == 403
 
 
 def test_torrent_move_and_delete_paths_ignore_text_plain_bodies(env, monkeypatch):
     monkeypatch.setenv('APP_AUTH_MODE', 'off')
-    c = aw.app.test_client()
+    c = client()
     h = {'Content-Type': 'application/json'}
     assert c.post('/delete-paths', data='not json', headers=h).status_code == 400
     assert c.post('/delete-paths', json={'paths': 'a-string'}).status_code == 400
@@ -388,7 +393,7 @@ def test_plex_error_never_echoes_the_token(monkeypatch):
     def boom(url, **kw):
         raise aw.requests.exceptions.ConnectionError(f'failed {url}?X-Plex-Token=tok-secret-1234')
     monkeypatch.setattr(aw.requests, 'get', boom)
-    r = aw.app.test_client().get('/plex-dupe-scan')
+    r = client().get('/plex-dupe-scan')
     assert r.status_code == 500
     assert 'tok-secret-1234' not in r.get_data(as_text=True)
 
@@ -396,8 +401,8 @@ def test_plex_error_never_echoes_the_token(monkeypatch):
 # ── loopback reports ─────────────────────────────────────────────────────────
 
 def from_addr(path, addr, method='GET', **headers):
-    return aw.app.test_client().open(path, method=method, headers=headers,
-                                     environ_overrides={'REMOTE_ADDR': addr})
+    return client().open(path, method=method, headers=headers,
+                         environ_overrides={'REMOTE_ADDR': addr})
 
 
 def test_loopback_get_report_passes_in_enforce(env):
@@ -406,11 +411,11 @@ def test_loopback_get_report_passes_in_enforce(env):
 
 
 def test_non_loopback_get_report_still_refused(env):
-    assert from_addr(PROTECTED, '192.0.2.10').status_code == 403
+    assert from_addr(PROTECTED, 'remote-peer').status_code == 403
 
 
 def test_forwarded_for_cannot_fake_loopback(env):
-    r = from_addr(PROTECTED, '192.0.2.10', **{'X-Forwarded-For': '127.0.0.1', 'X-Real-Ip': '127.0.0.1'})
+    r = from_addr(PROTECTED, 'remote-peer', **{'X-Forwarded-For': '127.0.0.1', 'X-Real-Ip': '127.0.0.1'})
     assert r.status_code == 403
 
 
