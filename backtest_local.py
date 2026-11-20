@@ -3,6 +3,16 @@
 
 usage: python backtest_local.py --kind K[,K2|all] [--limit N] [--facts FILE.jsonl]
        python backtest_local.py --kind K --layer claude --model claude-haiku-5-5 [--max-usd 2]
+       python backtest_local.py --kind all --layer unraid [--model qwen3:14b] [--wait-min 50]
+
+--layer unraid asks the Unraid Ollama (UNRAID_OLLAMA_URL) the way production does (llm_advisor._ollama_chat_fn, the
+production timeouts, the same _unraid_gate before every row) and scores only the answers production would KEEP: the
+ruled action is in UNRAID_DECISIVE[kind] and confidence is at least llm_decide.MIN_CONFIDENCE. The rest are passed
+on (unsure, weak, invalid, error, timeout) and counted by reason. The model is --model, else LLM_UNRAID_MODEL, else
+llm_advisor.UNRAID_MODEL, and must be listed by GET /api/tags (a back-test never pulls a model). The GPU is shared
+with the queue: while the gate says hold or another model is resident the run polls every 30 s, one --wait-min
+budget for the whole run; when it is spent the run stops INCONCLUSIVE (GPU busy) without sending a request.
+Only kinds in LLM_UNRAID_KINDS run. There is no answered-% bar: passing on is by design.
 
 --layer claude forces the Claude layer and model (key from ANTHROPIC_API_KEY; no Darkbloom needed, no GPU wait; the
 production spend file is not touched). It reports per kind the agreement with the stored reference decisions
@@ -215,6 +225,156 @@ def wait_for_gpu(env, http, wait_min, sleep=time.sleep, clock=time.monotonic, po
         sleep(poll_s)
 
 
+# ── --layer unraid ───────────────────────────────────────────────────────────
+
+GPU_POLL_S = 30.0
+PASS_REASONS = ('unsure', 'weak', 'invalid', 'error', 'timeout')
+
+
+def unraid_model_listed(base, model, http):
+    """(True, None) when GET {base}/api/tags lists model, else (False, reason). Never pulls."""
+    try:
+        r = http.get(base.rstrip('/') + '/api/tags', timeout=(2, 5))
+        r.raise_for_status()
+        tags = {llm_advisor._model_tag(m.get('model') or m.get('name')) for m in (r.json().get('models') or [])
+                if isinstance(m, dict)}
+    except Exception:  # noqa: BLE001
+        return False, 'tags-unreadable'
+    if llm_advisor._model_tag(model) not in tags:
+        return False, 'model-not-listed'
+    return True, None
+
+
+def score_unraid(kind, rows, chat, gate, state, budget, sleep=time.sleep, clock=time.monotonic):
+    """Replay rows through the Unraid layer the way run_chain keeps answers. Before every row gate() must return None
+    (GPU free for this model); any other answer (hold, other-model-resident, backoff, probe error) waits GPU_POLL_S
+    and asks again, drawing on budget['left_s'] shared across the whole run. When it is spent the run stops
+    (stopped_gpu=True) with no request sent. Counts, ids and latencies only."""
+    out = {'kind': kind, 'total': 0, 'kept': 0, 'passed': dict.fromkeys(PASS_REASONS, 0), 'rules_n': 0,
+           'rules_agree': 0, 'human_n': 0, 'human_agree': 0, 'blocks': [], 'disagree_ids': [], 'pairs': {},
+           'lat_ms': [], 'cold': 0, 'stopped_gpu': False, 'rows_available': len(rows)}
+    decisive = llm_advisor.UNRAID_DECISIVE.get(kind, ())
+    for i, row in enumerate(rows, 1):
+        while True:
+            try:
+                skip = gate()
+            except Exception:  # noqa: BLE001
+                skip = 'error'
+            if skip is None:
+                break
+            if budget['left_s'] < GPU_POLL_S:
+                out['stopped_gpu'] = True
+                return out
+            budget['left_s'] -= GPU_POLL_S
+            budget['waited_s'] += GPU_POLL_S
+            sleep(GPU_POLL_S)
+        facts, rules, human, rid = _split(row)
+        ref = '#%d' % i + ('/' + rid if rid else '')
+        out['total'] += 1
+        out['cold'] += bool(state.get('cold'))
+        t0 = clock()
+        dec, reason = None, None
+        try:
+            dec = llm_decide.parse_decision(kind, chat(llm_decide.build_prompt(kind, facts)))
+            if dec is None:
+                reason = 'invalid'
+        except Exception as e:  # noqa: BLE001
+            reason = 'timeout' if 'timeout' in type(e).__name__.lower() else 'error'
+        out['lat_ms'].append(int((clock() - t0) * 1000))
+        if dec is not None:
+            action, rule = llm_decide.apply_hard_rules(kind, dec['action'], facts)
+            if rule:
+                out['blocks'].append('%s:%s->%s:%s' % (ref, dec['action'], action, rule))
+            if action not in decisive:
+                reason = 'unsure'
+            elif dec['confidence'] < llm_decide.MIN_CONFIDENCE:
+                reason = 'weak'
+        if reason:
+            out['passed'][reason] += 1
+            continue
+        out['kept'] += 1
+        if rules:
+            pair = '%s->%s' % (rules, action)
+            out['pairs'][pair] = out['pairs'].get(pair, 0) + 1
+            out['rules_n'] += 1
+            if norm(kind, action) == norm(kind, rules):
+                out['rules_agree'] += 1
+            else:
+                out['disagree_ids'].append(ref)
+        if human:
+            out['human_n'] += 1
+            out['human_agree'] += norm(kind, action) == norm(kind, human)
+    return out
+
+
+def verdict_unraid(kind, res):
+    """INCONCLUSIVE when the run stopped, has too few rows or kept nothing; FAIL when kept agreement is under the bar;
+    else PASS. No answered-% bar: passing on is by design."""
+    if res.get('stopped_gpu'):
+        return 'INCONCLUSIVE', ['GPU busy']
+    if res['total'] < MIN_ROWS:
+        return 'INCONCLUSIVE', ['only %d rows (need %d)' % (res['total'], MIN_ROWS)]
+    if res['kept'] == 0:
+        return 'INCONCLUSIVE', ['nothing kept']
+    why = []
+    if kind in AGREE_KINDS and res['rules_n']:
+        a = pct(res['rules_agree'], res['rules_n'])
+        if a < MIN_AGREE_PCT:
+            why.append('rules agreement %.1f%% < %.0f%% (kept answers)' % (a, MIN_AGREE_PCT))
+    if res['human_n']:
+        h = pct(res['human_agree'], res['human_n'])
+        if h < MIN_AGREE_PCT:
+            why.append('human agreement %.1f%% < %.0f%% (kept answers)' % (h, MIN_AGREE_PCT))
+    return ('FAIL' if why else 'PASS'), why
+
+
+def report_unraid(kind, model, res, waited_min=0.0):
+    v, why = verdict_unraid(kind, res)
+    lat = res['lat_ms']
+    lines = ['model=%s kind=%s' % (model, kind),
+             'kept=%d/%d (%s%%)' % (res['kept'], res['total'], pct(res['kept'], res['total'])),
+             'passed_on=%d (%s)' % (sum(res['passed'].values()), ' '.join('%s=%d' % (r, res['passed'][r]) for r in PASS_REASONS)),
+             'rules_agree=%d/%d (%s%%)%s' % (res['rules_agree'], res['rules_n'], pct(res['rules_agree'], res['rules_n']),
+                                             '' if kind in AGREE_KINDS else ' [not scored: rules always ask/wait]'),
+             'human_agree=%d/%d (%s%%)' % (res['human_agree'], res['human_n'], pct(res['human_agree'], res['human_n'])),
+             'hard_rule_blocks=%d' % len(res['blocks'])]
+    lines += ['  block ' + b for b in res['blocks']]
+    lines.append('rules_disagree_ids=' + (','.join(res['disagree_ids']) or '-'))
+    lines += ['  pair %s %d' % (p, n) for p, n in sorted(res['pairs'].items())]
+    lines.append('latency_ms p50=%s p95=%s' % (percentile(lat, 50), percentile(lat, 95)))
+    lines.append('cold_rows=%d' % res['cold'])
+    lines.append('gpu_wait_min=%.1f' % waited_min)
+    lines.append('verdict=%s%s' % (v, (' (' + '; '.join(why) + ')') if why else ''))
+    if res['blocks'] or res['disagree_ids']:
+        lines.append('read every block and disagreement before approving')
+    return lines
+
+
+def _run_unraid(kinds, loaded, args, env, http, base, model, sleep):
+    """Run each loaded kind through the Unraid layer; returns the exit code."""
+    env2 = dict(env)
+    env2['LLM_UNRAID_BACKOFF_MIN'] = '0'    # one timeout must not stall the rest of the run
+    try:
+        cold_s = float(env.get('LLM_UNRAID_COLD_TIMEOUT') or llm_advisor.UNRAID_COLD_TIMEOUT)
+    except (TypeError, ValueError):
+        cold_s = llm_advisor.UNRAID_COLD_TIMEOUT
+    budget = {'left_s': args.wait_min * 60.0, 'waited_s': 0.0}
+    worst = 0
+    for kind in kinds:
+        state = {}
+        chat = llm_advisor._ollama_chat_fn(base, model, http, state=state, env=env2,
+                                           cold_total=cold_s if kind in llm_advisor.UNRAID_COLD_KINDS else None)
+        gate = llm_advisor._unraid_gate(base, model, env2, http, state)
+        res = score_unraid(kind, loaded[kind], chat, gate, state, budget, sleep)
+        print('\n'.join(report_unraid(kind, model, res, budget['waited_s'] / 60.0)))
+        v = verdict_unraid(kind, res)[0]
+        worst = max(worst, 0 if v == 'PASS' else 1)
+        if res['stopped_gpu']:
+            print('stopped: GPU busy, wait budget spent; later kinds not run')
+            return 3
+    return worst
+
+
 def _kinds(arg):
     names = [k.strip() for k in arg.split(',') if k.strip()]
     if names == ['all']:
@@ -229,9 +389,10 @@ def main(argv=None, env=None, http=None, transport=None, sleep=time.sleep):
     ap.add_argument('--kind', required=True, help='a kind, a comma list, or all')
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--facts', default='')
-    ap.add_argument('--layer', choices=('local', 'claude'), default='local')
+    ap.add_argument('--layer', choices=('local', 'claude', 'unraid'), default='local')
     ap.add_argument('--model', default='', help='local: one of the listed ids (default the first listed); '
-                                                'claude: the model id (default LLM_CLAUDE_MODEL or the layer default)')
+                                                'claude: the model id (default LLM_CLAUDE_MODEL or the layer default); '
+                                                'unraid: a model /api/tags lists (default LLM_UNRAID_MODEL or the layer default)')
     ap.add_argument('--max-usd', type=float, default=2.0, help='stop before a claude run passes this many dollars')
     ap.add_argument('--wait-min', type=float, default=50.0)
     ap.add_argument('--timeout', type=float, default=60.0)
@@ -244,8 +405,22 @@ def main(argv=None, env=None, http=None, transport=None, sleep=time.sleep):
         print('refused: --facts names one file, so it needs one --kind')
         return 2
     claude = args.layer == 'claude'
+    unraid = args.layer == 'unraid'
     waited = 0.0
-    if claude:
+    if unraid:
+        base = (env.get('UNRAID_OLLAMA_URL') or '').strip()
+        if not base:
+            print('refused: UNRAID_OLLAMA_URL not set')
+            return 2
+        model = args.model.strip() or (env.get('LLM_UNRAID_MODEL') or '').strip() or llm_advisor.UNRAID_MODEL
+        if http is None:
+            import requests as http
+        ok, why = unraid_model_listed(base, model, http)
+        if not ok:
+            print('refused: %s (no request sent; a back-test never pulls a model)' % why)
+            return 2
+        ukinds = {k.strip() for k in (env.get('LLM_UNRAID_KINDS') or llm_advisor.UNRAID_KINDS).split(',') if k.strip()}
+    elif claude:
         model = args.model.strip() or (env.get('LLM_CLAUDE_MODEL') or '').strip() or llm_advisor.CLAUDE_MODEL
         if transport is None and not (env.get('ANTHROPIC_API_KEY') or '').strip():
             print('refused: ANTHROPIC_API_KEY not set')
@@ -266,12 +441,23 @@ def main(argv=None, env=None, http=None, transport=None, sleep=time.sleep):
     print('model=%s layer=%s' % (model, args.layer))
     loaded = {}
     for kind in kinds:
+        if unraid and kind not in ukinds:
+            print('kind=%s skipped: not an Unraid kind' % kind)
+            continue
         path = args.facts or '/data/backtest/%s.jsonl' % kind
         try:
             loaded[kind] = load_rows(path, args.limit or None)
         except OSError:
-            print('refused: facts file not readable')
-            return 2
+            if len(kinds) == 1:
+                print('refused: facts file not readable')
+                return 2
+            print('kind=%s skipped: no facts file' % kind)
+    kinds = [k for k in kinds if k in loaded]
+    if not kinds:
+        print('refused: no kind left to run')
+        return 2
+    if unraid:
+        return _run_unraid(kinds, loaded, args, env, http, base, model, sleep)
     if not claude:
         free, waited = wait_for_gpu(env, http, args.wait_min, sleep)
         if not free:
