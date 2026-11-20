@@ -23,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: bash backup/tests/test_plex_db_r2.sh
+      - run: bash tests/update_sh_test.sh
 
       - name: CI auto-retry tests
         run: python3 -I tests/test-ci-infra-retry.py
