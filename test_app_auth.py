@@ -422,8 +422,8 @@ def test_forwarded_for_cannot_fake_loopback(env):
 
 
 def test_loopback_never_opens_action_routes_posts_or_share(env):
-    assert from_addr('/retire-seeds?apply=1', '127.0.0.1').status_code == 405
-    assert from_addr('/verify-labels', '127.0.0.1').status_code == 405
+    assert from_addr('/retire-seeds?apply=1', '127.0.0.1').status_code == 403
+    assert from_addr('/verify-labels', '127.0.0.1').status_code == 403
     assert from_addr(PROTECTED, '127.0.0.1', method='POST').status_code == 403
     assert from_addr('/webhook/radarr', '127.0.0.1', method='POST').status_code == 403
     assert from_addr('/share/', '127.0.0.1').status_code == 403
