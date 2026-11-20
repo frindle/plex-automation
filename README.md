@@ -95,8 +95,23 @@ A torrent is **stalled** when its state is Downloading, it moves under 1 KiB/s, 
 
 1. Force a reannounce and move it to the top of the queue.
 2. `STUCK_AFTER_MIN` later, if still stalled: pause, then resume.
-Every stalled torrent is diagnosed first, and `GET /stuck-downloads`, the dry-run lines and the push text carry the diagnosis: unregistered (left to the unregistered sweep), tracker error (reannounce, one report per failing tracker, never blocklisted), local problem (tracker OK and the swarm has seeds: uncap, reannounce, restart, notify once, never blocklisted), or dead (tracker OK and zero swarm seeds for the whole window). Only a dead torrent reaches step 3. Queued or paused time does not count.
-3. After `STUCK_GIVE_UP_HOURS` (default 6) still stalled: under 95% progress, blocklist it through the Sonarr/Radarr queue API (`removeFromClient=false`, `blocklist=true`), remove the torrent through the same guarded path as every other removal (seed floor and library guard apply; a torrent they refuse is kept) and run `EpisodeSearch` / `MoviesSearch` so another release is grabbed. At 95% or more it is never given up on: one notification is sent instead. A torrent that is in no arr queue is left alone.
+Every stalled torrent is diagnosed first from what Deluge reports, and `GET /stuck-downloads`, the dry-run lines and the digest carry the diagnosis. A release is removed only when it could never complete.
+
+What Deluge reports (from `deluge/core/torrentmanager.py` `on_alert_tracker_*`, `deluge/core/torrent.py`; 2.1.1 is identical to develop):
+
+| Field | Values | Meaning here |
+| --- | --- | --- |
+| `tracker_status` | `Announce OK` | tracker working |
+| | `Warning: <msg>` | tracker answered with a warning: working, the text stays on the row |
+| | `''` or `Announce Sent` | not announced yet: no conclusion, no tracker report, no never-complete clock |
+| | `Error: <msg>` | set only when no endpoint of that tracker works. `torrent_is_unregistered` is asked first (unregistered: left to the unregistered sweep), otherwise tracker error: reannounce, never blocklisted. One report per host, only after that host was in `Error:` on 2 passes in a row |
+| | anything else | no conclusion, logged once |
+| `total_seeds` | tracker `num_complete`, -1 unknown | 0 (not -1) is required for never-complete |
+| `pieces` (`_get_pieces_info`) | per piece 3 done, 2 downloading, 1 a connected peer has it, 0 no connected peer has it; none when seeding or no metadata | read per hash, only for stalled candidates with 0 seeds; only the count of state-0 pieces is kept |
+
+Diagnoses: unregistered, tracker error, pending, local (tracker working and seeds reported, or every missing piece is at a peer: uncap, reannounce, restart, notify once, never blocklisted), unknown swarm (seeds -1 or pieces unreadable: reannounce only) and **never complete** (tracker working, `total_seeds == 0` and at least one state-0 piece, on every pass for the whole `STUCK_GIVE_UP_HOURS` window; any other observation resets the window). Queued or paused time does not count.
+
+3. After `STUCK_GIVE_UP_HOURS` (default 6) of never-complete, at any progress (there is no 95% exception, and manual grabs and season packs follow the same rule): if the release is in a Sonarr/Radarr queue, blocklist it there (`removeFromClient=false`, `blocklist=true`); remove the torrent and delete its files (the library guard still keeps files in library paths; this path alone skips the upload-based seed floor for a torrent that never finished, via `remove_torrent(never_finished_ok=True)`); then run `EpisodeSearch` / `MoviesSearch`. A torrent in no arr queue is still removed, and the digest says it was not blocklisted. One digest line per removal: name, percent, seeds, pieces no peer has, hours, blocklisted yes/no, files deleted or kept by the library guard. In `dry` mode: `[dry] would remove ...`, once per torrent.
 
 A torrent that moves again starts over. The ladder is kept in `STUCK_STATE_PATH` (`/data/stuck_state.json`) in `on` mode so a restart does not reset it.
 
@@ -116,7 +131,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `main`: syn
 
 ### Unreleased
 
-- Stuck downloads (`stuck_plan.py`, see **Stuck downloads**): stalled sonarr/radarr torrents go up a ladder (reannounce + queue top, pause + resume, then removal through the arr queue with blocklist and a new search; 95% or more only notifies). Upgrade-lane torrents get a per-torrent connection cap. `STUCK_AUTOMATION=off|dry|on`, default `dry`. Preview at `/stuck-downloads`.
+- Stuck downloads (`stuck_plan.py`, see **Stuck downloads**): stalled sonarr/radarr torrents go up a ladder (reannounce + queue top, pause + resume, then, only for a release that could never complete (no seeds and a piece no peer has, for the whole window), blocklist in the arr, remove the torrent and its files, and search again, at any progress). Upgrade-lane torrents get a per-torrent connection cap. `STUCK_AUTOMATION=off|dry|on`, default `dry`. Preview at `/stuck-downloads`.
 
 - Deluge trimming (`deluge_trim.py`, see **Deluge trimming**): the upgrade lane is capped at `UPGRADE_LANE_MAX` (10) unfinished torrents. Untouched overflow is removed hourly, after the monthly relabel and at grab time, and the monthly search skips while the lane is full; torrents with any progress are never dropped. This trim is deliberate, unlike the 2026-09-26 queue-wipe incident. Long-seeded torrents on managed labels retire after `SEED_RETIRE_DAYS` (180), idle ones (no upload in `SEED_IDLE_DAYS`, 14) after `SEED_DAYS` (21), in swarms with more than 5 other seeds, 100 a day, download copy deleted only when the library holds every video. Previews at `/upgrade-lane-cap` and `/retire-seeds`. New `test_deluge_trim.py`.
 - Sonarr/Radarr health automation (`arr_health.py`, see **Arr health**): Pushover for outages over 30 minutes (arrs, indexers, download clients, root folders, Deluge) and their recovery, and for items newly removed from TheTVDB/TMDb (first read baselines silently). Broken library files (media info unreadable) are rescanned, confirmed an hour later and listed in `/digest`; only with `ARR_HEALTH_APPLY=1` are they repaired (Deluge recheck of the source torrent, else delete through the arr + search; unmonitored never deleted, 3 per pass, more than 5 at once changes nothing). New `test_arr_health.py`.
