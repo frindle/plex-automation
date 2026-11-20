@@ -111,9 +111,9 @@ def test_month_rollover_resets_cost(tmp_path):
 def test_spend_persists_across_processes(tmp_path):
     p = str(tmp_path / 's.json')
     now = lambda: epoch(2026, 11, 5)  # noqa: E731
-    la.ClaudeSpend(p, now).add('claude-haiku-5-5', 1_000_000, 1_000_000)
+    la.ClaudeSpend(p, now).add('claude-haiku-5-5', 100_000, 100_000)
     again = la.ClaudeSpend(p, now).snapshot()
-    assert again['usd'] == 0.6 and again['calls'] == 1
+    assert abs(again['usd'] - 0.06) < 1e-9 and again['calls'] == 1
 
 
 def test_spend_limit_error_skips_rest_of_month_and_logs_once(tmp_path, caplog):
@@ -179,7 +179,7 @@ def test_backoff_doubles_with_repeated_failures(tmp_path):
 
 def test_cost_math():
     assert la.CLAUDE_MODEL == 'claude-haiku-5-5'
-    assert abs(la.claude_cost_usd('claude-haiku-5-5', 1_000_000, 1_000_000) - 0.60) < 1e-12
+    assert abs(la.claude_cost_usd('claude-haiku-5-5', 100_000, 100_000) - 0.06) < 1e-12
     assert abs(la.claude_cost_usd('claude-sonnet-5-5', 1_000_000, 1_000_000) - 12.0) < 1e-12
     assert abs(la.claude_cost_usd('claude-haiku-5-5', 2000, 300) - (2000 * 0.10 + 300 * 0.50) / 1e6) < 1e-12
     assert abs(la.claude_cost_usd('claude-haiku-5-5', 200_000, 0) - 0.1) < 1e-12        # long-prompt tier $0.50/M
@@ -204,12 +204,12 @@ def test_llm_model_override_still_wins(tmp_path):
 
 def test_layer_status_fields_and_order(tmp_path):
     env = dict(ENV, LLM_DECISIONS='enforce', LLM_CLAUDE_SPEND_PATH=str(tmp_path / 's.json'), LLM_CLAUDE_MONTHLY_USD='50')
-    la.get_claude_spend(env['LLM_CLAUDE_SPEND_PATH']).add('claude-haiku-5-5', 1_000_000, 0)
+    la.get_claude_spend(env['LLM_CLAUDE_SPEND_PATH']).add('claude-haiku-5-5', 100_000, 0)
     st = la.layer_status(env)
     assert st['kinds']['upgrade_gate'] == ['local', 'claude', 'paid']
     assert st['claude_model'] == 'claude-haiku-5-5'
     m = st['claude_month']
-    assert m['usd'] == 0.1 and m['cap_usd'] == 50.0 and m['calls'] == 1 and m['capped'] is False
+    assert m['usd'] == 0.01 and m['cap_usd'] == 50.0 and m['calls'] == 1 and m['capped'] is False
     assert m['api_limit_hit'] is False and m['month'] == time.strftime('%Y-%m', time.gmtime())
     blob = json.dumps(st)
     assert 'sk-fake' not in blob and KEY not in blob
@@ -257,11 +257,11 @@ def test_backtest_max_usd_stops_the_run(tmp_path, capsys):
 
     def tr(p):
         calls.append(p)
-        return reply('allow', tin=1_000_000, tout=0)       # $0.10 each
-    code = bl.main(['--kind', 'upgrade_gate', '--layer', 'claude', '--model', 'claude-haiku-5-5', '--max-usd', '0.25',
+        return reply('allow', tin=100_000, tout=0)         # $0.01 each
+    code = bl.main(['--kind', 'upgrade_gate', '--layer', 'claude', '--model', 'claude-haiku-5-5', '--max-usd', '0.025',
                     '--facts', facts_file(tmp_path, n=20)], env={'ANTHROPIC_API_KEY': 'sk-fake'}, transport=tr)
     text = capsys.readouterr().out
-    assert len(calls) == 3                               # $0.30 >= $0.25: stop before the 4th
+    assert len(calls) == 3                               # $0.03 >= $0.025: stop before the 4th
     assert 'INCONCLUSIVE' in text and '--max-usd' in text and code == 1
 
 
@@ -270,7 +270,7 @@ def test_backtest_default_max_usd_is_two_dollars(tmp_path, capsys):
 
     def tr(p):
         n.append(1)
-        return reply('allow', tin=10_000_000, tout=0)      # $1.00 each at Haiku input price
+        return reply('allow', tin=0, tout=2_000_000)       # $1.00 each at the Haiku output price
     bl.main(['--kind', 'upgrade_gate', '--layer', 'claude', '--facts', facts_file(tmp_path, n=10)],
             env={'ANTHROPIC_API_KEY': 'sk-fake'}, transport=tr)
     assert len(n) == 2
@@ -286,12 +286,12 @@ def test_backtest_budget_is_shared_across_kinds(tmp_path, capsys):
 
         def tr(prompt):
             calls.append(1)
-            return reply('allow', tin=1_000_000, tout=0)
-        bl.main(['--kind', 'upgrade_gate,dupe_confirm', '--layer', 'claude', '--max-usd', '0.15'],
+            return reply('allow', tin=0, tout=200_000)         # $0.10 each
+        bl.main(['--kind', 'upgrade_gate,dupe_confirm', '--layer', 'claude', '--max-usd', '0.3', '--limit', '2'],
                 env={'ANTHROPIC_API_KEY': 'sk-fake'}, transport=tr)
     finally:
         bl.load_rows = real
-    assert len(calls) == 2 and 'later kinds not run' in capsys.readouterr().out
+    assert len(calls) == 3 and 'later kinds not run' in capsys.readouterr().out
 
 
 def test_backtest_unknown_kind_refused(capsys):
