@@ -24,8 +24,8 @@ def test_cap_reached_at_count():
     la = _load_llm_advisor()
     p = _log('a.jsonl', [
         ('2026-11-02T01:00:00+00:00', ['paid']),
-        ('2026-11-03T01:00:00+00:00', ['paid', 'claude']),
-        ('2026-10-30T01:00:00+00:00', ['paid', 'paid', 'claude']),
+        ('2026-11-03T01:00:00+00:00', ['paid', 'paid', 'claude', 'claude']),
+        ('2026-10-30T01:00:00+00:00', ['paid', 'paid', 'paid', 'claude']),
     ])
     assert la.paid_cap_reached({'LLM_PAID_MONTHLY_MAX_CALLS': '3'}, p, '2026-11') is True
     assert la.paid_cap_reached({'LLM_PAID_MONTHLY_MAX_CALLS': '4'}, p, '2026-11') is False
@@ -37,7 +37,8 @@ def test_cap_reached_at_count():
 def test_bad_or_missing_cap_defaults_to_300():
     la = _load_llm_advisor()
     p299 = _log('b299.jsonl', [('2026-11-05T00:00:00+00:00', ['paid'] * 299)])
-    p300 = _log('b300.jsonl', [('2026-11-05T00:00:00+00:00', ['paid'] * 150 + ['claude'] * 150)])
+    p300 = _log('b300.jsonl', [('2026-11-05T00:00:00+00:00', ['paid'] * 300 + ['claude'] * 50)])
+    assert la.paid_cap_reached({}, _log('c.jsonl', [('2026-11-05T00:00:00+00:00', ['claude'] * 500)]), '2026-11') is False
     for env in ({}, {'LLM_PAID_MONTHLY_MAX_CALLS': ''}, {'LLM_PAID_MONTHLY_MAX_CALLS': 'abc'},
                 {'LLM_PAID_MONTHLY_MAX_CALLS': '-1'}, {'LLM_PAID_MONTHLY_MAX_CALLS': '2.5'},
                 {'LLM_PAID_MONTHLY_MAX_CALLS': None}):

@@ -48,26 +48,27 @@ def _run(cap, logged, mode='shadow'):
     return out, calls, rows, layers
 
 
-def test_capped_skips_paid_and_claude():
+def test_capped_skips_paid_but_claude_still_answers():
     out, calls, rows, _ = _run(cap=2, logged=2, mode='enforce')
-    assert out == 'allow', out
-    assert calls == ['local'], calls
+    assert out == 'reject', out
+    assert calls == ['local', 'claude'], calls
     assert len(rows) == 2, rows
     assert rows[-1].get('paid_cap') is True, rows[-1]
 
 
-def test_zero_cap_enforce_rules_only():
+def test_zero_cap_enforce_paid_off_claude_on():
     out, calls, rows, layers = _run(cap=0, logged=0, mode='enforce')
-    assert out == 'allow', out
-    assert calls == ['local'], calls
+    assert out == 'reject', out
+    assert calls == ['local', 'claude'], calls
     assert rows[-1].get('paid_cap') is True, rows[-1]
     assert sorted(layers) == ['claude', 'local', 'paid'], sorted(layers)
 
 
 def test_under_cap_still_calls_paid():
+    # claude is the first backup now (ahead of paid Darkbloom), so it answers and paid is not asked
     out, calls, rows, _ = _run(cap=5, logged=2, mode='enforce')
     assert out == 'reject', out
-    assert calls == ['local', 'paid'], calls
+    assert calls == ['local', 'claude'], calls
     assert 'paid_cap' not in rows[-1], rows[-1]
 
 
@@ -78,7 +79,7 @@ def test_shadow_never_calls_paid_even_under_cap():
     assert 'paid_cap' not in rows[-1], rows[-1]
 
 
-TESTS = [test_capped_skips_paid_and_claude, test_zero_cap_enforce_rules_only, test_under_cap_still_calls_paid,
+TESTS = [test_capped_skips_paid_but_claude_still_answers, test_zero_cap_enforce_paid_off_claude_on, test_under_cap_still_calls_paid,
          test_shadow_never_calls_paid_even_under_cap]
 GUARDS = [test_under_cap_still_calls_paid]
 
