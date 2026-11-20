@@ -1864,7 +1864,10 @@ def rar_extract_scheduler():
 
 # remove_torrent result: the seed floor blocked the removal, retry later
 DEFERRED = 'deferred'
-def remove_torrent(torrent_hash, remove_data=True, info=None):
+def remove_torrent(torrent_hash, remove_data=True, info=None, never_finished_ok=False, outcome=None):
+    """never_finished_ok: explicit opt-in used only by the stuck-downloads never-complete path. It skips the
+    upload-based seed floor for a torrent that never finished (is_finished False, seeding_time 0); every other
+    caller keeps the floor. outcome: optional dict, filled with files_deleted (bool) when the removal happens."""
     # Pre-fetch: know the seed time before deciding anything, even for remove_data=False.
     # A field the caller left out or passed as None is unknown and is taken from Deluge.
     _i = {k: v for k, v in (info or {}).items() if v is not None}
@@ -1911,6 +1914,8 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
     progress = info.get('progress')
     never = (st == 0 and info.get('total_uploaded') == 0 and info.get('is_finished') is False
              and isinstance(progress, (int, float)) and progress < 100)
+    if never_finished_ok and st == 0 and info.get('is_finished') is False:
+        never = True
     if st is None or (st < SEED_DAYS * 86400 and not never):
         name = info.get('name')
         days = 'unknown' if st is None else f'{round(st / 86400, 1)}d'
@@ -1951,6 +1956,8 @@ def remove_torrent(torrent_hash, remove_data=True, info=None):
                 _queue_rar_sets(rsets, torrent_hash)
         else:
             log.warning(f'{torrent_hash}: Deluge did not confirm the removal; samples/rars left alone')
+    if outcome is not None:
+        outcome['files_deleted'] = bool(remove_data)
     log.info(f'Removed torrent {torrent_hash}' + (' and deleted files' if remove_data else ' (files left on disk)'))
     log_removal(traceback.extract_stack(limit=2)[0].name, torrent_hash, info.get('name'),
                 'files deleted' if remove_data else 'files kept',
@@ -4791,8 +4798,9 @@ def tracker_stall_scheduler():
 # check_tracker_stalls above only looks at torrents in their first 15 minutes. This pass
 # looks at every unfinished torrent with a normal sonarr/radarr label that has stopped
 # moving, and works up a ladder: reannounce + queue to top, then pause + resume, then
-# (STUCK_GIVE_UP_HOURS, under 95%) remove it through the arr queue API with blocklist and
-# search again. At 95% or more it only notifies. It also caps the connections of each
+# (STUCK_GIVE_UP_HOURS), only when it could never complete (tracker working, no seeds and a piece no
+# peer has, on every pass for the whole window), at any progress: blocklist it in the arr, remove the
+# torrent and its files, search again. It also caps the connections of each
 # upgrade-lane torrent so the normal lane can get peers.
 #   STUCK_AUTOMATION=off  does nothing on the timer (the preview still answers)
 #   STUCK_AUTOMATION=dry  (default, and anything unrecognised) logs and records only; no call is
@@ -4854,6 +4862,37 @@ def _stuck_save():
         log.warning(f'[stuck] could not save {STUCK_STATE_PATH}: {e}')
 
 
+def _stuck_fetch_pieces(torrent_hash):
+    """Deluge's per-piece state list for one torrent (3 done, 2 downloading, 1 a peer has it, 0 no peer has it),
+    or None. Read-only."""
+    try:
+        status = _deluge_status_fields(torrent_hash, ['pieces'])
+    except Exception as e:
+        log.warning(f'[stuck] pieces read failed for {torrent_hash} ({type(e).__name__})')
+        return None
+    pieces = (status or {}).get('pieces')
+    return pieces if isinstance(pieces, list) else None
+
+
+def _deluge_status_fields(torrent_hash, fields):
+    resp = session.post(f'{DELUGE_URL}/json',
+                        json={'method': 'core.get_torrent_status', 'params': [torrent_hash, fields], 'id': 91},
+                        timeout=30)
+    resp.raise_for_status()
+    return resp.json().get('result')
+
+
+def _stuck_zero_pieces(torrents, cfg):
+    """{hash: number of pieces no connected peer has} for the stalled 0-seed candidates only. A torrent whose
+    pieces cannot be read is left out (unknown)."""
+    out = {}
+    for h in stuck_plan.piece_check_candidates(torrents, cfg):
+        pieces = _stuck_fetch_pieces(h)
+        if pieces is not None:
+            out[h] = sum(1 for p in pieces if p == 0)
+    return out
+
+
 def _stuck_arr_queue():
     """({hash: {'who', 'ids', 'movieIds', 'episodeIds'}}, {who that could not be read})."""
     out, failed = {}, set()
@@ -4901,35 +4940,40 @@ def _stuck_say(h, what, text):
         record_activity('stuck-downloads', text)
 
 
+def _stuck_removal_text(action, blocklisted, files):
+    return (f'could never complete: 0 seeds, {action.get("zero_pieces")} pieces no peer has, '
+            f'for {action.get("never_hours")} h; blocklisted: {blocklisted}; files: {files}')
+
+
 def _stuck_give_up(action, queue, failed):
-    """Step 3 through the arr API. Returns a short outcome string."""
+    """Step 3: the torrent could never complete. Blocklist in the arr when it is in a queue, remove the torrent and
+    its files, search again. Returns a short outcome string."""
     h, name = action['hash'], action['name']
     q = queue.get(h.lower())
+    who = q['who'] if q else ('Sonarr' if action['label'].startswith('sonarr') else 'Radarr')
+    if not q and who in failed:
+        return f'skipped: {who} queue unreadable'
+    if q:
+        # Never ask the arr to delete from the client (removeFromClient=True): blocklist the release (client
+        # untouched), then remove through remove_torrent() so the library guard still applies.
+        _arr_blocklist_queue_items(who, q['ids'])
+    out = {}
+    if remove_torrent(h, remove_data=True, never_finished_ok=True, outcome=out) == DEFERRED:
+        record_activity('stuck-downloads', f'Could not remove stuck "{name}" at {action["progress"]:.1f}%: the removal was '
+                                           'deferred (status unreadable); it is kept and tried again')
+        return 'blocklisted, kept' if q else 'kept'
+    files = 'deleted' if out.get('files_deleted') else 'kept by the library guard'
+    bl = f'yes, in the {who} queue' if q else 'no (not in an arr queue)'
+    record_activity('stuck-downloads', f'Removed stuck "{name}" at {action["progress"]:.1f}%: '
+                                       + _stuck_removal_text(action, bl, files))
     if not q:
-        who = 'Sonarr' if action['label'].startswith('sonarr') else 'Radarr'
-        if who in failed:
-            return f'skipped: {who} queue unreadable'
-        _stuck_say(h, 'noqueue', f'Stuck "{name}" is not in a {who} queue; left in place')
-        return 'skipped: not in an arr queue'
-    who = q['who']
-    # Never ask the arr to delete from the client (removeFromClient=True): that bypasses remove_torrent()'s
-    # seed floor and library guard. Blocklist the release (client untouched), then remove through remove_torrent().
-    _arr_blocklist_queue_items(who, q['ids'])
-    kept = remove_torrent(h, remove_data=True) == DEFERRED
-    if kept:
-        record_activity('stuck-downloads', f'Gave up on stuck "{name}" at {action["progress"]:.1f}%: blocklisted in the {who} '
-                                           'queue; the torrent is kept because the seed floor refused the removal')
-    else:
-        record_activity('stuck-downloads', f'Gave up on stuck "{name}" at {action["progress"]:.1f}% ({action["diagnosis"]}): '
-                                           f'blocklisted in the {who} queue, download removed through the seed-floor and library guards')
+        return 'removed, not blocklisted'
     try:
         searched = _stuck_search(who, q)
     except Exception as e:
         log.error(f'[stuck] {who} search after removal failed: {type(e).__name__}: {e}')
-        record_activity('stuck-downloads', f'{who} search after giving up on "{name}" failed; {who} will find it on its next search')
-        return 'kept; search failed' if kept else 'removed; search failed'
-    if kept:
-        return 'blocklisted, kept by seed floor' + (' and searching' if searched else '')
+        record_activity('stuck-downloads', f'{who} search after removing "{name}" failed; {who} will find it on its next search')
+        return 'removed; search failed'
     return 'removed and searching' if searched else 'removed; nothing to search'
 
 
@@ -4951,11 +4995,6 @@ def _stuck_do(action, mode, queue, failed):
             _deluge_rpc('core.set_torrent_options', [[h], {'max_connections': action['max_connections']}])
         elif kind == stuck_plan.UNCAP:
             _deluge_rpc('core.set_torrent_options', [[h], {'max_connections': -1}])
-        elif kind == stuck_plan.NOTIFY:
-            send_pushover('Download stuck near the end',
-                          f'"{name}" is at {action["progress"]:.1f}% and has not moved for {action["stalled_hours"]} h. '
-                          f'Diagnosis: {action["diagnosis"]}. '
-                          'Left in place; the automation never gives up at 95% or more.')
         elif kind == stuck_plan.NOTIFY_LOCAL:
             send_pushover('Download stuck: local problem',
                           f'"{name}" is at {action["progress"]:.1f}% and has not moved for {action["stalled_hours"]} h. '
@@ -4994,7 +5033,9 @@ def stuck_pass(now=None, mode=None):
     with _stuck_lock:
         if mode == 'on':
             _stuck_load()
-        actions, new_state, rows = stuck_plan.plan(torrents, _stuck_state, now, cfg, torrent_is_unregistered)
+        zero_pieces = _stuck_zero_pieces(torrents, cfg)
+        actions, new_state, rows = stuck_plan.plan(torrents, _stuck_state, now, cfg, torrent_is_unregistered,
+                                                   zero_pieces)
         _stuck_state.clear()
         _stuck_state.update(new_state)
         if mode == 'on':
@@ -5011,11 +5052,14 @@ def stuck_pass(now=None, mode=None):
         outcome = _stuck_do(a, mode, queue, failed)
         results.append({'hash': a['hash'], 'action': a['action'], 'outcome': outcome})
         what = {'reannounce': 'reannounced', 'queue_top': 'queued to top', 'pause': 'paused', 'resume': 'resumed',
-                'give_up': 'given up on', 'notify': 'notified about', 'uncap_connections': 'uncapped',
+                'give_up': 'removed', 'uncap_connections': 'uncapped',
                 'notify_local': 'notified about a local problem with',
                 'notify_tracker': 'reported the failing tracker for'}[a['action']]
         prefix = '[dry] would have ' if mode != 'on' else ''
-        if a['action'] != stuck_plan.GIVE_UP or mode != 'on':     # a real give-up writes its own lines
+        if a['action'] == stuck_plan.GIVE_UP and mode != 'on':
+            _stuck_say(a['hash'], 'dry:give_up', f'[dry] would remove stuck "{a["name"]}" at {a["progress"]:.1f}%: '
+                       + _stuck_removal_text(a, 'yes if it is in an arr queue', 'deleted unless the library guard keeps them'))
+        elif a['action'] != stuck_plan.GIVE_UP:     # a real give-up writes its own lines
             line = f'{prefix}{what} stuck "{a["name"]}" (step {a.get("step", "-")}; diagnosis: {a["diagnosis"]})'
             if mode != 'on':      # a dry pass re-plans the same action every pass: say it once per torrent and step
                 _stuck_say(a['hash'], f'dry:{a["action"]}:{a.get("step", "-")}', line)
@@ -5033,6 +5077,10 @@ def stuck_pass(now=None, mode=None):
             for a in caps:
                 _stuck_say(a['hash'], 'dry:cap', f'[dry] would cap upgrade-lane torrent "{a["name"]}" at '
                                                  f'{cfg.upgrade_max_connections} connections')
+    for r in rows:
+        if r.get('status_unknown'):
+            _stuck_say(r['hash'], 'status', f'Stuck "{r["name"]}": unrecognised tracker status "{r["tracker_status"]}"; '
+                                            'treated as no conclusion')
     stalled = sum(1 for r in rows if r['stalled'])
     # The per-pass summary is log-only: one activity line per pass would bury /digest.
     log.info(f'[stuck] {mode} pass: {sum(1 for r in rows if r["label"] in cfg.normal_labels)} unfinished normal '
@@ -5061,7 +5109,8 @@ def stuck_downloads_preview():
         return jsonify({'ok': False, 'error': f'Deluge unreadable: {type(e).__name__}'}), 502
     with _stuck_lock:
         state = {h: dict(e) for h, e in _stuck_state.items()}
-    _, _, rows = stuck_plan.plan(torrents, state, time.time(), cfg, torrent_is_unregistered)
+    _, _, rows = stuck_plan.plan(torrents, state, time.time(), cfg, torrent_is_unregistered,
+                                 _stuck_zero_pieces(torrents, cfg))
     return jsonify({
         'ok': True, 'mode': stuck_mode(),
         'config': {'stuck_after_min': cfg.stuck_after_min, 'give_up_hours': cfg.give_up_hours,
