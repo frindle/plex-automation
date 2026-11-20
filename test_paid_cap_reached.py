@@ -24,8 +24,8 @@ def test_cap_reached_at_count():
     la = _load_llm_advisor()
     p = _log('a.jsonl', [
         ('2026-11-02T01:00:00+00:00', ['paid']),
-        ('2026-11-03T01:00:00+00:00', ['paid', 'claude', 'claude']),
-        ('2026-10-30T01:00:00+00:00', ['paid', 'paid', 'claude']),
+        ('2026-11-03T01:00:00+00:00', ['paid', 'paid', 'claude', 'claude']),
+        ('2026-10-30T01:00:00+00:00', ['paid', 'paid', 'paid', 'claude']),
     ])
     assert la.paid_cap_reached({'LLM_PAID_MONTHLY_MAX_CALLS': '3'}, p, '2026-11') is True
     assert la.paid_cap_reached({'LLM_PAID_MONTHLY_MAX_CALLS': '4'}, p, '2026-11') is False
