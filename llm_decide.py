@@ -16,6 +16,7 @@ KINDS = {
     'stuck_import': ('wait', 'retry_import', 'ask'),
     'stuck_upgrade_tag': ('wait', 'run_sweep', 'ask'),
     'duplicate_folder': ('leave', 'merge', 'ask'),
+    'audit_findings': ('fix', 'ignore', 'ask'),
 }
 MIN_CONFIDENCE = 0.75
 MIN_SEEDERS = 10
@@ -131,6 +132,16 @@ POLICY = {
         'follow-up), merge (one folder should be folded into the other; a person does it) or ask (a person '
         'should look). You can never move or delete anything; the choice is advice only. merge needs at least '
         'two folders and at least one that is not empty. Use ask when the facts do not settle it.'),
+    'audit_findings': (
+        'A read-only audit of the torrent client or the downloads folder reported one finding. Facts only: source '
+        '(library_audit or downloads_audit), finding (error, missing_data, arr_label_in_library, orphan_file, '
+        'single_link or unlabeled), label_class (sonarr, radarr, library_seed, other or none), files, size_gb, '
+        'human_only (true when the follow-up is a delete, move or relabel of files a person must do), '
+        'data_at_risk (true when ignoring it could lose library data), rules_action. Pick one action: fix (a '
+        'routine follow-up, such as a recheck or a label, is worth doing), ignore (harmless, no follow-up) or ask '
+        '(a person should look). You can never change, move or delete anything; the choice is advice only. fix '
+        'is never allowed when human_only is true, and ignore is never allowed when data_at_risk is true. Use ask '
+        'when the facts do not settle it.'),
 }
 
 
@@ -850,7 +861,8 @@ def dupe_comparison(facts):
 
 
 _SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure',
-                'torrent_error': 'ask', 'unregistered_triage': 'ask', 'stuck_import': 'ask', 'stuck_upgrade_tag': 'ask', 'duplicate_folder': 'ask'}
+                'torrent_error': 'ask', 'unregistered_triage': 'ask', 'stuck_import': 'ask', 'stuck_upgrade_tag': 'ask', 'duplicate_folder': 'ask',
+                'audit_findings': 'ask'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
 
@@ -942,6 +954,15 @@ def apply_hard_rules(kind, action, facts):
                 n, e = facts.get('folder_count'), facts.get('empty_folders')
                 if not isinstance(n, int) or isinstance(n, bool) or n < 2 or not isinstance(e, int) or e >= n:
                     return 'ask', 'merge_needs_content'
+        elif kind == 'audit_findings':
+            # Advice only (nothing here fixes, moves or deletes). The floors fail closed: a missing or non-bool
+            # flag counts as the cautious value, so a human-only action stays human-only.
+            if action not in KINDS['audit_findings']:
+                return 'ask', 'invalid_action'
+            if action == 'fix' and facts.get('human_only') is not False:
+                return 'ask', 'human_only'
+            if action == 'ignore' and facts.get('data_at_risk') is not False:
+                return 'ask', 'data_at_risk'
         elif kind == 'unregistered_triage' and action in ('remove_keep_library', 'remove_and_research'):
             # The model may never cause a delete the rules would not make (missing rules_action fails closed).
             if facts.get('rules_action') != 'remove':
