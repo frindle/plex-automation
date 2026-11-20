@@ -8,6 +8,11 @@ _DEAD = 'http://127.0.0.1:9'
 for _k in ('DELUGE_URL', 'SONARR_URL', 'RADARR_URL', 'PLEX_URL', 'TIERING_API', 'WEBHOOK'):
     os.environ[_k] = _DEAD
 
+# advise() captures facts for back-tests; keep that out of the real /data/backtest.
+import tempfile
+_TEST_BT = tempfile.mkdtemp(prefix='plex-test-backtest-')
+os.environ['LLM_BACKTEST_DIR'] = _TEST_BT
+
 import copy
 import sys
 import types
@@ -15,6 +20,8 @@ import types
 import pytest
 
 import llm_advisor
+
+llm_advisor.DEFAULT_BACKTEST_DIR = _TEST_BT   # tests that pass their own env must not reach /data/backtest
 
 # Test isolation: every test runs as if its file ran alone.
 # 1. Import time. Many files set os.environ and then import arr-webhook, which reads the env at import. Python caches
