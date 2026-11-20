@@ -65,9 +65,10 @@ def test_zero_cap_enforce_rules_only():
 
 
 def test_under_cap_still_calls_paid():
+    # claude is the first backup now (ahead of paid Darkbloom), so it answers and paid is not asked
     out, calls, rows, _ = _run(cap=5, logged=2, mode='enforce')
     assert out == 'reject', out
-    assert calls == ['local', 'paid'], calls
+    assert calls == ['local', 'claude'], calls
     assert 'paid_cap' not in rows[-1], rows[-1]
 
 
