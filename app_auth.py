@@ -9,7 +9,8 @@ APP_AUTH_MODE
 A request passes when it carries any of:
   * a Cloudflare Access JWT (Cf-Access-Jwt-Assertion) signed by the team's keys, with the
     configured issuer and one of the configured AUDs
-  * Authorization: Bearer <token>, the token being a line of APP_AUTH_TOKEN_FILE
+  * Authorization: Bearer <token>, the token being a line of APP_AUTH_TOKEN_FILE (or the line is
+    `sha256:<hex>` of the token, so the caller's token can stay in its own Keychain)
   * HTTP Basic, on /webhook/* only, user:password being a line of APP_AUTH_BASIC_FILE
 /health is always open. /share/dl/<token> is open at the gate: the link token is its credential
 and the route checks it.
@@ -22,7 +23,9 @@ with a JSON content type. A GET is refused (405) and so is a body the browser co
 sites without a preflight (415). Dry-run reports stay on GET.
 """
 import base64
+import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -204,13 +207,30 @@ def _any_equal(candidate, secrets):
     return ok
 
 
+_HASH_PREFIX = 'sha256:'
+
+
+def _token_matches(candidate, line):
+    """A token-file line is either the plain token or `sha256:<hex>` of it (only the hash need be stored
+    where the caller's token lives elsewhere, e.g. a Keychain). Both compare in constant time."""
+    if line[:len(_HASH_PREFIX)].lower() == _HASH_PREFIX:
+        digest = hashlib.sha256(candidate.encode()).hexdigest()
+        return hmac.compare_digest(digest.encode(), line[len(_HASH_PREFIX):].strip().lower().encode())
+    return hmac.compare_digest(candidate.encode(), line.encode())
+
+
 def _bearer_ok():
     h = request.headers.get('Authorization', '')
     if not h[:7].lower() == 'bearer ':
         return None
     tokens = _file_lines(os.environ.get('APP_AUTH_TOKEN_FILE', ''))
     cand = h[7:].strip()
-    return bool(cand) and _any_equal(cand, tokens)
+    if not cand:
+        return False
+    ok = False
+    for line in tokens:
+        ok |= _token_matches(cand, line)   # no early exit, as in _any_equal
+    return ok
 
 
 def _basic_ok():
@@ -240,6 +260,19 @@ def route_class(path):
 
 
 _LOOPBACK = ('127.0.0.1', '::1', '::ffff:127.0.0.1')
+
+
+def caller_class():
+    """Where the socket peer is, never its address: loopback, lan (private range), public or unknown.
+    For the log-mode watch, so an unknown caller can be placed without writing an IP into the log."""
+    addr = request.remote_addr or ''
+    if addr in _LOOPBACK:
+        return 'loopback'
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return 'unknown'
+    return 'lan' if ip.is_private else 'public'
 
 
 def _loopback_report():
@@ -323,11 +356,11 @@ def gate():
         ok, _kind, missing = check_credentials()
         if not ok:
             if m == 'enforce':
-                log.warning('app-auth: refused class=%s method=%s path=%s: %s',
-                            route_class(request.path), request.method, request.path, missing)
+                log.warning('app-auth: refused class=%s method=%s path=%s caller=%s: %s',
+                            route_class(request.path), request.method, request.path, caller_class(), missing)
                 return jsonify({'ok': False, 'error': 'authentication required'}), 403
-            log.warning('app-auth: would refuse (mode=log) class=%s method=%s path=%s: %s',
-                        route_class(request.path), request.method, request.path, missing)
+            log.warning('app-auth: would refuse (mode=log) class=%s method=%s path=%s caller=%s: %s',
+                        route_class(request.path), request.method, request.path, caller_class(), missing)
     return _action_refusal()
 
 
