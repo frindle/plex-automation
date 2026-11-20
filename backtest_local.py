@@ -119,6 +119,14 @@ def _tokens(meta):
     return g('input_tokens', 'prompt_tokens'), g('output_tokens', 'completion_tokens')
 
 
+def _error_line(e):
+    """Class, HTTP status and the API's own message (or str(e)), one line, at most 160 chars. Never the prompt."""
+    body = getattr(e, 'body', None)
+    msg = body.get('error', {}).get('message') if isinstance(body, dict) and isinstance(body.get('error'), dict) else None
+    msg = ' '.join(str(msg or e).split())[:160]
+    return '%s %s %s' % (type(e).__name__, getattr(e, 'status_code', '-'), msg)
+
+
 def score(kind, rows, transport, clock=time.monotonic, price_model=None, max_usd=None, spent_usd=0.0):
     """Replay rows through transport. Returns counts, hard-rule blocks and latencies; nothing from the facts.
     With price_model set, each call's tokens are priced (llm_advisor.claude_cost_usd) into cost_usd, and the run
@@ -143,6 +151,8 @@ def score(kind, rows, transport, clock=time.monotonic, price_model=None, max_usd
                 out['invalid'] += 1
         except Exception as e:  # noqa: BLE001
             out['errors'] += 1
+            if 'first_error' not in out:
+                out['first_error'] = _error_line(e)
             ti, to = _tokens(getattr(e, 'meta', None) or {})
         out['in_tokens'] += ti
         out['out_tokens'] += to
@@ -203,6 +213,8 @@ def report(kind, model, res, waited_min=0.0):
     lines.append('rules_disagree_ids=' + (','.join(res['disagree_ids']) or '-'))
     lines += ['  pair %s %d' % (p, n) for p, n in sorted(res['pairs'].items())]
     lines.append('invalid=%d errors=%d' % (res.get('invalid', 0), res.get('errors', 0)))
+    if res.get('first_error'):
+        lines.append('first_error=' + res['first_error'])
     lines.append('tokens in=%d out=%d cost_usd=%.4f' % (res.get('in_tokens', 0), res.get('out_tokens', 0),
                                                        res.get('cost_usd', 0.0)))
     lines.append('latency_ms p50=%s p95=%s' % (percentile(lat, 50), percentile(lat, 95)))
@@ -444,7 +456,8 @@ def main(argv=None, env=None, http=None, transport=None, sleep=time.sleep):
         if transport is None and not (env.get('ANTHROPIC_API_KEY') or '').strip():
             print('refused: ANTHROPIC_API_KEY not set')
             return 2
-        factory = llm_advisor._real_claude_client((env.get('ANTHROPIC_API_KEY') or '').strip())
+        factory = llm_advisor._real_claude_client((env.get('ANTHROPIC_API_KEY') or '').strip(),
+                                                  (env.get('ANTHROPIC_WORKSPACE_ID') or '').strip())
     else:
         base = (env.get('DARKBLOOM_BASE_URL') or '').strip()
         if not base:
