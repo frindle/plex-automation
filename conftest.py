@@ -8,6 +8,10 @@ _DEAD = 'http://127.0.0.1:9'
 for _k in ('DELUGE_URL', 'SONARR_URL', 'RADARR_URL', 'PLEX_URL', 'TIERING_API', 'WEBHOOK'):
     os.environ[_k] = _DEAD
 
+# advise() captures facts for back-tests; keep that out of the real /data/backtest.
+import tempfile
+os.environ['LLM_BACKTEST_DIR'] = tempfile.mkdtemp(prefix='plex-test-backtest-')
+
 import copy
 import sys
 import types
