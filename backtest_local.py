@@ -24,7 +24,8 @@ name a listed id; anything else, an unreadable or empty list, or an LLM_LOCAL_MO
 to run (no request is sent), so the run can never make Darkbloom load a model. Approval is not checked: this run is
 what earns a model its LLM_LOCAL_APPROVED_<KIND> entry.
 
-Facts: JSONL, default /data/backtest/<kind>.jsonl. A row is a facts dict, or {"facts": {...}, "id": "...",
+Facts: JSONL. Default, first found in LLM_BACKTEST_DIR (/data/backtest): <kind>.jsonl, <kind>-live.jsonl (written by
+the advisor's capture), then the newest <kind>-YYYYMMDD.jsonl; the run prints facts: plain|live|stamped. A row is a facts dict, or {"facts": {...}, "id": "...",
 "rules_action": "...", "human": "..."}. The rules action is the row's `rules_action`, else facts['rules_action'];
 `human` is the saved human decision, when there is one. The model answer goes through the same hard rules as
 production. Waits while LLM_LOCAL_HOLD_URL says Plex (or anything) holds the GPU, up to --wait-min.
@@ -383,6 +384,24 @@ def _kinds(arg):
     return None if bad or not names else names
 
 
+def default_facts(kind, env):
+    """Pick the facts file for a kind: plain, else live, else newest stamped. Returns (path, label); never a listing."""
+    d = env.get('LLM_BACKTEST_DIR') or '/data/backtest'
+    plain = os.path.join(d, '%s.jsonl' % kind)
+    if os.path.exists(plain):
+        return plain, 'plain'
+    live = os.path.join(d, '%s-live.jsonl' % kind)
+    if os.path.exists(live):
+        return live, 'live'
+    try:
+        stamped = sorted(n for n in os.listdir(d) if re.fullmatch(re.escape(kind) + r'-\d{8}\.jsonl', n))
+    except OSError:
+        stamped = []
+    if stamped:
+        return os.path.join(d, stamped[-1]), 'stamped'
+    return plain, 'plain'
+
+
 def main(argv=None, env=None, http=None, transport=None, sleep=time.sleep):
     env = os.environ if env is None else env
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
@@ -444,7 +463,10 @@ def main(argv=None, env=None, http=None, transport=None, sleep=time.sleep):
         if unraid and kind not in ukinds:
             print('kind=%s skipped: not an Unraid kind' % kind)
             continue
-        path = args.facts or '/data/backtest/%s.jsonl' % kind
+        path = args.facts
+        if not path:
+            path, which = default_facts(kind, env)
+            print('kind=%s facts: %s' % (kind, which))
         try:
             loaded[kind] = load_rows(path, args.limit or None)
         except OSError:

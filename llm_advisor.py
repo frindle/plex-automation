@@ -778,6 +778,62 @@ def pending_key(kind, facts):
     return '%s:%s' % (kind, hashlib.sha256(blob.encode('utf-8')).hexdigest())
 
 
+# ── backtest capture ─────────────────────────────────────────────────────────
+# Full facts for the kinds Haiku and paid Darkbloom would answer, so backtest_local.py can replay them. The decision
+# log keeps only 500 characters. Never raises; a failure logs one short line with no facts in it.
+DEFAULT_CAPTURE_KINDS = 'import_identity,upgrade_gate'
+DEFAULT_BACKTEST_DIR = '/data/backtest'
+DEFAULT_CAPTURE_MAX = 400
+_CAPTURE_LOCK = threading.Lock()
+
+
+def capture_facts(kind, facts, rules_action, env=None, now=None):
+    try:
+        env = os.environ if env is None else env
+        kinds = {k.strip() for k in env.get('LLM_CAPTURE_KINDS', DEFAULT_CAPTURE_KINDS).split(',') if k.strip()}
+        if kind not in kinds or '/' in kind or kind.startswith('.'):
+            return False
+        try:
+            cap = int(env.get('LLM_CAPTURE_MAX', DEFAULT_CAPTURE_MAX))
+        except (TypeError, ValueError):
+            cap = DEFAULT_CAPTURE_MAX
+        if cap < 1:
+            return False
+        rid = hashlib.sha256(pending_key(kind, facts).encode('utf-8')).hexdigest()[:12]
+        d = env.get('LLM_BACKTEST_DIR') or DEFAULT_BACKTEST_DIR
+        path = os.path.join(d, '%s-live.jsonl' % kind)
+        row = json.dumps({'facts': facts, 'rules_action': rules_action, 'id': rid,
+                          'ts': int((now or time.time)())}, default=str, sort_keys=True)
+        with _CAPTURE_LOCK:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            lines = []
+            try:
+                with open(path, encoding='utf-8') as fh:
+                    lines = [x.rstrip('\n') for x in fh if x.strip()]
+            except FileNotFoundError:
+                pass
+            for x in lines:
+                try:
+                    if json.loads(x).get('id') == rid:
+                        return False
+                except ValueError:
+                    continue
+            lines.append(row)
+            lines = lines[-cap:]
+            tmp = '%s.tmp.%d' % (path, os.getpid())
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write('\n'.join(lines) + '\n')
+            os.replace(tmp, path)
+        return True
+    except Exception as e:
+        try:
+            _LOG.warning('capture_facts failed: %s', type(e).__name__)
+        except Exception:
+            pass
+        return False
+
+
 class PendingStore:
     """Decisions waiting on the local layer. first_seen survives restarts (atomic tmp+rename under a lock)."""
 
@@ -1168,6 +1224,7 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
         if not res['pending'] or res['first_pending']:
             llm_decide.log_decision(path, kind, json.dumps(facts, default=str, sort_keys=True)[:500],
                                     rules_action, decision, mode, extra)
+            capture_facts(kind, facts, rules_action, env, now)
 
         if record is not None:
             try:
