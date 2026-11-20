@@ -18,6 +18,7 @@ import app_auth
 import episode_retention
 import rar_extract
 import torrent_breakdown
+import move_list
 import tiering_gate
 import library_audit
 import downloads_audit
@@ -10986,6 +10987,40 @@ def torrent_breakdown_route():
     deluge_login()
     torrents = _deluge_rpc('core.get_torrents_status', [{}, torrent_breakdown.FIELDS]) or {}
     return jsonify(torrent_breakdown.breakdown(torrents)), 200
+
+
+def _plex_for_move_list(path, params, token):
+    r = requests.get(f'{PLEX_URL}{path}', params=dict(params or {}), headers={
+        'Accept': 'application/json', 'X-Plex-Token': token}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def _plextv_for_move_list(url, token):
+    r = requests.get(url, headers={'X-Plex-Token': token, 'X-Plex-Client-Identifier': 'plex-automation-move-list'},
+                     timeout=30)
+    r.raise_for_status()
+    return r.text
+
+
+@app.route('/move-list', methods=['GET'])
+def move_list_route():
+    """What would move to the cloud Plex: auto (next 3 unwatched of recent shows, movies in progress) plus
+    every user's 'Move' playlist, de-duplicated by file. Read-only on Plex. ?format=json for dr-state."""
+    if not PLEX_TOKEN:
+        return jsonify({'ok': False, 'error': 'no PLEX_TOKEN'}), 400
+    data = move_list.build(_plex_for_move_list, _plextv_for_move_list, PLEX_TOKEN, time.time())
+    if request.args.get('format') == 'json':
+        return jsonify(data), 200
+    from html import escape
+    rows = ''.join('<tr><td>%s</td><td>%s</td><td style="text-align:right">%.2f</td><td>%s</td></tr>' % (
+        escape(i['title']), escape(i['type'] or ''), i['size_gb'], escape(', '.join(i['reasons']))) for i in data['items'])
+    html = ('<!doctype html><meta charset="utf-8"><title>Move list</title>'
+            '<body style="font-family:system-ui;margin:16px"><h1>Move list</h1>'
+            '<p>%d items, %.2f GB total (%d users read, %d errors)</p>'
+            '<table border="0" cellpadding="4"><tr><th>Title</th><th>Type</th><th>GB</th><th>Why</th></tr>%s</table></body>'
+            % (data['count'], data['total_gb'], data['users'], data['errors'], rows))
+    return app.response_class(html, mimetype='text/html'), 200
 
 
 @app.route('/episode-retention', methods=['GET'])

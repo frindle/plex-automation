@@ -17,6 +17,7 @@ COPY deluge_trim.py .
 COPY episode_retention.py .
 COPY rar_extract.py .
 COPY torrent_breakdown.py .
+COPY move_list.py .
 COPY tiering_gate.py .
 COPY speed_cap.py .
 COPY stuck_plan.py .
