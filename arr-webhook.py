@@ -11041,6 +11041,7 @@ class ArrHealthIO:
         self._arrs = {who: (url, key) for who, url, key in
                       (('Sonarr', SONARR_URL, SONARR_API_KEY), ('Radarr', RADARR_URL, RADARR_API_KEY)) if key}
         self.services = list(self._arrs)
+        self.advice = []
 
     def _req(self, method, who, path, **kw):
         url, key = self._arrs[who]
@@ -11073,6 +11074,10 @@ class ArrHealthIO:
     def push(self, title, message):
         send_pushover(title, message)
 
+    def advise(self, facts):
+        """arr_health (shadow only): remember the facts of a push that is going out; the tick queues them after."""
+        self.advice.append(facts)
+
     def record(self, category, summary):
         record_activity(category, summary)
 
@@ -11097,6 +11102,32 @@ def _arr_health_load():
         return {}
 
 
+def _arr_health_llm_max():
+    try:
+        return max(0, int(os.environ.get('ARR_HEALTH_LLM_MAX') or 10))
+    except ValueError:
+        return 10
+
+
+def _arr_health_shadow(facts_rows):
+    """arr_health (SHADOW ONLY, free layers only): ask the model about each push that went out and log the answer
+    next to the rules' action (notify). Facts are event, service, check name and minutes only. Runs off-thread."""
+    if not facts_rows or _llm_mode('arr_health') == 'off':
+        return
+    cap, asked = _arr_health_llm_max(), 0
+    for facts in facts_rows:
+        if asked >= cap:
+            break
+        qinfo = {}
+        try:
+            _llm_advise('arr_health', facts, 'notify', qinfo)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'[llm] arr_health failed: {e}')
+            continue
+        if qinfo.get('layer') != 'cache':
+            asked += 1
+
+
 def arr_health_tick(now=None, io=None):
     now = time.time() if now is None else now
     io = io or ArrHealthIO()
@@ -11110,6 +11141,9 @@ def arr_health_tick(now=None, io=None):
             rows = arr_health.broken_files_pass(io, state, now, apply=ARR_HEALTH_APPLY)
             log.info(f'[arr-health] broken-file pass: {len(rows)} file(s), {"apply" if ARR_HEALTH_APPLY else "dry run"}')
         _write_json_atomic(ARR_HEALTH_STATE, state)
+    rows = getattr(io, 'advice', None)
+    if rows and _llm_mode('arr_health') != 'off':
+        _run_llm_shadow('arr_health', functools.partial(_arr_health_shadow, list(rows)))
     return state
 
 

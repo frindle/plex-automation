@@ -17,6 +17,7 @@ KINDS = {
     'stuck_upgrade_tag': ('wait', 'run_sweep', 'ask'),
     'duplicate_folder': ('leave', 'merge', 'ask'),
     'audit_findings': ('fix', 'ignore', 'ask'),
+    'arr_health': ('notify', 'hold', 'self_heals'),
 }
 MIN_CONFIDENCE = 0.75
 MIN_SEEDERS = 10
@@ -142,6 +143,15 @@ POLICY = {
         '(a person should look). You can never change, move or delete anything; the choice is advice only. fix '
         'is never allowed when human_only is true, and ignore is never allowed when data_at_risk is true. Use ask '
         'when the facts do not settle it.'),
+    'arr_health': (
+        'Sonarr, Radarr or the download client reported a health event and a push notification is about to be '
+        'sent. Facts only: event (outage: a condition lasted past the alert threshold; recovered: a pushed outage '
+        'is over; removed: a series or movie vanished from its metadata site), service (sonarr, radarr or deluge), '
+        'condition (the check name, or unreachable or direct), minutes_down, outage_alert_min, active_outages '
+        '(how many conditions are down right now), site, rules_action. Pick one action: notify (a person should '
+        'hear about it now), hold (not worth a push; it stays in the digest) or self_heals (it is the kind of '
+        'event that usually clears by itself, so no push). You can never change anything; the choice is advice '
+        'only. An outage at or past outage_alert_min is always notify. Use notify when the facts do not settle it.'),
 }
 
 
@@ -862,7 +872,7 @@ def dupe_comparison(facts):
 
 _SAFE_ACTION = {'upgrade_gate': 'reject', 'import_identity': 'unsure', 'dupe_confirm': 'unsure',
                 'torrent_error': 'ask', 'unregistered_triage': 'ask', 'stuck_import': 'ask', 'stuck_upgrade_tag': 'ask', 'duplicate_folder': 'ask',
-                'audit_findings': 'ask'}
+                'audit_findings': 'ask', 'arr_health': 'notify'}
 _FALSE_STRINGS = ('', '0', 'false', 'no', 'n', 'off', 'none', 'null')
 
 
@@ -963,6 +973,16 @@ def apply_hard_rules(kind, action, facts):
                 return 'ask', 'human_only'
             if action == 'ignore' and facts.get('data_at_risk') is not False:
                 return 'ask', 'data_at_risk'
+        elif kind == 'arr_health':
+            # Advice only (nothing here changes a service). The floor: an outage that lasted past the existing
+            # threshold always notifies, and a missing or unusable duration or threshold counts as past it.
+            if action not in KINDS['arr_health']:
+                return 'notify', 'invalid_action'
+            if action != 'notify' and facts.get('event') == 'outage':
+                m, lim = facts.get('minutes_down'), facts.get('outage_alert_min')
+                ok = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (m, lim))
+                if not ok or m >= lim:
+                    return 'notify', 'outage_over_threshold'
         elif kind == 'unregistered_triage' and action in ('remove_keep_library', 'remove_and_research'):
             # The model may never cause a delete the rules would not make (missing rules_action fails closed).
             if facts.get('rules_action') != 'remove':
