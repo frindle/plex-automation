@@ -205,7 +205,7 @@ def test_bearer_sha256_line(env, tmp_path, monkeypatch):
 
 def test_would_refuse_line_names_the_caller_class_not_the_address(env, monkeypatch, caplog):
     monkeypatch.setenv('APP_AUTH_MODE', 'log')
-    for addr, want in (('10.1.2.3', 'lan'), ('203.0.113.9', 'public'), ('127.0.0.1', 'loopback'), ('remote-peer', 'unknown')):
+    for addr, want in (('10.1.2.3', 'lan'), ('93.184.216.34', 'public'), ('127.0.0.1', 'loopback'), ('remote-peer', 'unknown')):
         c = aw.app.test_client()
         c.environ_base['REMOTE_ADDR'] = addr
         caplog.clear()
