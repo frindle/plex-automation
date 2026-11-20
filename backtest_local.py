@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Back-test one decision kind through the local Darkbloom layer only, against whatever model is loaded.
 
-usage: python backtest_local.py --kind K [--limit N] [--facts FILE.jsonl]
+usage: python backtest_local.py --kind K[,K2|all] [--limit N] [--facts FILE.jsonl]
+       python backtest_local.py --kind K --layer claude --model claude-haiku-5-5 [--max-usd 2]
+
+--layer claude forces the Claude layer and model (key from ANTHROPIC_API_KEY; no Darkbloom needed, no GPU wait; the
+production spend file is not touched). It reports per kind the agreement with the stored reference decisions
+(rules_action / human), the invalid (unparseable) and error counts and the token cost, and stops before the run
+would pass --max-usd (default 2 dollars).
 
 Never a switch: the model is the first id GET {DARKBLOOM_BASE_URL}/v1/models lists (printed first). --model may only
 name a listed id; anything else, an unreadable or empty list, or an LLM_LOCAL_MODEL pin that is not listed, refuses
@@ -96,19 +102,41 @@ def percentile(vals, p):
     return vals[min(len(vals) - 1, max(0, int(-(-p * len(vals) // 100)) - 1))]
 
 
-def score(kind, rows, transport, clock=time.monotonic):
-    """Replay rows through transport. Returns counts, hard-rule blocks and latencies; nothing from the facts."""
+def _tokens(meta):
+    """(input, output) tokens from a Meta dict (Claude: input/output_tokens; chat: prompt/completion_tokens)."""
+    g = lambda *k: next((int(meta[x]) for x in k if isinstance(meta.get(x), (int, float))), 0)  # noqa: E731
+    return g('input_tokens', 'prompt_tokens'), g('output_tokens', 'completion_tokens')
+
+
+def score(kind, rows, transport, clock=time.monotonic, price_model=None, max_usd=None, spent_usd=0.0):
+    """Replay rows through transport. Returns counts, hard-rule blocks and latencies; nothing from the facts.
+    With price_model set, each call's tokens are priced (llm_advisor.claude_cost_usd) into cost_usd, and the run
+    stops before the next row once spent_usd + cost_usd has reached max_usd (stopped_budget=True)."""
     out = {'kind': kind, 'total': 0, 'answered': 0, 'rules_n': 0, 'rules_agree': 0, 'human_n': 0, 'human_agree': 0,
-           'blocks': [], 'disagree_ids': [], 'pairs': {}, 'lat_ms': []}
+           'blocks': [], 'disagree_ids': [], 'pairs': {}, 'lat_ms': [], 'invalid': 0, 'errors': 0,
+           'in_tokens': 0, 'out_tokens': 0, 'cost_usd': 0.0, 'stopped_budget': False, 'rows_available': len(rows)}
     for i, row in enumerate(rows, 1):
+        if max_usd is not None and spent_usd + out['cost_usd'] >= max_usd:
+            out['stopped_budget'] = True
+            break
         facts, rules, human, rid = _split(row)
         ref = '#%d' % i + ('/' + rid if rid else '')
         out['total'] += 1
         t0 = clock()
+        dec = None
         try:
-            dec = llm_decide.parse_decision(kind, transport(llm_decide.build_prompt(kind, facts)))
-        except Exception:  # noqa: BLE001
-            dec = None
+            raw = transport(llm_decide.build_prompt(kind, facts))
+            ti, to = _tokens(getattr(raw, 'meta', None) or {})
+            dec = llm_decide.parse_decision(kind, raw)
+            if dec is None:
+                out['invalid'] += 1
+        except Exception as e:  # noqa: BLE001
+            out['errors'] += 1
+            ti, to = _tokens(getattr(e, 'meta', None) or {})
+        out['in_tokens'] += ti
+        out['out_tokens'] += to
+        if price_model:
+            out['cost_usd'] += llm_advisor.claude_cost_usd(price_model, ti, to)
         out['lat_ms'].append(int((clock() - t0) * 1000))
         if dec is None:
             continue
@@ -135,6 +163,8 @@ def verdict(kind, res):
     why = []
     if res['total'] < MIN_ROWS:
         return 'INCONCLUSIVE', ['only %d rows (need %d)' % (res['total'], MIN_ROWS)]
+    if res.get('stopped_budget'):
+        return 'INCONCLUSIVE', ['stopped at the --max-usd guard after %d of %d rows' % (res['total'], res.get('rows_available', res['total']))]
     ans = pct(res['answered'], res['total'])
     if ans < MIN_ANSWERED_PCT:
         why.append('answered %.1f%% < %.0f%%' % (ans, MIN_ANSWERED_PCT))
@@ -161,6 +191,9 @@ def report(kind, model, res, waited_min=0.0):
     lines += ['  block ' + b for b in res['blocks']]
     lines.append('rules_disagree_ids=' + (','.join(res['disagree_ids']) or '-'))
     lines += ['  pair %s %d' % (p, n) for p, n in sorted(res['pairs'].items())]
+    lines.append('invalid=%d errors=%d' % (res.get('invalid', 0), res.get('errors', 0)))
+    lines.append('tokens in=%d out=%d cost_usd=%.4f' % (res.get('in_tokens', 0), res.get('out_tokens', 0),
+                                                       res.get('cost_usd', 0.0)))
     lines.append('latency_ms p50=%s p95=%s' % (percentile(lat, 50), percentile(lat, 95)))
     lines.append('gpu_wait_min=%.1f' % waited_min)
     lines.append('verdict=%s%s' % (v, (' (' + '; '.join(why) + ')') if why else ''))
@@ -182,44 +215,89 @@ def wait_for_gpu(env, http, wait_min, sleep=time.sleep, clock=time.monotonic, po
         sleep(poll_s)
 
 
+def _kinds(arg):
+    names = [k.strip() for k in arg.split(',') if k.strip()]
+    if names == ['all']:
+        return sorted(llm_decide.KINDS)
+    bad = [k for k in names if k not in llm_decide.KINDS]
+    return None if bad or not names else names
+
+
 def main(argv=None, env=None, http=None, transport=None, sleep=time.sleep):
     env = os.environ if env is None else env
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--kind', required=True, choices=sorted(llm_decide.KINDS))
+    ap.add_argument('--kind', required=True, help='a kind, a comma list, or all')
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--facts', default='')
-    ap.add_argument('--model', default='', help='must be one of the listed ids; default the first listed')
+    ap.add_argument('--layer', choices=('local', 'claude'), default='local')
+    ap.add_argument('--model', default='', help='local: one of the listed ids (default the first listed); '
+                                                'claude: the model id (default LLM_CLAUDE_MODEL or the layer default)')
+    ap.add_argument('--max-usd', type=float, default=2.0, help='stop before a claude run passes this many dollars')
     ap.add_argument('--wait-min', type=float, default=50.0)
     ap.add_argument('--timeout', type=float, default=60.0)
     args = ap.parse_args(argv)
-    base = (env.get('DARKBLOOM_BASE_URL') or '').strip()
-    if not base:
-        print('refused: DARKBLOOM_BASE_URL not set')
+    kinds = _kinds(args.kind)
+    if kinds is None:
+        print('refused: unknown kind')
         return 2
-    if http is None:
-        import requests as http
-    key = env.get('DARKBLOOM_API_KEY')
-    model, why = pick_model(base, key, http, args.model.strip() or None, (env.get('LLM_LOCAL_MODEL') or '').strip() or None)
-    if why:
-        print('refused: %s (no request sent; a back-test never loads or switches a model)' % why)
+    if args.facts and len(kinds) > 1:
+        print('refused: --facts names one file, so it needs one --kind')
         return 2
-    print('model=%s' % model)
-    path = args.facts or '/data/backtest/%s.jsonl' % args.kind
-    try:
-        rows = load_rows(path, args.limit or None)
-    except OSError:
-        print('refused: facts file not readable')
-        return 2
-    free, waited = wait_for_gpu(env, http, args.wait_min, sleep)
-    if not free:
-        print('gpu_wait_min=%.1f\nverdict=INCONCLUSIVE (GPU still held)' % waited)
-        return 3
-    if transport is None:
-        transport = llm_advisor._chat_fn(llm_advisor._chat_url(base), lambda: model, key, http, args.timeout, 2.0,
-                                         {'chat_template_kwargs': {'enable_thinking': False}})
-    res = score(args.kind, rows, transport)
-    print('\n'.join(report(args.kind, model, res, waited)))
-    return 0 if verdict(args.kind, res)[0] == 'PASS' else 1
+    claude = args.layer == 'claude'
+    waited = 0.0
+    if claude:
+        model = args.model.strip() or (env.get('LLM_CLAUDE_MODEL') or '').strip() or llm_advisor.CLAUDE_MODEL
+        if transport is None and not (env.get('ANTHROPIC_API_KEY') or '').strip():
+            print('refused: ANTHROPIC_API_KEY not set')
+            return 2
+        factory = llm_advisor._real_claude_client((env.get('ANTHROPIC_API_KEY') or '').strip())
+    else:
+        base = (env.get('DARKBLOOM_BASE_URL') or '').strip()
+        if not base:
+            print('refused: DARKBLOOM_BASE_URL not set')
+            return 2
+        if http is None:
+            import requests as http
+        key = env.get('DARKBLOOM_API_KEY')
+        model, why = pick_model(base, key, http, args.model.strip() or None, (env.get('LLM_LOCAL_MODEL') or '').strip() or None)
+        if why:
+            print('refused: %s (no request sent; a back-test never loads or switches a model)' % why)
+            return 2
+    print('model=%s layer=%s' % (model, args.layer))
+    loaded = {}
+    for kind in kinds:
+        path = args.facts or '/data/backtest/%s.jsonl' % kind
+        try:
+            loaded[kind] = load_rows(path, args.limit or None)
+        except OSError:
+            print('refused: facts file not readable')
+            return 2
+    if not claude:
+        free, waited = wait_for_gpu(env, http, args.wait_min, sleep)
+        if not free:
+            print('gpu_wait_min=%.1f\nverdict=INCONCLUSIVE (GPU still held)' % waited)
+            return 3
+    spent, worst = 0.0, 0
+    for kind in kinds:
+        tr = transport
+        if tr is None:
+            if claude:
+                tr = llm_advisor._claude_fn(kind, model, factory)
+            else:
+                tr = llm_advisor._chat_fn(llm_advisor._chat_url(base), lambda: model, key, http, args.timeout, 2.0,
+                                          {'chat_template_kwargs': {'enable_thinking': False}})
+        res = score(kind, loaded[kind], tr, price_model=model if claude else None,
+                    max_usd=args.max_usd if claude else None, spent_usd=spent)
+        spent += res['cost_usd']
+        print('\n'.join(report(kind, model, res, waited)))
+        v = verdict(kind, res)[0]
+        worst = max(worst, 0 if v == 'PASS' else 1)
+        if res['stopped_budget']:
+            print('stopped: --max-usd %.2f reached (spent %.4f); later kinds not run' % (args.max_usd, spent))
+            break
+    if claude and len(kinds) > 1:
+        print('total_cost_usd=%.4f' % spent)
+    return worst
 
 
 if __name__ == '__main__':
