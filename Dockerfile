@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY arr-webhook.py .
 COPY monthly_upgrade.py .
 COPY media_share.py .
+COPY app_auth.py .
 COPY llm_decide.py .
 COPY llm_advisor.py .
 COPY library_audit.py .

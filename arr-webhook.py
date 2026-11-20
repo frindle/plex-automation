@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 
 from media_share import share_bp, init_db as init_share_db
+import app_auth
 import episode_retention
 import rar_extract
 import torrent_breakdown
@@ -560,6 +561,7 @@ def read_removal_log(since=None, limit=100):
 
 app = Flask(__name__)
 app.register_blueprint(share_bp)
+app_auth.init_app(app)
 
 _DESTRUCTIVE_GET_GUARD_PATHS = {
     '/torrent-purge', '/purge-unstarted-superseded', '/complete-orphans',
@@ -7149,17 +7151,10 @@ def no_seed_check():
 @app.route('/delete-paths', methods=['POST'])
 def delete_paths():
     apply_ = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
-    body = request.get_data(as_text=True) or ''
-    paths = []
-    body_stripped = body.strip()
-    if body_stripped.startswith('{'):
-        try:
-            data = _json.loads(body_stripped)
-            paths = data.get('paths', [])
-        except Exception as e:
-            return jsonify({'ok': False, 'error': f'JSON parse: {e}'}), 400
-    else:
-        paths = [ln.strip() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith('#')]
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get('paths'), list):
+        return jsonify({'ok': False, 'error': 'body must be JSON {"paths": [...]}'}), 400
+    paths = [p for p in data['paths'] if isinstance(p, str) and p.strip()]
     if not paths:
         return jsonify({'ok': False, 'error': 'no paths provided in body'}), 400
 
@@ -7519,11 +7514,16 @@ def auto_rescue_endpoint():
 def _plex_get(path, params=None):
     if not PLEX_TOKEN:
         raise RuntimeError('no PLEX_TOKEN set')
-    p = dict(params or {})
-    p['X-Plex-Token'] = PLEX_TOKEN
-    r = requests.get(f'{PLEX_URL}{path}', params=p, headers={'Accept': 'application/json'}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    # The token goes in a header: a query-string token ends up in the URL that
+    # requests puts in its error text, which routes return to the caller.
+    try:
+        r = requests.get(f'{PLEX_URL}{path}', params=dict(params or {}),
+                         headers={'Accept': 'application/json', 'X-Plex-Token': PLEX_TOKEN}, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        msg = str(e).replace(PLEX_TOKEN, '***')
+        raise RuntimeError(f'{type(e).__name__}: {msg}') from None
 
 TITLE_TOKEN_RE = re.compile(r'[a-z0-9]+')
 FILENAME_YEAR_RE = re.compile(r'(?<![a-z0-9])(19\d{2}|20\d{2})(?![a-z0-9])', re.IGNORECASE)
@@ -7925,7 +7925,7 @@ def plex_dupe_keep_manage():
 # refuses move_storage" edge case, then resumes.
 @app.route('/torrent-move', methods=['POST'])
 def torrent_move():
-    body = request.get_json(force=True, silent=True) or {}
+    body = request.get_json(silent=True) or {}
     moves = body.get('moves') or []
     if not moves:
         return jsonify({'ok': False, 'error': 'body must be {"moves":[{hash,dest}]}'}), 400

@@ -298,7 +298,7 @@ def test_endpoints_preview_by_default(monkeypatch):
     body = c.get('/retire-seeds').get_json()
     assert body['dry_run'] is True and body['eligible'] == 1
     assert removed == []
-    assert c.post('/upgrade-lane-cap?apply=1').get_json()['removed'] == 1
+    assert c.post('/upgrade-lane-cap?apply=1', json={}).get_json()['removed'] == 1
 
 
 def test_monthly_scheduler_skips_when_lane_full(monkeypatch):

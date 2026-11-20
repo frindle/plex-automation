@@ -1,7 +1,7 @@
 """
 Friend-facing media portal + admin panel.
 
-Friends authenticate via Cloudflare Access (Cf-Access-Authenticated-User-Email).
+Friends authenticate via Cloudflare Access (the email in the validated Cf-Access-Jwt-Assertion JWT).
 Admin manages friends at /share/admin; friends update their own upload destination
 at /share/settings. Config stored in SQLite — no container restart needed.
 
@@ -23,6 +23,7 @@ import tempfile
 import zipfile
 import paramiko
 import requests as _requests
+import app_auth
 import ssl
 from flask import Blueprint, after_this_request, redirect, render_template_string, request, send_file
 
@@ -265,7 +266,9 @@ def _get_allowed_titles(email):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _current_email():
-    return request.headers.get('Cf-Access-Authenticated-User-Email', '')
+    # Only the identity in a validated Cloudflare Access JWT counts. The plain
+    # Cf-Access-Authenticated-User-Email header is set by whoever sends the request.
+    return app_auth.jwt_email()
 
 
 def _is_admin(email):
@@ -335,7 +338,18 @@ def _check_title_access(email, library, rel_path):
     if library not in titles:
         return True  # no restriction for this library
 
-    parts = [p for p in rel_path.replace('\\', '/').split('/') if p]
+    # Resolve '.' and '..' the way safe_join (realpath) will, so the title checked
+    # is the title that is served. Climbing out of the library root is never allowed.
+    parts = []
+    for seg in rel_path.replace('\\', '/').split('/'):
+        if seg in ('', '.'):
+            continue
+        if seg == '..':
+            if not parts:
+                return False
+            parts.pop()
+            continue
+        parts.append(seg)
     if not parts:
         return True  # library root — poster grid handles filtering
 
@@ -1460,7 +1474,7 @@ def share_status(upload_id):
     db.row_factory = sqlite3.Row
     row = db.execute('SELECT * FROM uploads WHERE id=?', (upload_id,)).fetchone()
     db.close()
-    if not row:
+    if not row or (row['friend_email'] != email and not _is_admin(email)):
         return 'Not found', 404
     return _render(STATUS_HTML, email, row=row)
 
@@ -1549,9 +1563,11 @@ def share_settings():
 
 @share_bp.route('/test-connection', methods=['POST'])
 def friend_test_connection():
-    email, err = _require_auth()
+    # Connects out from this container to a host and port the caller names, so
+    # only the admin may use it (the admin form has its own copy of this route).
+    email, err = _require_admin()
     if err:
-        return {'ok': False, 'error': 'Not authenticated'}, 403
+        return {'ok': False, 'error': 'Forbidden'}, 403
     protocol = request.form.get('protocol', 'sftp')
     host = request.form.get('sftp_host', '').strip()
     port_raw = request.form.get('sftp_port', '')
