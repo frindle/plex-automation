@@ -187,6 +187,35 @@ def test_bearer_from_file(env):
     assert get(Authorization='Bearer ').status_code == 403
 
 
+def test_bearer_sha256_line(env, tmp_path, monkeypatch):
+    import hashlib
+    f = tmp_path / 'hashed'
+    digest = hashlib.sha256(b'mac-token-9999').hexdigest()
+    f.write_text(f'# mac\nsha256:{digest.upper()}\nplain-token-1\n')
+    monkeypatch.setenv('APP_AUTH_TOKEN_FILE', str(f))
+    assert get(Authorization='Bearer mac-token-9999').status_code == 200
+    assert get(Authorization='Bearer plain-token-1').status_code == 200
+    assert get(Authorization='Bearer mac-token-9998').status_code == 403
+    # The hash itself is not a credential, and neither is the prefix alone.
+    assert get(Authorization=f'Bearer sha256:{digest}').status_code == 403
+    f.write_text('sha256:\n')
+    assert get(Authorization='Bearer ').status_code == 403
+    assert get(Authorization='Bearer anything').status_code == 403
+
+
+def test_would_refuse_line_names_the_caller_class_not_the_address(env, monkeypatch, caplog):
+    monkeypatch.setenv('APP_AUTH_MODE', 'log')
+    for addr, want in (('10.1.2.3', 'lan'), ('93.184.216.34', 'public'), ('127.0.0.1', 'loopback'), ('remote-peer', 'unknown')):
+        c = aw.app.test_client()
+        c.environ_base['REMOTE_ADDR'] = addr
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            c.get('/share/admin')
+        line = [m for m in caplog.messages if 'would refuse' in m]
+        assert line and f'caller={want}:' in line[0], (addr, caplog.messages)
+        assert addr == 'remote-peer' or addr not in line[0]
+
+
 def test_bearer_with_no_token_file_refused(env, monkeypatch, tmp_path):
     monkeypatch.setenv('APP_AUTH_TOKEN_FILE', str(tmp_path / 'missing'))
     assert get(Authorization='Bearer token-aaaa').status_code == 403

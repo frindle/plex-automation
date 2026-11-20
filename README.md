@@ -47,11 +47,11 @@ One `before_request` gate (`app_auth.py`) covers every route, including `/share`
 | `APP_AUTH_MODE` | `off`, `log` (default) or `enforce`. Anything else is treated as `enforce`. |
 | `CF_ACCESS_TEAM_DOMAIN` | The Access team domain. Signing keys come from `https://<domain>/cdn-cgi/access/certs` (cached 1 h, refetched on an unknown key id). |
 | `CF_ACCESS_AUDS` | Comma-separated AUD tags of the Access applications that may reach this app. |
-| `APP_AUTH_TOKEN_FILE` | File of bearer tokens, one per line (`#` comments). For scripts and the glacier mover. |
+| `APP_AUTH_TOKEN_FILE` | File of bearer tokens, one per line (`#` comments). A line is the plain token or `sha256:<hex>` of it (the sha-256 of the token, hex), so a caller such as the Mac can keep its token in its Keychain and only the hash is stored here. Compared in constant time. For scripts and the glacier mover. |
 | `APP_AUTH_BASIC_FILE` | File of `user:password` lines. Accepted on `/webhook/*` only, for Sonarr/Radarr. |
 | `ADMIN_EMAIL` | The identity allowed into `/share/admin*`. |
 
-Modes: `off` checks nothing. `log` allows every request but logs each one that `enforce` would refuse (route class, method, path, which credential was missing; never a secret). `enforce` answers 403.
+Modes: `off` checks nothing. `log` allows every request but logs each one that `enforce` would refuse (route class, method, path, caller class `loopback`/`lan`/`public`/`unknown` from the socket peer (never the address), which credential was missing; never a secret). `enforce` answers 403.
 
 A request passes with any of: a valid Access JWT (signature, expiry, issuer and one of the AUDs checked), `Authorization: Bearer <token>`, or HTTP Basic on `/webhook/*`. `/health` is always open; a `GET` report from loopback (the socket peer, never `X-Forwarded-For`) passes without a credential, so a job running inside the container still works under `enforce` (action routes, POSTs and `/share` never qualify); `/share/dl/<token>` link downloads are open at the gate because the link token is their credential.
 
@@ -64,6 +64,7 @@ The Plex token is sent as the `X-Plex-Token` header and scrubbed from any error 
 Rollout order:
 1. Deploy with `APP_AUTH_MODE=log` and the Access variables set. Nothing is refused; read the log for `app-auth: would refuse` lines to find callers without a credential.
 2. Put a Basic user in Sonarr and Radarr's webhook connections (and the credential file named by `APP_AUTH_BASIC_FILE`), put a token in each script or mover that calls the app (and in `APP_AUTH_TOKEN_FILE`), and change any caller that used GET or a non-JSON POST on an action route.
+   The token files live under the mounted `/data` (`APP_AUTH_TOKEN_FILE=/data/app-auth-tokens`, `APP_AUTH_BASIC_FILE=/data/app-auth-basic`), so no extra compose mount is needed; keep them mode 600.
 3. When the log is quiet, set `APP_AUTH_MODE=enforce`. Roll back by setting it to `log`.
 
 ## LLM decisions
