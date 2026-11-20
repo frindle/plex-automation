@@ -53,9 +53,28 @@ def summarize(entries, limit=SUMMARY_NAMES):
     return '\n'.join(lines)
 
 
+def _label_class(label):
+    l = (label or '').strip().lower()
+    return 'sonarr' if l.startswith('sonarr') else 'radarr' if l.startswith('radarr') else 'other' if l else 'none'
+
+
+def finding_facts(entry, message=''):
+    """audit_findings facts for one flagged torrent: classes only, no name, path or hash. One row per reason."""
+    rows = []
+    for r in entry['reasons']:
+        missing = r == 'error' and MISSING_DATA in (message or '').lower()
+        finding = 'arr_label_in_library' if r == 'arr-label-in-library' else 'missing_data' if missing else 'error'
+        rows.append({'source': 'library_audit', 'finding': finding, 'label_class': _label_class(entry.get('label')),
+                     'files': 1, 'size_gb': 0.0,
+                     # a retag or move of a torrent that seeds from the library is a person's call
+                     'human_only': r == 'arr-label-in-library',
+                     'data_at_risk': r == 'arr-label-in-library' or missing, 'rules_action': 'ask'})
+    return rows
+
+
 def library_seed_audit(torrents, notify, reported, dry_run=False):
-    result = {'flagged': [], 'notified': [], 'counts': {'error': 0, 'arr-label-in-library': 0}}
-    new = []
+    result = {'flagged': [], 'notified': [], 'advice_facts': [], 'counts': {'error': 0, 'arr-label-in-library': 0}}
+    new, messages = [], {}
     for h in sorted(torrents):
         t = torrents[h] or {}
         reasons = audit_reasons(t)
@@ -69,8 +88,10 @@ def library_seed_audit(torrents, notify, reported, dry_run=False):
             result['counts'][r] += 1
         if not dry_run and h not in reported:
             new.append(entry)
+            messages[h] = t.get('message') or ''
     if new:
         reported.update(e['hash'] for e in new)
         notify(f'Library seed audit: {len(new)} newly flagged', summarize(new))
         result['notified'] = [e['hash'] for e in new]
+        result['advice_facts'] = [f for e in new for f in finding_facts(e, messages[e['hash']])]
     return result

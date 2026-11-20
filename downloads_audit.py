@@ -132,6 +132,26 @@ def summarize(orphans, single, unlabeled, limit=SUMMARY_NAMES):
     return '\n'.join(lines)
 
 
+def _label_class(label):
+    l = (label or '').strip().lower()
+    return ('sonarr' if l.startswith('sonarr') else 'radarr' if l.startswith('radarr')
+            else 'library_seed' if l.startswith('library-seed') else 'other' if l else 'none')
+
+
+def finding_facts(kind, e):
+    """audit_findings facts for one finding (kind 'o', 's' or 'u'): classes, counts and sizes only, no names or paths.
+    Orphan files and single-link copies need a person to delete or relink; an unlabeled torrent only needs a label."""
+    if kind == 'o':
+        return {'source': 'downloads_audit', 'finding': 'orphan_file', 'label_class': 'none', 'files': 1,
+                'size_gb': round(e['size'] / 1e9, 2), 'human_only': True, 'data_at_risk': False, 'rules_action': 'ask'}
+    if kind == 's':
+        return {'source': 'downloads_audit', 'finding': 'single_link', 'label_class': _label_class(e.get('label')),
+                'files': e['files'], 'size_gb': round(e['size'] / 1e9, 2), 'human_only': True,
+                'data_at_risk': False, 'rules_action': 'ask'}
+    return {'source': 'downloads_audit', 'finding': 'unlabeled', 'label_class': 'none', 'files': 0, 'size_gb': 0.0,
+            'human_only': False, 'data_at_risk': False, 'rules_action': 'ask'}
+
+
 def audit(torrents, local_root, to_local, notify, reported, now, dry_run=False,
           walk=os.walk, lstat=os.lstat, stat=os.stat):
     """`reported` is a set of finding keys, updated in place: keys no longer
@@ -149,7 +169,7 @@ def audit(torrents, local_root, to_local, notify, reported, now, dry_run=False,
         'counts': {'orphan_files': len(orphans), 'orphan_bytes': sum(o['size'] for o in orphans),
                    'single_link_torrents': len(single), 'single_link_bytes': sum(s['size'] for s in single),
                    'unlabeled': len(unlabeled)},
-        'notified': [],
+        'notified': [], 'advice_facts': [],
     }
     if dry_run:
         return result
@@ -162,6 +182,7 @@ def audit(torrents, local_root, to_local, notify, reported, now, dry_run=False,
                          [e for _, kind, e in new if kind == 'u']))
         reported.update(k for k, _, _ in new)
         result['notified'] = [k for k, _, _ in new]
+        result['advice_facts'] = [finding_facts(kind, e) for _, kind, e in new]
     return result
 
 

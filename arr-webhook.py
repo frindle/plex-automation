@@ -10119,10 +10119,45 @@ def _deluge_rpc(method, params):
 _reported_library_audit = set()
 
 
+def _audit_findings_llm_max():
+    try:
+        return max(0, int(os.environ.get('AUDIT_FINDINGS_LLM_MAX') or 10))
+    except ValueError:
+        return 10
+
+
+def _audit_findings_shadow(facts_rows):
+    """audit_findings (SHADOW ONLY, free layers only): ask the model about each newly reported audit finding and
+    log the answer next to the rules' action (ask). Facts are classes, counts and sizes only. Runs off-thread."""
+    if not facts_rows or _llm_mode('audit_findings') == 'off':
+        return
+    cap, asked = _audit_findings_llm_max(), 0
+    for facts in facts_rows:
+        if asked >= cap:
+            break
+        qinfo = {}
+        try:
+            _llm_advise('audit_findings', facts, 'ask', qinfo)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'[llm] audit_findings failed: {e}')
+            continue
+        if qinfo.get('layer') != 'cache':
+            asked += 1
+
+
+def _audit_findings_queue(result):
+    """Queue the shadow batch for a finished audit run (the notice has already been sent)."""
+    rows = (result or {}).get('advice_facts') or []
+    if rows and _llm_mode('audit_findings') != 'off':
+        _run_llm_shadow('audit_findings', functools.partial(_audit_findings_shadow, rows))
+
+
 def library_seed_audit(dry_run=False):
     deluge_login()
-    return library_audit.library_seed_audit(library_audit.fetch_torrents(_deluge_rpc), send_pushover,
-                                            _reported_library_audit, dry_run=dry_run)
+    r = library_audit.library_seed_audit(library_audit.fetch_torrents(_deluge_rpc), send_pushover,
+                                         _reported_library_audit, dry_run=dry_run)
+    _audit_findings_queue(r)
+    return r
 
 
 DOWNLOADS_AUDIT_STATE = os.environ.get('DOWNLOADS_AUDIT_STATE', '/data/downloads_audit_reported.json')
@@ -10145,6 +10180,7 @@ def downloads_audit_run(dry_run=False):
                               send_pushover, reported, time.time(), dry_run=dry_run)
     if not dry_run:
         downloads_audit.save_reported(DOWNLOADS_AUDIT_STATE, reported)
+        _audit_findings_queue(r)
     return r
 
 
