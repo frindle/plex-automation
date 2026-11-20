@@ -123,6 +123,7 @@ def test_outage_recovery_and_removed_pushes_hand_over_name_free_facts():
     io.health = [{'source': 'IndexerStatusCheck', 'type': 'error', 'message': 'Indexer Synthetic.Host failing'}]
     state = {}
     ah.outage_tick(io, state, T0)
+    ah.outage_tick(io, state, T0 + 15 * MIN)
     assert io.advice == []
     ah.outage_tick(io, state, T0 + 31 * MIN)
     (f,) = io.advice
@@ -151,6 +152,7 @@ def test_advise_failure_never_blocks_the_push():
     io.health = [{'source': 'RootFolderCheck', 'type': 'error', 'message': 'm'}]
     state = {}
     ah.outage_tick(io, state, T0)
+    ah.outage_tick(io, state, T0 + 15 * MIN)
     ah.outage_tick(io, state, T0 + 31 * MIN)
     assert len(io.pushes) == 1
 
