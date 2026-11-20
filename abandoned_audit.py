@@ -6,9 +6,11 @@ Plex and the arrs say they own, and lists what nobody claims:
 - downloads_orphan: a file under Downloads that no torrent owns (the rule and
   the grace period of downloads_audit).
 - library_untracked: a video under a library root unknown to Plex, the arrs
-  and Deluge.
+  and Deluge. Plex local extras (Trailers/, Featurettes/, *-trailer.mkv, ...)
+  are not parts Plex or the arrs list, so they are left out.
 - library_no_video_dir: a library folder with no video anywhere below it
-  (leftover subtitles, nfo, artwork).
+  (leftover subtitles, nfo, artwork) that is not a Radarr movie folder or a
+  Sonarr series folder (those are waiting for a download).
 - torrent_not_in_library: a finished sonarr*/radarr* torrent, seeded long
   enough, none of whose videos Plex or the arrs know, every video of it a
   single link (so deleting it frees the space).
@@ -35,15 +37,31 @@ BUCKETS = ('downloads_orphan', 'library_untracked', 'library_no_video_dir',
 NEEDS = {
     'downloads_orphan': ('deluge',),
     'library_untracked': ('deluge', 'plex', 'arr'),
-    'library_no_video_dir': (),
+    'library_no_video_dir': ('arr',),
     'torrent_not_in_library': ('deluge', 'plex', 'arr'),
     'plex_missing_file': ('plex',),
 }
 TORRENT_LABELS = ('sonarr', 'radarr')
+# Plex local extras: https://support.plex.tv/articles/local-files-for-trailers-and-extras/
+EXTRA_DIRS = ('behind the scenes', 'deleted scenes', 'featurettes', 'interviews', 'scenes', 'shorts', 'trailers',
+              'other', 'others', 'extras')
+EXTRA_SUFFIXES = ('-behindthescenes', '-deleted', '-featurette', '-interview', '-scene', '-short', '-trailer',
+                  '-other')
 
 
 def _norm(p):
     return unicodedata.normalize('NFC', posixpath.normpath(p)) if p else ''
+
+
+def _base(p):
+    return unicodedata.normalize('NFC', posixpath.basename(posixpath.normpath(p))) if p else ''
+
+
+def _is_extra(path, root):
+    rel = posixpath.relpath(path, root).split('/')
+    if any(part.lower() in EXTRA_DIRS for part in rel[:-1]):
+        return True
+    return posixpath.splitext(rel[-1])[0].lower().endswith(EXTRA_SUFFIXES)
 
 
 def _is_video(path):
@@ -149,14 +167,16 @@ def _hidden(path, root):
     return any(part.startswith('.') for part in rel.split('/'))
 
 
-def _torrent_row(t, units, now, seed_days):
+def _torrent_row(t, units, now, seed_days, same_size=False):
     save = t.get('save_path') or ''
     firsts = {posixpath.relpath(u[0], save).split('/')[0] for u in units}
     path = posixpath.join(save, firsts.pop()) if len(firsts) == 1 else save
     mtime = max(u[5] for u in units)
     done = t.get('completed_time') or 0
     reason = (f"finished {int((now - done) // 86400)} days ago, label {t.get('label')}, "
-              f'no video known to Plex or the arrs, every video a single link')
+              f'not hardlinked into the library, no library file has its name; '
+              + ('a library file has the same size, so it was likely imported as a copy and the library keeps it'
+                 if same_size else 'no library file has its size either: check it is not a failed import'))
     return path, sum(u[1] for u in units), mtime, reason
 
 
@@ -173,12 +193,16 @@ def audit(walk_rows, torrents, plex_parts, arr_files, now, *, downloads_root, li
     torrents = torrents or {}
     plex_parts = plex_parts or []
     arr_files = arr_files or []
+    # arr rows with dir=True are Radarr movie folders and Sonarr series folders, not files
+    arr_dirs = {_base(p['path']) for p in arr_files if p.get('dir')}
+    arr_files = [p for p in arr_files if not p.get('dir')]
 
     lib_known = _known_sets(((p['path'], p.get('size')) for p in plex_parts),
                             ((p['path'], p.get('size')) for p in arr_files))
     any_known = _known_sets(_torrent_files(torrents), ((p['path'], p.get('size')) for p in plex_parts),
                             ((p['path'], p.get('size')) for p in arr_files))
     owned = {_norm(p) for t in torrents.values() for p in downloads_audit.torrent_paths(t)}
+    lib_sizes = {s for _b, s in lib_known[1] if s}
 
     def old(mtime):
         return now - mtime >= grace_s
@@ -200,7 +224,8 @@ def audit(walk_rows, torrents, plex_parts, arr_files, now, *, downloads_root, li
                 (path, r['size'], mtime, 'no Deluge torrent owns this file',
                  [(path, r['size'], r['dev'], r['ino'], r['nlink'], mtime)]))
         elif _under_any(path, library_roots) and _is_video(path):
-            if _hidden(path, next(x for x in library_roots if downloads_audit.under(path, x))):
+            root = next(x for x in library_roots if downloads_audit.under(path, x))
+            if _hidden(path, root) or _is_extra(path, root):
                 continue
             if _is_known(path, r['size'], any_known):
                 continue
@@ -209,7 +234,8 @@ def audit(walk_rows, torrents, plex_parts, arr_files, now, *, downloads_root, li
                  [(path, r['size'], r['dev'], r['ino'], r['nlink'], mtime)]))
 
     for r in walk_rows:
-        if r.get('is_dir') and _under_any(r['path'], library_roots) and old(r['mtime']):
+        if r.get('is_dir') and _under_any(r['path'], library_roots) and old(r['mtime']) \
+                and _base(r['path']) not in arr_dirs:
             units = [(p, s, d, i, n, r['mtime']) for p, s, d, i, n in r['files']]
             entries['library_no_video_dir'].append(
                 (r['path'], r['size'], r['mtime'], 'folder holds no video (subtitles, nfo, artwork only)', units))
@@ -239,7 +265,8 @@ def audit(walk_rows, torrents, plex_parts, arr_files, now, *, downloads_root, li
                     ok = False
                     break
         if ok and videos:
-            path, size, mtime, reason = _torrent_row(t, units, now, seed_days)
+            same_size = any(_is_video(u[0]) and u[1] in lib_sizes for u in units)
+            path, size, mtime, reason = _torrent_row(t, units, now, seed_days, same_size)
             entries['torrent_not_in_library'].append((path, size, mtime, reason, units))
 
     scanned = [r for r in library_roots] + [downloads_root]

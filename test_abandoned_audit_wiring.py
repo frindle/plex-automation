@@ -137,3 +137,36 @@ def test_source_failure_logs_name_not_url(monkeypatch, caplog):
     with caplog.at_level(logging.DEBUG):
         assert aw._abandoned_fetch_plex() is None
     assert 'plex source failed' in caplog.text and 'example.invalid' not in caplog.text and 'zzz' not in caplog.text
+
+
+def _plex_fake(pages, sections=({'key': '1', 'type': 'movie', 'title': 'Adult'},)):
+    calls = []
+
+    def fake(path, params=None, timeout=30):
+        calls.append(path)
+        if path == '/library/sections':
+            return {'MediaContainer': {'Directory': list(sections)}}
+        start = (params or {}).get('X-Plex-Container-Start', 0)
+        return {'MediaContainer': pages[start]}
+    return fake, calls
+
+
+def _part(name, size=1):
+    return {'Media': [{'Part': [{'file': '/fake/' + name, 'size': size}]}]}
+
+
+def test_plex_fetch_keeps_skip_libraries_and_pages_by_total(monkeypatch):
+    monkeypatch.setattr(aw, 'ABANDONED_PLEX_PAGE', 2)
+    pages = {0: {'totalSize': 3, 'Metadata': [_part('a'), _part('b')]}, 2: {'totalSize': 3, 'Metadata': [_part('c')]}}
+    fake, _ = _plex_fake(pages)
+    monkeypatch.setattr(aw, '_plex_get', fake)
+    got = aw._abandoned_fetch_plex()
+    assert got is not None and len(got) == 3
+
+
+def test_plex_short_page_fails_source(monkeypatch):
+    monkeypatch.setattr(aw, 'ABANDONED_PLEX_PAGE', 2)
+    pages = {0: {'totalSize': 5, 'Metadata': [_part('a'), _part('b')]}, 2: {'totalSize': 5, 'Metadata': []}}
+    fake, _ = _plex_fake(pages)
+    monkeypatch.setattr(aw, '_plex_get', fake)
+    assert aw._abandoned_fetch_plex() is None

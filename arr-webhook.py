@@ -10575,14 +10575,14 @@ def _abandoned_fetch_deluge():
 
 
 def _abandoned_fetch_plex():
-    """Every Plex media part of the movie and show libraries as {path, size}, paths mapped to local; None on error."""
+    """Every Plex media part of the movie and show libraries as {path, size}, paths mapped to local; None on error.
+    PLEX_SKIP_LIBRARIES is not applied: every section's files are owned, and leaving one out would flag its files.
+    A page that comes back short of totalSize fails the whole source, so a partial list never flags files."""
     try:
         sections = (_plex_get('/library/sections', timeout=ABANDONED_AUDIT_TIMEOUT).get('MediaContainer') or {}
                     ).get('Directory') or []
         parts = []
         for sec in sections:
-            if (sec.get('title') or '').lower() in PLEX_SKIP_LIBRARIES:
-                continue
             kind = {'movie': 1, 'show': 4}.get(sec.get('type'))
             if kind is None:
                 continue
@@ -10598,9 +10598,15 @@ def _abandoned_fetch_plex():
                         for part in media.get('Part') or []:
                             if part.get('file'):
                                 parts.append({'path': _translate_plex_path(part['file']), 'size': part.get('size') or 0})
-                if len(items) < ABANDONED_PLEX_PAGE:
+                total = mc.get('totalSize')
+                start += len(items)
+                if total is None:
+                    if len(items) < ABANDONED_PLEX_PAGE:
+                        break
+                elif start >= int(total):
                     break
-                start += ABANDONED_PLEX_PAGE
+                elif not items:
+                    raise RuntimeError('plex page empty before totalSize')
         return parts
     except Exception as e:  # noqa: BLE001
         log.warning(f'Abandoned audit: plex source failed ({type(e).__name__})')
@@ -10617,6 +10623,8 @@ def _abandoned_fetch_radarr():
     try:
         out = []
         for m in _abandoned_arr_get(RADARR_URL, RADARR_API_KEY, '/api/v3/movie'):
+            if m.get('path'):
+                out.append({'path': _deluge_to_local(m['path']), 'dir': True})   # movie folder
             mf = m.get('movieFile') or {}
             if mf.get('path'):
                 out.append({'path': _deluge_to_local(mf['path']), 'size': mf.get('size') or 0})
@@ -10630,6 +10638,8 @@ def _abandoned_fetch_sonarr():
     try:
         out = []
         for sr in _abandoned_arr_get(SONARR_URL, SONARR_API_KEY, '/api/v3/series'):
+            if sr.get('path'):
+                out.append({'path': _deluge_to_local(sr['path']), 'dir': True})   # series folder
             for ef in _abandoned_arr_get(SONARR_URL, SONARR_API_KEY, '/api/v3/episodefile', {'seriesId': sr['id']}):
                 if ef.get('path'):
                     out.append({'path': _deluge_to_local(ef['path']), 'size': ef.get('size') or 0})

@@ -157,9 +157,9 @@ A file is known when its path, or its (basename, size), appears in Deluge's file
 | Bucket | What it lists | Needs |
 | --- | --- | --- |
 | `downloads_orphan` | a Downloads file no torrent owns (same rule as the Downloads audit) | Deluge |
-| `library_untracked` | a video under a library root unknown to Plex, the arrs and Deluge | Deluge, Plex, arrs |
-| `library_no_video_dir` | a library folder with no video anywhere below it (leftover subtitles, nfo, art); size is the folder total | none |
-| `torrent_not_in_library` | a finished `sonarr*`/`radarr*` torrent seeded 21+ days whose videos neither Plex nor the arrs know and that all have a single link | Deluge, Plex, arrs |
+| `library_untracked` | a video under a library root unknown to Plex, the arrs and Deluge (Plex local extras such as `Trailers/` or `*-trailer.mkv` are left out) | Deluge, Plex, arrs |
+| `library_no_video_dir` | a library folder with no video anywhere below it (leftover subtitles, nfo, art) that is not a Radarr movie folder or Sonarr series folder; size is the folder total | arrs |
+| `torrent_not_in_library` | a finished `sonarr*`/`radarr*` torrent seeded 21+ days whose videos neither Plex nor the arrs know and that all have a single link. The reason says whether a library file has the same size (likely imported as a copy) or not (check for a failed import) | Deluge, Plex, arrs |
 | `plex_missing_file` | a Plex part whose file is not on disk (listed, no bytes, not in the totals) | Plex |
 
 **Reading the report.** `size` is the row's bytes; `reclaim_bytes` is what deleting it would actually free. A hardlinked file frees space only when every link of it was found in the scan and every one of them is listed; otherwise it is 0, and one inode is counted once in the totals. If a source could not be read (`sources` shows `failed`), every bucket that needs it is `incomplete` with no rows: a file is never called abandoned because a source failed. Each bucket keeps its 500 largest rows but counts all of them. A library root that does not exist is listed under `missing_root`. `walk_errors` counts folders that could not be read.

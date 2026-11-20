@@ -236,3 +236,43 @@ def test_never_deletes(tmp_path, monkeypatch):
     rep = run(tmp_path, {'h': torrent(tmp_path / 'dl', ['Z/z.mkv'])}, plex=[], arr=[])
     assert rep['totals']['count'] >= 2
     assert os.path.exists(tmp_path / 'dl' / 'T' / 'a.mkv')
+
+
+def test_plex_extras_not_untracked(tmp_path):
+    put(tmp_path / 'lib' / 'Film (2000)' / 'Trailers' / 'teaser.mkv', 20)
+    put(tmp_path / 'lib' / 'Film (2000)' / 'Film-trailer.mp4', 20)
+    put(tmp_path / 'lib' / 'Film (2000)' / 'Featurettes' / 'making.mkv', 20)
+    lone = put(tmp_path / 'lib' / 'Film (2000)' / 'Film.mkv', 50)
+    rep = run(tmp_path, plex=[], arr=[])
+    assert paths(rep, 'library_untracked') == {lone}
+
+
+def test_no_video_dir_skips_arr_folders(tmp_path):
+    put(tmp_path / 'lib' / 'Waiting (2024)' / 'poster.jpg', 5)      # Radarr folder, no file yet
+    put(tmp_path / 'lib' / 'Show' / 'tvshow.nfo', 5)                # Sonarr series folder, no episodes yet
+    put(tmp_path / 'lib' / 'Dropped (1990)' / 'a.srt', 5)           # nobody owns it
+    arr = [{'path': '/arr/movies/Waiting (2024)', 'dir': True}, {'path': '/arr/tv/Show/', 'dir': True}]
+    rep = run(tmp_path, plex=[], arr=arr)
+    assert paths(rep, 'library_no_video_dir') == {str(tmp_path / 'lib' / 'Dropped (1990)')}
+    rep2 = run(tmp_path, plex=[], arr=None)
+    assert rep2['buckets']['library_no_video_dir']['status'] == 'incomplete'
+    assert rep2['buckets']['library_no_video_dir']['rows'] == []
+
+
+def test_arr_folder_rows_are_not_known_files(tmp_path):
+    p = put(tmp_path / 'lib' / 'Movie (2000)' / 'Movie (2000).mkv', 50)
+    rep = run(tmp_path, plex=[], arr=[{'path': str(tmp_path / 'lib' / 'Movie (2000)'), 'dir': True}])
+    assert paths(rep, 'library_untracked') == {p}
+
+
+def test_torrent_reason_says_copy_or_failed_import(tmp_path):
+    dl = tmp_path / 'dl'
+    put(dl / 'A' / 'a.release.mkv', 100)
+    put(dl / 'B' / 'b.release.mkv', 300)
+    put(tmp_path / 'lib' / 'A (2000)' / 'A (2000).mkv', 100)        # same size, renamed copy
+    t = {'a': torrent(dl, ['A/a.release.mkv']), 'b': torrent(dl, ['B/b.release.mkv'])}
+    plex = [{'path': '/plexmount/A (2000)/A (2000).mkv', 'size': 100}]
+    rep = run(tmp_path, t, plex=plex, arr=[])
+    reasons = {r['path']: r['reason'] for r in rep['buckets']['torrent_not_in_library']['rows']}
+    assert 'imported as a copy' in reasons[str(dl / 'A')]
+    assert 'failed import' in reasons[str(dl / 'B')]
