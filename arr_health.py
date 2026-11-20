@@ -51,6 +51,23 @@ def _label(key):
     return names.get(what, f'{who} {what}')
 
 
+def advise_facts(event, who, what, minutes, active, site=''):
+    """arr_health model facts: event kind, service, check name and minutes only. No titles, hosts or URLs."""
+    return {'event': event, 'service': who.lower(), 'condition': what, 'minutes_down': minutes,
+            'outage_alert_min': OUTAGE_ALERT_MIN, 'active_outages': active, 'site': site, 'rules_action': 'notify'}
+
+
+def _advise(io, facts):
+    """Hand the facts of a push that is about to go out to the caller's optional `advise` (log-only)."""
+    fn = getattr(io, 'advise', None)
+    if fn is None:
+        return
+    try:
+        fn(facts)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ── 1. outages ────────────────────────────────────────────────────────────────
 
 def health_conditions(who, items):
@@ -91,6 +108,8 @@ def outage_tick(io, state, now):
             o = outages[key] = {'since': now, 'alerted': False}
         o['last_seen'], o['message'] = now, msg
         if not o['alerted'] and now - o['since'] >= OUTAGE_ALERT_MIN * 60:
+            who, _, what = key.partition(':')
+            _advise(io, advise_facts('outage', who, what, _mins(now - o['since']), len(current)))
             io.push(_label(key), f'{msg}\nDown for {_mins(now - o["since"])} min.')
             io.record('arr-health', f'{_label(key)} for {_mins(now - o["since"])} min: {msg}')
             o['alerted'] = True
@@ -98,6 +117,8 @@ def outage_tick(io, state, now):
         o = outages.pop(key)
         if o.get('alerted'):
             took = _mins(now - o['since'])
+            who, _, what = key.partition(':')
+            _advise(io, advise_facts('recovered', who, what, took, len(current)))
             io.push(f'{_label(key)}: recovered', f'Back after about {took} min.')
             io.record('arr-health', f'{_label(key)}: recovered after about {took} min')
     return health
@@ -130,6 +151,7 @@ def removed_tick(io, state, who, items):
         seen.add(key)
         if first:
             continue
+        _advise(io, advise_facts('removed', who, kind, 0, 0, site))
         io.push(f'{who}: removed from {site}',
                 f'{title} ({kind} {ident}) no longer exists on {site}, so {who} can\'t refresh it. '
                 f'Its files stay. It may have moved to a new {kind}.')
