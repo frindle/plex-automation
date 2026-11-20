@@ -201,6 +201,29 @@ upstream zz_new_module.py append
 run_update
 check "newly COPYed file changed: builds" "$(builds)" 1
 
+# 12b. a COPY this script cannot parse (continuation, JSON form) means build
+cp "$DEV/$DOCKERFILE" "$WORK/df.bak"
+printf 'COPY zz_new_module.py \\\n    ./\n' >> "$DEV/$DOCKERFILE"
+upstream "$DOCKERFILE" none
+run_update > /dev/null 2>&1
+set -- $NONINPUT_FILES
+upstream "$1" append
+run_update
+check "COPY continued with a backslash: a doc change builds" "$(builds)" 1
+cp "$WORK/df.bak" "$DEV/$DOCKERFILE"
+printf 'COPY ["zz_new_module.py", "./"]\n' >> "$DEV/$DOCKERFILE"
+upstream "$DOCKERFILE" none
+run_update > /dev/null 2>&1
+upstream "$1" append
+run_update
+check "JSON-form COPY: a doc change builds" "$(builds)" 1
+cp "$WORK/df.bak" "$DEV/$DOCKERFILE"
+upstream "$DOCKERFILE" none
+run_update > /dev/null 2>&1
+upstream "$1" append
+run_update
+check "parseable Dockerfile again: a doc change does not build" "$(builds)" 0
+
 # 13. COPY . copies the whole context, so any change builds
 echo "COPY . ./ctx/" >> "$DEV/$DOCKERFILE"
 upstream "$DOCKERFILE" none

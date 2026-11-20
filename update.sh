@@ -44,6 +44,17 @@ build_inputs() {
        }' Dockerfile 2>/dev/null
 }
 
+# dockerfile_unparseable: succeeds when a COPY/ADD line is in a form build_inputs
+# cannot read: continued with a trailing backslash, or the JSON form COPY [...].
+# Such a Dockerfile always means "build".
+dockerfile_unparseable() {
+  awk '(toupper($1) == "COPY" || toupper($1) == "ADD") {
+         if ($0 ~ /\\[ \t]*$/) bad = 1
+         for (i = 2; i <= NF; i++) if ($i !~ /^--/) { if ($i ~ /^\[/) bad = 1; break }
+       }
+       END { exit bad ? 0 : 1 }' Dockerfile 2>/dev/null
+}
+
 # is_build_input <path>: succeeds when a change to <path> can change the image:
 # the Dockerfile, the compose file, .dockerignore, or anything a COPY/ADD line
 # takes from the context (a file, a directory, `.`, or a glob such as *.py).
@@ -72,6 +83,7 @@ decide_build() {
   if [ -z "$old" ]; then BUILD_WHY="no build marker yet (first run)"; return; fi
   if ! git cat-file -e "${old}^{commit}" 2>/dev/null; then BUILD_WHY="build marker is not a known commit"; return; fi
   if [ "$old" = "$new" ]; then DO_BUILD=0; BUILD_WHY="no new commits since the last build (${new:0:7})"; return; fi
+  if dockerfile_unparseable; then BUILD_WHY="Dockerfile has a COPY/ADD line this script cannot parse (line continuation or JSON form)"; return; fi
   if [ -z "$(build_inputs)" ]; then BUILD_WHY="no COPY or ADD lines found in the Dockerfile"; return; fi
   if ! changed="$(git diff --relative --no-renames --name-only "$old" "$new" -- 2>/dev/null)"; then
     BUILD_WHY="cannot diff ${old:0:7}..${new:0:7}"; return
