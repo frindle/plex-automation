@@ -18,7 +18,8 @@ H1, H2, H3 = '1' * 40, '2' * 40, '3' * 40
 
 def tor(**kw):
     base = dict(name='Example Movie (2020)', label='radarr', state='Downloading', progress=40.0, is_finished=False,
-                download_payload_rate=0, time_since_download=30 * MIN, active_time=2 * HOUR, max_connections=-1)
+                download_payload_rate=0, time_since_download=30 * MIN, active_time=2 * HOUR, max_connections=-1,
+                tracker_status='Announce OK', tracker_host='tracker.example.com', total_seeds=0)
     base.update(kw)
     return base
 
@@ -81,6 +82,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(aw, '_stuck_state', {})
     monkeypatch.setattr(aw, '_stuck_state_loaded', [False])
     monkeypatch.setattr(aw, '_stuck_logged', set())
+    monkeypatch.setattr(aw, '_stuck_tracker_notified', set())
     for k in ('STUCK_AUTOMATION', 'STUCK_AFTER_MIN', 'STUCK_GIVE_UP_HOURS', 'UPGRADE_MAX_CONNECTIONS'):
         monkeypatch.delenv(k, raising=False)
     rec['set_torrents'] = lambda torrents: monkeypatch.setattr(aw, 'get_all_torrents', lambda fields=None, force=False: torrents)
@@ -352,6 +354,64 @@ def test_give_up_never_deletes_a_stalled_partial_that_uploaded_under_the_seed_fl
     assert 'core.remove_torrent' not in deluge, 'seed floor: the torrent is not deleted'
     assert all(c[2].get('params', {}).get('removeFromClient') is False for c in fake.calls if c[0] == 'DELETE')
     assert any('seed floor refused' in t for _, t in env['activity'])
+
+
+
+# ── diagnosis wired through ─────────────────────────────────────────────────
+def test_preview_dry_lines_and_push_carry_the_diagnosis(env, monkeypatch):
+    env['set_torrents']({H1: tor(), H2: tor(tracker_status='Announce OK', total_seeds=9, max_connections=10)})
+    aw.stuck_pass(now=T0)
+    text = ' | '.join(t for _, t in env['activity'])
+    assert 'diagnosis: tracker OK and the swarm has had no seeds' in text
+    assert 'diagnosis: tracker OK and the swarm has seeds' in text or 'local problem' in text
+    assert 'would have uncapped' in text
+    body = aw.app.test_client().get('/stuck-downloads').get_json()
+    assert {r['hash']: r['diagnosis'] for r in body['rows']} == {H1: 'dead', H2: 'local'}
+    assert all('diagnosis_text' in r for r in body['rows'])
+
+
+def test_on_dead_give_up_push_text_has_the_diagnosis(env, monkeypatch):
+    monkeypatch.setenv('STUCK_AUTOMATION', 'on')
+    env['set_torrents']({H1: tor(progress=96.0)})
+    for dt in (0, 25 * MIN, 7 * HOUR):
+        aw.stuck_pass(now=T0 + dt)
+    assert len(env['push']) == 1 and 'dead torrent' in env['push'][0][1]
+
+
+def test_on_local_problem_uncaps_and_notifies_but_never_touches_the_arr(env, monkeypatch):
+    monkeypatch.setenv('STUCK_AUTOMATION', 'on')
+    fake = FakeRequests(queue={'Radarr': [{'id': 77, 'downloadId': H1, 'movieId': 12}]})
+    env['set_requests'](fake)
+    env['set_torrents']({H1: tor(tracker_status='Announce OK', total_seeds=9, max_connections=10)})
+    for dt in (0, 25 * MIN, 7 * HOUR, 14 * HOUR):
+        aw.stuck_pass(now=T0 + dt)
+    assert ('core.set_torrent_options', [[H1], {'max_connections': -1}]) in env['rpc']
+    assert ('core.force_reannounce', [[H1]]) in env['rpc']
+    assert [p[0] for p in env['push']] == ['Download stuck: local problem']
+    assert fake.writes() == [] and env['removed'] == []
+
+
+def test_on_tracker_errors_reannounce_report_once_per_tracker_and_never_blocklist(env, monkeypatch):
+    monkeypatch.setenv('STUCK_AUTOMATION', 'on')
+    fake = FakeRequests(queue={'Radarr': [{'id': 77, 'downloadId': H1, 'movieId': 12}]})
+    env['set_requests'](fake)
+    err = dict(tracker_status='Error: Connection timed out', total_seeds=0)
+    env['set_torrents']({H1: tor(**err), H2: tor(**err), H3: tor(**err)})
+    for dt in (0, 25 * MIN, 50 * MIN, 7 * HOUR, 14 * HOUR):
+        aw.stuck_pass(now=T0 + dt)
+    assert [p[0] for p in env['push']] == ['Tracker failing']
+    assert 'tracker tracker.example.com failing for 3 torrent(s)' in env['push'][0][1]
+    assert fake.writes() == [] and env['removed'] == [] and env['pause'] == []
+
+
+def test_unregistered_is_left_to_the_unregistered_path(env, monkeypatch):
+    monkeypatch.setenv('STUCK_AUTOMATION', 'on')
+    fake = FakeRequests(queue={'Radarr': [{'id': 77, 'downloadId': H1, 'movieId': 12}]})
+    env['set_requests'](fake)
+    env['set_torrents']({H1: tor(tracker_status='Error: Unregistered torrent')})
+    for dt in (0, 25 * MIN, 7 * HOUR):
+        aw.stuck_pass(now=T0 + dt)
+    assert changes(env) == [] and fake.writes() == [] and env['removed'] == [] and env['push'] == []
 
 
 # ── settings ────────────────────────────────────────────────────────────────

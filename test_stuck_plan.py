@@ -17,7 +17,8 @@ def cfg(**kw):
 
 def tor(**kw):
     base = dict(name='Example Movie (2020)', label='radarr', state='Downloading', progress=40.0, is_finished=False,
-                download_payload_rate=0, time_since_download=30 * MIN, active_time=2 * HOUR, max_connections=-1)
+                download_payload_rate=0, time_since_download=30 * MIN, active_time=2 * HOUR, max_connections=-1,
+                tracker_status='Announce OK', tracker_host='tracker.example.com', total_seeds=0)
     base.update(kw)
     return base
 
@@ -76,7 +77,7 @@ def test_step_2_pause_then_resume_after_the_wait():
 
 
 def test_step_3_gives_up_after_the_hours_when_under_95_percent():
-    state = {H: {'step': 2, 'step_at': T0 + 20 * MIN, 'stalled_since': T0, 'notified': False}}
+    state = {H: {'step': 2, 'step_at': T0 + 20 * MIN, 'stalled_since': T0, 'dead_since': T0, 'notified': False}}
     actions, state2, rows = sp.plan({H: tor(progress=94.99)}, state, T0 + 6 * HOUR, cfg())
     assert kinds(actions) == [sp.GIVE_UP]
     give = actions[0]
@@ -85,27 +86,27 @@ def test_step_3_gives_up_after_the_hours_when_under_95_percent():
 
 
 def test_not_given_up_one_second_early():
-    state = {H: {'step': 2, 'step_at': T0 + 20 * MIN, 'stalled_since': T0, 'notified': False}}
+    state = {H: {'step': 2, 'step_at': T0 + 20 * MIN, 'stalled_since': T0, 'dead_since': T0, 'notified': False}}
     actions, _, rows = sp.plan({H: tor()}, state, T0 + 6 * HOUR - 1, cfg())
     assert actions == []
     assert rows[0]['next'].startswith('give up in')
 
 
 def test_give_up_is_asked_again_while_it_is_still_stalled():
-    state = {H: {'step': 3, 'step_at': T0 + 6 * HOUR, 'stalled_since': T0, 'notified': False}}
+    state = {H: {'step': 3, 'step_at': T0 + 6 * HOUR, 'stalled_since': T0, 'dead_since': T0, 'notified': False}}
     actions, _, _ = sp.plan({H: tor()}, state, T0 + 7 * HOUR, cfg())
     assert kinds(actions) == [sp.GIVE_UP]      # an earlier try that failed is retried
 
 
 def test_give_up_hours_is_configurable():
-    state = {H: {'step': 2, 'step_at': T0 + 20 * MIN, 'stalled_since': T0, 'notified': False}}
+    state = {H: {'step': 2, 'step_at': T0 + 20 * MIN, 'stalled_since': T0, 'dead_since': T0, 'notified': False}}
     assert sp.plan({H: tor()}, state, T0 + 2 * HOUR, cfg(give_up_hours=1))[0][0]['action'] == sp.GIVE_UP
     assert sp.plan({H: tor()}, state, T0 + 2 * HOUR, cfg(give_up_hours=3))[0] == []
 
 
 # ── the 95% rule ────────────────────────────────────────────────────────────
 def test_at_95_percent_or_more_it_is_never_given_up_only_notified_once():
-    state = {H: {'step': 2, 'step_at': T0 + 20 * MIN, 'stalled_since': T0, 'notified': False}}
+    state = {H: {'step': 2, 'step_at': T0 + 20 * MIN, 'stalled_since': T0, 'dead_since': T0, 'notified': False}}
     for progress in (95.0, 99.9):
         actions, state2, _ = sp.plan({H: tor(progress=progress)}, state, T0 + 6 * HOUR, cfg())
         assert kinds(actions) == [sp.NOTIFY], progress
@@ -117,7 +118,7 @@ def test_at_95_percent_or_more_it_is_never_given_up_only_notified_once():
 
 
 def test_a_notified_torrent_that_moves_again_starts_over_and_can_notify_again():
-    state = {H: {'step': 2, 'step_at': T0, 'stalled_since': T0, 'notified': True}}
+    state = {H: {'step': 2, 'step_at': T0, 'stalled_since': T0, 'dead_since': T0, 'notified': True}}
     _, state2, _ = sp.plan({H: tor(progress=97, download_payload_rate=50_000)}, state, T0 + 7 * HOUR, cfg())
     assert H not in state2
 
@@ -144,7 +145,10 @@ def test_queued_or_paused_keeps_the_ladder_and_gets_no_action():
     _, state, _ = sp.plan({H: tor()}, {}, T0, cfg())
     for st in ('Queued', 'Paused', 'Checking'):
         actions, state2, _ = sp.plan({H: tor(state=st)}, state, T0 + 25 * MIN, cfg())
-        assert actions == [] and state2[H] == state[H], st
+        assert actions == [] and state2[H]['step'] == state[H]['step'], st
+        # the time spent queued or paused does not count: every clock moved forward by the same 25 min
+        assert state2[H]['stalled_since'] == state[H]['stalled_since'] + 25 * MIN, st
+        assert state2[H]['dead_since'] == state[H]['dead_since'] + 25 * MIN, st
 
 
 def test_state_of_torrents_that_vanished_or_finished_is_dropped():
@@ -156,7 +160,7 @@ def test_state_of_torrents_that_vanished_or_finished_is_dropped():
 
 def test_plan_never_changes_its_inputs():
     torrents = {H: tor()}
-    state = {H: {'step': 1, 'step_at': T0, 'stalled_since': T0, 'notified': False}}
+    state = {H: {'step': 1, 'step_at': T0, 'stalled_since': T0, 'dead_since': T0, 'notified': False}}
     before = (dict(torrents[H]), {k: dict(v) for k, v in state.items()})
     sp.plan(torrents, state, T0 + 25 * MIN, cfg())
     assert (torrents[H], state) == (before[0], before[1])
@@ -225,3 +229,107 @@ def test_garbage_status_values_do_not_raise():
     bad = {H: {'name': None, 'label': 'radarr', 'state': 'Downloading', 'progress': None,
                'download_payload_rate': None, 'time_since_download': 'x', 'active_time': None}}
     sp.plan(bad, {}, T0, cfg())
+
+
+# ── diagnosis: the action follows why it is stuck ───────────────────────────
+DEAD_T = dict(tracker_status='Announce OK', total_seeds=0)
+LOCAL_T = dict(tracker_status='Announce OK', total_seeds=12, max_connections=10)
+ERR_T = dict(tracker_status='Error: Connection timed out', total_seeds=0)
+
+
+def run_passes(t, times, c=None, unreg=None):
+    state, out = {}, []
+    for dt in times:
+        actions, state, rows = sp.plan({H: t}, state, T0 + dt, c or cfg(), unreg)
+        out.append((actions, rows))
+    return state, out
+
+
+def test_diagnose_cases():
+    assert sp.diagnose(tor(**DEAD_T)) == sp.DEAD
+    assert sp.diagnose(tor(**LOCAL_T)) == sp.LOCAL
+    assert sp.diagnose(tor(tracker_status='Announce OK', total_seeds=-1)) == sp.UNKNOWN_SWARM
+    assert sp.diagnose(tor(tracker_status='Announce OK', total_seeds=None)) == sp.UNKNOWN_SWARM
+    assert sp.diagnose(tor(**ERR_T)) == sp.TRACKER_ERROR
+    assert sp.diagnose(tor(tracker_status='', total_seeds=9)) == sp.TRACKER_ERROR
+    assert sp.diagnose(tor(tracker_status='Error: Unregistered torrent'), lambda i: True) == sp.UNREGISTERED
+
+
+def test_unregistered_gets_no_ladder_and_no_state():
+    state, out = run_passes(tor(tracker_status='Error: Unregistered torrent'), [0, 25 * MIN, 7 * HOUR],
+                            unreg=lambda i: True)
+    assert state == {} and all(a == [] for a, _ in out)
+    assert out[0][1][0]['diagnosis'] == sp.UNREGISTERED
+
+
+def test_tracker_error_only_reannounces_never_gives_up_or_pauses():
+    state, out = run_passes(tor(**ERR_T), [0, 25 * MIN, 7 * HOUR, 30 * HOUR])
+    seen = {a['action'] for acts, _ in out for a in acts if a['hash'] == H}
+    assert seen == {sp.REANNOUNCE}, seen
+    assert out[0][1][0]['diagnosis'] == sp.TRACKER_ERROR
+
+
+def test_tracker_failure_is_reported_once_per_tracker_not_per_torrent():
+    ts = {c * 40: tor(name=f'Example {c}', **ERR_T) for c in 'abc'}
+    ts['d' * 40] = tor(name='Other tracker', tracker_host='other.example.com', **ERR_T)
+    _, st, _ = sp.plan(ts, {}, T0, cfg())
+    acts, st, _ = sp.plan(ts, st, T0 + 5 * MIN, cfg())
+    assert [a for a in acts if a['action'] == sp.NOTIFY_TRACKER] == [], 'not before the failure persists'
+    acts, st, _ = sp.plan(ts, st, T0 + 25 * MIN, cfg())
+    notes = [a for a in acts if a['action'] == sp.NOTIFY_TRACKER]
+    assert sorted((n['host'], n['count']) for n in notes) == [('other.example.com', 1), ('tracker.example.com', 3)]
+
+
+def test_local_problem_uncaps_reannounces_notifies_and_never_gives_up():
+    state, out = run_passes(tor(**LOCAL_T), [0, 25 * MIN, 26 * MIN, 7 * HOUR, 30 * HOUR])
+    first = [a['action'] for a in out[0][0]]
+    assert sp.REANNOUNCE in first and sp.UNCAP in first and sp.GIVE_UP not in first
+    uncap = [a for a in out[0][0] if a['action'] == sp.UNCAP][0]
+    assert uncap['max_connections'] == -1
+    seen = [a['action'] for acts, _ in out for a in acts]
+    assert seen.count(sp.NOTIFY_LOCAL) == 1, 'notified once when the first fixes did not help'
+    assert sp.GIVE_UP not in seen and sp.NOTIFY not in seen
+
+
+def test_unknown_swarm_never_gives_up():
+    state, out = run_passes(tor(tracker_status='Announce OK', total_seeds=-1), [0, 25 * MIN, 7 * HOUR, 30 * HOUR])
+    assert sp.GIVE_UP not in [a['action'] for acts, _ in out for a in acts]
+
+
+def test_only_a_dead_torrent_reaches_give_up():
+    state, out = run_passes(tor(**DEAD_T), [0, 25 * MIN, 6 * HOUR + MIN])
+    assert sp.GIVE_UP in [a['action'] for a in out[-1][0]]
+    assert out[-1][0][-1]['diagnosis'].endswith('dead torrent')
+
+
+def test_dead_must_be_confirmed_across_the_whole_window():
+    # seeds appear mid-window (then vanish again): the confirmation starts over, so no give-up yet
+    c = cfg()
+    state = {}
+    for dt, seeds in ((0, 0), (25 * MIN, 0), (3 * HOUR, 4), (6 * HOUR + MIN, 0)):
+        acts, state, _ = sp.plan({H: tor(tracker_status='Announce OK', total_seeds=seeds)}, state, T0 + dt, c)
+    assert sp.GIVE_UP not in [a['action'] for a in acts]
+    acts, state, _ = sp.plan({H: tor(**DEAD_T)}, state, T0 + 12 * HOUR + 2 * MIN, c)
+    assert sp.GIVE_UP in [a['action'] for a in acts]
+
+
+def test_dead_at_95_percent_notifies_with_the_diagnosis():
+    state, out = run_passes(tor(progress=96.0, **DEAD_T), [0, 25 * MIN, 6 * HOUR + MIN])
+    notes = [a for a in out[-1][0] if a['action'] == sp.NOTIFY]
+    assert notes and 'dead torrent' in notes[0]['diagnosis']
+
+
+def test_queued_time_does_not_count_toward_give_up():
+    c = cfg()
+    _, st, _ = sp.plan({H: tor(**DEAD_T)}, {}, T0, c)
+    _, st, _ = sp.plan({H: tor(**DEAD_T)}, st, T0 + 25 * MIN, c)
+    for dt in range(1, 10):                               # queued for 9 hours
+        _, st, rows = sp.plan({H: tor(state='Queued', **DEAD_T)}, st, T0 + 25 * MIN + dt * HOUR, c)
+    assert rows[0]['diagnosis'] == sp.QUEUED
+    acts, st, _ = sp.plan({H: tor(**DEAD_T)}, st, T0 + 25 * MIN + 9 * HOUR + 10 * MIN, c)
+    assert sp.GIVE_UP not in [a['action'] for a in acts], 'only a few minutes of real stall so far'
+
+
+def test_every_stalled_row_carries_a_diagnosis_text():
+    _, _, rows = sp.plan({H: tor(**LOCAL_T)}, {}, T0, cfg())
+    assert rows[0]['diagnosis'] == sp.LOCAL and 'local problem' in rows[0]['diagnosis_text']

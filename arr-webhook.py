@@ -4801,9 +4801,10 @@ def tracker_stall_scheduler():
 STUCK_CHECK_INTERVAL = max(60, int(os.environ.get('STUCK_CHECK_INTERVAL', '600')))
 STUCK_STATE_PATH = os.environ.get('STUCK_STATE_PATH', '/data/stuck_state.json')
 STUCK_FIELDS = ['name', 'label', 'state', 'progress', 'is_finished', 'download_payload_rate',
-                'time_since_download', 'active_time', 'max_connections']
+                'time_since_download', 'active_time', 'max_connections', 'tracker_status', 'tracker_host', 'total_seeds']
 _stuck_state = {}          # hash -> ladder entry (stuck_plan); in memory in dry, saved to STUCK_STATE_PATH in on
 _stuck_state_loaded = [False]
+_stuck_tracker_notified = set()   # tracker hosts already reported as failing (cleared when the host recovers)
 _stuck_lock = threading.Lock()
 _stuck_logged = set()      # (hash, what) already written to the activity log, so a repeat is not spammed
 
@@ -4919,8 +4920,8 @@ def _stuck_give_up(action, queue, failed):
         record_activity('stuck-downloads', f'Gave up on stuck "{name}" at {action["progress"]:.1f}%: blocklisted in the {who} '
                                            'queue; the torrent is kept because the seed floor refused the removal')
     else:
-        record_activity('stuck-downloads', f'Gave up on stuck "{name}" at {action["progress"]:.1f}%: blocklisted in the {who} '
-                                           'queue, download removed through the seed-floor and library guards')
+        record_activity('stuck-downloads', f'Gave up on stuck "{name}" at {action["progress"]:.1f}% ({action["diagnosis"]}): '
+                                           f'blocklisted in the {who} queue, download removed through the seed-floor and library guards')
     try:
         searched = _stuck_search(who, q)
     except Exception as e:
@@ -4948,10 +4949,25 @@ def _stuck_do(action, mode, queue, failed):
             deluge_resume_torrent(h)
         elif kind == stuck_plan.CAP_CONNECTIONS:
             _deluge_rpc('core.set_torrent_options', [[h], {'max_connections': action['max_connections']}])
+        elif kind == stuck_plan.UNCAP:
+            _deluge_rpc('core.set_torrent_options', [[h], {'max_connections': -1}])
         elif kind == stuck_plan.NOTIFY:
             send_pushover('Download stuck near the end',
                           f'"{name}" is at {action["progress"]:.1f}% and has not moved for {action["stalled_hours"]} h. '
+                          f'Diagnosis: {action["diagnosis"]}. '
                           'Left in place; the automation never gives up at 95% or more.')
+        elif kind == stuck_plan.NOTIFY_LOCAL:
+            send_pushover('Download stuck: local problem',
+                          f'"{name}" is at {action["progress"]:.1f}% and has not moved for {action["stalled_hours"]} h. '
+                          f'Diagnosis: {action["diagnosis"]}. Uncapping, reannouncing and a restart did not help; '
+                          'check the port, queue limits and the client. The release is not blocklisted.')
+        elif kind == stuck_plan.NOTIFY_TRACKER:
+            if action['host'] in _stuck_tracker_notified:
+                return 'already reported'
+            _stuck_tracker_notified.add(action['host'])
+            send_pushover('Tracker failing',
+                          f'tracker {action["host"]} failing for {action["count"]} torrent(s). '
+                          'Nothing is blocklisted or removed; reannouncing.')
         elif kind == stuck_plan.GIVE_UP:
             return _stuck_give_up(action, queue, failed)
         return 'done'
@@ -4978,11 +4994,13 @@ def stuck_pass(now=None, mode=None):
     with _stuck_lock:
         if mode == 'on':
             _stuck_load()
-        actions, new_state, rows = stuck_plan.plan(torrents, _stuck_state, now, cfg)
+        actions, new_state, rows = stuck_plan.plan(torrents, _stuck_state, now, cfg, torrent_is_unregistered)
         _stuck_state.clear()
         _stuck_state.update(new_state)
         if mode == 'on':
             _stuck_save()
+    failing = {a['host'] for a in actions if a['action'] == stuck_plan.NOTIFY_TRACKER}
+    _stuck_tracker_notified.intersection_update(failing)      # a recovered tracker can be reported again later
     ladder = [a for a in actions if a['action'] != stuck_plan.CAP_CONNECTIONS]
     caps = [a for a in actions if a['action'] == stuck_plan.CAP_CONNECTIONS]
     queue, failed = ({}, set())
@@ -4993,10 +5011,12 @@ def stuck_pass(now=None, mode=None):
         outcome = _stuck_do(a, mode, queue, failed)
         results.append({'hash': a['hash'], 'action': a['action'], 'outcome': outcome})
         what = {'reannounce': 'reannounced', 'queue_top': 'queued to top', 'pause': 'paused', 'resume': 'resumed',
-                'give_up': 'given up on', 'notify': 'notified about'}[a['action']]
+                'give_up': 'given up on', 'notify': 'notified about', 'uncap_connections': 'uncapped',
+                'notify_local': 'notified about a local problem with',
+                'notify_tracker': 'reported the failing tracker for'}[a['action']]
         prefix = '[dry] would have ' if mode != 'on' else ''
         if a['action'] != stuck_plan.GIVE_UP or mode != 'on':     # a real give-up writes its own lines
-            line = f'{prefix}{what} stuck "{a["name"]}" (step {a.get("step", "-")})'
+            line = f'{prefix}{what} stuck "{a["name"]}" (step {a.get("step", "-")}; diagnosis: {a["diagnosis"]})'
             if mode != 'on':      # a dry pass re-plans the same action every pass: say it once per torrent and step
                 _stuck_say(a['hash'], f'dry:{a["action"]}:{a.get("step", "-")}', line)
             else:
@@ -5041,7 +5061,7 @@ def stuck_downloads_preview():
         return jsonify({'ok': False, 'error': f'Deluge unreadable: {type(e).__name__}'}), 502
     with _stuck_lock:
         state = {h: dict(e) for h, e in _stuck_state.items()}
-    _, _, rows = stuck_plan.plan(torrents, state, time.time(), cfg)
+    _, _, rows = stuck_plan.plan(torrents, state, time.time(), cfg, torrent_is_unregistered)
     return jsonify({
         'ok': True, 'mode': stuck_mode(),
         'config': {'stuck_after_min': cfg.stuck_after_min, 'give_up_hours': cfg.give_up_hours,
