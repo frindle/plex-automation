@@ -1563,11 +1563,12 @@ def share_settings():
 
 @share_bp.route('/test-connection', methods=['POST'])
 def friend_test_connection():
-    # Connects out from this container to a host and port the caller names, so
-    # only the admin may use it (the admin form has its own copy of this route).
-    email, err = _require_admin()
+    # Friends test their own upload destination here. The identity is the validated
+    # Access JWT, so only signed-in friends can make the container connect out, and
+    # they can already point uploads at any host they save in settings.
+    email, err = _require_auth()
     if err:
-        return {'ok': False, 'error': 'Forbidden'}, 403
+        return {'ok': False, 'error': 'Not authenticated'}, 403
     protocol = request.form.get('protocol', 'sftp')
     host = request.form.get('sftp_host', '').strip()
     port_raw = request.form.get('sftp_port', '')

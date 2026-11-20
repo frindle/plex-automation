@@ -296,14 +296,15 @@ def test_status_has_owner_check(share):
     assert get('/share/status/1', **as_jwt(ADMIN)).status_code == 200
 
 
-def test_friend_test_connection_is_admin_only(share, monkeypatch):
+def test_friend_test_connection_needs_validated_identity(share, monkeypatch):
     calls = []
     monkeypatch.setattr(ms, '_test_connection', lambda *a: calls.append(a) or (True, ''))
     c = client()
     form = {'protocol': 'sftp', 'sftp_host': 'sftp-host', 'sftp_user': 'u', 'sftp_password': 'p'}
-    r = c.post('/share/test-connection', data=form, headers=as_jwt(FRIEND))
+    r = c.post('/share/test-connection', data=form,
+               headers={'Cf-Access-Authenticated-User-Email': FRIEND})
     assert r.status_code == 403 and calls == []
-    r = c.post('/share/test-connection', data=form, headers=as_jwt(ADMIN))
+    r = c.post('/share/test-connection', data=form, headers=as_jwt(FRIEND))
     assert r.status_code == 200 and r.get_json()['ok'] is True and len(calls) == 1
 
 

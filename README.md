@@ -18,7 +18,7 @@ Background schedulers (run inside the same process):
 `monthly_upgrade.py` is a standalone script duplicating the monthly cycle (purge → bulk search → wait 90 min → relabel/requeue), kept for manual or cron-triggered runs independent of the long-running webhook process.
 
 `media_share.py` adds a friend-facing media upload portal (Flask blueprint, registered into the same app/port) at `/share`:
-- Friends authenticate via Cloudflare Access. The app takes the identity from the email in the validated `Cf-Access-Jwt-Assertion` JWT (see **Access control**); the plain email header is ignored, so a spoofed header gets nothing. `/share/admin*` and `/share/test-connection` need the `ADMIN_EMAIL` identity, and `/share/status/<id>` shows an upload only to its owner (or the admin).
+- Friends authenticate via Cloudflare Access. The app takes the identity from the email in the validated `Cf-Access-Jwt-Assertion` JWT (see **Access control**); the plain email header is ignored, so a spoofed header gets nothing. `/share/admin*` needs the `ADMIN_EMAIL` identity, and `/share/status/<id>` shows an upload only to its owner (or the admin).
 - Browse the read-only-mounted Movies/TV Shows/Music libraries and upload a file or whole folder to that friend's own SFTP server, looked up by their authenticated email in `FRIENDS_CONFIG`.
 - Uploads run in a background thread, throttled to `UPLOAD_RATE_LIMIT_MBIT` (default 5 Mbit/s) so a large upload doesn't saturate the connection.
 - Every upload is logged to a SQLite DB (`/data/share_uploads.db`); `/share/usage` shows each friend their own bandwidth usage over the last 7/30/60/90/182/365 days.
@@ -49,7 +49,7 @@ One `before_request` gate (`app_auth.py`) covers every route, including `/share`
 | `CF_ACCESS_AUDS` | Comma-separated AUD tags of the Access applications that may reach this app. |
 | `APP_AUTH_TOKEN_FILE` | File of bearer tokens, one per line (`#` comments). For scripts and the glacier mover. |
 | `APP_AUTH_BASIC_FILE` | File of `user:password` lines. Accepted on `/webhook/*` only, for Sonarr/Radarr. |
-| `ADMIN_EMAIL` | The identity allowed into `/share/admin*` and `/share/test-connection`. |
+| `ADMIN_EMAIL` | The identity allowed into `/share/admin*`. |
 
 Modes: `off` checks nothing. `log` allows every request but logs each one that `enforce` would refuse (route class, method, path, which credential was missing; never a secret). `enforce` answers 403.
 
