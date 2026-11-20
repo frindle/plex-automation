@@ -331,3 +331,38 @@ def test_layer_status_shows_both_counters(tmp_path):
     st = la.layer_status(env)
     assert st['paid_month'] == {'month': month, 'calls': 2, 'cap_calls': 50, 'capped': False}
     assert 'usd' in st['claude_month'] and 'cap_usd' in st['claude_month']
+
+
+def test_workspace_id_sent_as_header_only_when_set(monkeypatch):
+    import sys
+    import types
+    seen = []
+    monkeypatch.setitem(sys.modules, 'anthropic', types.SimpleNamespace(Anthropic=lambda **kw: seen.append(kw)))
+    la._real_claude_client('k', 'ws-1')()
+    la._real_claude_client('k')()
+    assert seen[0]['default_headers'] == {'anthropic-workspace-id': 'ws-1'} and seen[0]['api_key'] == 'k'
+    assert 'default_headers' not in seen[1] and seen[1]['api_key'] == 'k'
+
+
+def test_build_layers_passes_workspace_from_env(monkeypatch, tmp_path):
+    got = []
+    monkeypatch.setattr(la, '_real_claude_client', lambda key, ws='': got.append((key, ws)) or (lambda: None))
+    env = dict(ENV, ANTHROPIC_WORKSPACE_ID=' ws-2 ', LLM_CLAUDE_SPEND_PATH=str(tmp_path / 's.json'))
+    la.build_layers('upgrade_gate', env, http=FakeHttp({}))
+    env.pop('ANTHROPIC_WORKSPACE_ID')
+    la.build_layers('upgrade_gate', env, http=FakeHttp({}))
+    assert got == [('sk-fake', 'ws-2'), ('sk-fake', '')]
+
+
+def test_backtest_reports_first_error_line():
+    body = {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'key not scoped to a workspace'}}
+    e = Err('raw', 400)
+    e.body = body
+    calls = iter([e, Err('second', 500)])
+
+    def transport(prompt):
+        raise next(calls)
+    rows = [{'facts': {'seeders': 50}, 'rules_action': 'allow', 'id': 'r%d' % i} for i in range(2)]
+    res = bl.score('upgrade_gate', rows, transport)
+    assert res['errors'] == 2 and res['first_error'] == 'Err 400 key not scoped to a workspace'
+    assert 'first_error=Err 400 key not scoped to a workspace' in bl.report('upgrade_gate', 'm', res)

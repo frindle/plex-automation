@@ -576,10 +576,13 @@ def _claude_fn(kind, model, client_factory, spend=None, env=None):
     return fn
 
 
-def _real_claude_client(key):
+def _real_claude_client(key, workspace=''):
+    """workspace (ANTHROPIC_WORKSPACE_ID): a key that is not scoped to a workspace gets HTTP 400 on every call
+    unless each request names the workspace in the anthropic-workspace-id header (seen 2026-11-20)."""
     def make():
         import anthropic
-        return anthropic.Anthropic(api_key=key, timeout=30.0, max_retries=1)
+        kw = {'default_headers': {'anthropic-workspace-id': workspace}} if workspace else {}
+        return anthropic.Anthropic(api_key=key, timeout=30.0, max_retries=1, **kw)
     return make
 
 
@@ -635,7 +638,8 @@ def build_layers(kind, env, transport=None, http=None, claude_client=None, now=t
     ckey = (env.get('ANTHROPIC_API_KEY') or '').strip()
     if ckey or claude_client is not None:
         cm = (env.get('LLM_CLAUDE_MODEL') or '').strip() or CLAUDE_MODEL
-        factory = (lambda: claude_client) if claude_client is not None else _real_claude_client(ckey)
+        factory = ((lambda: claude_client) if claude_client is not None
+                   else _real_claude_client(ckey, (env.get('ANTHROPIC_WORKSPACE_ID') or '').strip()))
         spend = get_claude_spend(_claude_spend_path(env), now)
         cap = claude_monthly_cap(env)
         layers['claude'] = Layer('claude', _claude_fn(kind, cm, factory, spend, env), cm,
