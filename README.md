@@ -53,7 +53,7 @@ One `before_request` gate (`app_auth.py`) covers every route, including `/share`
 
 Modes: `off` checks nothing. `log` allows every request but logs each one that `enforce` would refuse (route class, method, path, which credential was missing; never a secret). `enforce` answers 403.
 
-A request passes with any of: a valid Access JWT (signature, expiry, issuer and one of the AUDs checked), `Authorization: Bearer <token>`, or HTTP Basic on `/webhook/*`. `/health` is always open; `/share/dl/<token>` link downloads are open at the gate because the link token is their credential.
+A request passes with any of: a valid Access JWT (signature, expiry, issuer and one of the AUDs checked), `Authorization: Bearer <token>`, or HTTP Basic on `/webhook/*`. `/health` is always open; a `GET` report from loopback (the socket peer, never `X-Forwarded-For`) passes without a credential, so a job running inside the container still works under `enforce` (action routes, POSTs and `/share` never qualify); `/share/dl/<token>` link downloads are open at the gate because the link token is their credential.
 
 `/share` pages need a validated JWT in every mode, so set `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUDS` before deploying this version or friends lose access.
 

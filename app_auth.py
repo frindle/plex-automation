@@ -239,11 +239,24 @@ def route_class(path):
     return 'api'
 
 
+_LOOPBACK = ('127.0.0.1', '::1', '::ffff:127.0.0.1')
+
+
+def _loopback_report():
+    """A GET report fetched from inside the container (the nightly state job) needs no credential.
+    Only the socket peer counts: remote_addr is never taken from X-Forwarded-For, and a proxied
+    request arrives from the proxy's address, not loopback. Action routes and /share never qualify."""
+    return (request.method == 'GET' and request.remote_addr in _LOOPBACK
+            and request.path not in ACTION_ROUTES and route_class(request.path) == 'api')
+
+
 def check_credentials():
     """(ok, credential kind or '', what was missing)."""
     cls = route_class(request.path)
     if cls in ('health', 'share-link'):
         return True, 'open', ''
+    if _loopback_report():
+        return True, 'loopback', ''
     claims, jwt_reason = _jwt_state()
     if claims is not None:
         return True, 'jwt', ''

@@ -391,3 +391,32 @@ def test_plex_error_never_echoes_the_token(monkeypatch):
     r = aw.app.test_client().get('/plex-dupe-scan')
     assert r.status_code == 500
     assert 'tok-secret-1234' not in r.get_data(as_text=True)
+
+
+# ── loopback reports ─────────────────────────────────────────────────────────
+
+def from_addr(path, addr, method='GET', **headers):
+    return aw.app.test_client().open(path, method=method, headers=headers,
+                                     environ_overrides={'REMOTE_ADDR': addr})
+
+
+def test_loopback_get_report_passes_in_enforce(env):
+    assert from_addr(PROTECTED, '127.0.0.1').status_code == 200
+    assert from_addr(PROTECTED, '::1').status_code == 200
+
+
+def test_non_loopback_get_report_still_refused(env):
+    assert from_addr(PROTECTED, '192.0.2.10').status_code == 403
+
+
+def test_forwarded_for_cannot_fake_loopback(env):
+    r = from_addr(PROTECTED, '192.0.2.10', **{'X-Forwarded-For': '127.0.0.1', 'X-Real-Ip': '127.0.0.1'})
+    assert r.status_code == 403
+
+
+def test_loopback_never_opens_action_routes_posts_or_share(env):
+    assert from_addr('/retire-seeds?apply=1', '127.0.0.1').status_code == 405
+    assert from_addr('/verify-labels', '127.0.0.1').status_code == 405
+    assert from_addr(PROTECTED, '127.0.0.1', method='POST').status_code == 403
+    assert from_addr('/webhook/radarr', '127.0.0.1', method='POST').status_code == 403
+    assert from_addr('/share/', '127.0.0.1').status_code == 403
