@@ -154,3 +154,11 @@ def test_backtest_counts_and_pass_bar(tmp_path, capsys):
     # a model that says fix on a human-only row is held to ask by the same hard rules
     res = bt.backtest([facts(human_only=True)], lambda prompt: FIX)
     assert res['agree'] == 1 and res['pair:ask->ask'] == 1
+
+
+def test_listed_by_llm_layers_and_llm_stats():
+    assert la.layer_status({'LLM_DECISIONS': 'shadow'})['modes'][K] == 'off'
+    assert K in la.llm_stats([])
+    client = aw.app.test_client()
+    assert K in client.get('/llm-layers').get_json()['modes']
+    assert K in client.get('/llm-stats').get_json()['kinds']
