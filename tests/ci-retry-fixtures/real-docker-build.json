@@ -1,0 +1,38 @@
+{
+  "total_count": 1,
+  "jobs": [
+    {
+      "id": 1,
+      "name": "build",
+      "status": "completed",
+      "conclusion": "failure",
+      "runner_id": 1,
+      "steps": [
+        {
+          "number": 1,
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "number": 2,
+          "name": "Run actions/checkout@v4",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "number": 3,
+          "name": "Run docker/setup-buildx-action@v3",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "number": 4,
+          "name": "Run docker/build-push-action@v6",
+          "status": "completed",
+          "conclusion": "failure"
+        }
+      ]
+    }
+  ]
+}
