@@ -86,7 +86,9 @@ def env(monkeypatch, tmp_path):
 
 def client():
     # The test client's peer is loopback by default; real callers are not.
-    return aw.app.test_client(environ_base={'REMOTE_ADDR': 'remote-peer'})
+    c = aw.app.test_client()
+    c.environ_base['REMOTE_ADDR'] = 'remote-peer'
+    return c
 
 
 def get(path='/llm-stats', **headers):
