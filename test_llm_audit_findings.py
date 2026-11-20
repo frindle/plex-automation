@@ -89,15 +89,15 @@ def test_shadow_keeps_rules_action_logs_and_caches():
 def test_library_audit_facts_have_no_names():
     entry = {'hash': 'abc', 'name': 'Synthetic.Release.1080p', 'label': 'radarr-upgrade',
              'save_path': '/data/Media/Movies/Synthetic', 'state': 'Error',
-             'message': 'Missing or invalid torrent data!', 'reasons': ['error', 'arr-label-in-library']}
-    rows = la_.finding_facts(entry)
+             'reasons': ['error', 'arr-label-in-library']}
+    rows = la_.finding_facts(entry, 'Missing or invalid torrent data!')
     assert [r['finding'] for r in rows] == ['missing_data', 'arr_label_in_library']
     assert all(r['label_class'] == 'radarr' and r['rules_action'] == 'ask' for r in rows)
     assert rows[0]['human_only'] is False and rows[0]['data_at_risk'] is True
     assert rows[1]['human_only'] is True
     blob = json.dumps(rows)
     assert 'Synthetic' not in blob and '/data' not in blob and 'abc' not in blob
-    plain = la_.finding_facts({'hash': 'h', 'name': 'n', 'label': '', 'reasons': ['error'], 'message': 'x'})
+    plain = la_.finding_facts({'hash': 'h', 'name': 'n', 'label': '', 'reasons': ['error']}, 'x')
     assert plain[0]['finding'] == 'error' and plain[0]['data_at_risk'] is False and plain[0]['label_class'] == 'none'
 
 

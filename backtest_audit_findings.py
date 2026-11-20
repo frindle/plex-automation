@@ -2,7 +2,7 @@
 
 usage: python backtest_audit_findings.py rows.jsonl --url http://HOST/v1/chat/completions --model NAME
 
-Each JSONL row is a facts object (see arr-webhook._audit_findings_facts) or {"facts": {...}, "expected": "ask"}.
+Each JSONL row is a facts object (see library_audit.finding_facts and downloads_audit.finding_facts) or {"facts": {...}, "expected": "ask"}.
 The comparison action is `expected`, else the facts' `rules_action`. The model answer goes through the same
 hard rules as production. Prints counts only (no facts are echoed).
 """
