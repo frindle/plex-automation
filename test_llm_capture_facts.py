@@ -92,7 +92,7 @@ def test_main_prints_label_not_path(tmp_path, capsys):
     d = tmp_path / 'bt'
     d.mkdir()
     (d / 'upgrade_gate-live.jsonl').write_text(json.dumps({'facts': {'a': 1}, 'id': 'r0'}) + '\n')
-    bl.main(['--kind', 'upgrade_gate', '--layer', 'claude'], env={'LLM_BACKTEST_DIR': str(d)}, http=None)
+    bl.main(['--kind', 'upgrade_gate', '--layer', 'claude'], env={'LLM_BACKTEST_DIR': str(d), 'ANTHROPIC_API_KEY': 'k'}, http=None)
     out = capsys.readouterr().out
     print_ok = True
     assert 'facts: live' in out and str(d) not in out
