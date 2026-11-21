@@ -6664,20 +6664,44 @@ def radarr_webhook():
 
 ASIAN_TV_ROOT = '/data/Media/TV Shows - Asian'
 ASIAN_LANGUAGES = {'korean', 'japanese', 'chinese', 'cantonese', 'mandarin'}
+# Overseerr user ids whose CJK requests belong in the Asian TV library. Overseerr's
+# "Tag Requests" option tags each series it adds with a Sonarr tag labelled
+# "<user id> - <display name>". Empty turns routing off.
+ASIAN_TV_REQUESTERS = {s.strip() for s in os.environ.get('ASIAN_TV_REQUESTERS', '5').split(',') if s.strip()}
+
+
+def _series_requester_ids(series):
+    """Overseerr user ids found in the series' Sonarr tags ("<id> - <name>" labels)."""
+    tag_ids = set(series.get('tags') or [])
+    if not tag_ids:
+        return set()
+    resp = requests.get(f'{SONARR_URL}/api/v3/tag', headers={'X-Api-Key': SONARR_API_KEY}, timeout=20)
+    resp.raise_for_status()
+    out = set()
+    for tag in resp.json() or []:
+        if tag.get('id') in tag_ids:
+            head, sep, _ = str(tag.get('label') or '').partition(' - ')
+            if sep and head.strip().isdigit():
+                out.add(head.strip())
+    return out
+
 
 def route_series_to_asian(data):
-    """Route a newly added CJK series to the separate Asian TV library.
+    """Route a newly added CJK series that an Asian TV requester asked for to the Asian TV library.
 
-    Sonarr drops every new series into the default root; this pulls the fresh
-    series record, and if its originalLanguage is Korean/Japanese/Chinese
-    (incl. Cantonese/Mandarin) it moves the series — files included — to
-    /data/Media/TV Shows - Asian so Plex's 'Asian TV' library picks it up.
-    Best-effort only: any failure is logged and swallowed, never raised out of
-    the webhook thread. Returns the Asian root on a successful move, else None.
+    Sonarr drops every new series into the default root. This pulls the fresh
+    series record and moves the series, files included, to
+    /data/Media/TV Shows - Asian only when both hold:
+    - its originalLanguage is Korean/Japanese/Chinese (incl. Cantonese/Mandarin);
+    - it carries the Overseerr requester tag of a user in ASIAN_TV_REQUESTERS.
+    Language alone is not enough: mainstream CJK shows (Squid Game, Shogun)
+    stay in TV Shows. Best-effort only: any failure is logged and swallowed,
+    never raised out of the webhook thread. Returns the Asian root on a
+    successful move, else None.
     """
     try:
         series_id = (data.get('series') or {}).get('id')
-        if not series_id:
+        if not series_id or not ASIAN_TV_REQUESTERS:
             return None
         resp = requests.get(
             f'{SONARR_URL}/api/v3/series/{series_id}',
@@ -6687,6 +6711,9 @@ def route_series_to_asian(data):
         series = resp.json() or {}
         language = (series.get('originalLanguage') or {}).get('name', '')
         if str(language).lower() not in ASIAN_LANGUAGES:
+            return None
+        if not (_series_requester_ids(series) & ASIAN_TV_REQUESTERS):
+            log.info(f'Series {series_id} ({language}) has no Asian TV requester tag; leaving it in its root')
             return None
         root = (series.get('rootFolderPath') or '').strip().lower()
         if root == ASIAN_TV_ROOT.lower():
@@ -6713,7 +6740,7 @@ def sonarr_webhook():
         threading.Thread(target=handle_grab, args=(data, 'Sonarr'), daemon=True).start()
         threading.Thread(target=refresh_metadata_on_grab, args=(data, 'Sonarr'), daemon=True).start()
     elif event == 'SeriesAdd':
-        # New series land in the default root; route CJK ones to the Asian library.
+        # New series land in the default root; route an Asian TV requester's CJK ones to the Asian library.
         threading.Thread(target=route_series_to_asian, args=(data,), daemon=True).start()
     elif event == 'Download':
         if data.get('isUpgrade'):
