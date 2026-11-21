@@ -74,6 +74,7 @@ def wait_until(pred, timeout=60.0, poll=0.1, what="condition"):
         if v:
             return v
         if time.monotonic() >= end:
+            what = what() if callable(what) else what
             raise AssertionError(f"timed out after {timeout:.0f}s waiting for {what}")
         time.sleep(poll)
 
@@ -167,6 +168,8 @@ class _GateHandler(_Q):
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
         self.wfile.write(b)
+        if o.after_ask:
+            o.after_ask(paths)
 
 
 class FakeGate(fk._Server):
@@ -177,6 +180,7 @@ class FakeGate(fk._Server):
         self.keep_seeding = False
         self.down = False
         self.asked = []
+        self.after_ask = None  # called with the paths once an answer has gone out
         super().__init__(_GateHandler)
 
 
@@ -304,6 +308,7 @@ class Stack:
             "NEWZNAB_INDEXERS": json.dumps(
                 [{"name": "standin", "url": self.indexer.url, "apikey": self.indexer.key}]),
             "NEWZNAB_GRAB_INTERVAL": "0", "NEWZNAB_MIN_INTERVAL_S": "0",
+            "NEWZNAB_GRAB_BUDGET": "1000", "NEWZNAB_SEARCH_BUDGET": "1000",
             "NNTP_PRIMARY_HOST": "127.0.0.1", "NNTP_PRIMARY_PORT": str(self.nntp1.port),
             "NNTP_PRIMARY_USER": "nu", "NNTP_PRIMARY_PASS": "np", "NNTP_PRIMARY_TLS": "0",
             "NNTP_SECONDARY_HOST": "127.0.0.1", "NNTP_SECONDARY_PORT": str(self.nntp2.port),
