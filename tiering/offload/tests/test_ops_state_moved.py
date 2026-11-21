@@ -4,7 +4,6 @@ import os
 
 import pytest
 
-from tiering.offload import ops
 from tiering.offload import state as st
 from tiering.offload.tests.test_ops import ID, Env
 
