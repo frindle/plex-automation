@@ -80,6 +80,51 @@ Env for the intake clients (the design is in `OFFLOAD_DESIGN.md`):
 - `TIERING_ARR_PATH_MAP` (`arr_prefix=share_prefix`, optional) maps Radarr/Sonarr paths to share paths; `TIERING_PATH_MAP` (`share_prefix=disk_prefix`, one entry per disk) finds the file to stat. `register` stores the share path.
 - `NEWZNAB_SEARCH_BUDGET` (30 per indexer per 24 hours), `NEWZNAB_GRAB_BUDGET` (10 per 24 hours), `NEWZNAB_MIN_INTERVAL_S` (2) and `NEWZNAB_GRAB_INTERVAL` (1) keep the indexers from banning the account. An indexer is dropped for the window after 3 errors in a row, or on a 429. The client can keep these budgets in a file (`state_path`), so a restart does not reset them.
 
+## Offload runner (deploy)
+
+`python -m offload.runner` is the long-running process that applies the hot set (see `OFFLOAD_DESIGN.md`). It is a dry run unless `TIERING_APPLY=1`. With `TIERING_APPLY=1` it refuses to start without `TIERING_GATE_PATH_MAP` and `TIERFS_STUB_ROOTS`.
+
+`lib_path` in the database is the share path, the one Plex reports. The runner and ops resolve the disk path at the moment they need it, and a file that is not on exactly one disk is skipped and logged.
+
+Container requirements:
+- `pid: host`. Plex reads through Unraid's user share, so only the shfs daemon's open file descriptor shows that a file is in use. The runner has to see host processes to find it.
+- `cap_add: SYS_PTRACE`, so it can read `/proc/<pid>/fd` of those processes.
+- `TIERING_PROC_CANARY`: the `comm` of the media server process, which must be visible from the runner (`Plex Media Serv`: the kernel cuts `comm` to 15 characters, so write it cut). If it is unset or not visible, the open-file check says "not clear" and ops refuses to demote, so a container that does not see host processes cannot demote.
+- Two kinds of mount: the share at the path Plex uses (so `lib_path` reads) and each `/mnt/diskN` (where file operations run, never through the share's FUSE layer).
+
+```yaml
+services:
+  tiering-runner:
+    image: plex-automation
+    command: python -m offload.runner
+    pid: host
+    cap_add: [SYS_PTRACE]
+    volumes:
+      - /mnt/user/media:/media                 # the share, at Plex's path
+      - /mnt/disk1:/mnt/disk1
+      - /mnt/disk2:/mnt/disk2
+      - /mnt/cache/appdata/tiering:/state
+    environment:
+      TIERING_DB: /state/tiering.db
+      TIERING_APPLY: "0"                       # "1" to apply
+      TIERING_PROC_CANARY: "Plex Media Serv"
+      TIERING_PATH_MAP: /media=/mnt/disk1/media,/media=/mnt/disk2/media
+      TIERING_ARR_PATH_MAP: /tv=/media/tv,/movies=/media/movies
+      TIERING_GATE_PATH_MAP: /mnt/disk1/media=/data/media,/mnt/disk2/media=/data/media
+      TIERFS_STUB_ROOTS: /mnt/disk1/.stubs,/mnt/disk2/.stubs
+      TIERFS_MOUNT: /tierfs
+      TIERFS_MANIFESTS: /state/manifests
+      TIERFS_EVENTS: /state/events.jsonl
+```
+
+Path settings, each a comma list:
+- `TIERING_PATH_MAP`: `share_prefix=disk_prefix`, one entry per disk; several entries may share one share prefix (`/media=/mnt/disk1/media,/media=/mnt/disk2/media`). Only a candidate that exists counts.
+- `TIERING_ARR_PATH_MAP`: `arr_prefix=share_prefix`, for arrs that see other paths than Plex (`/tv=/media/tv`). Used by register.
+- `TIERING_GATE_PATH_MAP`: `disk_prefix=deluge_prefix`, the disk path in the torrent client's namespace. Several disk prefixes may map to one client prefix.
+- `TIERFS_STUB_ROOTS`: one stub directory per disk (`/mnt/disk1/.stubs,/mnt/disk2/.stubs`). Ops picks the one on the same disk as the file.
+
+Alerts go to `TIERING_ALERTS` (JSON lines): `bad_chunk`, `slot_timeout`, `promote_failed`, `demote_failed`, `register_failed`, and once per id `promote_short_remote` and `takeover_orphan`. A register with errors, or with missing or ambiguous files over 5% of the files it listed, blocks that night's demotes.
+
 ## Tests (run on a Linux test box)
 ```
 bash tiering/tests/test_glacier.sh        # fake /mnt tree, df and torrent gate stubbed
