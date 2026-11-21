@@ -38,6 +38,9 @@ These names apply to each library file system.
   - The stub keeps the original bytes in `[0, head_len)` and `[size - tail_len, size)`.
   - Everything else in the stub is a hole, made with `fallocate(PUNCH_HOLE | KEEP_SIZE)`.
   - The stub's mtime is the original mtime.
+- **Real file system only:** every file operation (link, `renameat2(RENAME_EXCHANGE)`, hole punch, nlink and inode checks) runs on the disk's own mount, never through a union or user-share FUSE layer. Such a layer can report nlink 1 for a hardlinked file and may not support `RENAME_EXCHANGE`. `TIERING_PATH_MAP` maps the share path Plex and the arrs report to the disk path that holds the file. A file that can't be mapped to exactly one disk path is never offloaded.
+  - The stub root is per disk (`${stub_root}` on the same disk as `L`).
+  - Anything else that moves library files between disks (for example a glacier mover) must skip a symlink that points into `${TIERFS_MOUNT}`.
 - `<id>` is 16 lowercase hex characters. It is random, assigned once, and never reused.
 - `head_len` is `ceil(size * head_frac)`, where `head_frac` defaults to 0.20.
   - It is rounded up to a 1 MiB boundary.
