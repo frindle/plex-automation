@@ -241,6 +241,7 @@ The inputs are plain dicts shaped like Plex's JSON: `ratingKey`, `grandparentRat
      - `pwrite` it into the stub's hole and `fdatasync`;
      - then append its start offset as one decimal line to `${TIERFS_MANIFESTS}/<id>.fill` and flush.
    - **Resume:** a resumed promote trusts the chunks the fill file already lists.
+   - **API:** `ops.promote(..., want: Callable[[], int | None] | None = None)`. The runner passes `want`; promote calls it before each chunk, and it returns the newest wanted offset for this id, or None.
    - **Errors:**
      - a fetch error is retried with backoff for up to `TIERING_PROMOTE_RETRY_S` (default 600) per chunk;
      - a BLAKE3 mismatch on two fetches stops the promote at once: append `failed <offset>` and set `state=failed`, as in step 2.
