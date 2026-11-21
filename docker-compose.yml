@@ -90,6 +90,19 @@ services:
       SEED_RETIRE_DAYS: "${SEED_RETIRE_DAYS:-180}"
       # ...or sooner when idle: no upload in this many days, seeded at least SEED_DAYS (0 = off).
       SEED_IDLE_DAYS: "${SEED_IDLE_DAYS:-14}"
+      # Glacier disk (disk1) quiet hours; off. HOLD_DISK1_UPGRADES: a finished upgrade download whose old file is
+      # on disk1 (per GLACIER_INDEX, never a disk lookup) waits on a hold label until disk1 is up (spin log says so, or
+      # inside GLACIER_WINDOW, host local time); meanwhile the new copy is hardlinked into GLACIER_HOLD_ROOT under a "- glacier-tmp" name
+      # (needs the /srv/data mount below and PLEX_URL/PLEX_TOKEN) and Plex is asked to scan that folder.
+      HOLD_DISK1_UPGRADES: "${HOLD_DISK1_UPGRADES:-0}"
+      GLACIER_INDEX: "/glacier-spin/glacier-index.txt"   # written by the nightly mover, same dir as spin-*.tsv
+      # Hold folders for the stopgap hardlinks, outside the arr roots; add <root>/TV Shows and <root>/Movies to the
+      # Plex TV/Movie libraries first (python plex_hold_folders.py, dry run by default).
+      GLACIER_HOLD_ROOT: "${GLACIER_HOLD_ROOT:-data/Glacier Hold}"
+      GLACIER_PATH_MAP: "${GLACIER_PATH_MAP:-/data:data}"
+      GLACIER_SPIN_DIR: "/glacier-spin"
+      GLACIER_WINDOW: "${GLACIER_WINDOW:-22:00-06:00}"
+      GLACIER_TZ: "${GLACIER_TZ:-}"
       UNRAID_OLLAMA_URL: "${UNRAID_OLLAMA_URL:-}"
       LLM_UNRAID_MODEL: "${LLM_UNRAID_MODEL:-}"
       LLM_UNRAID_KINDS: "${LLM_UNRAID_KINDS:-}"
@@ -146,6 +159,10 @@ services:
       # files back into torrent folders (hardlinks cannot cross mount points).
       # Paths /data/X map to RELINK_DATA_ROOT/X.
       - "/mnt/user/data:/srv/data"
+      # Glacier wake logger's spin-*.tsv rows, read-only (used only when HOLD_DISK1_UPGRADES is on).
+      - "${GLACIER_SPIN_HOST_DIR:-/mnt/cache/appdata/glacier-wake/data}:/glacier-spin:ro"
+      # The host's zone file, so the glacier window is read in host local time (the container itself stays on UTC).
+      - "/etc/localtime:/glacier-localtime:ro"
 
 networks:
   br0:

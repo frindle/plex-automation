@@ -22,4 +22,5 @@ COPY move_list.py .
 COPY tiering_gate.py .
 COPY speed_cap.py .
 COPY stuck_plan.py .
+COPY glacier_hold.py .
 CMD ["python", "-u", "arr-webhook.py"]
