@@ -91,6 +91,7 @@ class _Conn:
             s = socket.create_connection((cfg.host, cfg.port), cfg.timeout)
             if cfg.tls:
                 ctx = ssl.create_default_context(cafile=cfg.cafile)
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
                 s = ctx.wrap_socket(s, server_hostname=cfg.host)
             s.settimeout(cfg.timeout)
             self.sock = s

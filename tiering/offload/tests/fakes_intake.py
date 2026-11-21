@@ -319,6 +319,7 @@ class FakeNntp:
                 sock, addr = s.socket.accept()
                 if cert:
                     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
                     ctx.load_cert_chain(*cert)
                     sock = ctx.wrap_socket(sock, server_side=True)
                 return sock, addr
