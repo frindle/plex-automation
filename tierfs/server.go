@@ -395,6 +395,13 @@ type fileNode struct {
 }
 
 func (f *fileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	// An open handle knows its manifest even after the entry is removed
+	// (promote while a player holds the file).
+	if h, ok := fh.(*handle); ok && h != nil {
+		fillAttr(&out.Attr, h.m)
+		out.SetTimeout(kernelTTL)
+		return 0
+	}
 	e := f.srv.get(f.name)
 	if e == nil {
 		return syscall.ENOENT

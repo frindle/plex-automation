@@ -102,7 +102,7 @@ func NewRemote(cfg RemoteConfig, m *Metrics) (*Remote, error) {
 		cfg.ReadAhead = 32 << 20
 	}
 	if cfg.MaxStreams <= 0 {
-		cfg.MaxStreams = 8
+		cfg.MaxStreams = 16
 	}
 	if cfg.Window <= 0 {
 		cfg.Window = 10 * time.Second
@@ -201,6 +201,10 @@ type stream struct {
 	recv    atomic.Int64  // bytes received, in pieces, for stall detection
 	done    chan struct{} // closed when the producer goroutine exits
 
+	warm      bool          // started ahead of any reader; no slot deadline until attached
+	attached  atomic.Bool   // a reader has called readAt
+	attachSig chan struct{} // first reader -> acquire
+
 	mu     sync.Mutex
 	chunks []chunk
 	low    int64 // first retained byte
@@ -217,11 +221,18 @@ func (r *Remote) newStream(id, remotePath string, start, limit int64) *stream {
 // newVerifiedStream is newStream with every chunk checked against ck before
 // it is made readable. start must be chunk-aligned when ck is set.
 func (r *Remote) newVerifiedStream(id, remotePath string, start, limit int64, ck *chunkCheck) *stream {
+	return r.startStream(id, remotePath, start, limit, ck, false)
+}
+
+// startStream starts the producer. A warm stream (pre-warm, no reader yet) has
+// no slot deadline until its first reader attaches.
+func (r *Remote) startStream(id, remotePath string, start, limit int64, ck *chunkCheck, warm bool) *stream {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &stream{
 		r: r, id: id, url: r.urlFor(remotePath), start: start, limit: limit, ck: ck,
 		ctx: ctx, cancel: cancel,
 		dataSig: make(chan struct{}, 1), roomSig: make(chan struct{}, 1), done: make(chan struct{}),
+		attachSig: make(chan struct{}, 1), warm: warm,
 		low: start, end: start, maxPos: start,
 	}
 	s.touch()
@@ -353,16 +364,34 @@ func (s *stream) acquire() bool {
 	defer s.queued.Store(false)
 	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
-	limit := time.NewTimer(s.r.cfg.SlotWait)
-	defer limit.Stop()
+	var limit *time.Timer
+	var limitC <-chan time.Time
+	startLimit := func() {
+		limit = time.NewTimer(s.r.cfg.SlotWait)
+		limitC = limit.C
+	}
+	defer func() {
+		if limit != nil {
+			limit.Stop()
+		}
+	}()
+	if !s.warm {
+		startLimit()
+	}
 	for {
 		select {
+		case <-s.attachSig:
+			// First reader of a warm stream: its wait starts now, not when
+			// the warm stream was queued.
+			if limit == nil {
+				startLimit()
+			}
 		case s.r.sem <- struct{}{}:
 			s.r.track(s)
 			return true
 		case <-s.ctx.Done():
 			return false
-		case <-limit.C:
+		case <-limitC:
 			s.r.m.SlotTimeouts.Add(1)
 			log.Printf("stream %s: no slot after %v; %d of %d streams active", s.id, s.r.cfg.SlotWait, s.r.m.ActiveStreams.Load(), s.r.cfg.MaxStreams)
 			s.finish(errSlotTimeout)
@@ -519,6 +548,9 @@ func (s *stream) run() {
 // error. errOutOfWindow means off is behind the retained data.
 func (s *stream) readAt(ctx context.Context, p []byte, off int64) error {
 	s.touch()
+	if s.attached.CompareAndSwap(false, true) {
+		notify(s.attachSig)
+	}
 	need := off + int64(len(p))
 	stall := s.r.cfg.Window + 2*time.Second
 	timer := time.NewTimer(stall)

@@ -459,6 +459,7 @@ func TestFuseRemovedManifestKeepsOpenHandle(t *testing.T) {
 			t.Fatalf("wrong bytes at %d after removal", off)
 		}
 	}
+	time.Sleep(1200 * time.Millisecond) // let the kernel attr cache expire
 	if fi, err := f.Stat(); err != nil || fi.Size() != e.m.Size {
 		t.Fatalf("fstat after removal: %v, %v", fi, err)
 	}

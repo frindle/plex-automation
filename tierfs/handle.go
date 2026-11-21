@@ -102,7 +102,11 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 }
 
 func (h *handle) newStream(off int64) *stream {
-	s := h.srv.remote.newVerifiedStream(h.m.ID, h.m.RemotePath, h.ck.alignDown(off), h.m.MidEnd(), h.ck)
+	return h.startStream(off, false)
+}
+
+func (h *handle) startStream(off int64, warm bool) *stream {
+	s := h.srv.remote.startStream(h.m.ID, h.m.RemotePath, h.ck.alignDown(off), h.m.MidEnd(), h.ck, warm)
 	h.st = s
 	h.cur.Store(s)
 	return s
@@ -128,14 +132,16 @@ func (h *handle) maybeWarm(readEnd int64) {
 	if h.closed.Load() {
 		return
 	}
-	// Start (or restart, if the stream idled out or a seek moved it away) a
+	// Start (or restart, if the stream failed or a seek moved it away) a
 	// stream at the head of the middle. A live stream that already covers it
 	// is left alone.
-	if h.st != nil && h.st.alive() && h.st.covers(h.m.HeadLen) {
+	// An evicted stream that still holds the start of the middle is kept:
+	// restarting it would refetch the read-ahead for nothing.
+	if h.st != nil && h.st.covers(h.m.HeadLen) {
 		return
 	}
 	h.dropStream()
-	h.newStream(h.m.HeadLen)
+	h.startStream(h.m.HeadLen, true)
 }
 
 func (h *handle) readMid(ctx context.Context, p []byte, off int64) error {
