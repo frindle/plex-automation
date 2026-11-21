@@ -17,7 +17,7 @@ read from Usenet through AltMount's WebDAV. Plex is not told anything changed.
 The hot-set code implements these rules.
 
 - **Never offloaded:**
-  - the Adult and Asian TV sections;
+  - the Adult section (`Cfg.never_sections`; Asian TV is offloadable);
   - files Radarr and Sonarr don't manage;
   - files still seeding (the glacier gate is not "free");
   - files with more than one hardlink;
@@ -123,7 +123,7 @@ class RemoteReader(Protocol):
 
 ```python
 @dataclass(frozen=True)
-class Cfg: new_days=30; idle_days=60; near_end_eps=3; keep_4k=False; max_stream_kbps=0
+class Cfg: new_days=30; idle_days=60; near_end_eps=3; keep_4k=False; max_stream_kbps=0; never_sections=("Adult",)
 @dataclass(frozen=True)
 class Action: kind: str  # "promote" | "demote"
               rating_key: str; reason: str; priority: int  # 0 = now (live session)
