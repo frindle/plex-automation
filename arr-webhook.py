@@ -27,6 +27,7 @@ from html import escape as _html_escape
 import arr_health
 import deluge_trim
 import stuck_plan
+import glacier_hold
 import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -3496,6 +3497,8 @@ def cleanup_stalled_seeds(dry_run=False):
         for h, info in torrents.items():
             if not (info.get('label') or '').strip():
                 continue  # unlabeled/unmanaged torrent -- not ours to touch
+            if (info.get('label') or '') == GLACIER_HOLD_LABEL:
+                continue  # waiting on disk1; the hold pass puts it back
             if info.get('state') in ('Queued', 'Downloading', 'Checking', 'Allocating'):
                 continue
             uploaded = info.get('total_uploaded', 0)
@@ -6175,6 +6178,8 @@ def verify_and_fix_labels(services=('radarr', 'sonarr')):
         torrents = get_all_torrents(force=True)
         if not torrents:
             return fixed
+        held = _glacier_held_hashes()      # a download held for disk1 keeps its hold label
+        torrents = {h: t for h, t in torrents.items() if h not in held}
 
         if 'radarr' in services:
             try:
@@ -6925,7 +6930,7 @@ def purge_non_radarr():
         s.strip().lower() for s in
         request.args.get('keep', 'radarr,radarr-upgrade,superseded').split(',')
         if s.strip()
-    }
+    } | {GLACIER_HOLD_LABEL}
     # A torrent is treated as "broken" when its progress is below this
     # threshold. Default 100 (anything not fully downloaded). Pass
     # ?broken_below=1 to only sweep the truly-never-started zeros while
@@ -11744,6 +11749,224 @@ def _digest_arr_health_html():
         return ''
 
 
+# ── Glacier disk (disk1): hold work that would wake it ──────────────────────
+# See glacier_hold.py. The switch defaults off. The index and the spin logger's directory are read
+# as plain files; nothing here ever touches /mnt/disk1 or /mnt/user.
+HOLD_DISK1_UPGRADES = os.environ.get('HOLD_DISK1_UPGRADES', '0').lower() in ('1', 'true', 'yes')
+GLACIER_INDEX = os.environ.get('GLACIER_INDEX', '/data/glacier-index.txt')
+GLACIER_INDEX_MAX_AGE_DAYS = float(os.environ.get('GLACIER_INDEX_MAX_AGE_DAYS', str(glacier_hold.INDEX_MAX_AGE_DAYS)))
+GLACIER_SPIN_DIR = os.environ.get('GLACIER_SPIN_DIR', '/glacier-spin')
+GLACIER_WINDOW = os.environ.get('GLACIER_WINDOW', glacier_hold.DEFAULT_WINDOW)
+GLACIER_TZ = os.environ.get('GLACIER_TZ', '')           # IANA zone for the window; empty = container local time
+GLACIER_POLL_S = float(os.environ.get('GLACIER_POLL_S', '15'))
+GLACIER_STATE = os.environ.get('GLACIER_STATE', '/data/glacier_hold_state.json')
+GLACIER_HOLD_LABEL = glacier_hold.HOLD_LABEL
+_glacier_lock = threading.RLock()
+_glacier_checked = set()
+
+
+def _glacier_load():
+    try:
+        with open(GLACIER_STATE) as f:
+            d = _json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _glacier_held_hashes():
+    """Hashes currently held, for the passes that would otherwise relabel or purge them."""
+    try:
+        return set((_glacier_load().get('held') or {}))
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _glacier_now_dt():
+    if GLACIER_TZ:
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo(GLACIER_TZ))
+        except Exception:  # noqa: BLE001
+            pass
+    return datetime.now()
+
+
+class GlacierIO:
+    """The I/O glacier_hold needs, over this app's Sonarr/Radarr/Deluge settings."""
+
+    def __init__(self, state_doc):
+        self.doc = state_doc
+        self._arrs = {who: (url, key) for who, url, key in
+                      (('Sonarr', SONARR_URL, SONARR_API_KEY), ('Radarr', RADARR_URL, RADARR_API_KEY)) if key}
+
+    def services(self):
+        return list(self._arrs)
+
+    def now(self):
+        return time.time()
+
+    def _get(self, who, path, params=None):
+        url, key = self._arrs[who]
+        r = requests.get(f'{url}{path}', headers={'X-Api-Key': key}, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
+
+    def torrents(self):
+        deluge_login()
+        return get_all_torrents(force=True)
+
+    def queue(self, who):
+        size = 1000 if who == 'Sonarr' else 500
+        return (self._get(who, '/api/v3/queue', {'pageSize': size}) or {}).get('records') or []
+
+    def old_paths(self, who, recs):
+        """Paths of the files these queue rows would replace (empty = not an upgrade)."""
+        out = []
+        if who == 'Sonarr':
+            for ep_id in sorted({r.get('episodeId') for r in recs if r.get('episodeId') is not None}):
+                ep = self._get(who, f'/api/v3/episode/{ep_id}') or {}
+                if not ep.get('hasFile'):
+                    continue
+                path = (ep.get('episodeFile') or {}).get('path')
+                if not path and ep.get('episodeFileId'):
+                    path = (self._get(who, f'/api/v3/episodefile/{ep["episodeFileId"]}') or {}).get('path')
+                if path:
+                    out.append(path)
+        else:
+            for mid in sorted({r.get('movieId') for r in recs if r.get('movieId') is not None}):
+                mv = self._get(who, f'/api/v3/movie/{mid}') or {}
+                if mv.get('hasFile') and (mv.get('movieFile') or {}).get('path'):
+                    out.append(mv['movieFile']['path'])
+        return out
+
+    def has_grab(self, who, download_id):
+        recs = self._get(who, '/api/v3/history', {'downloadId': download_id, 'pageSize': 50}) or {}
+        recs = recs.get('records') if isinstance(recs, dict) else recs
+        return any(str(r.get('eventType') or '').lower() == 'grabbed'
+                   and str(r.get('downloadId') or '').lower() == download_id for r in (recs or []))
+
+    def set_label(self, h, label):
+        set_torrent_label(h, label)
+        _invalidate_snapshot()
+
+    def refresh(self, who):
+        url, key = self._arrs[who]
+        requests.post(f'{url}/api/v3/command', headers={'X-Api-Key': key},
+                      json={'name': 'RefreshMonitoredDownloads'}, timeout=20).raise_for_status()
+
+    # -- the stopgap link: the better copy hardlinked next to the old one under a marked name ------------
+    def pick_source(self, output_path):
+        """The download's biggest video file as a '/data/...' path, or None. Walks only the download folder."""
+        real = _relink_path(output_path or '')
+        if not real:
+            return None
+        if os.path.isfile(real):
+            return output_path
+        best, best_size = None, -1
+        for root, _dirs, files in os.walk(real):
+            for fn in files:
+                if os.path.splitext(fn)[1].lower() not in glacier_hold.VIDEO_EXTS:
+                    continue
+                try:
+                    size = os.stat(os.path.join(root, fn)).st_size
+                except OSError:
+                    continue
+                if size > best_size:
+                    best, best_size = posixpath.join(output_path, os.path.relpath(os.path.join(root, fn), real)), size
+        return best
+
+    def link(self, src, dst):
+        """Hardlink src to dst (both '/data/...' paths, mapped under RELINK_DATA_ROOT). A hardlink shares the
+        source's inode, so it can only sit on the source's filesystem; never overwrites."""
+        a, b = _relink_path(src), _relink_path(dst)
+        if not a or not b:
+            raise OSError('unmappable path')
+        os.link(a, b)
+
+    def unlink(self, dst):
+        b = _relink_path(dst)
+        if not b or glacier_hold.LINK_MARK not in os.path.basename(b):
+            raise OSError('refusing to remove an unmarked path')
+        os.unlink(b)
+
+    def plex_scan(self, folder):
+        """Partial scan of one folder: GET /library/sections/{id}/refresh?path=..."""
+        local = folder
+        plex_path = local
+        for plex_prefix, local_prefix in PLEX_PATH_MAP:
+            if local == local_prefix or local.startswith(local_prefix.rstrip('/') + '/'):
+                plex_path = plex_prefix.rstrip('/') + local[len(local_prefix.rstrip('/')):]
+                break
+        secs = (_plex_get('/library/sections') or {}).get('MediaContainer', {}).get('Directory') or []
+        for sec in secs:
+            for loc in sec.get('Location') or []:
+                root = (loc.get('path') or '').rstrip('/')
+                if root and (plex_path == root or plex_path.startswith(root + '/')):
+                    _plex_get(f"/library/sections/{sec['key']}/refresh", {'path': plex_path})
+                    return
+        raise RuntimeError('no plex section for folder')
+
+    def save(self, held):
+        self.doc['held'] = held
+        _write_json_atomic(GLACIER_STATE, self.doc)
+
+
+def glacier_tick(now=None, io=None, now_dt=None, sleep=time.sleep):
+    """One pass: release when disk1 is up (or the hold was switched off), else hold new candidates;
+    Returns a dict of counts."""
+    now = time.time() if now is None else now
+    out = {}
+    with _glacier_lock:
+        doc = _glacier_load()
+        doc.setdefault('held', {})
+        io = io or GlacierIO(doc)
+        io.doc = doc
+        up, why = glacier_hold.disk1_up(GLACIER_SPIN_DIR, GLACIER_WINDOW, now_dt or _glacier_now_dt())
+        if doc['held'] and (up or not HOLD_DISK1_UPGRADES):
+            out['release'] = dict(glacier_hold.release_pass(io, doc['held'], sleep=sleep))
+            _glacier_checked.clear()
+        elif HOLD_DISK1_UPGRADES and not up:
+            prefixes = glacier_hold.load_index(GLACIER_INDEX, now, GLACIER_INDEX_MAX_AGE_DAYS)
+            if prefixes:
+                labels = {'sonarr', 'radarr', *[lb.lower() for lb in UPGRADE_LANE_LABELS]}
+                out['hold'] = dict(glacier_hold.hold_pass(io, doc['held'], prefixes, labels, _glacier_checked))
+        if out.get('hold') or out.get('release'):
+            _write_json_atomic(GLACIER_STATE, doc)
+    if any(v for v in out.values()):
+        log.info(f'[glacier] disk1={why} {out}')
+    return out
+
+
+def glacier_startup(io=None):
+    """Once at start: list leftover stopgap links and clear any with no live hold behind it. Counts only."""
+    with _glacier_lock:
+        doc = _glacier_load()
+        if not (doc.get('held') or {}):
+            return {}
+        doc.setdefault('held', {})
+        io = io or GlacierIO(doc)
+        io.doc = doc
+        out = dict(glacier_hold.reconcile(io, doc['held']))
+        _write_json_atomic(GLACIER_STATE, doc)
+    log.info(f'[glacier] startup {out}')
+    return out
+
+
+def glacier_scheduler():
+    try:
+        glacier_startup()
+    except Exception as e:  # noqa: BLE001
+        log.error(f'[glacier] startup failed: {type(e).__name__}')
+    while True:
+        try:
+            if HOLD_DISK1_UPGRADES or _glacier_held_hashes():
+                glacier_tick()
+        except Exception as e:  # noqa: BLE001
+            log.error(f'[glacier] tick failed: {type(e).__name__}')
+        time.sleep(GLACIER_POLL_S)
+
+
 def maintenance_scheduler():
     """Every 6 hours: heal errored torrents, then look for duplicate library
     folders. Shares one thread because the dupe scan is scandir-only (sizes
@@ -11862,4 +12085,6 @@ if __name__ == '__main__':
     t14.start()
     t15 = threading.Thread(target=stuck_downloads_scheduler, daemon=True)
     t15.start()
+    t16 = threading.Thread(target=glacier_scheduler, daemon=True)
+    t16.start()
     app.run(host='0.0.0.0', port=port, threaded=True)
