@@ -75,8 +75,14 @@ class ItemFailed(NewznabError):
     not the indexer's. It never counts toward dropping the indexer."""
 
 
+class NotNzb(ItemFailed):
+    """What came back is no NZB (an HTML page, say). One such answer may be a maintenance
+    page, so it is only a strike against the release (see ``_mark_bad``)."""
+
+
 class BadRelease(ItemFailed):
-    """This release was found to have no NZB before; it is not grabbed again."""
+    """This release was found to have no NZB on two different nights; it is not grabbed
+    again until the mark expires."""
 
 
 class IndexersUnavailable(NewznabError):
@@ -95,6 +101,18 @@ WINDOW_S = 24 * 3600.0
 _BAD_MAX = 20000       # release ids remembered as having no NZB
 _ATTEMPTS_MAX = 20000  # rows whose last qualify attempt is remembered
 DROP_AFTER_ERRORS = 3
+# A release is called bad (not grabbed again) only after "no NZB" answers on two different
+# nights, at least BAD_CONFIRM_S apart. One answer can be a maintenance page, and a release
+# that is wrongly shut out costs a whole row; two nights apart is cheap and rules that out.
+# A confirmed mark expires after BAD_TTL_S without a new strike, so a release that comes
+# back is tried again; a valid NZB clears the mark at once.
+BAD_CONFIRM_S = 12 * 3600.0
+BAD_TTL_S = 7 * 24 * 3600.0
+# When one indexer answers with non-NZB bodies for this many different releases within
+# RUN_WINDOW_S and has given no NZB in between, the indexer is the problem (down, or an error
+# page for everything): it is dropped like any failing indexer and no release is marked.
+INDEXER_WIDE_AFTER = 4
+RUN_WINDOW_S = 3600.0
 
 
 def check_url(url: str) -> urllib.parse.SplitResult:
@@ -288,7 +306,10 @@ class NewznabClient:
         self._sync_depth = 0
         self._unsaved = False
         self._clamped = False
-        self._bad: collections.OrderedDict = collections.OrderedDict()  # indexer|guid -> time
+        # indexer|guid -> [first, last] wall times of "no NZB" answers (see BAD_CONFIRM_S)
+        self._bad: collections.OrderedDict = collections.OrderedDict()
+        self._run_bad: dict[str, collections.OrderedDict] = {}  # indexer -> key -> (t, previous)
+        self._sig = None  # (mtime_ns, size, inode) of the state file as last read or written
         self._attempts: dict[str, tuple[float, int]] = {}  # row key -> (last, row-fault nights)
         with self._sync():
             pass  # reads the file once at start, writing back any corrected times
@@ -308,9 +329,30 @@ class NewznabClient:
     def _from_wall(self, w: float) -> float:
         return self._clock() - (self._wall() - w)
 
+    def _file_sig(self):
+        try:
+            st = os.stat(self._state_path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+    def _refresh(self) -> None:
+        """For a read: reload only when the file changed since this client last read or wrote
+        it (a write is atomic, so no lock is needed). A big state file is not parsed per call."""
+        with self._lock:
+            if not self._state_path or self._sync_depth:
+                return
+            sig = self._file_sig()
+            if sig is not None and sig != self._sig:
+                self._load_state()
+                if self._clamped:  # corrected times are written back under the lock
+                    with self._sync():
+                        pass
+
     @contextlib.contextmanager
     def _sync(self):
-        """Hold the state-file lock and reload the file (outermost entry only)."""
+        """Hold the state-file lock and reload the file (outermost entry only). Every write
+        goes through here, so it always merges with what other processes saved."""
         with self._lock:
             if not self._state_path or self._sync_depth:
                 self._sync_depth += 1
@@ -344,6 +386,7 @@ class NewznabClient:
         clock that was set back cannot leave entries in the future."""
         if not self._state_path or self._unsaved:
             return  # nothing to read, or this client holds changes the file lacks
+        sig = self._file_sig()
         try:
             with open(self._state_path, encoding="utf-8") as f:
                 d = json.load(f)
@@ -366,14 +409,22 @@ class NewznabClient:
                 if until > now:
                     dropped[str(name)] = self._from_wall(until)
             errors = {str(n): int(c) for n, c in (d.get("errors") or {}).items()}
-            bad = {str(k): min(float(w), now) for k, w in (d.get("bad") or {}).items()}
+            bad = {}
+            for k, w in (d.get("bad") or {}).items():
+                if isinstance(w, (list, tuple)):
+                    first, last = min(float(w[0]), now), min(float(w[1]), now)
+                else:  # a single time: a mark that was confirmed
+                    last = min(float(w), now)
+                    first = last - BAD_CONFIRM_S
+                bad[str(k)] = [min(first, last), last]
             attempts = {str(k): (min(float(v[0]), now), int(v[1]))
                         for k, v in (d.get("attempts") or {}).items()}
         except (OSError, ValueError, TypeError, AttributeError, IndexError):
             return  # no file, or an unreadable one: keep what we have
         self._spent, self._dropped_until, self._errors = spent, dropped, errors
-        self._bad = collections.OrderedDict(sorted(bad.items(), key=lambda kv: kv[1]))
+        self._bad = collections.OrderedDict(sorted(bad.items(), key=lambda kv: kv[1][1]))
         self._attempts = attempts
+        self._sig = sig
         self._clamped = clamped  # the file holds times from the future: write them back
 
     def _save_state(self) -> None:
@@ -385,7 +436,7 @@ class NewznabClient:
                        for (k, n), q in self._spent.items() if q},
              "dropped": {n: self._to_wall(t) for n, t in self._dropped_until.items() if t > now},
              "errors": {n: c for n, c in self._errors.items() if c},
-             "bad": dict(self._bad),
+             "bad": {k: list(v) for k, v in self._bad.items()},
              "attempts": {k: list(v) for k, v in self._attempts.items()}}
         tmp = f"{self._state_path}.{uuid.uuid4().hex}.tmp"
         try:
@@ -395,6 +446,7 @@ class NewznabClient:
                 os.fsync(f.fileno())
             os.replace(tmp, self._state_path)
             self._unsaved = False
+            self._sig = self._file_sig()
         except OSError:
             self._unsaved = True  # a budget that cannot be saved still holds in memory
             try:
@@ -409,19 +461,60 @@ class NewznabClient:
         return f"{rel.indexer}|{ident}"
 
     def _mark_bad(self, rel: Release) -> None:
+        """A strike: this release had no NZB just now. It counts as bad (``is_bad``) only once
+        a second strike comes at least ``BAD_CONFIRM_S`` after the first."""
         with self._sync():
-            self._bad[self._bad_key(rel)] = self._wall()
+            key, now = self._bad_key(rel), self._wall()
+            old = self._bad.pop(key, None)
+            first = old[0] if old and now - old[1] < BAD_TTL_S else now
+            self._bad[key] = [first, now]
             while len(self._bad) > _BAD_MAX:
                 self._bad.popitem(last=False)
             self._save_state()
 
-    def is_bad(self, rel: Release) -> bool:
+    def _clear_bad(self, rel: Release) -> None:
+        """A valid NZB came back: forget any strikes against the release."""
+        self._refresh()
+        if self._bad_key(rel) not in self._bad:
+            return
         with self._sync():
-            return self._bad_key(rel) in self._bad
+            if self._bad.pop(self._bad_key(rel), None) is not None:
+                self._save_state()
+
+    def is_bad(self, rel: Release) -> bool:
+        self._refresh()
+        with self._lock:
+            e = self._bad.get(self._bad_key(rel))
+            return bool(e) and e[1] - e[0] >= BAD_CONFIRM_S and self._wall() - e[1] < BAD_TTL_S
+
+    def _indexer_wide(self, rel: Release) -> bool:
+        """Strike a release for a non-NZB answer; True when this makes the indexer the
+        problem (``INDEXER_WIDE_AFTER`` different releases in a row of non-NZB answers).
+        Then the strikes of that run are taken back and the indexer is dropped."""
+        with self._sync():
+            key, now = self._bad_key(rel), self._clock()
+            run = self._run_bad.setdefault(rel.indexer, collections.OrderedDict())
+            for k in [k for k, (t, _) in run.items() if now - t > RUN_WINDOW_S]:
+                del run[k]
+            prev = self._bad.get(key)
+            self._mark_bad(rel)
+            run.setdefault(key, (now, list(prev) if prev else None))
+            if len(run) < INDEXER_WIDE_AFTER:
+                return False
+            for k, (_, before) in run.items():
+                if before is None:
+                    self._bad.pop(k, None)
+                else:
+                    self._bad[k] = before
+            run.clear()
+            self._dropped_until[rel.indexer] = self._clock() + WINDOW_S
+            self._save_state()
+            return True
 
     def attempt_info(self, key: str) -> tuple[float, int]:
         """(wall time of the last qualify attempt, nights in a row it was the row's fault)."""
-        with self._sync():
+        self._refresh()
+        with self._lock:
             return self._attempts.get(key, (0.0, 0))
 
     def note_attempt(self, key: str, streak: str = "reset") -> int:
@@ -648,10 +741,15 @@ class NewznabClient:
                 raise _not_nzb(raw)
         except NewznabError as e:
             self._note(rel.indexer, e)
-            if isinstance(e, ItemFailed):
-                self._mark_bad(rel)  # never asked for again
+            if isinstance(e, NotNzb):
+                if self._indexer_wide(rel):
+                    raise IndexerDropped("indexer answers without an NZB for many releases") from None
+            elif isinstance(e, ItemFailed):
+                self._mark_bad(rel)
             raise
         self._note(rel.indexer, None)  # a success only once the bytes are an NZB
+        self._run_bad.pop(rel.indexer, None)
+        self._clear_bad(rel)
         return raw
 
     def fetch_nzb_ids(self, rel: Release) -> tuple[frozenset, bytes]:
@@ -708,7 +806,7 @@ def _not_nzb(raw: bytes) -> NewznabError:
             code = root.get("code", "") if root.tag == "error" else None
         except ET.ParseError:
             code = None
-    return ItemFailed("not an nzb") if code is None else _error_for(code)
+    return NotNzb("not an nzb") if code is None else _error_for(code)
 
 
 def _gunzip_capped(raw: bytes, limit: int) -> bytes:

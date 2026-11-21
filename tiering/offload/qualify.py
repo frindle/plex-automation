@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from xml.etree.ElementTree import ParseError
 
 from .altmount import AltMountError
-from .newznab import (GrabBudgetSpent, IndexersUnavailable, ItemFailed, NewznabError, archive_nzb, nzb_segment_ids, parse_resolution,
+from .newznab import (BadRelease, GrabBudgetSpent, IndexersUnavailable, ItemFailed, NewznabError, archive_nzb, nzb_segment_ids, parse_resolution,
                       read_archived, title_matches)
 from .nntp_stat import NntpUnavailable
 
@@ -178,9 +178,11 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
 
     Each candidate that passes the title and floor checks costs one NZB grab
     (cached per client). ``stop_at`` ends the loop once that many are verified, so
-    a caller that only needs "is there one" pays for as few grabs as it can. After
+    a caller that only needs "is there one" pays for as few grabs as it can. An alternative
+    with no NZB behind its listing, or known to have none, counts as dead (a "no"). After
     ``MAX_FAILED_GRABS`` failed grabs the row is unsure and no more are tried; a
-    spent grab budget also makes it unsure. Neither is a "no".
+    spent grab budget, an indexer that cannot be asked or a failed transport also make it
+    unsure. None of these is a "no".
 
     Returns {count, floor, best, below_floor, dead, partial, unsure, note, candidate}.
     ``candidate`` is {title, nzb} of the first verified alternative (its NZB bytes), or None.
@@ -220,6 +222,16 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
             ids, raw = indexers.fetch_nzb_ids(rel)
         except GrabBudgetSpent:
             unsure = True
+            continue
+        except BadRelease:
+            dead += 1  # known to have no NZB: no restore path, and no grab was spent
+            continue
+        except ItemFailed:
+            dead += 1  # no NZB behind the listing: as good as a dead one
+            fails += 1
+            if fails >= MAX_FAILED_GRABS:
+                unsure = True  # the rest were not asked
+                break
             continue
         except _ERRORS:
             unsure = True
@@ -279,6 +291,22 @@ def sha256_file(path: str) -> str:
 
 def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_secondary,
             archive_dir: str, clock=time.time) -> QualifyResult:
+    """Run the five steps. Every call records an attempt for the row (so ``oldest_first``
+    rotates it), whichever way it ends."""
+    noted: list = []
+    try:
+        return _qualify(row, noted, reader=reader, importer=importer, indexers=indexers,
+                        stat_primary=stat_primary, stat_secondary=stat_secondary,
+                        archive_dir=archive_dir, clock=clock)
+    finally:
+        if not noted:
+            fn = getattr(indexers, "note_attempt", None)
+            if fn:
+                fn(release_name_of(row), "keep")
+
+
+def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary,
+             stat_secondary, archive_dir: str, clock=time.time) -> QualifyResult:
     fields: dict = {}
     steps: dict = {}
     name = release_name_of(row)
@@ -292,6 +320,7 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
 
     def note_attempt(streak: str) -> int:
         """Record this attempt for the row (when the client keeps such a record)."""
+        noted.append(streak)
         fn = getattr(indexers, "note_attempt", None)
         return fn(name, streak) if fn else 0
 
@@ -305,6 +334,7 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
     try:
         if nzb_path and os.path.exists(nzb_path):
             nzb_bytes = read_archived(nzb_path)
+            note_attempt("reset")  # it has an NZB: nothing of the row's is failing here
             steps["nzb"] = {"ok": True, "reused": True}
         else:
             fails = 0
@@ -322,6 +352,10 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
                     break
                 except GrabBudgetSpent:
                     unsure = others = True
+                    continue
+                except BadRelease:
+                    unsure = True  # known to have no NZB: no grab was spent, so no failed try
+                    items += 1
                     continue
                 except ItemFailed:
                     unsure = True
