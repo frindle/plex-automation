@@ -22,7 +22,8 @@ The hot-set code implements these rules.
   - files still seeding (the glacier gate is not "free");
   - files with more than one hardlink;
   - files with no restore path;
-  - 4K when `TIERING_KEEP_4K=1`, which is set when the line is under 100 Mbit.
+  - any file whose bitrate is above `max_stream_kbps`, which is set to a quarter of the measured line speed (0 turns this off);
+  - 4K, when `TIERING_KEEP_4K=1`. This is a blunt override that can be used before the line speed has been measured.
 - **New import:** whole for `new_days` (30).
 - **Played, synced, on deck or in progress:** whole until `idle_days` (60) after the last play.
 - **TV:** a play or sync of any episode makes its whole season whole. If the episode is one of the last `near_end_eps` (3) of the season, the next season is made whole too. Each season stays whole until `idle_days` after the last play in it.
@@ -122,7 +123,7 @@ class RemoteReader(Protocol):
 
 ```python
 @dataclass(frozen=True)
-class Cfg: new_days=30; idle_days=60; near_end_eps=3; keep_4k=False
+class Cfg: new_days=30; idle_days=60; near_end_eps=3; keep_4k=False; max_stream_kbps=0
 @dataclass(frozen=True)
 class Action: kind: str  # "promote" | "demote"
               rating_key: str; reason: str; priority: int  # 0 = now (live session)
