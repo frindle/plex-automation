@@ -77,9 +77,10 @@ class Env:
         self.stub = str(root / "stubs" / f"{ID}.mkv")
         self.entry = str(root / "mount" / f"{ID}.mkv")
         self.manifest = str(root / "manifests" / f"{ID}.json")
+        self.chunks = str(root / "manifests" / f"{ID}.chunks")
         self.db = st.open_db(root / "state.db")
         self.row = {"id": ID, "lib_path": self.lib, "remote_path": "/r/Movie.mkv",
-                    "rating_key": "1", "kind": "movie"}
+                    "nzb_path": "/n/Movie.nzb", "rating_key": "1", "kind": "movie"}
         st.upsert(self.db, self.row)
 
     def kw(self, **extra):
@@ -132,6 +133,7 @@ def env(tmp_path):
 def tree(root):
     out = {}
     for dp, dns, fns in os.walk(root, followlinks=False):
+        dns[:] = [d for d in dns if d != "locks"]  # lock files live beside the db
         for n in dns + fns:
             if n.startswith("state.db"):
                 continue
@@ -169,13 +171,20 @@ def assert_whole(env):
     assert s.st_size == len(env.data) and s.st_mtime_ns == MTIME_NS
     assert env.read_lib() == env.data
     assert not os.path.lexists(env.stub)
-    assert not os.path.lexists(env.manifest)
+    assert not os.path.lexists(env.manifest) and not os.path.lexists(env.chunks)
     assert not os.path.lexists(env.lib + ops.TMP_SUFFIX)
     r = st.get(env.db, ID)
     assert r["state"] == "whole" and r["step"] == 0
 
 
 # ---------------------------------------------------------------- layout
+
+
+def test_plan_layout_tail_keeps_middle_aligned():
+    size = 50 * MIB + 12345
+    lay = ops.plan_layout("x", size)
+    assert lay.tail_len == 32 * MIB + 12345
+    assert lay.head_len % MIB == 0 and (size - lay.tail_len) % MIB == 0
 
 
 def test_plan_layout():
@@ -215,7 +224,7 @@ def test_offload_result_matches_contract(env):
     assert env.boundaries == [1, 2, 3, 4, 5, 6, 7]
     m = json.load(open(env.manifest))
     assert set(m) == {"v", "id", "ext", "size", "mtime_ns", "head_len", "tail_len", "stub_path",
-                      "remote_path", "sha256", "head_b3", "tail_b3"}
+                      "remote_path", "sha256", "head_b3", "tail_b3", "chunk_size", "chunks_b3"}
     assert m["v"] == 1 and m["id"] == ID and m["ext"] == ".mkv"
     assert m["size"] == len(env.data) and m["mtime_ns"] == MTIME_NS
     assert m["head_len"] == 10 * MIB and m["tail_len"] == 32 * MIB
@@ -224,6 +233,11 @@ def test_offload_result_matches_contract(env):
     import blake3
     assert m["head_b3"] == blake3.blake3(env.data[:m["head_len"]]).hexdigest()
     assert m["tail_b3"] == blake3.blake3(env.data[-m["tail_len"]:]).hexdigest()
+    blob = open(env.chunks, "rb").read()
+    assert m["chunk_size"] == 4 * MIB and m["chunks_b3"] == blake3.blake3(blob).hexdigest()
+    mid = env.data[m["head_len"]:len(env.data) - m["tail_len"]]
+    want = b"".join(blake3.blake3(mid[i:i + 4 * MIB]).digest() for i in range(0, len(mid), 4 * MIB))
+    assert blob == want and len(blob) == 32 * 2
     row = st.get(env.db, ID)
     assert row["state"] == "offloaded" and row["step"] == 7 and row["stub_path"] == env.stub
 
@@ -272,6 +286,11 @@ def test_offload_open_handles_blocks_punching(env):
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc")
+def _unpriv_scan(path):
+    # CI runs unprivileged; other users' /proc/*/fd cannot be read there.
+    return ops.scan_open_holders(path, ignore_unreadable=True)
+
+
 def test_default_open_check_sees_open_fd(env, tmp_path):
     import subprocess
     p = subprocess.Popen([sys.executable, "-c",
@@ -279,17 +298,15 @@ def test_default_open_check_sees_open_fd(env, tmp_path):
                           env.lib], stdout=subprocess.PIPE)
     try:
         assert p.stdout.readline().strip() == b"r"
-        assert p.pid in ops.scan_open_holders(env.lib)
-        kw = env.kw()
-        del kw["open_check"]
+        assert p.pid in ops.scan_open_holders(env.lib, ignore_unreadable=True)
+        kw = env.kw(open_check=_unpriv_scan)
         r = ops.offload(env.db, env.row, **kw, open_timeout=0.3, after_step=env.hook())
         assert not r.ok and "open" in r.reason
         assert st.get(env.db, ID)["state"] == "offloading"
     finally:
         p.kill()
         p.wait()
-    kw = env.kw()
-    del kw["open_check"]
+    kw = env.kw(open_check=_unpriv_scan)
     assert ops.offload(env.db, env.row, **kw, after_step=env.hook()).ok
 
 
@@ -310,6 +327,9 @@ def test_offload_refuses_modified_file(env):
     assert not r.ok
     assert st.get(env.db, ID)["state"] == "failed"
     assert not os.path.islink(env.lib)
+    assert not os.path.lexists(env.stub)  # our extra link is dropped
+    assert not os.path.lexists(env.manifest) and not os.path.lexists(env.chunks)
+    assert os.lstat(env.lib).st_nlink == 1
 
 
 # ---------------------------------------------------------------- refusals
@@ -338,9 +358,9 @@ def test_refuse_too_small(env, tmp_path):
     small = str(env.root / "lib" / "small.mkv")
     with open(small, "wb") as f:
         f.write(os.urandom(40 * MIB))
-    st.upsert(env.db, {"id": "f" * 16, "lib_path": small, "remote_path": "/r/s"})
+    st.upsert(env.db, {"id": "f" * 16, "lib_path": small, "remote_path": "/r/s", "nzb_path": "/n/s.nzb"})
     before = tree(env.root)
-    r = ops.offload(env.db, {"id": "f" * 16, "lib_path": small, "remote_path": "/r/s"}, **env.kw())
+    r = ops.offload(env.db, {"id": "f" * 16, "lib_path": small, "remote_path": "/r/s", "nzb_path": "/n/s.nzb"}, **env.kw())
     assert not r.ok and "too small" in r.reason
     assert tree(env.root) == before
 
@@ -464,7 +484,8 @@ def test_promote_corrupt_byte_fails_without_swap(env):
     assert os.stat(env.stub).st_nlink == 1  # never linked into L
     assert not os.path.lexists(env.lib + ops.TMP_SUFFIX)
     ev = st.events(env.db, ID)
-    assert ev[-1]["kind"] == "failed" and "sha256" in ev[-1]["detail"]["reason"]
+    assert ev[-1]["kind"] == "failed" and "chunk" in ev[-1]["detail"]["reason"]
+    assert os.stat(env.stub).st_blocks * 512 <= 10 * MIB + 32 * MIB + MIB  # bad chunk never written
     # failed is retryable with a good reader and only then swaps
     assert env.promote().ok
     assert_whole(env)
@@ -529,7 +550,19 @@ def test_demote_after_promote(env):
     assert st.get(env.db, ID)["sha256"] == row["sha256"] == env.sha
 
 
-def test_demote_needs_nzb_and_sha(env):
+def test_demote_needs_sha_and_nzb_path(env):
     r = ops.demote(env.db, env.row, **env.kw())
-    assert not r.ok and "NZB" in r.reason
+    assert not r.ok and "sha256" in r.reason
+    row = {**env.row, "sha256": env.sha}
+    st.upsert(env.db, {"id": ID, "nzb_path": None, "nzb_path2": "/n/restore.nzb"})
+    row.update(nzb_path=None, nzb_path2="/n/restore.nzb")
+    r = ops.demote(env.db, row, **env.kw())
+    assert not r.ok and "nzb_path" in r.reason  # nzb_path2 alone is not enough
+    assert not os.path.islink(env.lib)
+
+
+def test_offload_needs_nzb_path(env):
+    st.upsert(env.db, {"id": ID, "nzb_path": None, "nzb_path2": "/n/restore.nzb"})
+    r = ops.offload(env.db, {**env.row, "nzb_path": None, "nzb_path2": "/n/r.nzb"}, **env.kw())
+    assert not r.ok and "nzb_path" in r.reason
     assert not os.path.islink(env.lib)

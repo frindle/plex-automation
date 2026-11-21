@@ -12,6 +12,8 @@ COLUMNS = (
     "id", "lib_path", "stub_path", "remote_path",
     "size", "mtime_ns", "sha256", "head_len", "tail_len", "head_b3", "tail_b3",
     "nzb_path", "nzb_path2",
+    "title", "year", "imdb_id", "tvdb_id", "season", "episode", "release_name",
+    "dev", "ino",
     "rating_key", "kind", "is4k",
     "state", "step", "restore_score", "restore_note",
     "last_check_ts", "last_ok_ts", "created_ts", "updated_ts",
@@ -32,6 +34,15 @@ CREATE TABLE IF NOT EXISTS files (
     tail_b3 TEXT,
     nzb_path TEXT,
     nzb_path2 TEXT,
+    title TEXT,
+    year INTEGER,
+    imdb_id TEXT,
+    tvdb_id TEXT,
+    season INTEGER,
+    episode INTEGER,
+    release_name TEXT,
+    dev INTEGER,
+    ino INTEGER,
     rating_key TEXT,
     kind TEXT CHECK (kind IS NULL OR kind IN ('movie', 'episode')),
     is4k INTEGER NOT NULL DEFAULT 0,
@@ -65,6 +76,13 @@ def open_db(path) -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
     db.executescript(_SCHEMA)
+    have = {r[1] for r in db.execute("PRAGMA table_info(files)")}
+    ctype = {"year": "INTEGER", "season": "INTEGER", "episode": "INTEGER",
+             "dev": "INTEGER", "ino": "INTEGER"}
+    for c in ("title", "year", "imdb_id", "tvdb_id", "season", "episode", "release_name",
+              "dev", "ino"):
+        if c not in have:  # databases created before these columns existed
+            db.execute(f"ALTER TABLE files ADD COLUMN {c} {ctype.get(c, 'TEXT')}")
     db.commit()
     return db
 
