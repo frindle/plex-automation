@@ -98,7 +98,7 @@ tierfs reads the remote at `${TIERFS_REMOTE_BASE}` + `remote_path`. The credenti
 - **Remote stream:** each open handle has one sequential stream with a read-ahead buffer, `TIERFS_READAHEAD`, default 32 MiB.
   - Pre-warm: once a read reaches `0.75 * head_len`, start the stream at `head_len`.
   - A read outside the current stream window cancels the old request at once and starts a new one at that offset.
-  - The number of open remote streams is capped by `TIERFS_MAX_STREAMS`, default 8.
+  - The number of open remote streams is capped by `TIERFS_MAX_STREAMS`, default 16.
 - **Errors:** retry with backoff for up to 10 s, then return EIO. Never return zeros for bytes it could not fetch.
 - **Manifest reload:** poll every 5 s and on SIGHUP.
   - When a manifest is removed, its entry disappears.
