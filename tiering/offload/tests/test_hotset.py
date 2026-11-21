@@ -135,10 +135,12 @@ def test_bitrate_limit():
 
 
 def test_never_offloaded_sections_case_insensitive():
-    items = [movie(1, section="adult"), movie(2, section="ASIAN TV"), movie(3)]
+    items = [movie(1, section="adult"), movie(2, section="Asian TV"), movie(3)]
     d = want(items)
+    assert d["1"][0] == "section"
+    assert "2" not in d and "3" not in d  # Asian TV can be offloaded (Penn, 2026-11-21)
+    d = want(items, cfg=Cfg(never_sections=("adult", "ASIAN TV")))
     assert d["1"][0] == "section" and d["2"][0] == "section"
-    assert "3" not in d
     d = want(items, cfg=Cfg(never_sections=("Movies",)))
     assert set(d) == {"3"}
 

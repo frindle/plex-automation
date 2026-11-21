@@ -32,7 +32,7 @@ class Cfg:
     near_end_eps: int = 3
     keep_4k: bool = False
     max_stream_kbps: int = 0
-    never_sections: tuple = ("Adult", "Asian TV")
+    never_sections: tuple = ("Adult",)
 
 
 @dataclass(frozen=True)
