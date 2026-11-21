@@ -1,0 +1,33 @@
+name: tiering-e2e
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ["tiering/**", "tierfs/**", ".github/workflows/tiering-e2e.yml"]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install FUSE, ffmpeg, bindfs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 ffmpeg bindfs
+      - name: Syntax checks
+        run: |
+          python3 -m py_compile tiering/e2e/plexctl.py tiering/e2e/fake_webdav.py
+          for f in tiering/e2e/*.sh; do bash -n "$f"; done
+      - name: Media is deterministic
+        run: |
+          a=$(mktemp -d); b=$(mktemp -d)
+          MEDIA_SECONDS=2 tiering/e2e/make_media.sh "$a" --movies-only >/dev/null
+          MEDIA_SECONDS=2 tiering/e2e/make_media.sh "$b" --movies-only >/dev/null
+          diff "$a/SHA256SUMS" "$b/SHA256SUMS"
+      - name: Mount propagation smoke test
+        run: tiering/e2e/test_mount_propagation.sh
+      - name: Plex log on failure
+        if: failure()
+        run: |
+          docker logs --tail 100 tiering-e2e-plex 2>&1 || true
