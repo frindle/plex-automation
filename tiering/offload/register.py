@@ -8,9 +8,12 @@ path mapped through TIERING_ARR_PATH_MAP, never a disk path. Size and mtime come
 the one existing disk candidate of that share path (``resolve``). No candidate counts as
 ``missing_local`` and several as ``ambiguous``; the file is skipped and counted, never
 guessed. The result carries ``listed`` (distinct share paths the arrs listed) next to
-those counts so the caller can see trouble. An arr path that is already under a
-``TIERING_PATH_MAP`` disk prefix is a disk path, not a share path: it is never stored,
-and counts as ``disk_path`` (skipped like ``missing_local``):
+those counts so the caller can see trouble. An arr path that is under a
+``TIERING_PATH_MAP`` disk prefix is rewritten to its share path with the reverse of the
+map (``/mnt/disk1/movies/m.mkv`` becomes ``/mnt/user/movies/m.mkv``) and counted as
+``disk_path_mapped``; a disk path no entry covers (an unraid disk or cache mount, or a
+share equal to its disk) is skipped and counted as ``disk_path``. ``lib_path`` never holds
+a disk path:
 
 - a new row gets a fresh random 16-hex ``id``, ``state=whole``, ``size``,
   ``mtime_ns`` and the media identity (``title``, ``year``, ``imdb_id``,
@@ -52,6 +55,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import secrets
 import ssl
 import urllib.error
@@ -201,19 +205,49 @@ def _entry_row(ent: dict, local: str, size: int, mtime_ns: int) -> dict:
             "size": size, "mtime_ns": mtime_ns}
 
 
-def _disk_prefixes(env=None) -> list[str]:
+def _disk_map(env=None) -> list[tuple[str, str]]:
     e = os.environ if env is None else env
-    return [disk for _share, disk in paths.parse_path_map(e.get("TIERING_PATH_MAP"))]
+    return paths.parse_path_map(e.get("TIERING_PATH_MAP"))
+
+
+def _under(path: str, prefix: str) -> bool:
+    return prefix == "/" or path == prefix or path.startswith(prefix.rstrip("/") + "/")
+
+
+_UNRAID_DISK = re.compile(r"^/mnt/(?:disk\d+|cache\w*|disks?)(?:/|$)")
+
+
+def is_disk_path(path: str, disk_map: list[tuple[str, str]]) -> bool:
+    """A path under a ``disk_map`` disk prefix, or on an unraid disk or cache mount."""
+    norm = os.path.normpath(path)
+    return any(_under(norm, d) for _s, d in disk_map) or bool(_UNRAID_DISK.match(norm))
+
+
+def to_share(path: str, disk_map: list[tuple[str, str]]) -> str:
+    """The share path of a path under a ``disk_map`` disk prefix (the reverse of the map,
+    longest disk prefix first); any other path is returned unchanged."""
+    norm = os.path.normpath(path)
+    best = None
+    for share, disk in disk_map:
+        if _under(norm, disk) and (best is None or len(disk) > len(best[1])):
+            best = (share, disk)
+    if best is None:
+        return path
+    share, disk = best
+    rest = norm if disk == "/" else norm[len(disk):]
+    return (share.rstrip("/") + rest) if share != "/" else rest
 
 
 def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map=None,
-             resolve=None, stat=os.stat, new_id=None, disk_roots=None) -> dict:
+             resolve=None, stat=os.stat, new_id=None, disk_map=None) -> dict:
     """Sync rows from the arrs. Returns counts; with ``apply=False`` nothing is written.
 
     ``arr_map`` is ``arr=share,...`` text or a list of pairs (default: TIERING_ARR_PATH_MAP).
     ``resolve(share_path)`` returns the existing disk paths (default: from TIERING_PATH_MAP).
-    ``disk_roots`` are the disk prefixes (default: those of TIERING_PATH_MAP); an arr path that
-    is under one is a disk path, never stored as ``lib_path``, and counts as ``disk_path``.
+    ``disk_map`` is the ``(share, disk)`` pairs (default: TIERING_PATH_MAP). An arr path under
+    a disk prefix is rewritten to its share path and counted as ``disk_path_mapped``; one that
+    no entry can turn into a share path is skipped and counted as ``disk_path``.
+    ``lib_path`` is never a disk path.
     """
     if state is None:
         from . import state as _state
@@ -225,12 +259,12 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
     pmap = paths.parse_path_map(arr_map) if isinstance(arr_map, str) or arr_map is None \
         else list(arr_map)
     resolve = resolve or default_resolver()
-    if disk_roots is None:
-        disk_roots = _disk_prefixes()
-    disk_roots = [os.path.normpath(d) for d in disk_roots]
+    if disk_map is None:
+        disk_map = _disk_map()
     new_id = new_id or (lambda: secrets.token_hex(8))
     out = {"new": 0, "updated": 0, "unchanged": 0, "skipped_state": 0, "listed": 0,
-           "missing_local": 0, "ambiguous": 0, "disk_path": 0, "unlisted": 0, "errors": 0,
+           "missing_local": 0, "ambiguous": 0, "disk_path": 0,
+           "disk_path_mapped": 0, "unlisted": 0, "errors": 0,
            "applied": bool(apply)}
 
     listed: set[str] = set()
@@ -246,17 +280,19 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
             log.warning("register: an arr did not answer (%s)", e)
             continue
         for ent in ents:
-            local = map_path(str(ent["path"]), pmap)  # the share path: what is stored
+            arr_path = map_path(str(ent["path"]), pmap)
+            local = to_share(arr_path, disk_map)  # the share path: what is stored
+            if is_disk_path(local, disk_map):
+                # a disk path no map entry can turn into a share path: never stored
+                out["disk_path"] += 1
+                log.warning("register: an arr lists a disk path no map entry covers, skipped")
+                continue
+            if local != arr_path:
+                out["disk_path_mapped"] += 1
             if local in listed:
                 continue
             listed.add(local)
             out["listed"] += 1
-            norm = os.path.normpath(local)
-            if any(norm == d or norm.startswith(d.rstrip("/") + "/") for d in disk_roots):
-                # a disk path is not a library path: the arr needs a TIERING_ARR_PATH_MAP entry
-                out["disk_path"] += 1
-                log.warning("register: an arr lists a disk path, skipped (set TIERING_ARR_PATH_MAP)")
-                continue
             cands = list(resolve(local))
             if len(cands) != 1:
                 out["missing_local" if not cands else "ambiguous"] += 1

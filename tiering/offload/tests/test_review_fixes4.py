@@ -544,9 +544,51 @@ def test_R1_arr_reporting_a_disk_path_never_becomes_lib_path(tmp_path, arrs, mon
     out = rg.register(db, True, state=st, radarrs=[rg.ArrClient(r.url, r.key)], sonarrs=[])
     got = [x["lib_path"] for x in st.list_files(db)]
     print(out, got)
-    assert not any(p.startswith(d1) or p.startswith(d2) for p in got), \
-        f"a disk path was stored as lib_path: {got}"
-    assert out["disk_path"] == 1 and out["new"] == 0 and out["listed"] == 1
+    assert got == [f"{share}/m.mkv"], f"a disk path was stored as lib_path: {got}"
+    assert out["disk_path_mapped"] == 1 and out["disk_path"] == 0 and out["new"] == 1
+    assert out["listed"] == 1
+
+
+def test_R1c_a_disk_path_no_entry_covers_is_skipped(tmp_path, arrs, monkeypatch):
+    share, d1, d2 = _disks(tmp_path)
+    monkeypatch.delenv("TIERING_ARR_PATH_MAP", raising=False)
+    monkeypatch.setenv("TIERING_PATH_MAP", f"{share}={d1},{share}={d2}")
+    r = _movie(arrs, "/mnt/disk3/movies/m.mkv")  # an unraid disk the map does not list
+    db = st.open_db(tmp_path / "t.db")
+    out = rg.register(db, True, state=st, radarrs=[rg.ArrClient(r.url, r.key)], sonarrs=[])
+    assert out["disk_path"] == 1 and out["new"] == 0 and out["listed"] == 0
+    assert st.list_files(db) == []
+
+
+def test_R1d_lib_path_is_never_a_disk_path_on_any_register_path(tmp_path, arrs, monkeypatch):
+    """New row, updated row, dry run, mapped arr path, disk-path arr path, same file listed twice."""
+    share, d1, d2 = _disks(tmp_path)
+    with open(f"{d2}/n.mkv", "wb") as f:
+        f.write(b"y" * 50)
+    with open(f"{share}/n.mkv", "wb") as f:
+        f.write(b"y" * 50)
+    monkeypatch.setenv("TIERING_ARR_PATH_MAP", f"/arr={share}")
+    monkeypatch.setenv("TIERING_PATH_MAP", f"{share}={d1},{share}={d2}")
+    r = arrs(movies=[
+        {"title": "A", "year": 2020, "movieFile": {"path": "/arr/m.mkv", "size": 1}},
+        {"title": "A", "year": 2020, "movieFile": {"path": f"{d1}/m.mkv", "size": 1}},
+        {"title": "B", "year": 2020, "movieFile": {"path": f"{d2}/n.mkv", "size": 1}},
+        {"title": "C", "year": 2020, "movieFile": {"path": "/mnt/disk9/x.mkv", "size": 1}},
+        {"title": "D", "year": 2020, "movieFile": {"path": "/mnt/cache/x.mkv", "size": 1}}])
+    db = st.open_db(tmp_path / "t.db")
+    dry = rg.register(db, False, state=st, radarrs=[rg.ArrClient(r.url, r.key)], sonarrs=[])
+    assert st.list_files(db) == [] and dry["new"] == 2
+    out = rg.register(db, True, state=st, radarrs=[rg.ArrClient(r.url, r.key)], sonarrs=[])
+    with open(f"{d1}/m.mkv", "wb") as f:  # the file changes: the update path runs
+        f.write(b"z" * 120)
+    out2 = rg.register(db, True, state=st, radarrs=[rg.ArrClient(r.url, r.key)], sonarrs=[])
+    got = sorted(x["lib_path"] for x in st.list_files(db))
+    print(out, out2, got)
+    assert got == [f"{share}/m.mkv", f"{share}/n.mkv"]
+    assert out["new"] == 2 and out["disk_path_mapped"] == 2 and out["disk_path"] == 2
+    assert out2["updated"] == 1
+    for x in got:
+        assert not any(x.startswith(d) for d in (d1, d2, "/mnt/disk", "/mnt/cache"))
 
 
 def test_R1b_a_mapped_arr_path_is_not_a_disk_path(tmp_path, arrs, monkeypatch):
