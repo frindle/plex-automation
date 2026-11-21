@@ -24,7 +24,7 @@ cleanup() {
   rc=$?
   if [ $rc -ne 0 ]; then
     echo "--- container logs (tail)"; docker logs --tail 40 "$NAME" 2>&1 || true
-    echo "--- plex log (tail)"; tail -n 60 "$LOGDIR/Plex Media Server.log" 2>/dev/null || true
+    echo "--- plex log (tail)"; tail -n 60 "$LOGDIR/Plex Media Server.log" 2>/dev/null | cut -c1-300 || true
   fi
   "$here/plex_up.sh" down || true
   sudo umount "$MNT" 2>/dev/null || true

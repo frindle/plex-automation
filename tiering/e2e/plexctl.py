@@ -78,6 +78,7 @@ class Plex:
         while time.time() < end:
             try:
                 if self.mc("/identity").get("machineIdentifier"):
+                    self.sections()  # 4xx/5xx until the library is up
                     return True
             except Exception:
                 pass
@@ -91,17 +92,20 @@ class Plex:
     def create_section(self, name, kind, location):
         """kind is 'movie' or 'show'. Returns the section key."""
         last = None
-        for agent, scanner in AGENTS[kind]:
-            try:
-                self.request("/library/sections", method="POST", params={
-                    "name": name, "type": kind, "agent": agent, "scanner": scanner,
-                    "language": "en-US", "location": location})
-            except PlexError as e:
-                last = e
-                continue
-            for s in self.sections():
-                if s.get("title") == name:
-                    return s["key"]
+        end = time.time() + 180
+        while time.time() < end:  # "server is still starting up" is a 400 for a while
+            for agent, scanner in AGENTS[kind]:
+                try:
+                    self.request("/library/sections", method="POST", params={
+                        "name": name, "type": kind, "agent": agent, "scanner": scanner,
+                        "language": "en-US", "location": location})
+                except PlexError as e:
+                    last = e
+                    continue
+                for s in self.sections():
+                    if s.get("title") == name:
+                        return s["key"]
+            time.sleep(5)
         raise PlexError(f"could not create section {name}: {last}")
 
     def create_standard(self, movies_dir, tv_dir):
