@@ -294,6 +294,10 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                 else:
                     write(r, restore_score=sc["count"], restore_note=note, **extra)
             except NewznabError:
+                if n2_dead:  # every indexer failed and the stored NZB is known dead
+                    raise_alert(row, "restore NZB is dead and no indexer could be asked "
+                                     "for a replacement")
+                    state.log_event(db, rid, "restore_nzb_lost", {"unsure": True})
                 r["unchecked"].append("indexers_unreachable")
             except Exception as e:
                 r["failed"].append(f"restore_{type(e).__name__}")

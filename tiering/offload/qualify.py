@@ -38,13 +38,14 @@ from dataclasses import dataclass, field
 from xml.etree.ElementTree import ParseError
 
 from .altmount import AltMountError
-from .newznab import (GrabBudgetSpent, NewznabError, archive_nzb, nzb_segment_ids, parse_resolution,
+from .newznab import (BadRelease, GrabBudgetSpent, IndexersUnavailable, ItemFailed, NewznabError, archive_nzb, nzb_segment_ids, parse_resolution,
                       read_archived, title_matches)
 from .nntp_stat import NntpUnavailable
 
 _ERRORS = (AltMountError, NewznabError, NntpUnavailable, OSError, ParseError,
            EOFError, zlib.error, ValueError)
 MAX_FAILED_GRABS = 3  # failed NZB grabs for one row before it is called unsure
+GRAB_FAILED_NIGHTS = 3  # nights in a row a row's own grabs fail before it is called a miss
 _READ = 1 << 20
 
 
@@ -177,9 +178,11 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
 
     Each candidate that passes the title and floor checks costs one NZB grab
     (cached per client). ``stop_at`` ends the loop once that many are verified, so
-    a caller that only needs "is there one" pays for as few grabs as it can. After
+    a caller that only needs "is there one" pays for as few grabs as it can. An alternative
+    with no NZB behind its listing, or known to have none, counts as dead (a "no"). After
     ``MAX_FAILED_GRABS`` failed grabs the row is unsure and no more are tried; a
-    spent grab budget also makes it unsure. Neither is a "no".
+    spent grab budget, an indexer that cannot be asked or a failed transport also make it
+    unsure. None of these is a "no".
 
     Returns {count, floor, best, below_floor, dead, partial, unsure, note, candidate}.
     ``candidate`` is {title, nzb} of the first verified alternative (its NZB bytes), or None.
@@ -219,6 +222,16 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
             ids, raw = indexers.fetch_nzb_ids(rel)
         except GrabBudgetSpent:
             unsure = True
+            continue
+        except BadRelease:
+            dead += 1  # known to have no NZB: no restore path, and no grab was spent
+            continue
+        except ItemFailed:
+            dead += 1  # no NZB behind the listing: as good as a dead one
+            fails += 1
+            if fails >= MAX_FAILED_GRABS:
+                unsure = True  # the rest were not asked
+                break
             continue
         except _ERRORS:
             unsure = True
@@ -278,6 +291,22 @@ def sha256_file(path: str) -> str:
 
 def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_secondary,
             archive_dir: str, clock=time.time) -> QualifyResult:
+    """Run the five steps. Every call records an attempt for the row (so ``oldest_first``
+    rotates it), whichever way it ends."""
+    noted: list = []
+    try:
+        return _qualify(row, noted, reader=reader, importer=importer, indexers=indexers,
+                        stat_primary=stat_primary, stat_secondary=stat_secondary,
+                        archive_dir=archive_dir, clock=clock)
+    finally:
+        if not noted:
+            fn = getattr(indexers, "note_attempt", None)
+            if fn:
+                fn(release_name_of(row), "keep")
+
+
+def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary,
+             stat_secondary, archive_dir: str, clock=time.time) -> QualifyResult:
     fields: dict = {}
     steps: dict = {}
     name = release_name_of(row)
@@ -289,6 +318,12 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
             memo.append(_search(indexers, identity(row)))
         return memo[0]
 
+    def note_attempt(streak: str) -> int:
+        """Record this attempt for the row (when the client keeps such a record)."""
+        noted.append(streak)
+        fn = getattr(indexers, "note_attempt", None)
+        return fn(name, streak) if fn else 0
+
     def fail(step: str, reason: str, **info) -> QualifyResult:
         steps[step] = {"ok": False, **info}
         return QualifyResult(False, [reason], fields, steps)
@@ -299,26 +334,53 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
     try:
         if nzb_path and os.path.exists(nzb_path):
             nzb_bytes = read_archived(nzb_path)
+            note_attempt("reset")  # it has an NZB: nothing of the row's is failing here
             steps["nzb"] = {"ok": True, "reused": True}
         else:
             fails = 0
-            found = searched()
+            items = 0  # candidates that failed as items: no NZB behind the listing
+            try:
+                found = searched()
+            except IndexersUnavailable:
+                note_attempt("keep")
+                return fail("nzb", "nzb_unsure", why="indexers unavailable")
             unsure = bool(getattr(found, "partial", False))  # an indexer was not asked
+            others = unsure  # trouble that is not the row's
             for rel in _find_exact(found, name):
                 try:
                     nzb_bytes = indexers.fetch_nzb(rel)
                     break
                 except GrabBudgetSpent:
-                    unsure = True
+                    unsure = others = True
                     continue
-                except NewznabError:
+                except BadRelease:
+                    unsure = True  # known to have no NZB: no grab was spent, so no failed try
+                    items += 1
+                    continue
+                except ItemFailed:
                     unsure = True
+                    items += 1
+                    fails += 1
+                    if fails >= MAX_FAILED_GRABS:
+                        break
+                except NewznabError:
+                    unsure = others = True
                     fails += 1
                     if fails >= MAX_FAILED_GRABS:
                         break
             if nzb_bytes is None:
+                if unsure and items and not others:
+                    # every candidate failed as an item: the row's own trouble. A few nights
+                    # of it and the release is called gone, so the row is not retried for ever
+                    n = note_attempt("add")
+                    if n >= GRAB_FAILED_NIGHTS:
+                        note_attempt("reset")
+                        return fail("nzb", "no_exact_nzb", why="grab_failed", nights=n)
+                    return fail("nzb", "nzb_unsure", why="grab_failed", nights=n)
+                note_attempt("keep" if unsure else "reset")
                 # "not on any indexer" only after a complete search; else try again later
                 return fail("nzb", "nzb_unsure" if unsure else "no_exact_nzb")
+            note_attempt("reset")
             nzb_path = archive_nzb(nzb_bytes, archive_dir, name)
             steps["nzb"] = {"ok": True, "reused": False}
     except _ERRORS as e:
@@ -378,6 +440,8 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
     try:
         sc = score_restore(row, indexers, nzb_segment_ids(nzb_bytes), stop_at=1,
                            found=searched(), verify=verify)
+    except IndexersUnavailable:
+        return fail("restore", "restore_check_unsure", why="indexers unavailable")
     except _ERRORS as e:
         return fail("restore", "restore_check_failed", error=type(e).__name__)
     if sc["count"] or not sc["unsure"]:  # an unchecked 0 is not a score
@@ -404,3 +468,12 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
         fields["nzb_path2"] = path2
     steps["restore"] = {"ok": True, "count": sc["count"], "best": sc["best"]}
     return QualifyResult(True, [], fields, steps)
+
+
+def oldest_first(rows, indexers) -> list:
+    """``rows`` ordered by the time of their last qualify attempt, oldest (or never) first,
+    so a spent budget does not starve the same rows night after night."""
+    info = getattr(indexers, "attempt_info", None)
+    if info is None:
+        return list(rows)
+    return sorted(rows, key=lambda r: info(release_name_of(r))[0])

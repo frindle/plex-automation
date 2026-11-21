@@ -38,6 +38,8 @@ import os
 import re
 import ssl
 import collections
+import contextlib
+import fcntl
 import threading
 import time
 import urllib.error
@@ -68,6 +70,25 @@ class IndexerDropped(NewznabError):
     """This indexer is left alone for the rest of the window (errors, or a 429)."""
 
 
+class ItemFailed(NewznabError):
+    """One release failed (its NZB is gone, or what came back is no NZB): the item's fault,
+    not the indexer's. It never counts toward dropping the indexer."""
+
+
+class NotNzb(ItemFailed):
+    """What came back is no NZB (an HTML page, say). One such answer may be a maintenance
+    page, so it is only a strike against the release (see ``_mark_bad``)."""
+
+
+class BadRelease(ItemFailed):
+    """This release was found to have no NZB on two different nights; it is not grabbed
+    again until the mark expires."""
+
+
+class IndexersUnavailable(NewznabError):
+    """Every indexer is dropped, out of budget or rate limited: try later, nothing is wrong."""
+
+
 class RateLimited(NewznabError):
     """The indexer answered 429 (too many requests)."""
 
@@ -77,7 +98,21 @@ class RateLimited(NewznabError):
 
 
 WINDOW_S = 24 * 3600.0
+_BAD_MAX = 20000       # release ids remembered as having no NZB
+_ATTEMPTS_MAX = 20000  # rows whose last qualify attempt is remembered
 DROP_AFTER_ERRORS = 3
+# A release is called bad (not grabbed again) only after "no NZB" answers on two different
+# nights, at least BAD_CONFIRM_S apart. One answer can be a maintenance page, and a release
+# that is wrongly shut out costs a whole row; two nights apart is cheap and rules that out.
+# A confirmed mark expires after BAD_TTL_S without a new strike, so a release that comes
+# back is tried again; a valid NZB clears the mark at once.
+BAD_CONFIRM_S = 12 * 3600.0
+BAD_TTL_S = 7 * 24 * 3600.0
+# When one indexer answers with non-NZB bodies for this many different releases within
+# RUN_WINDOW_S and has given no NZB in between, the indexer is the problem (down, or an error
+# page for everything): it is dropped like any failing indexer and no release is marked.
+INDEXER_WIDE_AFTER = 4
+RUN_WINDOW_S = 3600.0
 
 
 def check_url(url: str) -> urllib.parse.SplitResult:
@@ -268,47 +303,141 @@ class NewznabClient:
         self._lock = threading.RLock()
         self._wall = wall  # the clock that survives a restart (state_path only)
         self._state_path = state_path
-        self._load_state()
+        self._sync_depth = 0
+        self._unsaved = False
+        self._clamped = False
+        # indexer|guid -> [first, last] wall times of "no NZB" answers (see BAD_CONFIRM_S)
+        self._bad: collections.OrderedDict = collections.OrderedDict()
+        self._run_bad: dict[str, collections.OrderedDict] = {}  # indexer -> key -> (t, previous)
+        self._sig = None  # (mtime_ns, size, inode) of the state file as last read or written
+        self._attempts: dict[str, tuple[float, int]] = {}  # row key -> (last, row-fault nights)
+        with self._sync():
+            pass  # reads the file once at start, writing back any corrected times
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=tls_context()), _SafeRedirect())
         self.grabs = 0
         self.searches = 0
 
     # -- persistence (optional): the budgets must outlive a restart of the runner
+    #
+    # With ``state_path`` the file is the truth shared by every client (and process) that
+    # uses it: each request reloads it under an ``flock``, changes it and writes it back
+    # before the lock is let go, so two writers cannot overwrite one another's counts.
     def _to_wall(self, t: float) -> float:
         return self._wall() - (self._clock() - t)
 
     def _from_wall(self, w: float) -> float:
         return self._clock() - (self._wall() - w)
 
+    def _file_sig(self):
+        try:
+            st = os.stat(self._state_path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+    def _refresh(self) -> None:
+        """For a read: reload only when the file changed since this client last read or wrote
+        it (a write is atomic, so no lock is needed). A big state file is not parsed per call."""
+        with self._lock:
+            if not self._state_path or self._sync_depth:
+                return
+            sig = self._file_sig()
+            if sig is not None and sig != self._sig:
+                self._load_state()
+                if self._clamped:  # corrected times are written back under the lock
+                    with self._sync():
+                        pass
+
+    @contextlib.contextmanager
+    def _sync(self):
+        """Hold the state-file lock and reload the file (outermost entry only). Every write
+        goes through here, so it always merges with what other processes saved."""
+        with self._lock:
+            if not self._state_path or self._sync_depth:
+                self._sync_depth += 1
+                try:
+                    yield
+                finally:
+                    self._sync_depth -= 1
+                return
+            fd = None
+            try:
+                fd = os.open(f"{self._state_path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError:
+                if fd is not None:
+                    os.close(fd)
+                fd = None  # no lock file: carry on unlocked
+            self._sync_depth = 1
+            try:
+                self._load_state()
+                if self._clamped:  # so the corrected times stick across the next reload
+                    self._clamped = False
+                    self._save_state()
+                yield
+            finally:
+                self._sync_depth = 0
+                if fd is not None:
+                    os.close(fd)  # closing releases the flock
+
     def _load_state(self) -> None:
-        if not self._state_path:
-            return
+        """Replace the in-memory state with the file's. Times are clamped to now, so a wall
+        clock that was set back cannot leave entries in the future."""
+        if not self._state_path or self._unsaved:
+            return  # nothing to read, or this client holds changes the file lacks
+        sig = self._file_sig()
         try:
             with open(self._state_path, encoding="utf-8") as f:
                 d = json.load(f)
             now = self._wall()
+            back = float(d.get("saved", now)) > now  # the clock went back since the save
+            clamped = back
+            spent: dict = {}
             for key, times in (d.get("spent") or {}).items():
                 kind, _, name = str(key).partition("|")
-                ts = sorted(float(w) for w in times if now - float(w) < WINDOW_S)
+                ts = sorted(min(float(w), now) for w in times)
+                clamped = clamped or any(float(w) > now for w in times)
+                ts = [w for w in ts if now - w < WINDOW_S]
                 if kind in ("grab", "search") and ts:
-                    self._spent[(kind, name)] = collections.deque(self._from_wall(w) for w in ts)
+                    spent[(kind, name)] = collections.deque(self._from_wall(w) for w in ts)
+            dropped: dict = {}
             for name, w in (d.get("dropped") or {}).items():
-                if float(w) > now:
-                    self._dropped_until[str(name)] = self._from_wall(float(w))
-            for name, n in (d.get("errors") or {}).items():
-                self._errors[str(name)] = int(n)
-        except (OSError, ValueError, TypeError, AttributeError):
-            return  # no file, or an unreadable one: start empty
+                until = float(w)
+                if back:  # keep the time that was left, counted from now
+                    until = now + max(0.0, until - float(d.get("saved", now)))
+                if until > now:
+                    dropped[str(name)] = self._from_wall(until)
+            errors = {str(n): int(c) for n, c in (d.get("errors") or {}).items()}
+            bad = {}
+            for k, w in (d.get("bad") or {}).items():
+                if isinstance(w, (list, tuple)):
+                    first, last = min(float(w[0]), now), min(float(w[1]), now)
+                else:  # a single time: a mark that was confirmed
+                    last = min(float(w), now)
+                    first = last - BAD_CONFIRM_S
+                bad[str(k)] = [min(first, last), last]
+            attempts = {str(k): (min(float(v[0]), now), int(v[1]))
+                        for k, v in (d.get("attempts") or {}).items()}
+        except (OSError, ValueError, TypeError, AttributeError, IndexError):
+            return  # no file, or an unreadable one: keep what we have
+        self._spent, self._dropped_until, self._errors = spent, dropped, errors
+        self._bad = collections.OrderedDict(sorted(bad.items(), key=lambda kv: kv[1][1]))
+        self._attempts = attempts
+        self._sig = sig
+        self._clamped = clamped  # the file holds times from the future: write them back
 
     def _save_state(self) -> None:
         if not self._state_path:
             return
         now = self._clock()
-        d = {"spent": {f"{k}|{n}": [self._to_wall(t) for t in q if now - t < WINDOW_S]
+        d = {"saved": self._wall(),
+             "spent": {f"{k}|{n}": [self._to_wall(t) for t in q if now - t < WINDOW_S]
                        for (k, n), q in self._spent.items() if q},
              "dropped": {n: self._to_wall(t) for n, t in self._dropped_until.items() if t > now},
-             "errors": {n: c for n, c in self._errors.items() if c}}
+             "errors": {n: c for n, c in self._errors.items() if c},
+             "bad": {k: list(v) for k, v in self._bad.items()},
+             "attempts": {k: list(v) for k, v in self._attempts.items()}}
         tmp = f"{self._state_path}.{uuid.uuid4().hex}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -316,50 +445,134 @@ class NewznabClient:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self._state_path)
+            self._unsaved = False
+            self._sig = self._file_sig()
         except OSError:
+            self._unsaved = True  # a budget that cannot be saved still holds in memory
             try:
                 os.unlink(tmp)
             except OSError:
-                pass  # a budget that cannot be saved still holds in memory
+                pass
+
+    # -- per-release and per-row memory (persisted with the rest)
+    def _bad_key(self, rel: Release) -> str:
+        # the guid, else a hash of the link: the link holds the key and is never kept
+        ident = rel.guid or hashlib.sha256(rel.link.encode()).hexdigest()
+        return f"{rel.indexer}|{ident}"
+
+    def _mark_bad(self, rel: Release) -> None:
+        """A strike: this release had no NZB just now. It counts as bad (``is_bad``) only once
+        a second strike comes at least ``BAD_CONFIRM_S`` after the first."""
+        with self._sync():
+            key, now = self._bad_key(rel), self._wall()
+            old = self._bad.pop(key, None)
+            first = old[0] if old and now - old[1] < BAD_TTL_S else now
+            self._bad[key] = [first, now]
+            while len(self._bad) > _BAD_MAX:
+                self._bad.popitem(last=False)
+            self._save_state()
+
+    def _clear_bad(self, rel: Release) -> None:
+        """A valid NZB came back: forget any strikes against the release."""
+        self._refresh()
+        if self._bad_key(rel) not in self._bad:
+            return
+        with self._sync():
+            if self._bad.pop(self._bad_key(rel), None) is not None:
+                self._save_state()
+
+    def is_bad(self, rel: Release) -> bool:
+        self._refresh()
+        with self._lock:
+            e = self._bad.get(self._bad_key(rel))
+            return bool(e) and e[1] - e[0] >= BAD_CONFIRM_S and self._wall() - e[1] < BAD_TTL_S
+
+    def _indexer_wide(self, rel: Release) -> bool:
+        """Strike a release for a non-NZB answer; True when this makes the indexer the
+        problem (``INDEXER_WIDE_AFTER`` different releases in a row of non-NZB answers).
+        Then the strikes of that run are taken back and the indexer is dropped."""
+        with self._sync():
+            key, now = self._bad_key(rel), self._clock()
+            run = self._run_bad.setdefault(rel.indexer, collections.OrderedDict())
+            for k in [k for k, (t, _) in run.items() if now - t > RUN_WINDOW_S]:
+                del run[k]
+            prev = self._bad.get(key)
+            self._mark_bad(rel)
+            run.setdefault(key, (now, list(prev) if prev else None))
+            if len(run) < INDEXER_WIDE_AFTER:
+                return False
+            for k, (_, before) in run.items():
+                if before is None:
+                    self._bad.pop(k, None)
+                else:
+                    self._bad[k] = before
+            run.clear()
+            self._dropped_until[rel.indexer] = self._clock() + WINDOW_S
+            self._save_state()
+            return True
+
+    def attempt_info(self, key: str) -> tuple[float, int]:
+        """(wall time of the last qualify attempt, nights in a row it was the row's fault)."""
+        self._refresh()
+        with self._lock:
+            return self._attempts.get(key, (0.0, 0))
+
+    def note_attempt(self, key: str, streak: str = "reset") -> int:
+        """Record a qualify attempt for a row now. ``streak``: ``add`` (the row's own
+        fault), ``keep`` (budget or indexer trouble: not the row's) or ``reset``."""
+        with self._sync():
+            _, n = self._attempts.get(key, (0.0, 0))
+            n = n + 1 if streak == "add" else (n if streak == "keep" else 0)
+            self._attempts.pop(key, None)
+            self._attempts[key] = (self._wall(), n)
+            while len(self._attempts) > _ATTEMPTS_MAX:
+                self._attempts.pop(next(iter(self._attempts)))
+            self._save_state()
+            return n
 
     # -- etiquette
     def _take(self, kind: str, name: str, budget: int, exc: type[NewznabError]) -> None:
         """Count one request against the rolling window, or raise ``exc``."""
-        now = self._clock()
-        q = self._spent.setdefault((kind, name), collections.deque())
-        while q and now - q[0] >= WINDOW_S:
-            q.popleft()
-        if len(q) >= budget:
-            raise exc(f"{kind} budget spent")
-        q.append(now)
-        self._save_state()
+        with self._sync():
+            now = self._clock()
+            q = self._spent.setdefault((kind, name), collections.deque())
+            while q and now - q[0] >= WINDOW_S:
+                q.popleft()
+            if len(q) >= budget:
+                raise exc(f"{kind} budget spent")
+            q.append(now)
+            self._save_state()
 
     def _gate(self, name: str) -> None:
         """Refuse a dropped indexer; space requests to one indexer apart."""
-        now = self._clock()
-        until = self._dropped_until.get(name)
-        if until is not None:
-            if now < until:
-                raise IndexerDropped("indexer dropped for the window")
-            del self._dropped_until[name]
-            self._errors[name] = 0
-            self._save_state()
-        last = self._last_req.get(name)
-        if self.min_interval and last is not None:
-            wait = self.min_interval - (now - last)
-            if wait > 0:
-                self._sleep(wait)
-        self._last_req[name] = self._clock()
+        with self._sync():
+            now = self._clock()
+            until = self._dropped_until.get(name)
+            if until is not None:
+                if now < until:
+                    raise IndexerDropped("indexer dropped for the window")
+                del self._dropped_until[name]
+                self._errors[name] = 0
+                self._save_state()
+            last = self._last_req.get(name)
+            if self.min_interval and last is not None:
+                wait = self.min_interval - (now - last)
+                if wait > 0:
+                    self._sleep(wait)
+            self._last_req[name] = self._clock()
 
     def _note(self, name: str, err: NewznabError | None) -> None:
-        """Track consecutive errors; drop the indexer on the third, or at once on a 429."""
-        with self._lock:
+        """Track consecutive errors; drop the indexer on the third, or at once on a 429.
+
+        A failure of one item (a release whose NZB is gone, a page that is no NZB) is not
+        the indexer's: it counts for nothing."""
+        with self._sync():
             if err is None:
                 if self._errors.get(name):
                     self._errors[name] = 0
                     self._save_state()
                 return
-            if isinstance(err, (IndexerDropped, SearchBudgetSpent, GrabBudgetSpent)):
+            if isinstance(err, (IndexerDropped, SearchBudgetSpent, GrabBudgetSpent, ItemFailed)):
                 return
             if isinstance(err, RateLimited):
                 # the indexer's own Retry-After, however long; without one, the window
@@ -378,7 +591,7 @@ class NewznabClient:
         sep = "&" if "?" in base else "?"
         return self._fetch(f"{base}{sep}{q}", limit)
 
-    def _fetch(self, url: str, limit: int) -> bytes:
+    def _fetch(self, url: str, limit: int, item: bool = False) -> bytes:
         check_url(url)
         err: NewznabError | None = None
         data = b""
@@ -391,6 +604,8 @@ class NewznabClient:
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 err = RateLimited("indexer status 429", _retry_after(e.headers))
+            elif item and e.code in (404, 410):
+                err = ItemFailed(f"no such item (status {e.code})")
             else:
                 err = NewznabError(f"indexer status {e.code}")
         except (OSError, ValueError, http.client.HTTPException) as e:
@@ -420,7 +635,7 @@ class NewznabClient:
             p["season"] = season
         if episode is not None:
             p["ep"] = episode
-        with self._lock:
+        with self._sync():
             self._gate(ix.name)
             self._take("search", ix.name, self.search_budget, SearchBudgetSpent)
             self.searches += 1
@@ -444,12 +659,18 @@ class NewznabClient:
             raise NewznabError("no indexers configured")
         out = SearchResult()
         out.total = len(self.indexers)
+        waiting = 0  # failed only because it is dropped, out of budget or rate limited
         for ix in self.indexers:
             try:
                 out.extend(self.search_indexer(ix, **kw))
+            except (IndexerDropped, SearchBudgetSpent, RateLimited):
+                out.failed += 1
+                waiting += 1
             except NewznabError:
                 out.failed += 1
         if out.failed == out.total:
+            if waiting == out.total:
+                raise IndexersUnavailable("every indexer is dropped, out of budget or rate limited")
             raise NewznabError("all indexers failed")
         return out
 
@@ -461,7 +682,10 @@ class NewznabClient:
         if root is None:
             raise NewznabError("indexer sent bad xml")
         if root.tag == "error":
-            raise _error_for(root.get("code", ""))
+            err = _error_for(root.get("code", ""))
+            if isinstance(err, ItemFailed):  # a search is not about one item
+                err = NewznabError("indexer error 300")
+            raise err
         out = []
         for it in root.iter("item"):
             try:
@@ -498,7 +722,9 @@ class NewznabClient:
         """Download the NZB for a release. Returns raw NZB XML bytes."""
         if not rel.link:
             raise NewznabError("release has no link")
-        with self._lock:
+        if self.is_bad(rel):
+            raise BadRelease("this release had no NZB before")
+        with self._sync():
             self._gate(rel.indexer)
             self._take("grab", rel.indexer, self.grab_budget, GrabBudgetSpent)
             if self.grab_interval and self._last_grab is not None:
@@ -508,15 +734,22 @@ class NewznabClient:
             self._last_grab = self._clock()
             self.grabs += 1
         try:
-            raw = self._fetch(rel.link, NZB_MAX)
+            raw = self._fetch(rel.link, NZB_MAX, item=True)
             if raw[:2] == b"\x1f\x8b":
                 raw = _gunzip_capped(raw, NZB_MAX)
             if b"<nzb" not in raw[:2048]:
                 raise _not_nzb(raw)
         except NewznabError as e:
             self._note(rel.indexer, e)
+            if isinstance(e, NotNzb):
+                if self._indexer_wide(rel):
+                    raise IndexerDropped("indexer answers without an NZB for many releases") from None
+            elif isinstance(e, ItemFailed):
+                self._mark_bad(rel)
             raise
         self._note(rel.indexer, None)  # a success only once the bytes are an NZB
+        self._run_bad.pop(rel.indexer, None)
+        self._clear_bad(rel)
         return raw
 
     def fetch_nzb_ids(self, rel: Release) -> tuple[frozenset, bytes]:
@@ -559,6 +792,8 @@ def _error_for(code: str) -> NewznabError:
     RateLimited (the indexer is left alone), any other counts as one error."""
     if code in _LIMIT_CODES:
         return RateLimited(f"indexer error {code}")
+    if code == "300":  # no such item
+        return ItemFailed("no such item")
     return NewznabError(f"indexer error {code}")
 
 
@@ -571,7 +806,7 @@ def _not_nzb(raw: bytes) -> NewznabError:
             code = root.get("code", "") if root.tag == "error" else None
         except ET.ParseError:
             code = None
-    return NewznabError("not an nzb") if code is None else _error_for(code)
+    return NotNzb("not an nzb") if code is None else _error_for(code)
 
 
 def _gunzip_capped(raw: bytes, limit: int) -> bytes:
