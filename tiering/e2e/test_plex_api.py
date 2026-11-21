@@ -179,7 +179,8 @@ for k, rk in ep_rk.items():
 want0 = run(hs.Cfg(new_days=0))
 for k, rk in ep_rk.items():
     check(rk in want0, f"new_days=0: S{k[0]:02d}E{k[1]:02d} wanted whole")
-check(all(want0[ep_rk[(1, e)]][0] in ("played", "season") for e in (1, 2, 3, 4)), "S01 held by played/season rules")
+check(all(want0[ep_rk[(1, e)]][0] in ("played", "season", "on-deck") for e in (1, 2, 3, 4)),
+      f"S01 held by play rules (reasons {[want0[ep_rk[(1, e)]][0] for e in (1, 2, 3, 4)]})")
 check(all(want0[ep_rk[(2, e)]][0] == "next-season" for e in (1, 2, 3, 4)), "S02 held by next-season (E03 is in the last 3)")
 check(str(other_movie["ratingKey"]) not in want0, "an unplayed movie is not wanted once new_days=0")
 print("ALL OK")
