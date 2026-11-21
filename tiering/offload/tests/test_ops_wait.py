@@ -219,3 +219,118 @@ def test_restart_after_failed_drops_the_failed_line(big):
 
     assert env.promote(Look(env.data)).ok
     assert not any(ln.startswith("failed") for ln in seen[0])
+
+
+# ---- every permanent failure ends the fill file with a `failed` line, so a
+# ---- waiting player gets EIO at once instead of waiting out TIERFS_WAIT_S
+
+
+def small(tmp_path):
+    env = Env(tmp_path)
+    assert env.offload().ok
+    return env, st.get(env.db, ID)["head_len"]
+
+
+def assert_ends_failed(env, offset=None):
+    lines = fill_lines(env)
+    assert lines and lines[-1].startswith("failed "), lines
+    assert "" not in lines  # no blank line left by a torn-line repair
+    if offset is not None:
+        assert lines[-1] == f"failed {offset}"
+
+
+def test_permanent_short_remote_writes_failed(tmp_path):
+    env, head = small(tmp_path)
+    trunc = FakeReader(env.data[:14 * MIB])  # the middle is [10, 18) MiB
+    for _ in (1, 2):
+        assert env.promote(trunc).state == "promoting"
+        assert not any(ln.startswith("failed") for ln in fill_lines(env))  # transient: players keep waiting
+    r = env.promote(trunc)
+    assert r.state == "failed"
+    assert_ends_failed(env, 14 * MIB)
+    assert str(head) in fill_lines(env)  # what was listed stays listed
+
+
+def test_fill_refusal_writes_failed(tmp_path):
+    env, head = small(tmp_path)
+    os.link(env.stub, env.stub + ".second")  # the stub is no longer a single-link file
+    r = env.promote()
+    assert not r.ok and r.state == "failed"
+    assert st.get(env.db, ID)["state"] == "failed"
+    assert_ends_failed(env, head)
+
+
+def test_sha256_mismatch_leaves_a_failed_fill_file_and_a_retry_refetches(tmp_path):
+    env, head = small(tmp_path)
+    good = env.sha
+    st.set_state(env.db, ID, "offloaded", sha256="0" * 64)
+    r = env.promote()
+    assert not r.ok and r.state == "failed"
+    assert fill_lines(env) == [f"failed {head}"]  # chunks cannot be trusted, players told
+    st.set_state(env.db, ID, "failed", sha256=good)
+    reader = FakeReader(env.data)
+    assert env.promote(reader).ok
+    assert len(reader.calls) == 2  # both middle chunks fetched again
+    assert fill_lines(env) is None
+
+
+def test_failed_swap_writes_failed(tmp_path):
+    env, head = small(tmp_path)
+
+    def stop_after_step(step):
+        env.fake_tierfs()
+        if step == 3:  # chunks are in; L is replaced before the swap
+            os.unlink(env.lib)
+            with open(env.lib, "wb") as f:
+                f.write(b"someone else's file")
+
+    r = env.promote(after_step=stop_after_step)
+    assert not r.ok and r.state == "failed"
+    assert_ends_failed(env)
+
+
+def test_chunk_mismatch_failed_line_has_no_blank_line(tmp_path):
+    env, head = small(tmp_path)
+    r = env.promote(FakeReader(env.data, corrupt_at=head + 5))
+    assert r.state == "failed"
+    assert_ends_failed(env, head)
+
+
+def test_mark_failed_closes_a_torn_last_line(tmp_path):
+    p = str(tmp_path / "x.fill")
+    with open(p, "w") as f:
+        f.write("100\n20")  # torn
+    ops._mark_failed(p, 300)
+    assert open(p).read() == "100\n20\nfailed 300\n"
+
+
+# ---- data safety: the bytes are on disk before the line that vouches for them
+
+
+def test_fdatasync_runs_between_the_write_and_the_fill_line(tmp_path, monkeypatch):
+    env, head = small(tmp_path)
+    log = []
+    real_pwrite, real_sync, real_write = os.pwrite, os.fdatasync, os.write
+
+    def pwrite(fd, data, off):
+        log.append(("pwrite", off))
+        return real_pwrite(fd, data, off)
+
+    def fdatasync(fd):
+        log.append(("fdatasync",))
+        return real_sync(fd)
+
+    def write(fd, data):
+        if data.strip().isdigit():
+            log.append(("line", int(data)))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "pwrite", pwrite)
+    monkeypatch.setattr(os, "fdatasync", fdatasync)
+    monkeypatch.setattr(os, "write", write)
+    assert env.promote().ok
+    kinds = [e[0] for e in log if e[0] in ("pwrite", "fdatasync", "line")]
+    assert kinds.count("line") == 2
+    for i, k in enumerate(kinds):
+        if k == "line":  # the nearest earlier events are the chunk's write and its sync
+            assert kinds[i - 2:i] == ["pwrite", "fdatasync"], kinds

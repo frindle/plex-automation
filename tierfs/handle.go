@@ -40,6 +40,7 @@ type handle struct {
 	remoteSeen atomic.Bool
 
 	fill    *fillView
+	seekMu  sync.Mutex  // SEEK_DATA/SEEK_HOLE move the stub fd offset
 	allDone atomic.Bool // manifest removed: the stub is the whole file
 	warmed  atomic.Bool // pre-warm want sent
 	wantMu  sync.Mutex

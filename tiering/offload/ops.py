@@ -1116,10 +1116,14 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
                   offset=e.offset)
             return Result(False, "failed", step, "chunk mismatch")
         except OpsError as e:  # a refusal about the stub itself: retrying cannot help
+            _mark_failed(fpath, head_len)
             _fail(db, id, f"fill refused: {e}")
             return Result(False, "failed", step, str(e))
         except ShortRead as e:
-            return _short_remote(db, id, e.offset, step)
+            res = _short_remote(db, id, e.offset, step)
+            if res.state == "failed":  # permanent: waiting players must not hang
+                _mark_failed(fpath, e.offset)
+            return res
         except Exception as e:  # reader trouble is transient: stay resumable
             return _stall(db, id, "promote_read_error", f"{type(e).__name__}: {e}", "promoting", step)
         _record(db, id, 1, "promoting", after_step)
@@ -1129,7 +1133,9 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
     if step < 2:
         got = _sha256_file(stub)
         if got != row["sha256"]:
-            _rm(fpath)  # the listed chunks cannot be trusted: a retry must refetch them
+            # The listed chunks cannot be trusted: a retry must refetch them, and
+            # players waiting on this file must be told at once.
+            _reset_failed(fpath, head_len)
             _fail(db, id, "sha256 mismatch after filling the stub; nothing swapped",
                   expected=row["sha256"], got=got)
             return Result(False, "failed", step, "sha256 mismatch")
@@ -1146,6 +1152,8 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
     if step < 4:
         res = _promote_swap(db, row, lib, stub, tmp, ours_symlink)
         if res is not None:
+            if res.state == "failed":
+                _mark_failed(fpath, head_len)
             return res
         _fsync_dir(os.path.dirname(lib) or ".")
         _record(db, id, 4, "promoting", after_step)
@@ -1244,6 +1252,29 @@ def _read_fill(path, start, chunk_size, n) -> set[int]:
     return done
 
 
+def _mark_failed(path, offset) -> None:
+    """Tell tierfs's waiting players the promote has given up: a `failed` line,
+    on disk before this returns."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    except OSError:
+        log.exception("could not write the failed line to %s", path)
+        return
+    try:
+        size = os.fstat(fd).st_size
+        torn = size > 0 and os.pread(fd, 1, size - 1) != b"\n"
+        os.write(fd, (b"\n" if torn else b"") + f"failed {offset}\n".encode())  # close a torn last line
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _reset_failed(path, offset) -> None:
+    """Replace the fill file with one that holds only a `failed` line: no chunk
+    in it can be trusted any more."""
+    _write_atomic(path, f"failed {offset}\n".encode())
+
+
 def _drop_failed_lines(path) -> None:
     """A promote that starts again after a failure must not leave the old
     `failed` line in front of tierfs's waiting readers."""
@@ -1289,9 +1320,10 @@ def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry
     n_chunks = len(digests)
     done = _read_fill(fpath, start, chunk_size, n_chunks)
     _drop_failed_lines(fpath)
-    fd = os.open(stub, os.O_WRONLY)
-    ffd = os.open(fpath, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    fd = ffd = None
     try:
+        fd = os.open(stub, os.O_WRONLY)
+        ffd = os.open(fpath, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         fs = os.fstat(fd)
         if not stat_mod.S_ISREG(fs.st_mode) or fs.st_nlink != 1:
             raise OpsError("stub is not a single-link regular file; refusing to write into it")
@@ -1330,5 +1362,6 @@ def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry
             cursor = (idx + 1) % n_chunks
         os.fsync(fd)
     finally:
-        os.close(fd)
-        os.close(ffd)
+        for x in (fd, ffd):
+            if x is not None:
+                os.close(x)

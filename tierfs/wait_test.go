@@ -205,14 +205,20 @@ func TestWaitNoProgressTimesOut(t *testing.T) {
 
 func TestWaitGrowingFillFileKeepsTheWaitAlive(t *testing.T) {
 	w := wSetup(t)
-	w.s.cfg.WaitTimeout = time.Second
+	// Each step (a pause plus a 4 MiB write and fsync, slow under -race) is
+	// far shorter than the timeout; the steps together run well past it.
+	w.s.cfg.WaitTimeout = 4 * time.Second
 	h := w.open(t)
 	off := w.m.HeadLen + 20*w.m.ChunkSize
 	done := make(chan syscall.Errno, 1)
 	go func() { _, e := w.readAs(ctxPid(playerPid), h, off, 4096); done <- e }()
-	for i := int64(0); i < 8; i++ { // 8 x 400 ms, well past the timeout
-		time.Sleep(400 * time.Millisecond)
+	start := time.Now()
+	for i := int64(0); i < 20; i++ {
+		time.Sleep(250 * time.Millisecond)
 		w.promoteChunk(t, w.m.HeadLen+i*w.m.ChunkSize)
+	}
+	if time.Since(start) < w.s.cfg.WaitTimeout+time.Second {
+		t.Fatal("test did not run past the timeout")
 	}
 	select {
 	case e := <-done:
@@ -363,6 +369,31 @@ func TestReaderClassFromProc(t *testing.T) {
 	os.RemoveAll(filepath.Join(proc, "10"))
 	if !c.background(ctxPid(10)) {
 		t.Error("class was not cached")
+	}
+}
+
+func TestReaderClassResolvesThreadToProcess(t *testing.T) {
+	proc := fakeProc(t, map[uint32][2]string{
+		10: {"Plex Media Scan", "1"},
+		20: {"Plex Transcoder", "10"}, // a process whose parent is the scanner
+		30: {"Plex Media Serv", "1"},
+	})
+	fakeThread(t, proc, 11, 10, "Scan Worker")     // renamed scanner thread
+	fakeThread(t, proc, 21, 20, "ffmpeg-thread")   // thread of the scanner's child
+	fakeThread(t, proc, 31, 30, "Plex Media Scan") // a player thread that borrowed the scanner's name
+	c := newClassifier(proc, DefaultBackgroundComms)
+	for _, tc := range []struct {
+		tid  uint32
+		want bool
+	}{{11, true}, {21, true}, {31, false}} {
+		if got := c.background(ctxPid(tc.tid)); got != tc.want {
+			t.Errorf("tid %d: background = %v, want %v", tc.tid, got, tc.want)
+		}
+	}
+	// No status file: the thread group cannot be resolved, so it is a player.
+	os.Remove(filepath.Join(proc, "10", "status"))
+	if newClassifier(proc, DefaultBackgroundComms).background(ctxPid(10)) {
+		t.Error("an unresolvable pid must be a player")
 	}
 }
 
