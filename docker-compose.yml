@@ -123,6 +123,7 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       ANTHROPIC_WORKSPACE_ID: "${ANTHROPIC_WORKSPACE_ID:-}"
       LLM_CLAUDE_MODEL: "${LLM_CLAUDE_MODEL:-}"
+      LLM_CLAUDE_MONTHLY_USD: "${LLM_CLAUDE_MONTHLY_USD:-}"
       LLM_DECISIONS_LOG: "/data/llm_decisions.jsonl"
       LLM_PENDING_PATH: "/data/llm_pending.json"
     mac_address: "02:8e:b2:5d:a1:37"
