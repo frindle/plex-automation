@@ -653,7 +653,15 @@ class Stack:
 
     def _start_tierfs(self):
         self.bgsum = os.path.join(self.root, "bgsum")
-        shutil.copy(shutil.which("sha256sum"), self.bgsum)
+        # A script's process name is the script's file name, which is what tierfs
+        # reads. (A renamed copy of sha256sum will not do: where the coreutils are
+        # one binary, the name picks the tool.)
+        with open(self.bgsum, "w") as fh:
+            fh.write(f"#!{sys.executable}\nimport hashlib, sys\nh = hashlib.sha256()\n"
+                     "with open(sys.argv[1], 'rb') as f:\n"
+                     "    for b in iter(lambda: f.read(1 << 20), b''):\n"
+                     "        h.update(b)\nprint(h.hexdigest())\n")
+        os.chmod(self.bgsum, 0o755)
         env = self.env(TIERFS_POLL="500ms", TIERFS_WAIT_S=os.environ.get("E2E_WAIT_S", "30"),
                        TIERFS_HTTP=f"127.0.0.1:{self.tierfs_http}", TIERFS_MAX_STREAMS="4",
                        TIERFS_BACKGROUND_COMMS="Plex Media Scan,bgsum,bgcmp")
