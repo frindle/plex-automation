@@ -28,15 +28,18 @@ import hashlib
 import os
 import re
 import time
+import zlib
 from dataclasses import dataclass, field
 from xml.etree.ElementTree import ParseError
 
 from .altmount import AltMountError
-from .newznab import (NewznabError, archive_nzb, nzb_segment_ids, parse_resolution,
+from .newznab import (GrabBudgetSpent, NewznabError, archive_nzb, nzb_segment_ids, parse_resolution,
                       read_archived, title_matches)
 from .nntp_stat import NntpUnavailable
 
-_ERRORS = (AltMountError, NewznabError, NntpUnavailable, OSError, ParseError)
+_ERRORS = (AltMountError, NewznabError, NntpUnavailable, OSError, ParseError,
+           EOFError, zlib.error, ValueError)
+MAX_FAILED_GRABS = 3  # failed NZB grabs for one row before it is called unsure
 _READ = 1 << 20
 
 
@@ -109,7 +112,7 @@ def _search(indexers, ident: dict):
 
 
 def score_restore(row: dict, indexers, own_ids: frozenset | None,
-                  stop_at: int | None = None) -> dict:
+                  stop_at: int | None = None, verify: bool = True) -> dict:
     """Count releases that could replace this file if the exact upload dies.
 
     ``own_ids`` is the set of message-ids of our NZB. A candidate whose NZB shares
@@ -118,7 +121,13 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
 
     Each candidate that passes the title and floor checks costs one NZB grab
     (cached per client). ``stop_at`` ends the loop once that many are verified, so
-    a caller that only needs "is there one" pays for as few grabs as it can.
+    a caller that only needs "is there one" pays for as few grabs as it can. After
+    ``MAX_FAILED_GRABS`` failed grabs the row is unsure and no more are tried; a
+    spent grab budget also makes it unsure. Neither is a "no".
+
+    With ``verify=False`` nothing is grabbed: a candidate whose cleaned title differs
+    from the row's own release name is counted as a different upload (a search can
+    not tell more). ``own_ids`` is then not needed.
 
     Returns {count, floor, best, below_floor, partial, unsure, note}.
     ``partial`` means some indexer did not answer; ``unsure`` means ``partial`` or
@@ -130,7 +139,8 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
     floor = resolution_floor(source_resolution(row))
     found = _search(indexers, ident)
     partial = bool(getattr(found, "partial", False))
-    unsure = partial or own_ids is None
+    unsure = partial or (verify and own_ids is None)
+    own_name = _clean(release_name_of(row))
     cands, below = [], 0
     for rel in found:
         if not title_matches(rel.title, ident["title"] or "", ident["year"],
@@ -143,13 +153,30 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
     cands.sort(key=lambda r: (-r.resolution, _clean(r.title), r.link))
     counted: list[frozenset] = []
     best = 0
+    fails = 0
+    if not verify:
+        seen_names: set[str] = set()
+        for rel in cands:
+            nm = _clean(rel.title)
+            if nm == own_name or nm in seen_names:
+                continue
+            seen_names.add(nm)
+            counted.append(frozenset({nm}))
+            best = max(best, rel.resolution)
+        cands = []
     for rel in cands if own_ids is not None else ():
         if stop_at and len(counted) >= stop_at:
             break
         try:
             ids = indexers.fetch_ids(rel)
+        except GrabBudgetSpent:
+            unsure = True
+            continue
         except _ERRORS:
             unsure = True
+            fails += 1
+            if fails >= MAX_FAILED_GRABS:
+                break
             continue
         if not ids or ids & own_ids:
             continue  # the same upload (or nothing to compare)
@@ -207,12 +234,17 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
             nzb_bytes = read_archived(nzb_path)
             steps["nzb"] = {"ok": True, "reused": True}
         else:
+            fails = 0
             for rel in _find_exact(row, indexers, name):
                 try:
                     nzb_bytes = indexers.fetch_nzb(rel)
                     break
-                except NewznabError:
+                except GrabBudgetSpent:
                     continue
+                except NewznabError:
+                    fails += 1
+                    if fails >= MAX_FAILED_GRABS:
+                        break
             if nzb_bytes is None:
                 return fail("nzb", "no_exact_nzb")
             nzb_path = archive_nzb(nzb_bytes, archive_dir, name)

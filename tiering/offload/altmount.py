@@ -20,6 +20,9 @@ Environment:
                        it reports so the result is relative to the WebDAV root
   ALTMOUNT_CATEGORY    optional import category
   TIERFS_REMOTE_BASE / TIERFS_REMOTE_USER / TIERFS_REMOTE_PASS  WebDAV
+  TIERING_ALTMOUNT_ALLOW_HTTP=1  allow plain http to a host that is not loopback
+                       (a trusted LAN only; the key and password are sent in clear).
+                       Without it, https is required except to localhost.
 """
 from __future__ import annotations
 
@@ -63,7 +66,8 @@ class _Http:
         u = urllib.parse.urlsplit(base)
         if u.scheme not in ("http", "https") or not u.hostname:
             raise AltMountError("bad base url")
-        if u.scheme == "http" and u.hostname not in _LOCAL_HOSTS:
+        if (u.scheme == "http" and u.hostname not in _LOCAL_HOSTS
+                and os.environ.get("TIERING_ALTMOUNT_ALLOW_HTTP", "") not in ("1", "true", "yes")):
             raise AltMountError("plain http is only allowed to localhost")
         self._https = u.scheme == "https"
         self._host = u.hostname
@@ -151,7 +155,10 @@ class WebDavReader:
             n = resp.getheader("Content-Length")
             if n is None:
                 raise AltMountError("no content length")
-            return int(n)
+            try:
+                return int(n)
+            except ValueError:
+                raise AltMountError("bad content length") from None
         finally:
             conn.close()
 
@@ -192,7 +199,11 @@ class WebDavReader:
             conn.close()
         ns = {"d": "DAV:"}
         out = []
-        for r in ET.fromstring(raw).findall("d:response", ns):
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            raise AltMountError("bad webdav listing") from None
+        for r in root.findall("d:response", ns):
             href = urllib.parse.unquote(r.findtext("d:href", "", ns))
             href = urllib.parse.urlsplit(href).path
             is_dir = r.find(".//d:resourcetype/d:collection", ns) is not None
@@ -200,7 +211,11 @@ class WebDavReader:
             name = href.rstrip("/").rsplit("/", 1)[-1]
             if is_dir and href.rstrip("/").endswith(d.rstrip("/")):
                 continue  # the directory itself
-            out.append({"name": name, "path": d + name, "size": int(ln), "is_dir": is_dir})
+            try:
+                size = int(ln)
+            except ValueError:
+                raise AltMountError("bad content length in listing") from None
+            out.append({"name": name, "path": d + name, "size": size, "is_dir": is_dir})
         return out
 
     def find_media(self, remote_path: str) -> str:
@@ -281,11 +296,13 @@ class ImportClient:
             raise ImportFailed("altmount did not echo the job id")
 
     def _history(self, job_id: str) -> dict | None:
-        # The key goes in the body, never in the URL.
+        # The key goes in the body, never in the URL. AltMount reads ``nzo_ids`` (and
+        # ``mode``) from the query string, so those two are sent there.
+        q = urllib.parse.urlencode({"mode": "history", "output": "json", "nzo_ids": job_id})
         body = urllib.parse.urlencode({"mode": "history", "output": "json",
-                                       "apikey": self._key, "nzo_ids": job_id}).encode()
+                                       "apikey": self._key}).encode()
         conn, resp = self._http.open(
-            "POST", "/sabnzbd/api",
+            "POST", f"/sabnzbd/api?{q}",
             {"Content-Type": "application/x-www-form-urlencoded"}, body)
         data = self._json(resp, conn)
         for s in (data.get("history") or {}).get("slots") or []:

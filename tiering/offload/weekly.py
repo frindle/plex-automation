@@ -22,9 +22,12 @@ check "unchecked", never "no restore path", and unchecked never promotes.
 providers found every segment. An alert is raised for a row whose
 ``last_stat_ok_ts`` is older than 14 days.
 
-Restore-path cost. Each candidate costs one NZB grab. The weekly check only needs
-to know "is there at least one other upload", so it stops at the first verified
-one (``stop_at=1``), the client caches grabs per run and spaces them apart.
+Restore-path cost. Searches are free but an NZB grab is the indexers' quota, so the
+weekly check makes no grab in the ordinary case: a search result whose title differs
+from the row's own release counts as another upload. It grabs (``stop_at=1``, within
+the client's per-run budget) only for a row whose known restore path no longer turns
+up in the search, and for the monthly full-read row. A spent budget or a failed grab
+makes the row "unchecked", never "no restore path".
 
 Monthly (the first 7 days, or ``monthly=True``) it reads a rotating 5% of the
 offloaded bytes in full through WebDAV and compares the SHA-256. Rows are picked
@@ -222,8 +225,18 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
         # restore path
         if has_nzb:
             try:
-                own = nzb_segment_ids(read_archived(nzb))
-                sc = score_restore(row, indexers, own, stop_at=1)
+                # a search is free; an NZB grab is the indexers' quota. Grab only for the
+                # monthly full-read row, or when the restore path we knew of is gone.
+                verified = rid in picked
+                if verified:
+                    sc = None
+                else:
+                    sc = score_restore(row, indexers, None, stop_at=1, verify=False)
+                    verified = (sc["count"] == 0 and not sc["partial"]
+                                and (row.get("restore_score") or 0) > 0)
+                if verified:
+                    own = nzb_segment_ids(read_archived(nzb))
+                    sc = score_restore(row, indexers, own, stop_at=1)
                 note = sc["note"]
                 if r["flags"]:
                     note = "promote flagged: " + ", ".join(r["flags"]) + "; " + note

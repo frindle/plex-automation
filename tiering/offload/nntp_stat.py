@@ -144,8 +144,13 @@ class _Conn:
                 f"STAT <{ids[i].strip().strip('<>')}>\r\n".encode("ascii", "replace")
                 for i in cmds))
             for i in cmds:
-                code = self._line()[:3]
+                line = self._line()
+                code = line[:3]
                 if code == "223":
+                    want = ids[i].strip().strip("<>")
+                    got = line.split()[-1].strip("<>") if len(line.split()) > 2 else None
+                    if got != want:  # a reply that is not for this id: out of step
+                        raise NntpUnavailable("protocol", "stat reply for another id")
                     out[i] = True
                 elif code == "430":
                     out[i] = False

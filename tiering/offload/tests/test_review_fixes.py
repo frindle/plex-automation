@@ -267,18 +267,16 @@ def test_qualify_unsure_restore_check_is_a_fail(tmp_path):
     assert not r.ok and r.reasons == ["restore_check_unsure"]
 
 
-def test_weekly_stops_grabbing_at_the_first_verified_alternative(tmp_path):
+def test_weekly_makes_no_grabs_when_the_restore_path_is_still_there(tmp_path):
     e = Env(tmp_path, ["Alpha"])
     try:
-        for i in range(4):  # four more distinct alternatives
+        for i in range(4):
             e.nz.releases[f"x{i}"] = {"title": f"Alpha.2020.1080p.WEB-DL-X{i}",
                                       "nzb": make_nzb([f"x{i}@t"])}
         e.run()
-        def alt_grabs():
-            return [g for g in e.nz.gets if not g.startswith("own-")]
-        assert len(alt_grabs()) == 1
-        e.run()  # the next run uses the same client: the grab is cached
-        assert len(alt_grabs()) == 1
+        e.run()
+        assert e.nz.gets == [] and e.indexers.grabs == 0
+        assert e.state.rows[f"{0:016x}"]["restore_score"] >= 1
     finally:
         e.close()
 

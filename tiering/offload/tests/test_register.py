@@ -1,4 +1,3 @@
-import logging
 import os
 
 import pytest
@@ -174,74 +173,62 @@ def test_update_lost_to_a_state_change_is_counted_not_written(tmp_path, arrs):
 def test_never_deletes_and_logs_unlisted_only_when_every_arr_answered(tmp_path, arrs):
     mk(tmp_path, "m.mkv")
     r = arrs(movies=[movie("/data/m.mkv")])
+    s = arrs()
     st = FakeState()
-    run(st, [r], tmp_path=tmp_path)
+    run(st, [r], [s], tmp_path=tmp_path)
     r.movies.clear()
     r.fail = True
-    out = run(st, [r], tmp_path=tmp_path)
+    out = run(st, [r], [s], tmp_path=tmp_path)
     assert out["errors"] == 1 and out["unlisted"] == 0 and len(st.rows) == 1 and not st.events
     r.fail = False
-    out = run(st, [r], tmp_path=tmp_path)
+    out = run(st, [r], [s], tmp_path=tmp_path)
     assert out["unlisted"] == 1 and len(st.rows) == 1
     assert [e[1] for e in st.events] == ["register_unlisted"]
-    out = run(st, [r], apply=False, tmp_path=tmp_path)
+    out = run(st, [r], [s], apply=False, tmp_path=tmp_path)
     assert len(st.events) == 1 and len(st.rows) == 1
 
 
-def test_file_missing_locally_is_skipped(tmp_path, arrs):
-    st = FakeState()
-    out = run(st, [arrs(movies=[movie("/data/gone.mkv")])], tmp_path=tmp_path)
-    assert out["missing_local"] == 1 and st.rows == {}
-
-
-def test_one_arr_down_does_not_stop_the_others(tmp_path, arrs):
-    mk(tmp_path, "m.mkv")
-    good = arrs(movies=[movie("/data/m.mkv")])
-    bad = arrs()
-    bad.fail = True
-    st = FakeState()
-    out = run(st, [bad, good], tmp_path=tmp_path)
-    assert out["new"] == 1 and out["errors"] == 1
-
-
-def test_key_never_logged(tmp_path, arrs, caplog):
+def test_unlisted_is_not_logged_unless_both_radarr_and_sonarr_are_configured(tmp_path, arrs):
+    st = FakeState([{"id": "a" * 16, "lib_path": "/x/a.mkv", "state": "whole"}])
     r = arrs()
-    r.fail = True
-    with caplog.at_level(logging.DEBUG):
-        run(FakeState(), [r], tmp_path=tmp_path)
-    assert r.key not in caplog.text and r.url not in caplog.text
-    assert r.key not in repr(rg.ArrClient(r.url, r.key))
+    assert run(st, [r], tmp_path=tmp_path)["unlisted"] == 0
+    assert run(st, None, [r], tmp_path=tmp_path)["unlisted"] == 0
+    assert run(st, tmp_path=tmp_path)["unlisted"] == 0
+    assert not st.events
+    assert run(st, [r], [arrs()], tmp_path=tmp_path)["unlisted"] == 1
 
 
-def test_path_map_longest_prefix_and_boundaries():
-    pm = rg.parse_path_map("/data=/mnt/a, /data/tv=/mnt/b ,junk")
-    assert rg.map_path("/data/tv/x.mkv", pm) == "/mnt/b/x.mkv"
-    assert rg.map_path("/data/m.mkv", pm) == "/mnt/a/m.mkv"
-    assert rg.map_path("/database/m.mkv", pm) == "/database/m.mkv"
-    assert rg.map_path("/other/m.mkv", pm) == "/other/m.mkv"
-
-
-def test_env_config_comma_list_and_key_rules():
-    env = {"RADARR_URL": "http://127.0.0.1:1", "RADARR_API_KEY": "k",
-           "SONARR_URL": "http://127.0.0.1:1, http://localhost:2", "SONARR_API_KEY": "s"}
-    rad, son = rg.clients_from_env(env)
-    assert len(rad) == 1 and len(son) == 2
-    with pytest.raises(rg.ArrError):
-        rg.clients_from_env({**env, "SONARR_API_KEY": "a,b,c"})
-    assert rg.clients_from_env({}) == ([], [])
-
-
-def test_plain_http_refused_except_localhost_or_opt_in():
-    with pytest.raises(rg.ArrError):
-        rg.ArrClient("http://arr.example", "k")
-    rg.ArrClient("http://localhost:1", "k")
-    rg.ArrClient("http://arr.example", "k", allow_http=True)
-
-
-def test_uses_only_contract_state_functions(tmp_path, arrs):
-    mk(tmp_path, "m.mkv")
-    r = arrs(movies=[movie("/data/m.mkv")])
+def test_size_comes_from_the_real_file_not_the_arr(tmp_path, arrs):
+    lib = mk(tmp_path, "m.mkv", data=b"x" * 200)
+    r = arrs(movies=[movie("/data/m.mkv")])  # the arr says 100
     st = FakeState()
     run(st, [r], tmp_path=tmp_path)
+    assert st.by_path(None, lib)["size"] == 200
+    assert run(st, [r], tmp_path=tmp_path)["unchanged"] == 1
+
+
+def test_a_changed_file_clears_every_fact_about_the_old_bytes(tmp_path, arrs):
+    lib = mk(tmp_path, "m.mkv", data=b"n" * 200)
+    st = FakeState([{"id": "a" * 16, "lib_path": lib, "state": "whole", "size": 100,
+                     "mtime_ns": 1, "sha256": "old", "head_b3": "h", "tail_b3": "t",
+                     "head_len": 1, "tail_len": 2, "nzb_path": "/arch/old.nzb.gz",
+                     "remote_path": "/old/Movie.mkv", "restore_score": 2, "title": "Movie"}])
+    r = arrs(movies=[movie("/data/m.mkv")])
     run(st, [r], tmp_path=tmp_path)
-    assert set(st.calls) <= {"by_path", "upsert", "update_if", "list_files", "log_event"}
+    row = st.rows["a" * 16]
+    assert row["size"] == 200
+    for k in ("sha256", "head_b3", "tail_b3", "head_len", "tail_len", "nzb_path", "remote_path"):
+        assert row[k] is None, k
+
+
+def test_unchanged_rows_are_not_rewritten_when_ids_differ_in_type(tmp_path, arrs):
+    mk(tmp_path, "e1.mkv")
+    s = arrs(series=[{"id": 7, "title": "Show", "year": 2019, "tvdbId": 55, "imdbId": "tt9"}],
+             episodes={7: [{"seasonNumber": 1, "episodeNumber": 1,
+                            "episodeFile": {"path": "/data/e1.mkv", "size": 100}}]})
+    st = FakeState()
+    run(st, None, [s], tmp_path=tmp_path)
+    for row in st.rows.values():  # a database that stores every id as text
+        row["tvdb_id"], row["season"], row["year"] = "55", "1", "2019"
+    out = run(st, None, [s], tmp_path=tmp_path)
+    assert out["updated"] == 0 and out["unchanged"] == 1

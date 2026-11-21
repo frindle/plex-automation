@@ -10,11 +10,13 @@ For every movie file and episode file the arrs list, it upserts a row keyed on
   ``tvdb_id``, ``season``, ``episode``, ``release_name``). ``sha256`` stays empty
   until qualify fills it;
 - an existing row is only touched while ``state=whole``. Its identity fields are
-  refreshed; when the size or mtime differs it takes the new ones and ``sha256``
-  is cleared, so qualify hashes the file again. The write is
+  refreshed; when the size or mtime differs it takes the new ones and clears
+  ``sha256``, ``head_b3``, ``tail_b3``, ``head_len``, ``tail_len``, ``nzb_path``
+  and ``remote_path``, so qualify finds the NZB of the file that is there now. The write is
   ``update_if(db, id, "whole", ...)``, so a row the runner moved on is left alone;
 - it never deletes a row. A path the arrs no longer list is logged (only when
-  every arr answered: a missing answer is not a missing file);
+  both Radarr and Sonarr are configured and every arr answered: a missing answer
+  is not a missing file);
 - ``apply=False`` writes nothing and only reports what it would do.
 
 Environment (nothing here is ever logged, including keys and URLs):
@@ -48,6 +50,7 @@ log = logging.getLogger(__name__)
 
 _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 _LIMIT = 256 * 1024 * 1024
+STALE = ("sha256", "head_b3", "tail_b3", "head_len", "tail_len", "nzb_path", "remote_path")
 IDENTITY = ("title", "year", "imdb_id", "tvdb_id", "season", "episode", "release_name")
 
 
@@ -216,7 +219,7 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, path_ma
             except OSError:
                 out["missing_local"] += 1
                 continue
-            size = int(ent.get("size") or st.st_size)
+            size = int(st.st_size)  # the real file, not the arr's idea of it
             want = _entry_row(ent, local, size, st.st_mtime_ns)
             have = state.by_path(db, local)
             if have is None:
@@ -229,9 +232,11 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, path_ma
                 out["skipped_state"] += 1
                 continue
             change = {k: v for k, v in want.items()
-                      if k in IDENTITY and v is not None and have.get(k) != v}
+                      if k in IDENTITY and v is not None
+                      and (have.get(k) is None or str(have.get(k)) != str(v))}
             if have.get("size") != size or have.get("mtime_ns") != st.st_mtime_ns:
-                change.update(size=size, mtime_ns=st.st_mtime_ns, sha256=None)
+                # a changed file is a different release: every fact about the old bytes goes
+                change.update(size=size, mtime_ns=st.st_mtime_ns, **{k: None for k in STALE})
             if not change:
                 out["unchanged"] += 1
                 continue
@@ -240,7 +245,7 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, path_ma
                 out["updated"] -= 1
                 out["skipped_state"] += 1
 
-    if complete:
+    if complete and radarrs and sonarrs:  # one arr alone does not list the other's files
         for row in state.list_files(db):
             lp = row.get("lib_path")
             if lp and lp not in listed:

@@ -156,10 +156,11 @@ class _AmHandler(_Quiet):
         self.end_headers()
         self.wfile.write(b)
 
-    def _history(self, o, q):
+    def _history(self, o, q, query):
+        # like upstream, nzo_ids is read from the query string only
         if q.get("apikey", [""])[0] != o.key:
             return self._json({"status": False, "error": "Invalid API key"})
-        jid = q.get("nzo_ids", [""])[0]
+        jid = query.get("nzo_ids", [""])[0]
         job = o.jobs.get(jid)
         slots = []
         if job is not None:
@@ -179,8 +180,9 @@ class _AmHandler(_Quiet):
         ctype = self.headers["Content-Type"]
         if ctype.startswith("application/x-www-form-urlencoded"):
             q = urllib.parse.parse_qs(body.decode())
-            if q.get("mode", [""])[0] == "history":
-                return self._history(o, q)
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            if query.get("mode", [""])[0] == "history":
+                return self._history(o, q, query)
             return self._json({"status": False, "error": "bad request"})
         msg = email.message_from_bytes(
             b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + body, policy=email.policy.HTTP)
@@ -305,7 +307,7 @@ class _NntpHandler(socketserver.StreamRequestHandler):
                     w.write(b"400 over quota\r\n")
                 else:
                     mid = cmd[5:].strip().strip("<>")
-                    w.write(b"223 0 <x>\r\n" if mid in o.ids else b"430 no\r\n")
+                    w.write(f"223 0 <{mid}>\r\n".encode() if mid in o.ids else b"430 no\r\n")
             elif cmd == "QUIT":
                 w.write(b"205 bye\r\n")
                 return

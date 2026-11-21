@@ -9,6 +9,10 @@ Every URL must be https, except http to the local machine (used by tests), and
 TLS is 1.2 or newer. NZB grabs are cached per client and spaced
 ``NEWZNAB_GRAB_INTERVAL`` seconds apart (default 1), because each grab is one
 call against the indexer's daily API allowance.
+
+``NEWZNAB_GRAB_BUDGET`` caps the grabs per indexer per client (one run); default 10.
+When an indexer's budget is spent, ``fetch_nzb`` raises ``GrabBudgetSpent`` and the
+caller treats the check as unsure (unchecked, not failed). Searches are not counted.
 """
 from __future__ import annotations
 
@@ -27,6 +31,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
+import zlib
 from dataclasses import dataclass, field
 
 NZB_MAX = 100 * 1024 * 1024
@@ -35,6 +40,10 @@ _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 class NewznabError(Exception):
     pass
+
+
+class GrabBudgetSpent(NewznabError):
+    """The per-run NZB grab budget for this indexer is used up."""
 
 
 def check_url(url: str) -> urllib.parse.SplitResult:
@@ -154,7 +163,8 @@ class SearchResult(list):
 
 class NewznabClient:
     def __init__(self, indexers: list[Indexer], timeout: float = 30.0,
-                 grab_interval: float | None = None, sleep=time.sleep, clock=time.monotonic):
+                 grab_interval: float | None = None, sleep=time.sleep, clock=time.monotonic,
+                 grab_budget: int | None = None):
         self.indexers = list(indexers)
         self.timeout = timeout
         if grab_interval is None:
@@ -163,6 +173,13 @@ class NewznabClient:
             except ValueError:
                 grab_interval = 1.0
         self.grab_interval = max(0.0, grab_interval)
+        if grab_budget is None:
+            try:
+                grab_budget = int(os.environ.get("NEWZNAB_GRAB_BUDGET", "10"))
+            except ValueError:
+                grab_budget = 10
+        self.grab_budget = max(0, grab_budget)  # per indexer, per client
+        self._grabbed: dict[str, int] = {}
         self._sleep, self._clock = sleep, clock
         self._ids_cache: dict[str, frozenset] = {}
         self._last_grab: float | None = None
@@ -277,6 +294,9 @@ class NewznabClient:
         if not rel.link:
             raise NewznabError("release has no link")
         with self._lock:
+            if self._grabbed.get(rel.indexer, 0) >= self.grab_budget:
+                raise GrabBudgetSpent("grab budget spent")
+            self._grabbed[rel.indexer] = self._grabbed.get(rel.indexer, 0) + 1
             if self.grab_interval and self._last_grab is not None:
                 wait = self.grab_interval - (self._clock() - self._last_grab)
                 if wait > 0:
@@ -285,10 +305,7 @@ class NewznabClient:
             self.grabs += 1
         raw = self._fetch(rel.link, NZB_MAX)
         if raw[:2] == b"\x1f\x8b":
-            try:
-                raw = gzip.decompress(raw)
-            except (OSError, EOFError):
-                raise NewznabError("bad gzip") from None
+            raw = _gunzip_capped(raw, NZB_MAX)
         if b"<nzb" not in raw[:2048]:
             raise NewznabError("not an nzb")
         return raw
@@ -304,6 +321,26 @@ class NewznabClient:
             raise NewznabError("bad nzb xml") from None
         self._ids_cache[rel.link] = ids
         return ids
+
+
+def _gunzip_capped(raw: bytes, limit: int) -> bytes:
+    """Decompress gzip, refusing to produce more than ``limit`` bytes."""
+    d = zlib.decompressobj(31)
+    out, total = [], 0
+    try:
+        data = raw
+        while data:
+            chunk = d.decompress(data, limit + 1 - total)
+            total += len(chunk)
+            if total > limit:
+                raise NewznabError("nzb too large")
+            out.append(chunk)
+            data = d.unconsumed_tail
+        if not d.eof:
+            raise NewznabError("bad gzip")
+    except zlib.error:
+        raise NewznabError("bad gzip") from None
+    return b"".join(out)
 
 
 def nzb_segment_ids(nzb_bytes: bytes) -> frozenset[str]:
@@ -357,5 +394,8 @@ def archive_nzb(nzb_bytes: bytes, archive_dir: str, release_name: str) -> str:
 
 
 def read_archived(path: str) -> bytes:
-    with gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb") as f:
-        return f.read()
+    try:
+        with gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb") as f:
+            return f.read()
+    except (EOFError, zlib.error):
+        raise NewznabError("bad archived nzb") from None
