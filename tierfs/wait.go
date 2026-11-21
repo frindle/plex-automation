@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -15,7 +16,42 @@ const wantSpan = 64 << 20
 var (
 	errFillFailed  = errors.New("promote failed")
 	errWaitTimeout = errors.New("no progress from the promote")
+	errNoData      = errors.New("range is not on disk and nothing is filling it")
 )
+
+// Linux lseek whence values. They are fixed numbers there; the syscall package
+// does not export them for every platform tierfs builds on.
+const (
+	seekData = 3
+	seekHole = 4
+)
+
+// holeIn reports whether any byte of [off, off+n) in the stub is a hole, that
+// is, a part the promote has not written. Anything it cannot tell counts as a
+// hole: a player must never get zeros that are not the file's data.
+func (h *handle) holeIn(off, n int64) bool {
+	h.seekMu.Lock()
+	defer h.seekMu.Unlock()
+	fd := int(h.stub.Fd())
+	end := off + n
+	for pos := off; pos < end; {
+		d, err := syscall.Seek(fd, pos, seekData)
+		if err != nil || d > pos {
+			return true // ENXIO: only hole to the end of the file
+		}
+		hs, err := syscall.Seek(fd, pos, seekHole)
+		if err != nil {
+			return true
+		}
+		pos = hs
+	}
+	return false
+}
+
+func (h *handle) fillFileExists() bool {
+	_, err := os.Stat(filepath.Join(h.srv.cfg.Manifests, h.m.ID+".fill"))
+	return err == nil
+}
 
 // noteWant writes a want event for the chunk at off, unless it falls in the
 // 64 MiB after this handle's last want.
@@ -71,9 +107,9 @@ func (h *handle) readPlayerMid(ctx context.Context, p []byte, off int64) error {
 	if h.closed.Load() {
 		return errHandleClosed
 	}
-	if !h.allDone.Load() {
+	if !h.allDone.Load() || h.holeIn(off, int64(len(p))) {
 		first, last := h.ck.alignDown(off), h.ck.alignDown(off+int64(len(p))-1)
-		if err := h.waitChunks(ctx, first, last); err != nil {
+		if err := h.waitChunks(ctx, first, last, off, int64(len(p))); err != nil {
 			return err
 		}
 	}
@@ -81,7 +117,7 @@ func (h *handle) readPlayerMid(ctx context.Context, p []byte, off int64) error {
 	return err
 }
 
-func (h *handle) waitChunks(ctx context.Context, first, last int64) error {
+func (h *handle) waitChunks(ctx context.Context, first, last, off, n int64) error {
 	if _, miss := h.firstMissing(first, last); !miss {
 		return nil
 	}
@@ -104,7 +140,15 @@ func (h *handle) waitChunks(ctx context.Context, first, last int64) error {
 			srv.m.WaitFailed.Add(1)
 			return errFillFailed
 		case h.manifestGone():
-			return nil
+			// The manifest is gone. That normally means the promote finished
+			// and the stub is whole; if the range still has holes it is not.
+			if !h.holeIn(off, n) {
+				return nil
+			}
+			if !h.fillFileExists() {
+				srv.m.WaitFailed.Add(1)
+				return errNoData
+			}
 		}
 		h.noteWant(miss)
 		since := start

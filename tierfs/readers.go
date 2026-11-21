@@ -106,7 +106,28 @@ func (c *classifier) ppid(pid uint32) (uint32, bool) {
 	return uint32(n), err == nil && n > 0
 }
 
-func (c *classifier) classify(pid uint32) bool {
+// tgid maps a thread id (what the FUSE request carries) to its process id.
+func (c *classifier) tgid(tid uint32) (uint32, bool) {
+	b, err := os.ReadFile(filepath.Join(c.procRoot, strconv.FormatUint(uint64(tid), 10), "status"))
+	if err != nil {
+		return 0, false
+	}
+	for _, ln := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(ln, "Tgid:"); ok {
+			n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+			return uint32(n), err == nil && n > 0
+		}
+	}
+	return 0, false
+}
+
+// classify looks at the comm of the caller's process (the thread group
+// leader, so a renamed worker thread does not matter) and of its parent.
+func (c *classifier) classify(tid uint32) bool {
+	pid, ok := c.tgid(tid)
+	if !ok {
+		return false // cannot resolve it: a player
+	}
 	name, ok := c.comm(pid)
 	if !ok {
 		return false // cannot read it: a player
