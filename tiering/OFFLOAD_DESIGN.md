@@ -125,10 +125,16 @@ log_event(db, id, kind, detail: dict) -> None
 The `files` table has these columns:
 - identity and placement: `id`, `lib_path`, `stub_path`, `remote_path`;
 - file facts: `size`, `mtime_ns`, `sha256`, `head_len`, `tail_len`, `head_b3`, `tail_b3`;
-- sources: `nzb_path`, `nzb_path2`;
+- sources:
+  - `nzb_path`: the archived NZB of the byte-identical release that AltMount streams. An offload needs it.
+  - `nzb_path2`: the archived NZB of the restore-path release, which is a different release at or above the quality floor. It may be empty when the restore path is only known from a search.
+- media identity, filled from the arr when the row is created and used by qualify and weekly to search: `title`, `year`, `imdb_id`, `tvdb_id`, `season`, `episode`, `release_name`;
 - Plex facts: `rating_key`, `kind` (movie or episode), `is4k`;
 - state: `state`, `step` (the last finished step of an offload or promote, so a crash can resume), `restore_score`, `restore_note`;
-- timestamps: `last_check_ts`, `last_ok_ts`, `created_ts`, `updated_ts`.
+- timestamps:
+  - `last_check_ts`: the last weekly STAT check, whatever its result;
+  - `last_ok_ts`: the last full read whose hash matched;
+  - `created_ts`, `updated_ts`.
 
 ### RemoteReader
 
