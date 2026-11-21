@@ -214,13 +214,30 @@ def _under(path: str, prefix: str) -> bool:
     return prefix == "/" or path == prefix or path.startswith(prefix.rstrip("/") + "/")
 
 
-_UNRAID_DISK = re.compile(r"^/mnt/(?:disk\d+|cache\w*|disks?)(?:/|$)")
+_MNT = re.compile(r"^/mnt/([^/]+)")
+_SLASHES = re.compile(r"/{2,}")
+
+
+def clean_path(path: str) -> str:
+    """Repeated slashes collapsed to one and ``/mnt/user0`` (the array without the cache)
+    written as ``/mnt/user``. ``..`` is not resolved."""
+    p = _SLASHES.sub("/", path)
+    if p == "/mnt/user0" or p.startswith("/mnt/user0/"):
+        p = "/mnt/user" + p[len("/mnt/user0"):]
+    return p
 
 
 def is_disk_path(path: str, disk_map: list[tuple[str, str]]) -> bool:
-    """A path under a ``disk_map`` disk prefix, or on an unraid disk or cache mount."""
-    norm = os.path.normpath(path)
-    return any(_under(norm, d) for _s, d in disk_map) or bool(_UNRAID_DISK.match(norm))
+    """True when the path is not an array path: under a ``disk_map`` disk prefix, or under
+    any ``/mnt/<x>`` other than ``/mnt/user`` (a disk, a named pool, ``/mnt/disks``,
+    ``/mnt/remotes``...) that no map share prefix covers."""
+    norm = os.path.normpath(clean_path(path))
+    if any(_under(norm, d) for _s, d in disk_map):
+        return True
+    if any(_under(norm, sh) for sh, _d in disk_map):
+        return False
+    m = _MNT.match(norm)
+    return bool(m) and m.group(1) != "user"
 
 
 def to_share(path: str, disk_map: list[tuple[str, str]]) -> str:
@@ -280,14 +297,14 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
             log.warning("register: an arr did not answer (%s)", e)
             continue
         for ent in ents:
-            arr_path = map_path(str(ent["path"]), pmap)
-            local = to_share(arr_path, disk_map)  # the share path: what is stored
+            arr_path = map_path(clean_path(str(ent["path"])), pmap)
+            local = clean_path(to_share(arr_path, disk_map))  # the share path: what is stored
             if is_disk_path(local, disk_map):
                 # a disk path no map entry can turn into a share path: never stored
                 out["disk_path"] += 1
                 log.warning("register: an arr lists a disk path no map entry covers, skipped")
                 continue
-            if local != arr_path:
+            if to_share(arr_path, disk_map) != arr_path:
                 out["disk_path_mapped"] += 1
             if local in listed:
                 continue

@@ -365,7 +365,7 @@ def test_E7c_state_file_is_atomic_json_and_a_bad_one_is_ignored(tmp_path):
         import json
         d = json.loads(sp.read_text())
         assert len(d["spent"]["search|one"]) == 1
-        assert [p.name for p in tmp_path.iterdir()] == ["budget.json"]  # no temp left behind
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["budget.json", "budget.json.lock"]  # no temp left
         sp.write_text("{not json")
         ix2 = _client(s, Clock(), search_budget=3, state_path=str(sp))
         assert _try_search(ix2) == "ok"
