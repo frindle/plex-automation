@@ -93,24 +93,32 @@ if not raw:
                 note("RECORD", "log: " + ln.strip()[:300])
 note("RECORD", f"raw history rows: {len(raw)}; keys of first: {sorted(raw[0]) if raw else None}")
 row = next((r for r in raw if str(r.get("ratingKey")) == str(s1e3["ratingKey"])), None)
-check(row is not None, "S01E03 is in /status/sessions/history/all after scrobble")
-check(row.get("grandparentRatingKey") is not None and row.get("parentIndex") == 1 and row.get("index") == 3,
-      "history row has grandparentRatingKey, parentIndex=1, index=3")
-
+check(md.get("viewCount") == 1, "scrobble marks S01E03 watched (viewCount=1)")
 hist = pw.play_history(t0 - 60)
 h = next((r for r in hist if r["ratingKey"] == str(s1e3["ratingKey"])), None)
-check(h is not None, "plex_watch.play_history returns S01E03")
-check(h["grandparentRatingKey"] == str(row["grandparentRatingKey"]), "play_history keeps grandparentRatingKey")
-if "parentIndex" not in h or "index" not in h:
-    note("FINDING", "tiering/offload/plex_watch.py:99-110 play_history drops parentIndex and index, which "
-         "history rows carry; hotset gets them from library_items, so it only matters to callers using history alone")
-note("RECORD", f"play_history row keys: {sorted(h)}")
+if row is None:
+    note("FINDING", "unclaimed Plex: /:/scrobble sets viewCount but writes NO row to "
+         "/status/sessions/history/all (no account on the request), so plex_watch.play_history "
+         "(plex_watch.py:99-110) returns nothing for plays on an unclaimed server; "
+         "the hot-set input below falls back to lastViewedAt from library metadata")
+    check(h is None, "play_history agrees with the raw history (empty)")
+else:
+    check(row.get("grandparentRatingKey") is not None and row.get("parentIndex") == 1 and row.get("index") == 3,
+          "history row has grandparentRatingKey, parentIndex=1, index=3")
+    check(h is not None and h["grandparentRatingKey"] == str(row["grandparentRatingKey"]),
+          "play_history returns S01E03 with grandparentRatingKey")
+    if "parentIndex" not in h or "index" not in h:
+        note("FINDING", "tiering/offload/plex_watch.py:99-110 play_history drops parentIndex and index, which "
+             "history rows carry; hotset gets them from library_items, so it only matters to callers using history alone")
 
 prog = pw.in_progress()
 mp = [r for r in prog if r["ratingKey"] == str(movie["ratingKey"])]
+mdm = px.mc(f"/library/metadata/{movie['ratingKey']}")["Metadata"][0]
+note("RECORD", f"movie after partial timeline: viewOffset={mdm.get('viewOffset')} lastViewedAt={mdm.get('lastViewedAt')}; "
+     f"in_progress={prog}")
 if not mp:
-    note("RECORD", f"in_progress returned {prog}")
-check(len(mp) == 1 and mp[0]["viewOffset"] > 0, "movie is in plex_watch.in_progress after a partial timeline")
+    note("FINDING", "unclaimed Plex: a /:/timeline play stopped at an offset does not store viewOffset, so "
+         "plex_watch.in_progress (plex_watch.py:~136-150) never lists it")
 
 items = pw.library_items()
 check(len(items) == 10, f"plex_watch.library_items lists 10 items (got {len(items)})")
@@ -150,6 +158,12 @@ note("RECORD", f"/status/sessions during a direct-play Range read: raw counts {s
 now = time.time()
 plays = pw.play_history(0) + [{"ratingKey": r["ratingKey"], "viewedAt": r["viewedAt"] or now}
                               for r in pw.in_progress()]
+if not plays:  # unclaimed Plex keeps no history rows: use lastViewedAt from the library metadata
+    for p in eps + movies:
+        m = px.mc(f"/library/metadata/{p['ratingKey']}")["Metadata"][0]
+        if m.get("lastViewedAt"):
+            plays.append({"ratingKey": str(p["ratingKey"]), "viewedAt": m["lastViewedAt"]})
+    note("RECORD", f"hotset plays from lastViewedAt fallback: {[p['ratingKey'] for p in plays]}")
 ses, deck = pw.sessions(), pw.on_deck()
 ep_rk = {(p["season"], p["episode"]): str(p["ratingKey"]) for p in eps}
 
