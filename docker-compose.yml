@@ -96,6 +96,9 @@ services:
       # (needs the /srv/data mount below and PLEX_URL/PLEX_TOKEN) and Plex is asked to scan that folder.
       HOLD_DISK1_UPGRADES: "${HOLD_DISK1_UPGRADES:-0}"
       GLACIER_INDEX: "/glacier-spin/glacier-index.txt"   # written by the nightly mover, same dir as spin-*.tsv
+      # Hold folders for the stopgap hardlinks, outside the arr roots; add <root>/TV Shows and <root>/Movies to the
+      # Plex TV/Movie libraries first (python plex_hold_folders.py, dry run by default).
+      GLACIER_HOLD_ROOT: "${GLACIER_HOLD_ROOT:-data/Glacier Hold}"
       GLACIER_PATH_MAP: "${GLACIER_PATH_MAP:-/data:data}"
       GLACIER_SPIN_DIR: "/glacier-spin"
       GLACIER_WINDOW: "${GLACIER_WINDOW:-22:00-06:00}"

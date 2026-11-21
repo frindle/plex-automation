@@ -111,10 +111,13 @@ class World:
         self.fail_cmd = set()
         self.tracked = {}                  # (who, hash) -> 'upgrade' | 'unknown'
         self.hash_unreadable = set()
+        self.idx = {}                      # hash -> item id (episodeId / movieId)
 
     def add(self, h, who, label, files, grabbed=True, state='downloading', finished=True):
         self.torrents[h] = {'label': label, 'is_finished': finished, 'progress': 100 if finished else 10,
-                            'state': 'Seeding' if finished else 'Downloading'}
+                            'state': 'Seeding' if finished else 'Downloading',
+                            'save_path': '/data/Downloads', 'name': h[:6]}
+        self.idx.setdefault(h, len(self.idx) + 1)
         self.history[(who, h)] = ['grabbed'] if grabbed else []
         self.files[(who, h)] = files
         self.state[(who, h)] = state
@@ -161,13 +164,15 @@ class FakeIO:
         if who in self.w.hash_unreadable:
             raise ConnectionError('down')
         return [{'downloadId': h.upper(), 'trackedDownloadState': self.w.state[(who, h)],
-                 'episodeId': 1, 'movieId': 1, 'outputPath': self.w.out_of(h)}
+                 'episodeId': self.w.idx[h], 'movieId': self.w.idx[h], 'outputPath': self.w.out_of(h)}
                 for (w, h) in self.w.tracked if w == who]
 
     def old_paths(self, who, recs):
         if self.lookup_fails:
             raise ConnectionError('boom')
-        h = recs[0]['downloadId'].lower()
+        r0 = recs[0]
+        h = r0['downloadId'].lower() if r0.get('downloadId') else next(
+            k for k, v in self.w.idx.items() if v == (r0.get('episodeId') or r0.get('movieId')))
         return self.w.files[(who, h)]
 
     def has_grab(self, who, h):
@@ -197,6 +202,9 @@ class FakeIO:
             raise FileNotFoundError(dst)
         del self.w.fs[dst]
         self.w.events.append(('unlink', dst))
+
+    def rmdir_empty(self, folder, stop):
+        self.w.events.append(('rmdir', folder))
 
     def plex_scan(self, folder):
         if self.w.fail_scan:
@@ -354,6 +362,9 @@ def test_release_counts_unmatched_when_the_arr_never_tracks_it():
 # ── the stopgap link ──────────────────────────────────────────────────────────
 
 OLD_FOLDER = '/data/Media/TV Shows/Cold Show/Season 1'
+HOLD_ROOT = '/data/Glacier Hold'
+HOLD_FOLDER = HOLD_ROOT + '/TV Shows/Cold Show'
+HOLD_LINK = HOLD_FOLDER + '/Season 1/ep - glacier-tmp.mkv'
 
 
 def held_with_link():
@@ -367,8 +378,9 @@ def test_link_is_made_next_to_the_old_file_on_the_downloads_disk_and_plex_is_tol
     w, c, st, io = held_with_link()
     link = st[H1]['link']
     assert (c['linked'], c['scanned']) == (1, 1)
-    assert link == OLD_FOLDER + '/ep - glacier-tmp.mkv' and gh.is_link_name(link.rsplit('/', 1)[1])
-    assert w.scans == [OLD_FOLDER]
+    assert link == HOLD_LINK and gh.is_link_name(link.rsplit('/', 1)[1])
+    assert not link.startswith('/data/Media/')                          # outside every arr root folder
+    assert w.scans == [HOLD_FOLDER]
     # proof (i): the link is never on the old file's disk: it shares the download's inode and disk
     assert w.fs[link] == w.fs[w.src_of(H1)] == 'disk2'
     assert w.fs[link] != w.fs[COLD_EP[0]] == 'disk1'
@@ -403,7 +415,7 @@ def test_release_removes_the_link_first_then_relabels_then_refreshes():
     r = gh.release_pass(io, st)
     assert r['released'] == 1
     kinds = [e[0] for e in w.events]
-    assert kinds == ['unlink', 'label', 'refresh']                       # proof (ii)
+    assert kinds == ['unlink', 'rmdir', 'scan', 'label', 'refresh']                       # proof (ii)
     assert w.events[0] == ('unlink', link) and link not in w.fs
     assert w.torrents[H1]['label'] == 'sonarr-upgrade'
 
@@ -439,16 +451,16 @@ def test_restart_between_hold_and_release_loses_nothing():
     w.events.clear()
     r = gh.release_pass(FakeIO(w), after_restart)                        # proof (iv)
     assert r['released'] == 1 and r['rematched'] == 1
-    assert [e[0] for e in w.events] == ['unlink', 'label', 'refresh']
+    assert [e[0] for e in w.events] == ['unlink', 'rmdir', 'scan', 'label', 'refresh']
     assert w.tracked == {('Sonarr', H1): 'upgrade'}
 
 
 def test_restart_clears_a_link_that_has_no_live_hold():
     w = World()
     w.add(H1, 'Sonarr', 'sonarr-upgrade', COLD_EP)
-    link = OLD_FOLDER + '/ep - glacier-tmp.mkv'
+    link = HOLD_LINK
     w.fs[link] = 'disk2'
-    state = {H1: {'label': 'sonarr-upgrade', 'who': 'Sonarr', 'since': NOW, 'link': link, 'folder': OLD_FOLDER}}
+    state = {H1: {'label': 'sonarr-upgrade', 'who': 'Sonarr', 'since': NOW, 'link': link, 'folder': HOLD_FOLDER, 'scan_root': HOLD_ROOT + '/TV Shows'}}
     rc = gh.reconcile(FakeIO(w), state)                                  # torrent never got the hold label
     assert rc['orphan_links_removed'] == 1 and rc['orphan_entries_dropped'] == 1
     assert state == {} and link not in w.fs and w.saved[-1] == {}
@@ -457,8 +469,8 @@ def test_restart_clears_a_link_that_has_no_live_hold():
 def test_crash_after_journal_before_link_leaves_a_record_not_an_orphan():
     w = World()
     w.add(H1, 'Sonarr', 'sonarr-upgrade', COLD_EP)
-    link = OLD_FOLDER + '/ep - glacier-tmp.mkv'
-    state = {H1: {'label': 'sonarr-upgrade', 'who': 'Sonarr', 'since': NOW, 'link': link, 'folder': OLD_FOLDER}}
+    link = HOLD_LINK
+    state = {H1: {'label': 'sonarr-upgrade', 'who': 'Sonarr', 'since': NOW, 'link': link, 'folder': HOLD_FOLDER, 'scan_root': HOLD_ROOT + '/TV Shows'}}
     w.torrents[H1]['label'] = gh.HOLD_LABEL                              # held, link never created
     r = gh.release_pass(FakeIO(w), state)
     assert r['released'] == 1 and w.torrents[H1]['label'] == 'sonarr-upgrade'
@@ -472,7 +484,7 @@ def test_journal_is_written_before_the_link_exists():
     real = io.link
     io.link = lambda a, b: (seen.append(w.saved[-1][H1]['link']), real(a, b))
     gh.hold_pass(io, {}, PREFIXES, LABELS, set())
-    assert seen == [OLD_FOLDER + '/ep - glacier-tmp.mkv']
+    assert seen == [HOLD_LINK]
 
 
 def test_gone_torrent_releases_its_link_too():
@@ -614,3 +626,177 @@ def test_label_verify_pass_skips_held_downloads(monkeypatch, tmp_path):
 
 def test_dockerfile_copies_the_module():
     assert 'COPY glacier_hold.py .' in open('Dockerfile').read()
+
+
+# ── hold folder layout ────────────────────────────────────────────────────────
+
+def test_hold_layout_for_tv_season_tv_flat_and_movies():
+    src = '/data/Downloads/x/ep.mkv'
+    f = lambda who, old: gh.plan_link(src, [old], PREFIXES, who)[0]  # noqa: E731
+    assert f('Sonarr', '/data/Media/TV Shows/Cold Show/Season 02/e.mkv') == \
+        '/data/Glacier Hold/TV Shows/Cold Show/Season 02/ep - glacier-tmp.mkv'
+    assert f('Sonarr', '/data/Media/TV Shows/Cold Show/e.mkv') == '/data/Glacier Hold/TV Shows/Cold Show/ep - glacier-tmp.mkv'
+    assert f('Radarr', '/data/Media/Movies/Cold Movie (2001)/m.mkv') == \
+        '/data/Glacier Hold/Movies/Cold Movie (2001)/ep - glacier-tmp.mkv'
+    assert gh.hold_folders('/data/Glacier Hold/Movies/Cold Movie (2001)/ep - glacier-tmp.mkv') == \
+        ('/data/Glacier Hold/Movies/Cold Movie (2001)', '/data/Glacier Hold/Movies')
+
+
+def test_hold_root_is_configurable_and_never_inside_the_index():
+    src = '/data/Downloads/x/ep.mkv'
+    dst, _ = gh.plan_link(src, ['/data/Media/Movies/Cold Movie (2001)/m.mkv'], PREFIXES, 'Radarr', 'data/Elsewhere')
+    assert dst.startswith('/data/Elsewhere/Movies/')
+    inside = frozenset({'data/Glacier Hold/Movies/Cold Movie (2001)'})
+    assert gh.plan_link(src, ['/data/Media/Movies/Cold Movie (2001)/m.mkv'], inside, 'Radarr') == \
+        (None, 'link_skipped_dst_on_disk1')
+
+
+def test_release_rescans_the_hold_folder_after_removing_the_link():
+    w, c, st, io = held_with_link()
+    w.events.clear()
+    gh.release_pass(io, st)
+    assert ('rmdir', HOLD_FOLDER) in w.events and ('scan', HOLD_ROOT + '/TV Shows') in w.events
+    assert w.events.index(('unlink', HOLD_LINK)) < w.events.index(('scan', HOLD_ROOT + '/TV Shows'))
+
+
+# ── hold at grab time ─────────────────────────────────────────────────────────
+
+def grab(w, h=H1, who='Sonarr', **kw):
+    io = FakeIO(w, **kw)
+    st = {}
+    return gh.grab_hold(io, st, PREFIXES, who, h, [w.idx.get(h, 1)]), st, io
+
+
+def test_grab_then_poll_must_not_import():
+    w = World()
+    w.add(H1, 'Sonarr', 'sonarr-upgrade', COLD_EP, finished=False)       # just grabbed, still downloading
+    status, st, io = grab(w)
+    assert status == 'held' and w.torrents[H1]['label'] == gh.HOLD_LABEL
+    w.torrents[H1].update(is_finished=True, progress=100)                # download completes
+    w.refresh_tracking('Sonarr')                                         # the arr's poll
+    assert w.tracked == {}                                               # nothing to import: no disk1 wake
+    lk = gh.link_pass(io, st, PREFIXES)                                  # the finished copy gets its stopgap link
+    assert lk['linked'] == 1 and st[H1]['link'] == HOLD_LINK
+    gh.release_pass(io, st)
+    assert w.tracked == {('Sonarr', H1): 'upgrade'}
+
+
+def test_grab_hold_skips_other_disks_non_upgrades_and_missing_grab_history():
+    w = World()
+    w.add(H1, 'Sonarr', 'sonarr-upgrade', WARM_EP, finished=False)
+    w.add(H2, 'Sonarr', 'sonarr', [], finished=False)
+    w.add(H3, 'Sonarr', 'sonarr-upgrade', COLD_EP, grabbed=False, finished=False)
+    assert grab(w, H1)[0] == 'old_file_elsewhere'
+    assert grab(w, H2)[0] == 'not_upgrade'
+    assert grab(w, H3)[0] == 'no_grab_history'
+    assert all(t['label'] != gh.HOLD_LABEL for t in w.torrents.values())
+    assert grab(w, 'f' * 40)[0] == 'not_in_deluge'
+    assert grab(w, H1, lookup_fails=True)[0] == 'lookup_failed'
+
+
+def test_grab_hold_radarr():
+    w = World()
+    w.add(H1, 'Radarr', 'radarr-upgrade', ['/data/Media/Movies/Cold Movie (2001)/m.mkv'], finished=False)
+    status, st, io = grab(w, H1, 'Radarr')
+    assert status == 'held' and st[H1]['who'] == 'Radarr' and st[H1]['label'] == 'radarr-upgrade'
+
+
+def test_on_grab_retries_until_deluge_has_the_torrent(monkeypatch, tmp_path):
+    wire(monkeypatch, tmp_path)
+    monkeypatch.setattr(aw, 'GLACIER_GRAB_TRIES', 5)
+    w = World()
+    sleeps = []
+
+    def sleeper(s):
+        sleeps.append(s)
+        if len(sleeps) == 2:
+            w.add(H1, 'Sonarr', 'sonarr-upgrade', COLD_EP, finished=False)   # torrent shows up later
+    w.idx[H1] = 1
+    data = {'downloadId': H1.upper(), 'episodes': [{'id': 1}]}
+    assert aw.glacier_on_grab(data, 'Sonarr', io=FakeIO(w), sleep=sleeper, now_dt=NOON) == 'held'
+    assert len(sleeps) == 2 and aw._glacier_held_hashes() == {H1}
+
+
+def test_on_grab_does_nothing_when_off_up_or_without_a_fresh_index(monkeypatch, tmp_path):
+    wire(monkeypatch, tmp_path)
+    w = World()
+    w.add(H1, 'Sonarr', 'sonarr-upgrade', COLD_EP, finished=False)
+    data = {'downloadId': H1, 'episodes': [{'id': 1}]}
+    assert aw.glacier_on_grab(data, 'Sonarr', io=FakeIO(w), now_dt=NIGHT) == 'inactive'      # disk1 is up
+    monkeypatch.setattr(aw, 'HOLD_DISK1_UPGRADES', False)
+    assert aw.glacier_on_grab(data, 'Sonarr', io=FakeIO(w), now_dt=NOON) == 'off'
+    wire(monkeypatch, tmp_path, index=False)
+    (tmp_path / 'idx').unlink()
+    assert aw.glacier_on_grab(data, 'Sonarr', io=FakeIO(w), now_dt=NOON) == 'inactive'
+    assert w.torrents[H1]['label'] == 'sonarr-upgrade'
+
+
+def test_other_relabels_of_a_held_torrent_become_the_label_to_restore(monkeypatch, tmp_path):
+    wire(monkeypatch, tmp_path)
+    w = World()
+    w.add(H1, 'Sonarr', 'sonarr', COLD_EP, finished=False)
+    data = {'downloadId': H1, 'episodes': [{'id': 1}]}
+    assert aw.glacier_on_grab(data, 'Sonarr', io=FakeIO(w), now_dt=NOON) == 'held'
+    calls = []
+    monkeypatch.setattr(aw, '_ensure_deluge_label', lambda lb: calls.append(lb))
+    monkeypatch.setattr(aw.session, 'post', lambda *a, **k: calls.append('post'))
+    aw.set_torrent_label(H1, 'sonarr-upgrade')                           # the grab throttle wants its label
+    assert calls == [] and aw._glacier_load()['held'][H1]['label'] == 'sonarr-upgrade'
+    aw.glacier_tick(now=NOW + 60, io=FakeIO(w), now_dt=NIGHT)
+    assert w.torrents[H1]['label'] == 'sonarr-upgrade'
+
+
+def test_tick_links_a_grab_time_hold_once_it_finishes(monkeypatch, tmp_path):
+    wire(monkeypatch, tmp_path)
+    w = World()
+    w.add(H1, 'Sonarr', 'sonarr-upgrade', COLD_EP, finished=False)
+    aw.glacier_on_grab({'downloadId': H1, 'episodes': [{'id': 1}]}, 'Sonarr', io=FakeIO(w), now_dt=NOON)
+    assert not any(aw.glacier_tick(now=NOW, io=FakeIO(w), now_dt=NOON).values())   # not finished: nothing to link
+    w.torrents[H1].update(is_finished=True, progress=100)
+    out = aw.glacier_tick(now=NOW + 60, io=FakeIO(w), now_dt=NOON)
+    assert out['link']['linked'] == 1 and aw._glacier_load()['held'][H1]['link'] == HOLD_LINK
+
+
+def test_webhooks_start_the_grab_hold():
+    src = open('arr-webhook.py').read()
+    assert src.count('target=glacier_on_grab') == 2
+
+
+# ── plex_hold_folders.py ──────────────────────────────────────────────────────
+
+class _Resp:
+    def __init__(self, data=None, code=200):
+        self._d, self.status_code = data, code
+
+    def json(self):
+        return self._d
+
+    def raise_for_status(self):
+        pass
+
+
+def _plex_get_fn():
+    secs = {'MediaContainer': {'Directory': [
+        {'key': '1', 'Location': [{'path': '/data/Media/TV Shows'}]},
+        {'key': '2', 'Location': [{'path': '/data/Media/Movies'}, {'path': '/data/Glacier Hold/Movies'}]}]}}
+    return lambda url, **k: _Resp(secs)
+
+
+def test_plex_hold_folders_dry_run_changes_nothing(capsys):
+    import plex_hold_folders as p
+    puts = []
+    rc = p.main(['--plex-url', 'http://x', '--tv', '1', '--movie', '2'], get=_plex_get_fn(),
+                put=lambda *a, **k: puts.append(1), env={'PLEX_TOKEN': 't'})
+    out = capsys.readouterr().out
+    assert rc == 0 and puts == [] and 'to_add=1' in out and 'already_present=1' in out and 'dry run' in out
+
+
+def test_plex_hold_folders_apply_keeps_existing_locations(capsys):
+    import plex_hold_folders as p
+    puts = []
+    rc = p.main(['--plex-url', 'http://x', '--tv', '1', '--movie', '2', '--apply'], get=_plex_get_fn(),
+                put=lambda url, **k: (puts.append((url, k['params'])), _Resp())[1], env={'PLEX_TOKEN': 't'})
+    assert rc == 0 and len(puts) == 1
+    assert puts[0][1]['location'] == ['/data/Media/TV Shows', '/data/Glacier Hold/TV Shows']
+    assert p.main(['--plex-url', 'http://x', '--tv', '1', '--movie', '2'], get=_plex_get_fn(), env={}) == 2
+    assert p.plan([], {'9': '/a'}) == {'9': 'missing'}

@@ -1052,6 +1052,8 @@ def _ensure_deluge_label(label):
             log.warning(f'ensure_label({label}) failed: {e}')
 
 def set_torrent_label(torrent_hash, label):
+    if _glacier_label_guard(torrent_hash, label):
+        return
     _ensure_deluge_label(label)
     resp = session.post(
         f'{DELUGE_URL}/json',
@@ -6648,6 +6650,7 @@ def radarr_webhook():
     event = data.get('eventType', '')
     log.info(f'Radarr event: {event} | isUpgrade: {data.get("isUpgrade")} | downloadId: {data.get("downloadId")}')
     if event == 'Grab':
+        threading.Thread(target=glacier_on_grab, args=(data, 'Radarr'), daemon=True).start()
         threading.Thread(target=handle_grab, args=(data, 'Radarr'), daemon=True).start()
         threading.Thread(target=refresh_metadata_on_grab, args=(data, 'Radarr'), daemon=True).start()
     elif event == 'Download':
@@ -6706,6 +6709,7 @@ def sonarr_webhook():
     event = data.get('eventType', '')
     log.info(f'Sonarr event: {event} | isUpgrade: {data.get("isUpgrade")} | downloadId: {data.get("downloadId")}')
     if event == 'Grab':
+        threading.Thread(target=glacier_on_grab, args=(data, 'Sonarr'), daemon=True).start()
         threading.Thread(target=handle_grab, args=(data, 'Sonarr'), daemon=True).start()
         threading.Thread(target=refresh_metadata_on_grab, args=(data, 'Sonarr'), daemon=True).start()
     elif event == 'SeriesAdd':
@@ -11763,6 +11767,10 @@ GLACIER_PATH_MAP = (_gpm[0], _gpm[1] if len(_gpm) > 1 else '')   # arr container
 GLACIER_POLL_S = float(os.environ.get('GLACIER_POLL_S', '15'))
 GLACIER_STATE = os.environ.get('GLACIER_STATE', '/data/glacier_hold_state.json')
 GLACIER_HOLD_LABEL = glacier_hold.HOLD_LABEL
+GLACIER_HOLD_ROOT = os.environ.get('GLACIER_HOLD_ROOT', glacier_hold.DEFAULT_HOLD_ROOT)   # share-relative; outside the arr roots
+GLACIER_GRAB_TRIES = int(os.environ.get('GLACIER_GRAB_TRIES', '10'))
+GLACIER_GRAB_DELAY_S = float(os.environ.get('GLACIER_GRAB_DELAY_S', '3'))
+_glacier_tls = threading.local()
 _glacier_lock = threading.RLock()
 _glacier_checked = set()
 
@@ -11782,6 +11790,24 @@ def _glacier_held_hashes():
         return set((_glacier_load().get('held') or {}))
     except Exception:  # noqa: BLE001
         return set()
+
+
+def _glacier_label_guard(h, label):
+    """True when `h` is held for disk1 and someone else (grab throttle, label fixers) wants another label on
+    it: the change is not applied, it is recorded as the label to restore on release."""
+    if getattr(_glacier_tls, 'bypass', False) or label == GLACIER_HOLD_LABEL:
+        return False
+    try:
+        with _glacier_lock:
+            doc = _glacier_load()
+            entry = (doc.get('held') or {}).get(h)
+            if not entry:
+                return False
+            entry['label'] = label
+            _write_json_atomic(GLACIER_STATE, doc)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _glacier_now_dt():
@@ -11849,7 +11875,11 @@ class GlacierIO:
                    and str(r.get('downloadId') or '').lower() == download_id for r in (recs or []))
 
     def set_label(self, h, label):
-        set_torrent_label(h, label)
+        _glacier_tls.bypass = True
+        try:
+            set_torrent_label(h, label)
+        finally:
+            _glacier_tls.bypass = False
         _invalidate_snapshot()
 
     def refresh(self, who):
@@ -11861,7 +11891,7 @@ class GlacierIO:
     def pick_source(self, output_path):
         """The download's biggest video file as a '/data/...' path, or None. Walks only the download folder."""
         real = _relink_path(output_path or '')
-        if not real:
+        if not real or not os.path.exists(real):
             return None
         if os.path.isfile(real):
             return output_path
@@ -11884,7 +11914,20 @@ class GlacierIO:
         a, b = _relink_path(src), _relink_path(dst)
         if not a or not b:
             raise OSError('unmappable path')
+        os.makedirs(os.path.dirname(b), exist_ok=True)
         os.link(a, b)
+
+    def rmdir_empty(self, folder, stop):
+        """Remove `folder` and then its parents while empty, never `stop` itself or anything outside it."""
+        cur, top = _relink_path(folder), _relink_path(stop)
+        if not cur or not top or not cur.startswith(top + os.sep):
+            return
+        while cur != top:
+            try:
+                os.rmdir(cur)
+            except OSError:
+                break
+            cur = os.path.dirname(cur)
 
     def unlink(self, dst):
         b = _relink_path(dst)
@@ -11933,12 +11976,49 @@ def glacier_tick(now=None, io=None, now_dt=None, sleep=time.sleep):
             if prefixes:
                 labels = {'sonarr', 'radarr', *[lb.lower() for lb in UPGRADE_LANE_LABELS]}
                 out['hold'] = dict(glacier_hold.hold_pass(io, doc['held'], prefixes, labels, _glacier_checked,
-                                                                  path_map=GLACIER_PATH_MAP))
-        if out.get('hold') or out.get('release'):
+                                                                  path_map=GLACIER_PATH_MAP, hold_root=GLACIER_HOLD_ROOT))
+                lk = dict(glacier_hold.link_pass(io, doc['held'], prefixes, GLACIER_HOLD_ROOT, GLACIER_PATH_MAP))
+                if lk:
+                    out['link'] = lk
+        if out.get('hold') or out.get('release') or out.get('link'):
             _write_json_atomic(GLACIER_STATE, doc)
     if any(v for v in out.values()):
         log.info(f'[glacier] disk1={why} {out}')
     return out
+
+
+def glacier_on_grab(data, source, io=None, sleep=time.sleep, now_dt=None):
+    """OnGrab webhook: hold the download now when the item's current file is on disk1 and disk1 is down, so the
+    completion poll cannot import it. Retries briefly while Deluge or the *arr's history catches up."""
+    if not HOLD_DISK1_UPGRADES:
+        return 'off'
+    h = (data.get('downloadId') or '').lower()
+    if source == 'Sonarr':
+        ids = [e.get('id') for e in (data.get('episodes') or [])][:1]
+    else:
+        ids = [(data.get('movie') or {}).get('id')]
+    if not h or not any(i is not None for i in ids):
+        return 'no_ids'
+    status = 'none'
+    for attempt in range(max(GLACIER_GRAB_TRIES, 1)):
+        with _glacier_lock:
+            up, _why = glacier_hold.disk1_up(GLACIER_SPIN_DIR, GLACIER_WINDOW, now_dt or _glacier_now_dt())
+            prefixes = None if up else glacier_hold.load_index(GLACIER_INDEX, time.time(), GLACIER_INDEX_MAX_AGE_DAYS)
+            if not prefixes:
+                return 'inactive'
+            doc = _glacier_load()
+            doc.setdefault('held', {})
+            io_ = io or GlacierIO(doc)
+            io_.doc = doc
+            status = glacier_hold.grab_hold(io_, doc['held'], prefixes, source, h, ids,
+                                            path_map=GLACIER_PATH_MAP)
+            if status == 'held':
+                _write_json_atomic(GLACIER_STATE, doc)
+        if status not in ('not_in_deluge', 'no_grab_history', 'lookup_failed') or attempt + 1 >= GLACIER_GRAB_TRIES:
+            break
+        sleep(GLACIER_GRAB_DELAY_S)
+    log.info(f'[glacier] grab {h} {status}')
+    return status
 
 
 def glacier_startup(io=None):
