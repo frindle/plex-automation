@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import fcntl
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -50,7 +51,10 @@ BACKOFF_MAX = 6 * 3600.0  # promote retry delay: RETRY_DELAY doubling, capped he
 FAIL_ALERT_AFTER = 3  # failures in a row per id before an alert
 REGISTER_KEYS = ("listed", "missing_local", "ambiguous", "errors")  # required in the result
 HISTORY_DROP = 0.20  # a Plex history this much shorter than last time is not trusted
-FLAG_PREFIX = "promote flagged"  # restore_note #82's weekly check writes with weekly_flag
+WEEKLY_EVERY = 7 * DAY  # the weekly check runs when the last one is this old
+WEEKLY_RETRY = 3600.0  # after a failed weekly check, wait this long before trying again
+FOLLOW_POLL = 0.25  # the tierfs event file is read this often (a want starts a promote within 1 s)
+WANT_FRESH = 900.0  # a want older than this is not a player waiting any more (TIERFS_WAIT_S)
 # Used only when the state module does not export COLUMNS.
 FALLBACK_COLUMNS = ("sha256", "nzb_path", "nzb_path2", "remote_path", "restore_score",
                     "restore_note", "last_check_ts", "last_stat_ok_ts")
@@ -248,6 +252,7 @@ class Deps:
     qualify: Callable
     gate: Callable
     register: Callable | None = None  # register(db, apply) -> dict, once a night
+    weekly: Callable | None = None  # weekly(db) runs weekly.run_weekly; flags come as events
 
 
 def _http_gate(cfg: Config):
@@ -278,6 +283,14 @@ def _http_gate(cfg: Config):
     return gate
 
 
+def _takes_want(fn) -> bool:
+    """True when `fn` accepts a `want=` argument (ops.promote gains it in a later change)."""
+    try:
+        return "want" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def load_deps(cfg: Config) -> Deps:
     """Wire the real modules. Imported here so the runner imports without them."""
     from . import altmount, ops
@@ -285,9 +298,10 @@ def load_deps(cfg: Config) -> Deps:
 
     reader = altmount.WebDavReader()
 
-    def promote(db, row, apply):
+    def promote(db, row, apply, want=None):
+        kw = {"want": want} if want is not None and _takes_want(ops.promote) else {}
         return ops.promote(db, row["id"], reader, apply=apply, manifest_dir=cfg.manifests,
-                           path_map=cfg.path_map)
+                           path_map=cfg.path_map, **kw)
 
     def demote(db, row, apply):
         # lib_path stays the share path; ops resolves the disk path and picks the stub
@@ -299,11 +313,14 @@ def load_deps(cfg: Config) -> Deps:
         f"{__package__}.wiring:qualify_from_env"
     mod, _, fn = factory.partition(":")
     qualify = getattr(importlib.import_module(mod), fn)()
+    weekly = None
+    if not os.environ.get("TIERING_QUALIFY_FACTORY"):  # a custom factory has its own clients
+        weekly = importlib.import_module(f"{__package__}.wiring").weekly_from_env()
 
     def register(db, apply):
         return importlib.import_module(f"{__package__}.register").register(db, apply)
 
-    return Deps(st, promote, demote, qualify, _http_gate(cfg), register)
+    return Deps(st, promote, demote, qualify, _http_gate(cfg), register, weekly)
 
 
 # --------------------------------------------------------------------------
@@ -312,7 +329,7 @@ def load_deps(cfg: Config) -> Deps:
 
 class BadChunkScanner:
     """Tails the tierfs event file (and rotated copies on the first look or
-    after a rotation) for `bad_chunk` and `slot_timeout` events."""
+    after a rotation) for `bad_chunk`, `slot_timeout` and `want` events."""
 
     def __init__(self, path):
         self.path, self.ino, self.pos = path, None, 0
@@ -330,7 +347,7 @@ class BadChunkScanner:
         for line in data[:cut].splitlines():
             try:
                 e = json.loads(line)
-                if e.get("ev") in ("bad_chunk", "slot_timeout") and e.get("id"):
+                if e.get("ev") in ("bad_chunk", "slot_timeout", "want") and e.get("id"):
                     out.append({"ev": e["ev"], "id": str(e["id"]),
                                 "ts": float(e.get("ts") or 0), "offset": e.get("offset")})
             except (ValueError, TypeError, AttributeError):
@@ -382,7 +399,15 @@ class Runner:
         self.worker_deaths = 0
         self.promote_started: dict = {}  # id -> start time of a running promote
         self.flagged: set = set()  # ids a weekly_flag event asked to promote
-        self.ops_seq = 0  # last events row read
+        self.ops_seq = 0  # last events row read for alerts
+        self.flag_seq = 0  # last events row read for weekly flags
+        self.want_off: dict = {}  # id -> newest offset a player waits at
+        self.tail_events: list = []  # bad_chunk and slot_timeout events for the pass
+        self.follow_mu = threading.Lock()
+        self.weekly_last = 0.0
+        self.weekly_running = False
+        self.weekly_tried = False
+        self.weekly_retry_at = 0.0
         self.history_ok = True
         self.read_failed: set = set()
         self.history_alerted: set = set()  # night starts
@@ -483,6 +508,8 @@ class Runner:
         self._loaded = True
         self.slot_alerted = {(float(n), str(i)) for n, i in self._kv_get(db, "slot_alerted", [])}
         self.ops_seq = int(self._kv_get(db, "ops_seq", 0) or 0)
+        self.flag_seq = int(self._kv_get(db, "weekly_flag_cursor", 0) or 0)
+        self.weekly_last = float(self._kv_get(db, "weekly_last_ts", 0) or 0)
         self.flagged = set(self._kv_get(db, "flagged", []))
 
     def _demote_block(self, now) -> str:
@@ -500,11 +527,46 @@ class Runner:
             return "a promote is pending"
         if n["bytes"] >= self.cfg.demote_bytes_per_night:
             return "the night's byte cap is reached"
+        if self._weekly_due(now):
+            return "the weekly check has not finished"
         if self.deps.register is not None and \
                 not (self.register_state["start"] == night_start(now, self.cfg.window)
                      and self.register_state["ok"]):
             return "tonight's register did not succeed"
         return ""
+
+    # ---- weekly check
+
+    def _weekly_due(self, now) -> bool:
+        if self.deps.weekly is None or not self.cfg.apply:
+            return False
+        return self.weekly_running or now - self.weekly_last >= WEEKLY_EVERY
+
+    def _weekly(self, db, now):
+        """Start the weekly check when the last one is 7 days old: on start-up, and
+        at the start of the demote window. It runs on its own thread; demotes wait."""
+        if not self._weekly_due(now) or self.weekly_running or now < self.weekly_retry_at:
+            return
+        if self.weekly_tried and night_start(now, self.cfg.window) is None:
+            return
+        self.weekly_tried = True
+        self.weekly_running = True
+        self._spawn(self._weekly_worker)
+
+    def _weekly_worker(self):
+        try:
+            db = self._open()
+            log.info("weekly check start")
+            self.deps.weekly(db)
+            now = self.clock()
+            self.weekly_last = now
+            self._kv_set(db, "weekly_last_ts", now)
+            log.info("weekly check done")
+        except Exception as e:
+            self._alert("weekly_failed", "-", reason=f"{type(e).__name__}: {e}")
+            self.weekly_retry_at = self.clock() + WEEKLY_RETRY  # demotes stay blocked meanwhile
+        finally:
+            self.weekly_running = False
 
     # ---- reading the world
 
@@ -616,11 +678,59 @@ class Runner:
         self.ops_alerted.add((kind, str(id)))
         self._alert(kind, id, **detail)
 
+    def _follow_once(self):
+        """Read new tierfs events. A `want` starts its promote now; the rest wait
+        in tail_events for the next pass."""
+        with self.follow_mu:
+            for ev in self.scanner.scan():
+                if ev["ev"] == "want":
+                    self._want(ev)
+                else:
+                    self.tail_events.append(ev)
+
+    def _want(self, ev):
+        """A player waits on a file that is not all on local disk: promote it now,
+        ahead of every other promote and outside the concurrency limit."""
+        id = ev["id"]
+        now = self.clock()
+        if now - ev["ts"] > WANT_FRESH:  # nobody waits that long
+            return
+        off = ev.get("offset")
+        with self.mu:
+            if off is not None:
+                self.want_off[id] = off
+            if not self.cfg.apply or id in self.promote_running or id in self.demote_running \
+                    or self.retry_after.get(id, 0) > now:
+                return
+            self.promote_running.add(id)
+            self.promote_started[id] = now
+        self._spawn(lambda: self._want_worker(id))
+
+    def _want_worker(self, id):
+        try:
+            self._promote_one(self._open(), id, None, wanted=True)
+        except Exception as e:
+            log.error("wanted promote %s died: %s: %s", id, type(e).__name__, e)
+            with self.mu:
+                self.promote_running.discard(id)
+                self.promote_started.pop(id, None)
+
+    def follow_forever(self):
+        while not self.stop.is_set():
+            try:
+                self._follow_once()
+            except Exception as e:
+                log.error("event follower failed: %s", type(e).__name__)
+            self.stop.wait(FOLLOW_POLL)
+
     def _bad_chunks(self, db, now):
         self.slot_timeouts = 0
         night = next_night_start(now, self.cfg.window)
         self.slot_alerted = {k for k in self.slot_alerted if k[0] == night}
-        for ev in self.scanner.scan():
+        self._follow_once()
+        with self.follow_mu:
+            evs, self.tail_events = self.tail_events, []
+        for ev in evs:
             if ev["ev"] == "slot_timeout":
                 self.slot_timeouts += 1
                 if (night, ev["id"]) in self.slot_alerted:
@@ -728,18 +838,22 @@ class Runner:
         if not callable(read):
             return
         try:
-            evs = read(db, after_seq=self.ops_seq)
+            evs = read(db, after_seq=min(self.ops_seq, self.flag_seq))
         except Exception as e:
             log.error("cannot read ops events: %s", type(e).__name__)
             return
         for e in evs:
             kind, id = e.get("kind"), str(e.get("id"))
-            self.ops_seq = max(self.ops_seq, int(e.get("seq") or 0))
-            if kind == "weekly_flag":
+            seq = int(e.get("seq") or 0)
+            if kind == "weekly_flag" and seq > self.flag_seq:
                 self.flagged.add(id)
-            elif kind in ALERT_EVENTS:
+            elif kind in ALERT_EVENTS and seq > self.ops_seq:
                 self._once(kind, id, **(e.get("detail") or {}))
+        top = max([int(e.get("seq") or 0) for e in evs] + [0])
+        self.ops_seq = max(self.ops_seq, top)
+        self.flag_seq = max(self.flag_seq, top)
         self._kv_set(db, "ops_seq", self.ops_seq)
+        self._kv_set(db, "weekly_flag_cursor", self.flag_seq)
         self._kv_set(db, "flagged", sorted(self.flagged))
 
     def _find_disk(self, r):
@@ -782,6 +896,7 @@ class Runner:
         self._load_persisted(db)
         self.skipped_paths = set()
         self._register(db, now)
+        self._weekly(db, now)
         data, complete = self._read_plex(now)
         items = data["items"]
         if items is None:
@@ -856,8 +971,7 @@ class Runner:
         queued = {r["id"] for _, r in pjobs}
         extra = [r for r in rows if r["id"] not in queued and r["id"] not in self.demote_running
                  and (r["state"] == "promoting"
-                      or (r["state"] in ACTIVE_STATES and r["id"] in self.flagged
-                          and str(r.get("restore_note") or "").startswith(FLAG_PREFIX)))]
+                      or (r["state"] in ACTIVE_STATES and r["id"] in self.flagged))]
         pjobs = [(hotset.Action("promote", r.get("rating_key"),
                                 "flagged" if r["id"] in self.flagged else "resume", 1), r)
                  for r in sorted(extra, key=lambda r: r["id"])] + pjobs
@@ -1003,22 +1117,7 @@ class Runner:
                 id, row = self._next_promote()
                 if id is None:
                     return
-                try:
-                    cur = self.state.get(db, id) or row
-                    if cur["state"] not in ACTIVE_STATES:
-                        continue
-                    log.info("promote start %s", id)
-                    res = self.deps.promote(db, cur, True)
-                    self._after(db, id, "promote", res)
-                except Exception as e:
-                    log.error("promote %s raised %s: %s", id, type(e).__name__, e)
-                    self._note_failure(self.clock())
-                    self._alert("promote_failed", id, reason=f"{type(e).__name__}: {e}")
-                    self._backoff(id, "promote", f"{type(e).__name__}")
-                finally:
-                    with self.mu:
-                        self.promote_running.discard(id)
-                        self.promote_started.pop(id, None)
+                self._promote_one(db, id, row)
         except Exception as e:
             self.worker_deaths += 1
             log.error("promote worker died: %s: %s", type(e).__name__, e)
@@ -1027,10 +1126,38 @@ class Runner:
             with self.mu:
                 self.promote_workers -= 1
 
+    def _promote_one(self, db, id, row, wanted=False):
+        """Promote one row (already in promote_running). A wanted promote only runs for
+        a row that is still offloaded or promoting."""
+        try:
+            cur = self.state.get(db, id) or row
+            if cur is None or cur["state"] not in (ACTIVE_STATES if not wanted
+                                                  else ("offloaded", "promoting")):
+                return
+            log.info("promote start %s%s", id, " (wanted)" if wanted else "")
+            if _takes_want(self.deps.promote):
+                res = self.deps.promote(db, cur, True, want=lambda: self.want_off.get(id))
+            else:
+                res = self.deps.promote(db, cur, True)
+            self._after(db, id, "promote", res)
+        except Exception as e:
+            log.error("promote %s raised %s: %s", id, type(e).__name__, e)
+            self._note_failure(self.clock())
+            self._alert("promote_failed", id, reason=f"{type(e).__name__}: {e}")
+            self._backoff(id, "promote", f"{type(e).__name__}")
+        finally:
+            with self.mu:
+                self.promote_running.discard(id)
+                self.promote_started.pop(id, None)
+                self.want_off.pop(id, None)
+
     def _after(self, db, id, what, res):
         if res.ok:
             log.info("%s %s done: state=%s", what, id, res.state)
             self.fails.pop(id, None)
+            if what == "promote" and id in self.flagged:  # its flag ends with its promote
+                self.flagged.discard(id)
+                self._kv_set(db, "flagged", sorted(self.flagged))
             return
         log.warning("%s %s not done: %s (state=%s)", what, id, res.reason, res.state)
         self._backoff(id, what, res.reason)
@@ -1100,6 +1227,10 @@ class Runner:
                 return
             # qualify reads the file, so it gets the disk path; the DB row keeps the share path
             q = self.deps.qualify({**row, "lib_path": disk})
+            if not q.ok and any(str(r).endswith("_unsure") for r in q.reasons):
+                # a partial search or a spent budget: not tonight, and nothing is recorded
+                log.info("demote %s not tonight: %s", id, ",".join(q.reasons))
+                return
             if not q.ok:
                 log.info("demote %s skipped: qualify failed: %s", id, ",".join(q.reasons))
                 st.log_event(db, id, "qualify_failed", {"reasons": list(q.reasons)})
@@ -1155,6 +1286,8 @@ class Runner:
                                          if self.clock() - t > STUCK_AFTER)}
 
     def run_forever(self):
+        if self.cfg.apply and self.cfg.events:
+            threading.Thread(target=self.follow_forever, daemon=True).start()
         while not self.stop.is_set():
             try:
                 self.run_pass()

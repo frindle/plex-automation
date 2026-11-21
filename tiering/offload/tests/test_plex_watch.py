@@ -142,11 +142,11 @@ def test_missing_env(monkeypatch):
 def test_read_tierfs_events(tmp_path):
     p = tmp_path / "events.jsonl"
     ev = lambda ts, i, e: json.dumps({"ts": ts, "id": i, "ev": e}) + "\n"  # noqa: E731
-    p.write_text(ev(1000, "aa", "open") + "not json\n" + ev(1100, "aa", "remote_read")
-                 + "\n[1,2]\n" + '{"ts": "x", "id": "aa", "ev": "remote_read"}\n'
-                 + ev(1200, "zz", "remote_read") + ev(50, "bb", "remote_read"))
-    (tmp_path / "events.jsonl.1").write_text(ev(900, "cc", "remote_read") + "\xff garbage")
-    (tmp_path / "events.jsonl.3").write_text(ev(950, "dd", "remote_read"))
+    p.write_text(ev(1000, "aa", "open") + "not json\n" + ev(1100, "aa", "want")
+                 + "\n[1,2]\n" + '{"ts": "x", "id": "aa", "ev": "want"}\n'
+                 + ev(1200, "zz", "want") + ev(50, "bb", "want"))
+    (tmp_path / "events.jsonl.1").write_text(ev(900, "cc", "want") + "\xff garbage")
+    (tmp_path / "events.jsonl.3").write_text(ev(950, "dd", "want"))
     ids = {"aa": 7, "bb": "8", "cc": "9", "dd": 4}
     got = plex_watch.read_tierfs_events(str(p), 100, ids)
     assert got == {"7": 1100.0, "9": 900.0, "4": 950.0}
