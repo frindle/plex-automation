@@ -37,31 +37,27 @@ def kinds(w):
 
 # P1: a weekly flag promotes the row whether or not the hot set wants it
 def test_p1_weekly_flagged_row_is_promoted(w):
-    w.row("wk", 1, w.movie(1), "offloaded", restore_note="promote flagged: missing")
+    w.row("wk", 1, w.movie(1), "offloaded")
     w.state.evlog.append(("wk", "weekly_flag", {"reasons": ["missing_segments_x"]}))
     w.run()
     w.run()
     assert w.ops("promote") == ["wk"], "a weekly-flagged row must be promoted even when idle"
 
 
-def test_p1_flag_without_the_note_or_after_promote_is_not_repeated(w):
-    w.row("a", 1, w.movie(1), "offloaded")  # event but no "promote flagged" note
-    w.state.evlog.append(("a", "weekly_flag", {"reasons": []}))
+def test_p1_flag_needs_an_event_and_ends_with_its_promote(w):
+    w.row("a", 1, w.movie(1), "offloaded", restore_note="promote flagged: stale")
     w.run()
-    assert w.ops("promote") == []
-    w.row("b", 2, w.movie(2), "offloaded", restore_note="promote flagged: x")
+    assert w.ops("promote") == [], "a note alone is not a flag"
+    w.row("b", 2, w.movie(2), "offloaded")  # no note: the event is the flag
     w.state.evlog.append(("b", "weekly_flag", {"reasons": []}))
     w.run()
-    w.state.rows["b"]["state"] = "whole"  # promoted
-    w.state.rows["b"]["restore_note"] = "promote flagged: x"
-    w.run()
-    w.state.rows["b"]["state"] = "offloaded"  # offloaded again later, stale note
+    w.state.rows["b"]["state"] = "offloaded"  # offloaded again later
     w.run()
     assert w.ops("promote") == ["b"]
 
 
 def test_p1_flagged_promote_failure_backs_off(w):
-    w.row("wk", 1, w.movie(1), "offloaded", restore_note="promote flagged: x")
+    w.row("wk", 1, w.movie(1), "offloaded")
     w.state.evlog.append(("wk", "weekly_flag", {}))
     w.promote_result["wk"] = Res(False, "offloaded", reason="no")
     w.run()
@@ -382,11 +378,11 @@ def test_events_are_read_incrementally(w):
 
 def test_cursor_and_flags_survive_a_restart(tmp_path, monkeypatch):
     w = World(tmp_path, monkeypatch)
-    w.row("wk", 1, w.movie(1), "offloaded", restore_note="promote flagged: x")
+    w.row("wk", 1, w.movie(1), "offloaded")
     w.state.evlog.append(("wk", "weekly_flag", {}))
     w.promote_result["wk"] = Res(False, "offloaded", reason="no")
     w.run()
-    assert w.state.kv["ops_seq"] == 1 and w.state.kv["flagged"] == ["wk"]
+    assert w.state.kv["weekly_flag_cursor"] == 1 and w.state.kv["flagged"] == ["wk"]
     w2 = World(tmp_path, monkeypatch)
     w2.state = w.state
     w2.runner.state = w.state
@@ -394,7 +390,7 @@ def test_cursor_and_flags_survive_a_restart(tmp_path, monkeypatch):
     w2.runner.deps.promote = w2._promote
     w2.clock.t = w.clock.t + 400
     w2.run()
-    assert w2.ops("promote") == ["wk"] and w2.runner.ops_seq == 1
+    assert w2.ops("promote") == ["wk"] and w2.runner.flag_seq == 1
 
 
 def test_slot_timeout_dedup_survives_a_restart(tmp_path, monkeypatch):

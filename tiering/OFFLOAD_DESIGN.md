@@ -27,7 +27,7 @@ The hot-set code implements these rules.
 - **New import:** whole for `new_days` (30).
 - **Played, synced, on deck or in progress:** whole until `idle_days` (60) after the last play.
 - **TV:** a play or sync of any episode makes its whole season whole. If the episode is one of the last `near_end_eps` (3) of the season, the next season is made whole too. Each season stays whole until `idle_days` after the last play in it.
-- **Synced:** any tierfs `remote_read` event, which is a read past the local head. A Plex download reads the whole file, so this covers sync.
+- **Synced:** any tierfs `want` event, which is a read that waits for data not yet on local disk. A Plex download reads the whole file, so this covers sync.
 
 ## Layout on disk
 

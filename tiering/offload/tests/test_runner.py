@@ -718,6 +718,7 @@ def test_load_deps_passes_path_map_and_no_stub_root(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, f"{pkg}.state", types.ModuleType(f"{pkg}.state"))
     from offload import wiring
     monkeypatch.setattr(wiring, "qualify_from_env", lambda env=None: "q")
+    monkeypatch.setattr(wiring, "weekly_from_env", lambda env=None: "w")
     pm = paths.parse_path_map("/share=/d1")
     deps = runner.load_deps(Config(db=str(tmp_path / "t.db"), path_map=pm, apply=True,
                                    gate_path_map=[("/a", "/b")], stub_roots="/d1/s"))
@@ -847,7 +848,7 @@ def _fake_intake(monkeypatch, calls):
 
     mk("nntp_stat", ProviderCfg=Cfg, Checker=lambda cfg: ("checker", cfg))
     mk("newznab", load_indexers=lambda raw: [("idx", raw)],
-       NewznabClient=lambda ix: ("indexers", ix))
+       NewznabClient=lambda ix, state_path=None: ("indexers", ix, state_path))
     mk("altmount", WebDavReader=lambda: "reader",
        ImportClient=lambda reader=None: ("importer", reader))
     mk("qualify", qualify=lambda row, **kw: (calls.append((row, kw)), "result")[1])
@@ -864,7 +865,7 @@ def test_wiring_builds_clients_from_env(tmp_path, monkeypatch):
     assert kw["stat_primary"] == ("checker", "primary")
     assert kw["stat_secondary"] == ("checker", "secondary")
     assert kw["reader"] == "reader" and kw["importer"] == ("importer", "reader")
-    assert kw["indexers"] == ("indexers", [("idx", "[]")])
+    assert kw["indexers"] == ("indexers", [("idx", "[]")], str(tmp_path / "newznab_state.json"))
     assert kw["archive_dir"] == str(tmp_path / "nzb")
     env["TIERING_NZB_DIR"] = "/x/nzb"
     wiring.qualify_from_env(env)({"id": "b"})
@@ -877,6 +878,7 @@ def test_default_factory_is_wiring(tmp_path, monkeypatch):
     from offload import wiring
     monkeypatch.delenv("TIERING_QUALIFY_FACTORY", raising=False)
     monkeypatch.setattr(wiring, "qualify_from_env", lambda env=None: "built")
+    monkeypatch.setattr(wiring, "weekly_from_env", lambda env=None: "weekly")
     _fake_intake(monkeypatch, [])
     import types
     for name in ("ops", "state"):
@@ -884,7 +886,7 @@ def test_default_factory_is_wiring(tmp_path, monkeypatch):
                             types.ModuleType(f"{runner.__package__}.{name}"))
     cfg = Config(db=str(tmp_path / "t.db"), gate_path_map=[("/a", "/b")])
     deps = runner.load_deps(cfg)
-    assert deps.qualify == "built" and deps.register is not None
+    assert deps.qualify == "built" and deps.register is not None and deps.weekly == "weekly"
 
 
 _HAVE_INTAKE = all(importlib.util.find_spec(f"offload.{m}") for m in
@@ -896,7 +898,8 @@ def test_wiring_against_real_intake_modules(tmp_path, monkeypatch):
     from offload import wiring
     env = {"TIERING_DB": str(tmp_path / "t.db"), "NNTP_PRIMARY_HOST": "p.example",
            "NNTP_SECONDARY_HOST": "s.example", "NEWZNAB_INDEXERS": "[]",
-           "ALTMOUNT_URL": "http://altmount.example", "ALTMOUNT_API_KEY": "k"}
+           "ALTMOUNT_URL": "https://altmount.example", "ALTMOUNT_API_KEY": "k",
+           "TIERFS_REMOTE_BASE": "https://dav.example"}
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert callable(wiring.qualify_from_env(env))
