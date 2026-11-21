@@ -79,7 +79,18 @@ px.timeline(s1e3["ratingKey"], "stopped", 8000, d3)
 px.scrobble(s1e3["ratingKey"])
 time.sleep(3)
 
+md = px.mc(f"/library/metadata/{s1e3['ratingKey']}")["Metadata"][0]
+note("RECORD", f"S01E03 after scrobble: viewCount={md.get('viewCount')} lastViewedAt={md.get('lastViewedAt')} "
+     f"viewOffset={md.get('viewOffset')}")
 raw = px.history()
+if not raw:
+    for q in ({"accountID": 1}, {"sort": "viewedAt:desc"}):
+        note("RECORD", f"history with {q}: {len(px.mc('/status/sessions/history/all', params=q).get('Metadata', []))} rows")
+    logp = os.path.join(os.environ.get("E2E_PLEX_LOGDIR", ""), "Plex Media Server.log")
+    if os.path.exists(logp):
+        for ln in open(logp, errors="replace"):
+            if "scrobble" in ln.lower() or "timeline" in ln.lower():
+                note("RECORD", "log: " + ln.strip()[:300])
 note("RECORD", f"raw history rows: {len(raw)}; keys of first: {sorted(raw[0]) if raw else None}")
 row = next((r for r in raw if str(r.get("ratingKey")) == str(s1e3["ratingKey"])), None)
 check(row is not None, "S01E03 is in /status/sessions/history/all after scrobble")

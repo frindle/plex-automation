@@ -27,4 +27,4 @@ sudo mount --make-rshared "$MNT"
 "$here/plex_up.sh" up "$WORK" "$LIB" "$MNT"
 python3 "$here/plexctl.py" create-sections --movies "$LIB/Movies" --tv "$LIB/TV" >/dev/null
 python3 "$here/plexctl.py" scan >/dev/null
-python3 "$here/test_plex_api.py"
+E2E_PLEX_LOGDIR="$LOGDIR" python3 "$here/test_plex_api.py"
