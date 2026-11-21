@@ -27,7 +27,7 @@ The hot-set code implements these rules.
 - **New import:** whole for `new_days` (30).
 - **Played, synced, on deck or in progress:** whole until `idle_days` (60) after the last play.
 - **TV:** a play or sync of any episode makes its whole season whole. If the episode is one of the last `near_end_eps` (3) of the season, the next season is made whole too. Each season stays whole until `idle_days` after the last play in it.
-- **Synced:** any tierfs `want` event, which is a read that waits for data not yet on local disk. A Plex download reads the whole file, so this covers sync.
+- **Synced:** any tierfs `want` event, which is a player read past the local head (see tierfs, **Waiting reads**). A Plex download reads the whole file, so this covers sync. A background reader's `remote_read` does not count.
 
 ## Layout on disk
 
@@ -89,22 +89,37 @@ tierfs reads the remote at `${TIERFS_REMOTE_BASE}` + `remote_path`. The credenti
   - Mode is 0444 and nlink is 1.
   - Handles are opened with direct I/O, so reads arrive with their exact offset and size and tierfs does its own read-ahead.
   - Size and mtime come from the manifest.
-- **Reads:** any read in the head or tail ranges comes from the stub with `pread`. Any read in the middle comes from the remote with HTTP Range requests. A read that crosses a boundary is split.
+- **Reads:** any read in the head or tail ranges comes from the stub with `pread`. A read in the middle goes one of two ways, depending on the reader (see **Waiting reads**). A read that crosses a boundary is split.
 - **Verified middle:** tierfs never returns a remote byte it has not checked.
   - It fetches whole chunks and checks each one's BLAKE3 against the chunk list before any byte of it is returned.
   - On a mismatch it fetches the chunk again once with a new request. If that also fails, the read returns EIO and a `bad_chunk` event is written.
   - A manifest whose chunk list is missing or does not match `chunks_b3` is skipped, so its entry is not shown.
-  - This is what stops a Plex stream or a mobile download from ever getting zero-filled data. A download that hits a bad chunk fails and Plex retries it later.
-- **Remote stream:** each open handle has one sequential stream with a read-ahead buffer, `TIERFS_READAHEAD`, default 32 MiB.
+  - This is what stops a reader from ever getting zero-filled data.
+- **Waiting reads (playback and sync never fail on a slow remote):** a play or a sync makes the file whole anyway, so a Plex player never streams the middle from the remote. Its reads wait for the promote, which fetches each chunk only once.
+  - **Reader class:** each FUSE request carries the caller's pid.
+    - tierfs reads `/proc/<pid>/comm` and the parent's `comm`, cached per pid. `comm` is cut to 15 characters.
+    - The reader is *background* when either name is in `TIERFS_BACKGROUND_COMMS` (comma list, default `Plex Media Scan`). Every other reader, including a pid it cannot read, is a *player*.
+    - tierfs runs with `pid: host`, so it can see the pids of Plex processes in other containers.
+  - **Background reads** use the remote stream below, unchanged, and write `remote_read` as before.
+  - **Player reads** of the middle come only from the stub, and only for chunks listed in the fill file `${TIERFS_MANIFESTS}/<id>.fill` (see **Promote order**). A read whose chunks are not listed yet waits:
+    - On the first wait of a handle, tierfs writes a `want` event with `"offset"` set to the chunk start. It writes another whenever the wanted offset falls outside the 64 MiB after the last `want` of that handle.
+    - Pre-warm: once a player read reaches `0.75 * head_len`, tierfs writes a `want` at `head_len`, so the promote starts before the reader reaches the middle.
+    - The read is answered as soon as the fill file lists its chunks. tierfs watches the file, polling at least every 200 ms.
+    - A `failed <offset>` line in the fill file returns EIO at once.
+    - Otherwise, EIO only after `TIERFS_WAIT_S` (default 900) with no new line in the fill file. There is no limit while the fill file keeps growing.
+    - When the caller goes away and the request is interrupted, the wait stops.
+  - Each handle keeps its stub fd open. When the manifest is removed after a finished promote, open handles treat every chunk as local, because the stub inode is now the whole file.
+  - Player reads never return remote bytes, so the 10 s remote error limit does not apply to them.
+- **Remote stream (background readers only):** each open handle has one sequential stream with a read-ahead buffer, `TIERFS_READAHEAD`, default 32 MiB.
   - Pre-warm: once a read reaches `0.75 * head_len`, start the stream at `head_len`.
   - A read outside the current stream window cancels the old request at once and starts a new one at that offset.
   - The number of open remote streams is capped by `TIERFS_MAX_STREAMS`, default 16.
-- **Errors:** retry with backoff for up to 10 s, then return EIO. Never return zeros for bytes it could not fetch.
+- **Errors (background readers):** retry with backoff for up to 10 s, then return EIO. Never return zeros for bytes it could not fetch.
 - **Manifest reload:** poll every 5 s and on SIGHUP.
   - When a manifest is removed, its entry disappears.
   - Handles that are already open keep working until they are closed.
 - **Events:** JSON lines appended to `${TIERFS_EVENTS}`. The file rotates at 64 MiB and 3 old files are kept.
-  - Format: `{"ts": <unix s float>, "id": "...", "ev": "open"|"remote_read"|"close"|"bad_chunk", "bytes_local": n, "bytes_remote": n}`. `bad_chunk` also carries `"offset": n`, the chunk's start in the file.
+  - Format: `{"ts": <unix s float>, "id": "...", "ev": "open"|"remote_read"|"want"|"close"|"bad_chunk", "bytes_local": n, "bytes_remote": n}`. `bad_chunk` and `want` also carry `"offset": n`, the chunk's start in the file.
   - `remote_read` is written once per handle, on the first remote byte. `close` carries the totals.
 - **Status:** `/healthz` and `/metrics` on `TIERFS_HTTP`, which listens on localhost only.
 

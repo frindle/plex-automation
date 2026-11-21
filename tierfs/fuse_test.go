@@ -76,6 +76,10 @@ func startFuse(t *testing.T, mod func(*Config)) *fuseEnv {
 		Mount: e.mnt, Manifests: e.mdir, EventsPath: e.events, HTTPAddr: "127.0.0.1:0",
 		PollInterval: time.Hour, // tests call Reload themselves
 		StubRoots:    []string{filepath.Join(root, "stubs")},
+		// The test process itself is the reader, so it counts as background
+		// (it keeps the remote stream) unless a test says otherwise.
+		BackgroundComms: []string{selfComm(t)},
+		FillPoll:        20 * time.Millisecond,
 		Remote: RemoteConfig{
 			Base: e.rs.URL, User: testUser, Pass: testPass, ReadAhead: 16 << 20, MaxStreams: 8,
 		},

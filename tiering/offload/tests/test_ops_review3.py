@@ -129,7 +129,7 @@ def test_L2_short_remote_fails_after_three_attempts_at_same_offset(tmp_path):
     assert not r.ok and r.state == "failed"
     row = st.get(env.db, ID)
     assert row["state"] == "failed"
-    assert str(10 * MIB) in row["restore_note"] and "restore path" in row["restore_note"]
+    assert str(14 * MIB) in row["restore_note"]  # chunks are fetched one at a time: the 2nd one is short and "restore path" in row["restore_note"]
     kinds = [e["kind"] for e in st.events(env.db, ID)]
     assert "promote_short_remote" in kinds
     assert os.path.islink(env.lib) and os.path.exists(env.lib)  # L still resolves

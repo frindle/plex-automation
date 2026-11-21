@@ -66,6 +66,11 @@ class ShortRead(ConnectionError):
 
 
 SHORT_LIMIT = 3  # consecutive attempts that end short at the same offset
+WANT_SPAN = 64 * MIB  # a want inside the next 64 MiB does not move the fill cursor
+DEFAULT_RETRY_S = 600.0
+RETRY_MAX_DELAY = 30.0
+_sleep = time.sleep  # tests patch these two
+_mono = time.monotonic
 
 
 class ChunkMismatch(OpsError):
@@ -147,6 +152,10 @@ def manifest_path(manifest_dir, id) -> str:
 
 def chunks_path(manifest_dir, id) -> str:
     return os.path.join(str(manifest_dir), f"{id}.chunks")
+
+
+def fill_path(manifest_dir, id) -> str:
+    return os.path.join(str(manifest_dir), f"{id}.fill")
 
 
 def write_manifest(manifest_dir, manifest: dict) -> str:
@@ -613,6 +622,7 @@ def _abort_offload(db, id, reason, lib, stub, manifest_dir, step, to_whole=False
     if not ours_link:
         _rm(manifest_path(manifest_dir, id))
         _rm(chunks_path(manifest_dir, id))
+        _rm(fill_path(manifest_dir, id))
     if to_whole and not ours_link and not orphan:
         st.set_state(db, id, "whole", step=0, stub_path=None)
         st.log_event(db, id, "offload_aborted", {"at_step": step, "reason": reason})
@@ -761,6 +771,7 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
             return _abort_offload(db, id, "sha256 of the stub differs from the row; nothing swapped",
                                   lib, stub, manifest_dir, step)
         chunks_blob = sc["chunks"]
+        _rm(fill_path(manifest_dir, id))  # a fill file left by an earlier cycle is stale
         write_chunks(manifest_dir, id, chunks_blob)
         _point("offload.chunks_written")
         write_manifest(manifest_dir, {
@@ -970,14 +981,21 @@ def promote(
     manifest_dir=None,
     after_step: Callable[[int], None] | None = None,
     path_map=None,
+    want: Callable[[], int | None] | None = None,
 ) -> Result:
     """Fill the stub's middle from the remote (every chunk checked against the
     chunk list), verify sha256, swap it over L. On a mismatch nothing is
-    swapped: state=failed and the symlink stays."""
+    swapped: state=failed and the symlink stays.
+
+    Chunks are fetched one at a time, starting at the newest offset `want()`
+    returns (None: from the start of the middle), then wrapping round. Each
+    chunk is written, fdatasync'd and only then listed in <id>.fill, which is
+    what tierfs's waiting players watch. `chunk` is kept for callers; one read
+    is always one list chunk."""
     with _id_lock(db, id) as held:
         if not held:
             return Result(False, None, 0, _BUSY)
-        return _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map)
+        return _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map, want)
 
 
 def _short_remote(db, id, offset, step):
@@ -1018,7 +1036,14 @@ def _swapped(lib, stub, state, step) -> bool:
         return step >= 4
 
 
-def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=None) -> Result:
+def _retry_budget() -> float:
+    try:
+        return max(0.0, float(os.environ.get("TIERING_PROMOTE_RETRY_S", DEFAULT_RETRY_S)))
+    except ValueError:
+        return DEFAULT_RETRY_S
+
+
+def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=None, want=None) -> Result:
     row = st.get(db, id)
     if row is None:
         return Result(False, None, 0, "unknown id")
@@ -1043,6 +1068,7 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
     ext = os.path.splitext(lib)[1]
     tmp = lib + TMP_SUFFIX
     mpath, cpath = manifest_path(manifest_dir, id), chunks_path(manifest_dir, id)
+    fpath = fill_path(manifest_dir, id)
 
     def ours_symlink():
         return os.path.islink(lib) and os.path.basename(os.readlink(lib)) == f"{id}{ext}"
@@ -1065,6 +1091,7 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
             _rm_our_symlink(tmp, id, lib)
             _rm(mpath)
             _rm(cpath)
+            _rm(fpath)
             st.set_state(db, id, "whole", step=0, stub_path=None)
             st.log_event(db, id, "offload_aborted", {"at_step": step})
             return Result(True, "whole", 0, "offload aborted; file is whole")
@@ -1116,7 +1143,7 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
     # ---- step 1: fill the middle (only that range, chunk by chunk), fsync
     if step < 1:
         try:
-            _fill_middle(reader, row, stub, lib, chunk, chunk_size, chunk_digests)
+            _fill_middle(reader, row, stub, lib, chunk_size, chunk_digests, fpath, want, _retry_budget())
         except ChunkMismatch as e:
             _fail(db, id, f"chunk mismatch from the remote at offset {e.offset}; nothing swapped",
                   offset=e.offset)
@@ -1135,6 +1162,7 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
     if step < 2:
         got = _sha256_file(stub)
         if got != row["sha256"]:
+            _rm(fpath)  # the listed chunks cannot be trusted: a retry must refetch them
             _fail(db, id, "sha256 mismatch after filling the stub; nothing swapped",
                   expected=row["sha256"], got=got)
             return Result(False, "failed", step, "sha256 mismatch")
@@ -1156,7 +1184,7 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
         _record(db, id, 4, "promoting", after_step)
         step = 4
 
-    # ---- step 5: drop the stub's extra link, the manifest and the chunk list
+    # ---- step 5: drop the stub's extra link, the manifest, the chunk list and the fill file
     ls = os.lstat(lib)
     if not stat_mod.S_ISREG(ls.st_mode):
         raise OpsError("L is not a regular file after the swap")
@@ -1169,6 +1197,7 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
     _rm(mpath)
     _point("promote.manifest_removed")
     _rm(cpath)
+    _rm(fpath)
     _fsync_dir(os.path.dirname(lib) or ".")
     st.set_state(db, id, "whole", step=0, stub_path=None, head_b3=None, tail_b3=None,
                  last_ok_ts=time.time())
@@ -1229,10 +1258,72 @@ def _same_regular(a, b) -> bool:
     return stat_mod.S_ISREG(sa.st_mode) and _same_inode(sa, sb)
 
 
-def _fill_middle(reader, row, stub, lib, chunk, chunk_size, digests):
+def _read_fill(path, start, chunk_size, n) -> set[int]:
+    """Chunk indexes the fill file lists. Lines that are not a chunk start of
+    this middle (a `failed` line, a torn last line) are ignored."""
+    done = set()
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return done
+    for line in raw.split(b"\n")[:-1]:  # the last piece has no newline: torn
+        try:
+            off = int(line)
+        except ValueError:
+            continue
+        if off >= start and (off - start) % chunk_size == 0 and (off - start) // chunk_size < n:
+            done.add((off - start) // chunk_size)
+    return done
+
+
+def _drop_failed_lines(path) -> None:
+    """A promote that starts again after a failure must not leave the old
+    `failed` line in front of tierfs's waiting readers."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return
+    if b"failed" not in raw:
+        return
+    keep = b"".join(ln + b"\n" for ln in raw.split(b"\n")[:-1] if not ln.startswith(b"failed"))
+    _write_atomic(path, keep)
+
+
+def _fetch_chunk(reader, remote_path, off, n, digest, retry_s):
+    """One chunk, checked against the chunk list. A fetch error is retried with
+    backoff for up to retry_s; a second hash mismatch raises ChunkMismatch."""
+    deadline, delay, bad = None, 1.0, 0
+    while True:
+        try:
+            data = reader.read_range(remote_path, off, n)
+            if len(data) != n:
+                raise ShortRead(off, n, len(data))
+        except Exception as e:
+            now = _mono()
+            if deadline is None:
+                deadline = now + retry_s
+            if now + delay > deadline:
+                raise
+            log.warning("chunk at %d: %s: %s; retrying in %.0fs", off, type(e).__name__, e, delay)
+            _sleep(delay)
+            delay = min(delay * 2, RETRY_MAX_DELAY)
+            continue
+        if blake3.blake3(data).digest() == digest:
+            return data
+        bad += 1
+        if bad >= 2:
+            raise ChunkMismatch(off)
+
+
+def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry_s):
     start, end = row["head_len"], row["size"] - row["tail_len"]
-    step_len = max(chunk_size, chunk // chunk_size * chunk_size)
+    n_chunks = len(digests)
+    done = _read_fill(fpath, start, chunk_size, n_chunks)
+    _drop_failed_lines(fpath)
     fd = os.open(stub, os.O_WRONLY)
+    ffd = os.open(fpath, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
         fs = os.fstat(fd)
         if not stat_mod.S_ISREG(fs.st_mode) or fs.st_nlink != 1:
@@ -1243,22 +1334,34 @@ def _fill_middle(reader, row, stub, lib, chunk, chunk_size, digests):
             ls = None
         if ls is not None and _same_inode(fs, ls):
             raise OpsError("stub is the same inode as L; refusing to write into the library file")
-        off = start
-        while off < end:
-            n = min(step_len, end - off)
-            data = reader.read_range(row["remote_path"], off, n)
-            if len(data) != n:
-                raise ShortRead(off, n, len(data))
-            for p in range(0, n, chunk_size):  # check every chunk before any byte is written
-                piece = data[p:p + chunk_size]
-                idx = (off + p - start) // chunk_size
-                if blake3.blake3(piece).digest() != digests[idx]:
-                    raise ChunkMismatch(off + p)
+        cursor, last_want, first = 0, None, True
+        while len(done) < n_chunks:
+            w = want() if want else None
+            if w is not None and w != last_want:
+                last_want = w
+                widx = (w - start) // chunk_size
+                if 0 <= widx < n_chunks and (first or not 0 <= w - (start + cursor * chunk_size) < WANT_SPAN):
+                    cursor = widx
+                first = False
+            idx = cursor
+            while idx in done:  # first chunk at or after the cursor that is still to fetch
+                idx = (idx + 1) % n_chunks
+            off = start + idx * chunk_size
+            n = min(chunk_size, end - off)
+            try:
+                data = _fetch_chunk(reader, row["remote_path"], off, n, digests[idx], retry_s)
+            except ChunkMismatch:
+                os.write(ffd, f"failed {off}\n".encode())
+                raise
             view = memoryview(data)
-            w = 0
-            while w < n:
-                w += os.pwrite(fd, view[w:], off + w)
-            off += n
+            w_ = 0
+            while w_ < n:
+                w_ += os.pwrite(fd, view[w_:], off + w_)
+            os.fdatasync(fd)
+            os.write(ffd, f"{off}\n".encode())
+            done.add(idx)
+            cursor = (idx + 1) % n_chunks
         os.fsync(fd)
     finally:
         os.close(fd)
+        os.close(ffd)

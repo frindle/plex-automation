@@ -55,7 +55,7 @@ func TestServerGetattrAfterRemovalWithOpenFile(t *testing.T) {
 	}
 	buf := make([]byte, 4096)
 	off := e.m.HeadLen + 5<<20
-	rr, rst := raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: eo.NodeId}, Fh: oo.Fh, Offset: uint64(off), Size: 4096}, buf)
+	rr, rst := raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: eo.NodeId, Caller: fuse.Caller{Pid: scanPid}}, Fh: oo.Fh, Offset: uint64(off), Size: 4096}, buf)
 	if !rst.Ok() {
 		t.Fatal(rst)
 	}
