@@ -80,7 +80,7 @@ func TestSplitCoversExactly(t *testing.T) {
 }
 
 func TestManifestValidate(t *testing.T) {
-	const tmpl = `{"v":%V,"id":"%ID","ext":"%EXT","size":%SIZE,"mtime_ns":5,"head_len":200,"tail_len":100,"stub_path":"%STUB","remote_path":"%REMOTE"}`
+	const tmpl = `{"v":%V,"id":"%ID","ext":"%EXT","size":%SIZE,"mtime_ns":5,"head_len":200,"tail_len":100,"chunk_size":4194304,"chunks_b3":"abababababababababababababababababababababababababababababababab","stub_path":"%STUB","remote_path":"%REMOTE"}`
 	build := func(v, id, ext, size, stub, remote string) []byte {
 		return []byte(strings.NewReplacer("%V", v, "%ID", id, "%EXT", ext, "%SIZE", size, "%STUB", stub, "%REMOTE", remote).Replace(tmpl))
 	}
