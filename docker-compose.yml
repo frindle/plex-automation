@@ -92,7 +92,7 @@ services:
       SEED_IDLE_DAYS: "${SEED_IDLE_DAYS:-14}"
       # Glacier disk (disk1) quiet hours; off. HOLD_DISK1_UPGRADES: a finished upgrade download whose old file is
       # on disk1 (per GLACIER_INDEX, never a disk lookup) waits on a hold label until disk1 is up (spin log says so, or
-      # inside GLACIER_WINDOW); meanwhile the new copy is hardlinked next to the old one under a "- glacier-tmp" name
+      # inside GLACIER_WINDOW, host local time); meanwhile the new copy is hardlinked into GLACIER_HOLD_ROOT under a "- glacier-tmp" name
       # (needs the /srv/data mount below and PLEX_URL/PLEX_TOKEN) and Plex is asked to scan that folder.
       HOLD_DISK1_UPGRADES: "${HOLD_DISK1_UPGRADES:-0}"
       GLACIER_INDEX: "/glacier-spin/glacier-index.txt"   # written by the nightly mover, same dir as spin-*.tsv
@@ -161,6 +161,8 @@ services:
       - "/mnt/user/data:/srv/data"
       # Glacier wake logger's spin-*.tsv rows, read-only (used only when HOLD_DISK1_UPGRADES is on).
       - "${GLACIER_SPIN_HOST_DIR:-/mnt/cache/appdata/glacier-wake/data}:/glacier-spin:ro"
+      # The host's zone file, so the glacier window is read in host local time (the container itself stays on UTC).
+      - "/etc/localtime:/glacier-localtime:ro"
 
 networks:
   br0:

@@ -11810,13 +11810,24 @@ def _glacier_label_guard(h, label):
         return False
 
 
+GLACIER_TZ_FILE = os.environ.get('GLACIER_TZ_FILE', '/glacier-localtime')   # the host's /etc/localtime, read-only
+
+
 def _glacier_now_dt():
+    """Now in the host's zone: the nightly window is the mover's, which runs on host local time, and this
+    container runs on UTC. GLACIER_TZ (an IANA name) wins; else the host's zone file mounted at
+    GLACIER_TZ_FILE; else container local time."""
+    from zoneinfo import ZoneInfo
     if GLACIER_TZ:
         try:
-            from zoneinfo import ZoneInfo
             return datetime.now(ZoneInfo(GLACIER_TZ))
         except Exception:  # noqa: BLE001
             pass
+    try:
+        with open(GLACIER_TZ_FILE, 'rb') as fh:
+            return datetime.now(ZoneInfo.from_file(fh))
+    except Exception:  # noqa: BLE001
+        pass
     return datetime.now()
 
 

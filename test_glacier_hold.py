@@ -515,6 +515,27 @@ def wire(monkeypatch, tmp_path, hold=True, index=True):
 NOON, NIGHT = datetime(2026, 1, 1, 12, 0), datetime(2026, 1, 1, 23, 0)
 
 
+def _tzif(offset_h):
+    """A minimal TZif v1 file for a fixed UTC offset (no transitions)."""
+    import struct
+    hdr = b'TZif' + b'\0' * 16 + struct.pack('>6l', 0, 0, 0, 0, 1, 4)
+    return hdr + struct.pack('>lBB', offset_h * 3600, 0, 0) + b'XXX\0'
+
+
+def test_window_clock_uses_the_host_zone_file(monkeypatch, tmp_path):
+    f = tmp_path / 'localtime'
+    f.write_bytes(_tzif(-8))
+    monkeypatch.setattr(aw, 'GLACIER_TZ', '')
+    monkeypatch.setattr(aw, 'GLACIER_TZ_FILE', str(f))
+    got = aw._glacier_now_dt()
+    assert got.utcoffset().total_seconds() == -8 * 3600
+    monkeypatch.setattr(aw, 'GLACIER_TZ', 'UTC')                       # an explicit zone wins
+    assert aw._glacier_now_dt().utcoffset().total_seconds() == 0
+    monkeypatch.setattr(aw, 'GLACIER_TZ', '')
+    monkeypatch.setattr(aw, 'GLACIER_TZ_FILE', str(tmp_path / 'missing'))
+    assert aw._glacier_now_dt().tzinfo is None                          # no file: container local time
+
+
 def test_tick_holds_by_day_releases_at_night_and_persists(monkeypatch, tmp_path):
     wire(monkeypatch, tmp_path)
     w = World()
