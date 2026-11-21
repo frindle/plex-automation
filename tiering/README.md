@@ -75,6 +75,20 @@ A live run turns Unraid's turbo write on (`mdcmd set md_write_method 1`, reconst
 
 The run aborts if the array is stopped, a parity check/rebuild is running, or another glacier run holds the lock. If the mover is running (its pid file `/var/run/mover.pid`, which Mover Tuning also writes, or a process named `mover`), a live run waits for it to finish, at the start and before each unit, so both share one spin-up; if the move window ends first, the rest waits for the next night. A dry run goes ahead with a warning.
 
+## Deploy with compose (offload tier)
+
+`docker-compose.tiering.yml` adds two services to the stack: `tierfs` (the FUSE mount) and `tiering-runner` (the offload runner, image built from `tiering/Dockerfile`). It is not loaded until `.env` says so, and the runner is a dry run until `TIERING_APPLY=1`.
+
+1. Host, once per array start (User Scripts, "At Startup of Array"): `bash tiering/tierfs-host-mount.sh`. It makes `TIERFS_MOUNT` a shared mount point so the FUSE mount reaches the host.
+2. Make the state folders: `mkdir -p "$TIERING_STATE_DIR"/{manifests,events,nzb}` and one stub folder per media disk (`mkdir /mnt/diskN/.stubs`).
+3. Fill the "Offload tier" block in `.env` (see `.env.example`) and uncomment `COMPOSE_FILE=...`.
+4. Plex and each arr: add a path mapping `TIERFS_MOUNT` -> the same path in the container, access mode **Read Only - Slave**. Library symlinks point at that path, so it must be identical everywhere. A container started before tierfs still gets the mount (slave propagation); one mapped without Slave sees an empty folder and every offloaded file looks broken.
+5. `./update.sh`, then check `docker logs tierfs` and `docker logs tiering-runner`. The dry run logs `plan: demote ...` lines; read a night of them before setting `TIERING_APPLY=1`.
+
+To pause offloading, stop only the runner: `docker-compose stop tiering-runner`. Leave tierfs running: offloaded files are read through it, and while it is stopped they do not open. Promote every file back before removing tierfs.
+
+Alerts (`alerts.jsonl` in the state folder) are only written to that file and the runner log. Nothing pushes them yet.
+
 ## Tests (run on a Linux test box)
 ```
 bash tiering/tests/test_glacier.sh        # fake /mnt tree, df and torrent gate stubbed

@@ -142,6 +142,17 @@ for f in $DOCKERFILE $COMPOSE_FILE $LOCKFILE; do
   check "$f changed: builds" "$(builds)" 1
 done
 
+# 5b. the offload tier's images: its compose file, tierfs/ and tiering/offload/ build;
+# the rest of tiering/ does not
+for f in docker-compose.tiering.yml tierfs/config.go tiering/Dockerfile tiering/offload/state.py; do
+  upstream "$f" append
+  run_update
+  check "$f changed: builds" "$(builds)" 1
+done
+upstream tiering/README.md append
+run_update
+check "tiering/README.md only: no build" "$(builds)" 0
+
 # 6. a commit that touches both a doc and an input
 set -- $NONINPUT_FILES
 echo "# both $RANDOM" >> "$DEV/$1"
