@@ -44,5 +44,5 @@ if [ "$movies_only" = 0 ]; then
   done
 fi
 
-( cd "$out" && find . -name '*.mkv' | LC_ALL=C sort | xargs sha256sum > "$out/SHA256SUMS" )
+( cd "$out" && find . -name '*.mkv' -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$out/SHA256SUMS" )
 cat "$out/SHA256SUMS"
