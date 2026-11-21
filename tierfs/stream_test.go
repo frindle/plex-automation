@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zeebo/blake3"
 )
 
 // These tests exercise the remote stream without FUSE.
@@ -378,5 +381,31 @@ func TestReloadSkipsInvalidAndKeepsOpenSetStable(t *testing.T) {
 	s.Reload()
 	if len(s.names()) != 1 {
 		t.Fatal("a missing manifest dir emptied the set")
+	}
+}
+
+func TestStreamVerifiedBadChunkFailsAfterOneRefetch(t *testing.T) {
+	const cs = 1 << 20
+	data := randomData(streamTestSize, 9)
+	rs := newRangeServer(t, data)
+	ck := &chunkCheck{base: 0, size: cs}
+	for off := int64(0); off < streamTestSize; off += cs {
+		ck.sums = append(ck.sums, blake3.Sum256(data[off:min(off+cs, streamTestSize)]))
+	}
+	rs.zero(2*cs, 3*cs, 1000)
+	r := newTestRemote(t, rs, nil)
+	s := r.newVerifiedStream("x", testRemote, 0, streamTestSize, ck)
+	defer s.Close()
+	p := make([]byte, 1000)
+	if err := s.readAt(context.Background(), p, cs); err != nil || !bytes.Equal(p, data[cs:cs+1000]) {
+		t.Fatalf("good chunk: %v", err)
+	}
+	err := s.readAt(context.Background(), p, 2*cs+5)
+	var bc *badChunkError
+	if !errors.As(err, &bc) || bc.Offset != 2*cs {
+		t.Fatalf("got %v, want a bad chunk at %d", err, 2*cs)
+	}
+	if rs.reqCount() != 2 {
+		t.Errorf("%d requests, want 2 (original and one refetch)", rs.reqCount())
 	}
 }

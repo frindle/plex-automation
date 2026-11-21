@@ -20,6 +20,18 @@ a symlink into the mount, so Plex sees a normal file. The design is in
   and starts a new one.
 - If the remote fails, tierfs retries with backoff for up to 10 seconds and then
   returns EIO. It never returns zeros for data it could not fetch.
+- Middle bytes are verified. The remote can answer a missing segment with zeros
+  and a normal 206, so tierfs fetches whole chunks (`chunk_size`, 4 MiB; the last
+  may be short) and checks each one's BLAKE3 against `<id>.chunks` before any of
+  it is returned. A random seek fetches the chunk that holds the offset. On a
+  mismatch the chunk is fetched again once with a new request. If that fails too
+  the read returns EIO and a `bad_chunk` event is written. Other chunks keep
+  working.
+- A manifest is skipped (its entry is not shown) when `<id>.chunks` is missing,
+  is not 32 bytes per chunk, or does not match the manifest's `chunks_b3`. If an
+  entry was valid before, the old entry stays.
+- Handles are opened with direct I/O, and the tail is `32 MiB + size mod 1 MiB`,
+  so head-only and tail-only reads make no remote request.
 - At most `TIERFS_MAX_STREAMS` streams are open at once. An unused stream gives
   its slot back after 30 seconds.
 
@@ -45,13 +57,15 @@ removed its entry disappears, but handles that are already open keep working.
 
 One JSON line per event: `{"ts": 1711393377.5, "id": "...", "ev": "open", "bytes_local": 0, "bytes_remote": 0}`.
 `ev` is `open`, `remote_read` (once per handle, on the first byte read from the
-remote) or `close` (carries the totals for the handle).
+remote), `close` (carries the totals for the handle) or `bad_chunk` (a chunk
+failed verification twice; it also carries `"offset"`, the chunk's start in the
+file).
 
 ## Metrics
 
 `/metrics` is Prometheus text: `tierfs_bytes_local_total`,
 `tierfs_bytes_remote_total`, `tierfs_open_handles`, `tierfs_active_streams`,
-`tierfs_remote_errors_total`, `tierfs_remote_requests_total`,
+`tierfs_remote_errors_total`, `tierfs_remote_requests_total`, `tierfs_bad_chunks_total`,
 `tierfs_manifests` and the histogram `tierfs_remote_ttfb_seconds`.
 
 ## Running it

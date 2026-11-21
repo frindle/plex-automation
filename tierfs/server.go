@@ -33,8 +33,9 @@ type Config struct {
 }
 
 type entry struct {
-	m   *Manifest
-	raw string
+	m    *Manifest
+	raw  string
+	sums [][32]byte
 }
 
 // Server ties the manifest set, the FUSE mount, the remote and the status
@@ -213,7 +214,7 @@ func (s *Server) Reload() {
 	}
 	for name, l := range good {
 		if _, ok := s.entries[name]; !ok {
-			s.entries[name] = &entry{m: l.m, raw: l.raw}
+			s.entries[name] = &entry{m: l.m, raw: l.raw, sums: l.sums}
 			added++
 		}
 	}
@@ -370,7 +371,7 @@ func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	if f.srv.get(f.e.m.Name()) != f.e { // manifest removed since lookup
 		return nil, 0, syscall.ENOENT
 	}
-	h, err := f.srv.openHandle(f.e.m)
+	h, err := f.srv.openHandle(f.e)
 	if err != nil {
 		log.Printf("open %s: stub: %v", f.e.m.ID, err)
 		return nil, 0, syscall.EIO

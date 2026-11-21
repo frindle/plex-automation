@@ -23,6 +23,7 @@ type Event struct {
 	Ev          string  `json:"ev"`
 	BytesLocal  int64   `json:"bytes_local"`
 	BytesRemote int64   `json:"bytes_remote"`
+	Offset      *int64  `json:"offset,omitempty"` // bad_chunk: start of the chunk
 }
 
 // EventLog appends JSON lines to a file and rotates it by size. A nil
@@ -82,13 +83,20 @@ func (e *EventLog) rotate() error {
 
 // Emit appends one event.
 func (e *EventLog) Emit(id, ev string, local, remote int64) {
+	e.emit(Event{ID: id, Ev: ev, BytesLocal: local, BytesRemote: remote})
+}
+
+// EmitBad records a chunk that failed verification twice.
+func (e *EventLog) EmitBad(id string, offset int64) {
+	e.emit(Event{ID: id, Ev: "bad_chunk", Offset: &offset})
+}
+
+func (e *EventLog) emit(ev Event) {
 	if e == nil {
 		return
 	}
-	line, _ := json.Marshal(Event{
-		TS: float64(time.Now().UnixNano()) / 1e9, ID: id, Ev: ev,
-		BytesLocal: local, BytesRemote: remote,
-	})
+	ev.TS = float64(time.Now().UnixNano()) / 1e9
+	line, _ := json.Marshal(ev)
 	line = append(line, '\n')
 	e.mu.Lock()
 	defer e.mu.Unlock()

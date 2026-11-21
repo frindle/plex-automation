@@ -68,6 +68,7 @@ func startFuse(t *testing.T, mod func(*Config)) *fuseEnv {
 	}
 	e.m = buildManifest(int64(len(data)), filepath.Join(root, "stubs", testID+".mkv"))
 	writeStub(t, e.m, data)
+	writeChunks(t, e.mdir, e.m, data)
 	writeManifest(t, e.mdir, e.m)
 	e.rs = newRangeServer(t, data)
 
@@ -468,6 +469,7 @@ func TestFuseNewManifestAppearsOnReload(t *testing.T) {
 	m2.ID, m2.Ext = "ffeeddccbbaa9988", ".mp4"
 	m2.StubPath = filepath.Join(filepath.Dir(e.m.StubPath), m2.ID+".mp4")
 	writeStub(t, &m2, e.data)
+	writeChunks(t, e.mdir, &m2, e.data)
 	os.WriteFile(filepath.Join(e.mdir, "junk.json"), []byte("not json"), 0o644)
 	writeManifest(t, e.mdir, &m2)
 	e.srv.Reload()
@@ -509,5 +511,134 @@ func TestFuseStatusEndpoints(t *testing.T) {
 		if !bytes.Contains([]byte(body), []byte(want)) {
 			t.Errorf("metrics missing %q:\n%s", want, body)
 		}
+	}
+}
+
+func (e *fuseEnv) chunkOff(k int64) int64 { return e.m.HeadLen + k*e.m.ChunkSize }
+
+func (e *fuseEnv) readAtMust(f *os.File, off int64, n int) {
+	e.t.Helper()
+	p := make([]byte, n)
+	if _, err := f.ReadAt(p, off); err != nil {
+		e.t.Fatalf("read at %d: %v", off, err)
+	}
+	if !bytes.Equal(p, e.data[off:off+int64(n)]) {
+		e.t.Fatalf("data at %d differs", off)
+	}
+}
+
+func TestFuseZeroFilledChunkGivesEIOAndEvent(t *testing.T) {
+	e := startFuse(t, nil)
+	bad := e.chunkOff(3)
+	e.rs.zero(bad, bad+e.m.ChunkSize, 1000)
+	f := e.open()
+	e.readAtMust(f, e.chunkOff(2), 64<<10)
+	p := make([]byte, 64<<10)
+	for i := range p {
+		p[i] = 0xEE
+	}
+	n, err := f.ReadAt(p, bad+100)
+	if !errors.Is(err, syscall.EIO) || n != 0 {
+		t.Fatalf("got n=%d err=%v, want EIO and no bytes", n, err)
+	}
+	for _, b := range p {
+		if b == 0 {
+			t.Fatal("zeros were returned")
+		}
+	}
+	waitFor(t, 5*time.Second, "bad_chunk event", func() bool { return countEv(readEvents(t, e.events), "bad_chunk") >= 1 })
+	for _, ev := range readEvents(t, e.events) {
+		if ev.Ev == "bad_chunk" && (ev.Offset == nil || *ev.Offset != bad || ev.ID != testID) {
+			t.Fatalf("bad_chunk event %+v, want offset %d", ev, bad)
+		}
+	}
+	if e.srv.Metrics().BadChunks.Load() == 0 {
+		t.Error("bad chunks not counted")
+	}
+	// Other chunks still read, with no waiting out a cooldown.
+	t0 := time.Now()
+	e.readAtMust(f, e.chunkOff(5)+12345, 100<<10)
+	e.readAtMust(f, e.chunkOff(1), 100<<10)
+	e.readAtMust(f, e.chunkOff(3)-4096, 4096)
+	if time.Since(t0) > 3*time.Second {
+		t.Error("reads of good chunks were slow after a bad chunk")
+	}
+}
+
+func TestFuseTransientBadChunkIsRefetched(t *testing.T) {
+	e := startFuse(t, nil)
+	bad := e.chunkOff(3)
+	e.rs.zero(bad, bad+e.m.ChunkSize, 1)
+	f := e.open()
+	before := e.rs.reqCount()
+	e.readAtMust(f, bad+777, 256<<10)
+	if got := e.rs.reqCount() - before; got != 2 {
+		t.Errorf("%d remote requests, want 2 (one refetch)", got)
+	}
+	if n := countEv(readEvents(t, e.events), "bad_chunk"); n != 0 {
+		t.Errorf("%d bad_chunk events for a chunk that verified on refetch", n)
+	}
+}
+
+func TestFuseLastShortChunkVerifies(t *testing.T) {
+	e := startFuse(t, nil)
+	mid := e.m.MidEnd() - e.m.HeadLen
+	last := mid / e.m.ChunkSize * e.m.ChunkSize
+	if mid%e.m.ChunkSize == 0 {
+		t.Fatal("test data has no short last chunk")
+	}
+	f := e.open()
+	e.readAtMust(f, e.m.MidEnd()-5000, 5000)
+	// A zeroed short chunk must fail too.
+	e.rs.zero(e.m.HeadLen+last, e.m.MidEnd(), 1000)
+	f2 := e.open()
+	p := make([]byte, 5000)
+	if _, err := f2.ReadAt(p, e.m.MidEnd()-5000); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("zeroed last chunk: err=%v, want EIO", err)
+	}
+}
+
+func TestFuseBadChunkListHidesEntry(t *testing.T) {
+	e := startFuse(t, nil)
+	good, err := os.ReadFile(filepath.Join(e.mdir, testID+".chunks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(id string, chunks []byte) string {
+		m2 := *e.m
+		m2.ID = id
+		m2.StubPath = filepath.Join(filepath.Dir(e.m.StubPath), id+".mkv")
+		writeStub(t, &m2, e.data)
+		writeChunks(t, e.mdir, &m2, e.data)
+		if chunks != nil {
+			os.WriteFile(filepath.Join(e.mdir, id+".chunks"), chunks, 0o644)
+		}
+		writeManifest(t, e.mdir, &m2)
+		return m2.Name()
+	}
+	flipped := append([]byte(nil), good...)
+	flipped[40] ^= 1
+	names := []string{
+		mk("a000000000000001", good[:len(good)-32]), // cut short
+		mk("a000000000000002", flipped),             // wrong content
+		mk("a000000000000003", nil),                 // fine, control
+	}
+	names = append(names, mk("a000000000000004", nil))
+	os.Remove(filepath.Join(e.mdir, "a000000000000004.chunks")) // missing list
+	e.srv.Reload()
+	waitFor(t, 5*time.Second, "control entry", func() bool {
+		_, err := os.Stat(filepath.Join(e.mnt, names[2]))
+		return err == nil
+	})
+	for _, i := range []int{0, 1, 3} {
+		if _, err := os.Stat(filepath.Join(e.mnt, names[i])); err == nil {
+			t.Errorf("%s with a bad chunk list is visible", names[i])
+		}
+	}
+	// A list that goes bad after the entry was valid keeps the old entry.
+	os.WriteFile(filepath.Join(e.mdir, testID+".chunks"), good[:100], 0o644)
+	e.srv.Reload()
+	if _, err := os.Stat(e.path); err != nil {
+		t.Errorf("previously valid entry vanished: %v", err)
 	}
 }

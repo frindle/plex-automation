@@ -24,6 +24,7 @@ var errHandleClosed = errors.New("handle closed")
 type handle struct {
 	srv  *Server
 	m    *Manifest
+	ck   *chunkCheck
 	stub *os.File
 
 	mu         sync.Mutex // guards st, warmed, lastErr
@@ -38,12 +39,13 @@ type handle struct {
 	remoteSeen atomic.Bool
 }
 
-func (s *Server) openHandle(m *Manifest) (*handle, error) {
+func (s *Server) openHandle(e *entry) (*handle, error) {
+	m := e.m
 	f, err := os.Open(m.StubPath)
 	if err != nil {
 		return nil, err
 	}
-	h := &handle{srv: s, m: m, stub: f}
+	h := &handle{srv: s, m: m, stub: f, ck: &chunkCheck{base: m.HeadLen, size: m.ChunkSize, sums: e.sums}}
 	s.m.OpenHandles.Add(1)
 	s.ev.Emit(m.ID, "open", 0, 0)
 	return h, nil
@@ -60,6 +62,11 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 			if err := h.readMid(ctx, p, sg.Off); err != nil {
 				if ctx.Err() != nil {
 					return nil, syscall.EINTR
+				}
+				var bc *badChunkError
+				if errors.As(err, &bc) {
+					h.srv.m.BadChunks.Add(1)
+					h.srv.ev.EmitBad(m.ID, bc.Offset)
 				}
 				log.Printf("read %s: offset %d: %v", m.ID, sg.Off, err)
 				return nil, syscall.EIO
@@ -86,7 +93,7 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 }
 
 func (h *handle) newStream(off int64) *stream {
-	s := h.srv.remote.newStream(h.m.ID, h.m.RemotePath, off, h.m.MidEnd())
+	s := h.srv.remote.newVerifiedStream(h.m.ID, h.m.RemotePath, h.ck.alignDown(off), h.m.MidEnd(), h.ck)
 	h.st = s
 	h.cur.Store(s)
 	return s
@@ -144,7 +151,8 @@ func (h *handle) readMid(ctx context.Context, p []byte, off int64) error {
 			}
 			continue // idle timeout or race with a trim: start a fresh stream
 		}
-		if ctx.Err() == nil {
+		var bc *badChunkError
+		if ctx.Err() == nil && !errors.As(err, &bc) { // a bad chunk says nothing about other chunks
 			h.lastErr, h.lastErrAt = err, time.Now()
 		}
 		return err

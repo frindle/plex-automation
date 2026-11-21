@@ -2,8 +2,10 @@ package tierfs
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/zeebo/blake3"
 )
 
 const (
@@ -63,6 +67,9 @@ type rangeServer struct {
 	cutFirst atomic.Int64
 	// ignoreRange answers 200 with the whole body.
 	ignoreRange atomic.Bool
+	// zero answers with zeros (a normal 206) for [zeroLo, zeroHi) in the
+	// next zeroTimes requests whose range overlaps it.
+	zeroLo, zeroHi, zeroTimes atomic.Int64
 
 	mu     sync.Mutex
 	starts []int64
@@ -122,7 +129,11 @@ func (rs *rangeServer) handle(w http.ResponseWriter, r *http.Request) {
 		panic(http.ErrAbortHandler)
 	}
 	ew := &errWriter{ResponseWriter: w}
-	http.ServeContent(ew, r, "movie.mkv", time.Time{}, bytes.NewReader(rs.data))
+	body := &maskedReader{Reader: bytes.NewReader(rs.data)}
+	if lo, hi := rs.zeroLo.Load(), rs.zeroHi.Load(); haveRange && hi > lo && rs0 < hi && re0 >= lo && rs.zeroTimes.Add(-1) >= 0 {
+		body.lo, body.hi = lo, hi
+	}
+	http.ServeContent(ew, r, "movie.mkv", time.Time{}, body)
 	if ew.failed.Load() {
 		// The client went away mid-body. Wait for the server to notice and
 		// cancel the request context, then record it.
@@ -134,6 +145,31 @@ func (rs *rangeServer) handle(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Err() != nil {
 		rs.cancelled.Add(1)
 	}
+}
+
+// zero makes the next `times` overlapping requests see zeros in [lo, hi).
+func (rs *rangeServer) zero(lo, hi, times int64) {
+	rs.zeroLo.Store(lo)
+	rs.zeroHi.Store(hi)
+	rs.zeroTimes.Store(times)
+}
+
+// maskedReader zero-fills [lo, hi) of what it reads, like a remote that has
+// lost part of a file but still answers 206.
+type maskedReader struct {
+	*bytes.Reader
+	lo, hi int64
+}
+
+func (m *maskedReader) Read(p []byte) (int, error) {
+	pos, _ := m.Reader.Seek(0, io.SeekCurrent)
+	n, err := m.Reader.Read(p)
+	for i := 0; i < n; i++ {
+		if q := pos + int64(i); q >= m.lo && q < m.hi {
+			p[i] = 0
+		}
+	}
+	return n, err
 }
 
 func parseRange(h string) (start, end int64, ok bool) {
@@ -169,7 +205,7 @@ func buildManifest(size int64, stub string) *Manifest {
 	}
 	return &Manifest{
 		V: 1, ID: testID, Ext: ".mkv", Size: size, MtimeNS: testMtime,
-		HeadLen: head, TailLen: 32 * mib, StubPath: stub, RemotePath: testRemote,
+		HeadLen: head, TailLen: 32*mib + size%mib, ChunkSize: 4 * mib, StubPath: stub, RemotePath: testRemote,
 	}
 }
 
@@ -188,6 +224,27 @@ func writeStub(t testing.TB, m *Manifest, data []byte) {
 		t.Fatal(err)
 	}
 	if _, err := f.WriteAt(data[m.Size-m.TailLen:], m.Size-m.TailLen); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// chunkSums hashes the middle of data the way the offloader does.
+func chunkSums(m *Manifest, data []byte) []byte {
+	var out []byte
+	for off := m.HeadLen; off < m.MidEnd(); off += m.ChunkSize {
+		s := blake3.Sum256(data[off:min(off+m.ChunkSize, m.MidEnd())])
+		out = append(out, s[:]...)
+	}
+	return out
+}
+
+// writeChunks writes <id>.chunks and sets chunks_b3 on m.
+func writeChunks(t testing.TB, dir string, m *Manifest, data []byte) {
+	t.Helper()
+	b := chunkSums(m, data)
+	sum := blake3.Sum256(b)
+	m.ChunksB3 = hex.EncodeToString(sum[:])
+	if err := os.WriteFile(filepath.Join(dir, m.ID+".chunks"), b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

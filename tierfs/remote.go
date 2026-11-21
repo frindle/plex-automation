@@ -14,9 +14,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zeebo/blake3"
 )
 
-const chunkSize = 256 << 10
+// unitSize is the read unit when a stream has no chunk list to check against.
+const unitSize = 256 << 10
 
 var (
 	errStreamClosed = errors.New("stream closed")
@@ -24,7 +27,34 @@ var (
 	errOutOfWindow = errors.New("offset outside stream window")
 )
 
-var chunkPool = sync.Pool{New: func() any { b := make([]byte, chunkSize); return &b }}
+var chunkPool sync.Pool
+
+func getBuf(n int) *[]byte {
+	if v, ok := chunkPool.Get().(*[]byte); ok && cap(*v) >= n {
+		return v
+	}
+	b := make([]byte, n)
+	return &b
+}
+
+// chunkCheck describes the verified middle: chunk k covers
+// [base+k*size, base+(k+1)*size) and must hash to sums[k].
+type chunkCheck struct {
+	base, size int64
+	sums       [][32]byte
+}
+
+// alignDown moves off to the start of the chunk that contains it.
+func (c *chunkCheck) alignDown(off int64) int64 {
+	return c.base + (off-c.base)/c.size*c.size
+}
+
+// badChunkError means a chunk failed verification twice.
+type badChunkError struct{ Offset int64 }
+
+func (e *badChunkError) Error() string {
+	return fmt.Sprintf("chunk at offset %d failed verification", e.Offset)
+}
 
 // RemoteConfig configures the HTTP range client shared by all handles.
 type RemoteConfig struct {
@@ -113,6 +143,7 @@ type stream struct {
 	url    string
 	start  int64
 	limit  int64 // exclusive end of the range this stream may fetch
+	ck     *chunkCheck
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -131,9 +162,15 @@ type stream struct {
 
 // newStream starts fetching [start, limit) of remotePath in the background.
 func (r *Remote) newStream(id, remotePath string, start, limit int64) *stream {
+	return r.newVerifiedStream(id, remotePath, start, limit, nil)
+}
+
+// newVerifiedStream is newStream with every chunk checked against ck before
+// it is made readable. start must be chunk-aligned when ck is set.
+func (r *Remote) newVerifiedStream(id, remotePath string, start, limit int64, ck *chunkCheck) *stream {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &stream{
-		r: r, id: id, url: r.urlFor(remotePath), start: start, limit: limit,
+		r: r, id: id, url: r.urlFor(remotePath), start: start, limit: limit, ck: ck,
 		ctx: ctx, cancel: cancel,
 		dataSig: make(chan struct{}, 1), roomSig: make(chan struct{}, 1), done: make(chan struct{}),
 		low: start, end: start, maxPos: start,
@@ -276,6 +313,7 @@ func (s *stream) run() {
 
 	window := s.r.cfg.Window
 	var failStart time.Time
+	refetched := int64(-1) // chunk offset that already had its one refetch
 	backoff := 250 * time.Millisecond
 	// failed handles one error. It returns false when the stream is done.
 	failed := func(err error, began time.Time) bool {
@@ -331,8 +369,12 @@ func (s *stream) run() {
 			}
 			body, cancelReq = b, c
 		}
-		bp := chunkPool.Get().(*[]byte)
-		n := int(min(int64(chunkSize), s.limit-end))
+		unit := int64(unitSize)
+		if s.ck != nil {
+			unit = s.ck.size
+		}
+		n := int(min(unit, s.limit-end))
+		bp := getBuf(n)
 		wd := time.AfterFunc(window, cancelReq)
 		_, err := io.ReadFull(body, (*bp)[:n])
 		wd.Stop()
@@ -342,6 +384,20 @@ func (s *stream) run() {
 				return
 			}
 			continue
+		}
+		if s.ck != nil {
+			k := (end - s.ck.base) / s.ck.size
+			if k < 0 || k >= int64(len(s.ck.sums)) || blake3.Sum256((*bp)[:n]) != s.ck.sums[k] {
+				chunkPool.Put(bp)
+				closeBody()
+				if refetched != end { // one fresh request for this chunk
+					refetched = end
+					log.Printf("stream %s: chunk at %d failed verification, fetching again", s.id, end)
+					continue
+				}
+				s.finish(&badChunkError{Offset: end})
+				return
+			}
 		}
 		failStart, backoff = time.Time{}, 250*time.Millisecond
 		s.mu.Lock()

@@ -1,6 +1,7 @@
 package tierfs
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/zeebo/blake3"
 )
 
 // Manifest describes one offloaded file. See tiering/OFFLOAD_DESIGN.md.
@@ -24,6 +27,8 @@ type Manifest struct {
 	SHA256     string `json:"sha256,omitempty"`
 	HeadB3     string `json:"head_b3,omitempty"`
 	TailB3     string `json:"tail_b3,omitempty"`
+	ChunkSize  int64  `json:"chunk_size"`
+	ChunksB3   string `json:"chunks_b3"`
 }
 
 var (
@@ -52,6 +57,10 @@ func (m *Manifest) Validate() error {
 		return errors.New("bad head_len/tail_len")
 	case m.HeadLen+m.TailLen >= m.Size:
 		return errors.New("head_len + tail_len must be below size")
+	case m.ChunkSize <= 0 || m.ChunkSize > 256<<20:
+		return errors.New("bad chunk_size")
+	case len(m.ChunksB3) != 64:
+		return errors.New("bad chunks_b3")
 	case !filepath.IsAbs(m.StubPath):
 		return errors.New("stub_path must be absolute")
 	case !strings.HasPrefix(m.RemotePath, "/"):
@@ -72,9 +81,35 @@ func ParseManifest(b []byte) (*Manifest, error) {
 	return &m, nil
 }
 
+// NumChunks is the number of verified pieces in the middle.
+func (m *Manifest) NumChunks() int64 {
+	mid := m.MidEnd() - m.HeadLen
+	return (mid + m.ChunkSize - 1) / m.ChunkSize
+}
+
 type loaded struct {
-	m   *Manifest
-	raw string
+	m    *Manifest
+	raw  string
+	sums [][32]byte
+}
+
+// loadChunks reads <id>.chunks and checks it against the manifest.
+func loadChunks(dir string, m *Manifest) ([][32]byte, string, error) {
+	b, err := os.ReadFile(filepath.Join(dir, m.ID+".chunks"))
+	if err != nil {
+		return nil, "", fmt.Errorf("chunk list: %w", err)
+	}
+	if int64(len(b)) != 32*m.NumChunks() {
+		return nil, "", fmt.Errorf("chunk list is %d bytes, want %d", len(b), 32*m.NumChunks())
+	}
+	if got := blake3.Sum256(b); hex.EncodeToString(got[:]) != strings.ToLower(m.ChunksB3) {
+		return nil, "", errors.New("chunk list does not match chunks_b3")
+	}
+	sums := make([][32]byte, len(b)/32)
+	for i := range sums {
+		copy(sums[i][:], b[i*32:])
+	}
+	return sums, string(b), nil
 }
 
 // scanManifests reads every <id>.json in dir. Invalid files are reported
@@ -105,7 +140,12 @@ func scanManifests(dir string) (good map[string]loaded, bad map[string]string, e
 			bad[n] = "file name does not match id"
 			continue
 		}
-		good[m.Name()] = loaded{m, string(raw)}
+		sums, craw, err := loadChunks(dir, m)
+		if err != nil {
+			bad[n] = err.Error()
+			continue
+		}
+		good[m.Name()] = loaded{m, string(raw) + "\x00" + craw, sums}
 	}
 	return good, bad, nil
 }
