@@ -13,6 +13,10 @@ import tempfile
 _TEST_BT = tempfile.mkdtemp(prefix='plex-test-backtest-')
 os.environ['LLM_BACKTEST_DIR'] = _TEST_BT
 
+# The earner set (top 30 uploaders never unseed) would cover every torrent in a
+# small test fixture. Off by default here; test_seed_earners.py turns it on.
+os.environ['SEED_KEEP_TOP_EARNERS'] = '0'
+
 import copy
 import sys
 import types

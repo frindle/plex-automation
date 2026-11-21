@@ -117,12 +117,37 @@ def seed_retire_rule(t, labels, min_days, min_swarm, idle_days=0, idle_min_days=
     return None
 
 
-def seed_retire_picks(torrents, labels, min_days, min_swarm, idle_days=0, idle_min_days=0, limit=0):
+def top_earners(torrents, n, labels=None):
+    """Hashes of the n torrents with the most total_uploaded (known and above
+    0), ties broken by hash. labels=None means any non-empty label; unlabeled
+    torrents never count. n <= 0 gives none.
+
+    Penn, 11-21: keep the top earners seeding (ratio and bonus points), on top
+    of the 21-day minimum that remove_torrent's SEED_DAYS floor enforces."""
+    if not n or n <= 0:
+        return frozenset()
+    ranked = []
+    for h, t in (torrents or {}).items():
+        label = t.get('label') or ''
+        if not label or (labels is not None and label not in labels):
+            continue
+        up = _num(t.get('total_uploaded'))
+        if up is not None and up > 0:
+            ranked.append((-up, h))
+    ranked.sort()
+    return frozenset(h for _, h in ranked[:n])
+
+
+def seed_retire_picks(torrents, labels, min_days, min_swarm, idle_days=0, idle_min_days=0, limit=0,
+                      keep=()):
     """[(hash, rule)] to stop seeding: aged-out torrents first (longest seeded
     first), then idle ones (longest idle first, never-uploaded before all).
-    With the idle rule on, both are idle torrents only. limit > 0 caps one run."""
+    With the idle rule on, both are idle torrents only. limit > 0 caps one run.
+    Hashes in keep (the earner set) are never picked."""
     out = []
     for h, t in (torrents or {}).items():
+        if h in keep:
+            continue
         rule = seed_retire_rule(t, labels, min_days, min_swarm, idle_days, idle_min_days)
         if rule == 'age':
             out.append((0, -t['seeding_time'], h, rule))
@@ -133,11 +158,11 @@ def seed_retire_picks(torrents, labels, min_days, min_swarm, idle_days=0, idle_m
     return picks[:limit] if limit and limit > 0 else picks
 
 
-def seed_retire_plan(torrents, labels, min_days, min_swarm, limit=0, idle_days=0, idle_min_days=0):
+def seed_retire_plan(torrents, labels, min_days, min_swarm, limit=0, idle_days=0, idle_min_days=0, keep=()):
     """Hashes of finished torrents to stop seeding (seed_retire_picks order).
     With idle_days 0 this is the age rule alone: longest-seeded first."""
     return [h for h, _ in seed_retire_picks(torrents, labels, min_days, min_swarm,
-                                            idle_days, idle_min_days, limit)]
+                                            idle_days, idle_min_days, limit, keep)]
 
 
 def parse_labels(raw, default):

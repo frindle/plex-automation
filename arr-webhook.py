@@ -654,6 +654,9 @@ SEED_RETIRE_FIRST_DELAY = 900
 # 0 idle days = idle rule off (then SEED_RETIRE_DAYS alone retires by age).
 SEED_IDLE_DAYS = int(os.environ.get('SEED_IDLE_DAYS', '14'))
 SEED_IDLE_MIN_DAYS = max(int(os.environ.get('SEED_IDLE_MIN_DAYS', str(SEED_DAYS))), SEED_DAYS)
+# Earner set (Penn, 11-21: keep the top earners seeding, yes). The labeled torrents
+# with the most total_uploaded are never retired or unseeded as stalled. 0 = off.
+SEED_KEEP_TOP_EARNERS = int(os.environ.get('SEED_KEEP_TOP_EARNERS', '30'))
 UPGRADE_LANE_LABELS = (SONARR_UPG_LABEL, RADARR_UPG_LABEL, SONARR_UPG_PRIORITY_LABEL, RADARR_UPG_PRIORITY_LABEL)
 SEED_RETIRE_LABELS = deluge_trim.parse_labels(
     os.environ.get('SEED_RETIRE_LABELS'),
@@ -3496,6 +3499,7 @@ def cleanup_stalled_seeds(dry_run=False):
         torrents = get_all_torrents()
         state = _load_seed_state()
         removed = 0
+        earners = deluge_trim.top_earners(torrents, SEED_KEEP_TOP_EARNERS)
         for h, info in torrents.items():
             if not (info.get('label') or '').strip():
                 continue  # unlabeled/unmanaged torrent -- not ours to touch
@@ -3509,6 +3513,8 @@ def cleanup_stalled_seeds(dry_run=False):
                 state[h] = {'total_uploaded': uploaded}
             if prev is None:
                 continue
+            if h in earners:
+                continue  # top earner: keeps seeding (Penn, 11-21)
             if info.get('seeding_time', 0) < STALL_SEED_MIN_DAYS * 86400:
                 continue
             gained = uploaded - prev.get('total_uploaded', 0)
@@ -6526,8 +6532,10 @@ def retire_old_seeds(dry_run=False):
         log.error(f'Seed retirement: Deluge read failed: {e}')
         out['error'] = str(e)
         return out
+    earners = deluge_trim.top_earners(torrents, SEED_KEEP_TOP_EARNERS)
+    out['kept_earners'] = len(earners)
     every = deluge_trim.seed_retire_picks(torrents, SEED_RETIRE_LABELS, SEED_RETIRE_DAYS, SEED_RETIRE_MIN_SWARM,
-                                          SEED_IDLE_DAYS, SEED_IDLE_MIN_DAYS)
+                                          SEED_IDLE_DAYS, SEED_IDLE_MIN_DAYS, keep=earners)
     out['eligible'] = len(every)
     for _, rule in every:
         out['by_rule'][rule] += 1
