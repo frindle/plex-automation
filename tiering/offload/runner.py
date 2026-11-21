@@ -40,6 +40,11 @@ GB = 10**9
 PASS_INTERVAL = 60.0
 RETRY_DELAY = 300.0
 ACTIVE_STATES = ("offloaded", "promoting")
+REGISTER_LEAD = 3600.0  # register this long before the demote window opens
+PROTECTED_COLUMNS = ("id", "state", "created_ts", "updated_ts")
+# Used only when the state module does not export COLUMNS.
+FALLBACK_COLUMNS = ("sha256", "nzb_path", "nzb_path2", "remote_path", "restore_score",
+                    "restore_note", "last_check_ts", "last_stat_ok_ts")
 
 
 # --------------------------------------------------------------------------
@@ -65,6 +70,29 @@ def map_path(path: str, pairs) -> str:
         if path == plex or path.startswith(plex + "/"):
             return local + path[len(plex):]
     return path
+
+
+def disk_paths(path, pairs, exists=os.path.lexists) -> list[str]:
+    """Disk paths a share path can mean, per TIERING_PATH_MAP.
+
+    No map: the path itself. Otherwise every entry whose share prefix matches
+    gives a candidate, and only candidates that exist count. A path already
+    under one of the disk prefixes is a disk path and stays as it is. An empty
+    list means the path maps nowhere."""
+    if not pairs:
+        return [path]
+    cands = []
+    for src, dst in pairs:
+        if path == src or path.startswith(src + "/"):
+            c = dst + path[len(src):]
+            if c not in cands:
+                cands.append(c)
+    if cands:
+        return [c for c in cands if exists(c)]
+    for _, dst in pairs:
+        if path == dst or path.startswith(dst + "/"):
+            return [path] if exists(path) else []
+    return []
 
 
 def parse_window(spec: str) -> tuple[int, int]:
@@ -103,6 +131,18 @@ def night_start(now: float, window: tuple[int, int]) -> float | None:
     return None
 
 
+def next_night_start(now: float, window: tuple[int, int]) -> float:
+    """Start of the night `now` is in, or of the next one."""
+    cur = night_start(now, window)
+    if cur is not None:
+        return cur
+    day = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    t = (day + timedelta(minutes=window[0])).timestamp()
+    if t <= now:
+        t = (day + timedelta(days=1, minutes=window[0])).timestamp()
+    return t
+
+
 def _flag(v) -> bool:
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -119,6 +159,7 @@ class Config:
     window: tuple = (120, 360)
     demote_bytes_per_night: int = 200 * GB
     path_map: list = field(default_factory=list)
+    gate_path_map: list = field(default_factory=list)
     alerts: str = ""
     http: str = "127.0.0.1:8471"
     pass_seconds: float = PASS_INTERVAL
@@ -140,17 +181,24 @@ class Config:
             never_sections=tuple(s.strip() for s in
                                  (e.get("TIERING_NEVER_SECTIONS", "Adult")).split(",") if s.strip()),
         )
+        gate_map = parse_path_map(e.get("TIERING_GATE_PATH_MAP", ""))
+        apply = e.get("TIERING_APPLY") == "1"
+        if apply and not gate_map:
+            raise ValueError(
+                "TIERING_APPLY=1 needs TIERING_GATE_PATH_MAP (runner paths to the torrent "
+                "client's /data paths). Without it the glacier gate reads every file as free")
         return cls(
             db=db,
             tierfs_mount=e.get("TIERFS_MOUNT", "").rstrip("/"),
             manifests=e.get("TIERFS_MANIFESTS", ""),
             events=e.get("TIERFS_EVENTS", ""),
             stub_root=e.get("TIERING_STUB_ROOT", ""),
-            apply=e.get("TIERING_APPLY") == "1",
+            apply=apply,
             promote_concurrency=max(1, int(e.get("TIERING_PROMOTE_CONCURRENCY") or 2)),
             window=parse_window(e.get("TIERING_DEMOTE_WINDOW") or "02:00-06:00"),
             demote_bytes_per_night=int(float(e.get("TIERING_DEMOTE_GB_PER_NIGHT") or 200) * GB),
             path_map=parse_path_map(e.get("TIERING_PATH_MAP", "")),
+            gate_path_map=gate_map,
             alerts=e.get("TIERING_ALERTS") or os.path.join(
                 os.path.dirname(os.path.abspath(db)), "alerts.jsonl"),
             http=e.get("TIERING_HTTP") or "127.0.0.1:8471",
@@ -197,6 +245,7 @@ class Deps:
     demote: Callable
     qualify: Callable
     gate: Callable
+    register: Callable | None = None  # register(db, apply) -> dict, once a night
 
 
 def _http_gate(cfg: Config):
@@ -205,7 +254,7 @@ def _http_gate(cfg: Config):
     paths into the namespace the gate knows."""
     import urllib.request
     api = os.environ.get("TIERING_API", "").rstrip("/")
-    pairs = parse_path_map(os.environ.get("TIERING_GATE_PATH_MAP", ""))
+    pairs = cfg.gate_path_map
 
     def gate(path):
         if not api:
@@ -237,24 +286,24 @@ def load_deps(cfg: Config) -> Deps:
         return ops.demote(db, row, stub_root=cfg.stub_root, manifest_dir=cfg.manifests,
                           tierfs_mount=cfg.tierfs_mount, apply=apply)
 
-    factory = os.environ.get("TIERING_QUALIFY_FACTORY", "")
-    if factory:
-        mod, _, fn = factory.partition(":")
-        qualify = getattr(importlib.import_module(mod), fn)()
-    else:
-        def qualify(row):
-            from .qualify import QualifyResult
-            return QualifyResult(False, ["qualify is not wired (set TIERING_QUALIFY_FACTORY)"])
-    return Deps(st, promote, demote, qualify, _http_gate(cfg))
+    factory = os.environ.get("TIERING_QUALIFY_FACTORY") or \
+        f"{__package__}.wiring:qualify_from_env"
+    mod, _, fn = factory.partition(":")
+    qualify = getattr(importlib.import_module(mod), fn)()
+
+    def register(db, apply):
+        return importlib.import_module(f"{__package__}.register").register(db, apply)
+
+    return Deps(st, promote, demote, qualify, _http_gate(cfg), register)
 
 
 # --------------------------------------------------------------------------
-# tierfs bad_chunk events
+# tierfs bad_chunk and slot_timeout events
 
 
 class BadChunkScanner:
     """Tails the tierfs event file (and rotated copies on the first look or
-    after a rotation) for `bad_chunk` events."""
+    after a rotation) for `bad_chunk` and `slot_timeout` events."""
 
     def __init__(self, path):
         self.path, self.ino, self.pos = path, None, 0
@@ -272,9 +321,9 @@ class BadChunkScanner:
         for line in data[:cut].splitlines():
             try:
                 e = json.loads(line)
-                if e.get("ev") == "bad_chunk" and e.get("id"):
-                    out.append({"id": str(e["id"]), "ts": float(e.get("ts") or 0),
-                                "offset": e.get("offset")})
+                if e.get("ev") in ("bad_chunk", "slot_timeout") and e.get("id"):
+                    out.append({"ev": e["ev"], "id": str(e["id"]),
+                                "ts": float(e.get("ts") or 0), "offset": e.get("offset")})
             except (ValueError, TypeError, AttributeError):
                 continue
         return out, start + cut
@@ -316,6 +365,11 @@ class Runner:
         self.desired_rks: set = set()
         self.complete = False
         self.pending_bad: dict = {}
+        self.slot_alerted: set = set()  # (night start, id)
+        self.slot_timeouts = 0  # seen this pass
+        self.register_state = {"start": None, "ok": False}
+        self.skipped_paths: set = set()
+        self.disk: dict = {}
         self.scanner = BadChunkScanner(cfg.events)
         self._db = None
         self.night = self._load_night()
@@ -398,6 +452,10 @@ class Runner:
             return "the night's byte cap is reached"
         if self.cfg.apply and not self.cfg.stub_root:
             return "TIERING_STUB_ROOT is not set"
+        if self.deps.register is not None and \
+                not (self.register_state["start"] == night_start(now, self.cfg.window)
+                     and self.register_state["ok"]):
+            return "tonight's register did not succeed"
         return ""
 
     # ---- reading the world
@@ -443,7 +501,20 @@ class Runner:
             log.warning("%s: L replaced, no longer managed", row["id"])
 
     def _bad_chunks(self, db, now):
+        self.slot_timeouts = 0
+        night = next_night_start(now, self.cfg.window)
+        self.slot_alerted = {k for k in self.slot_alerted if k[0] == night}
         for ev in self.scanner.scan():
+            if ev["ev"] == "slot_timeout":
+                self.slot_timeouts += 1
+                if (night, ev["id"]) in self.slot_alerted:
+                    continue
+                self.slot_alerted.add((night, ev["id"]))
+                if not self.cfg.apply:
+                    log.error("dry run: slot_timeout on %s", ev["id"])
+                    continue
+                self._alert("slot_timeout", ev["id"])
+                continue
             self.pending_bad[ev["id"]] = ev
         for id, ev in list(self.pending_bad.items()):
             row = self.state.get(db, id)
@@ -463,6 +534,37 @@ class Runner:
             self.state.log_event(db, id, "bad_chunk", {"offset": ev["offset"]})
             self._alert("bad_chunk", id, offset=ev["offset"], lib_path=row.get("lib_path"))
 
+    # ---- nightly register
+
+    def _register(self, db, now):
+        """Run register once per night, before the demote window opens. A
+        failure is logged and blocks that night's demotes."""
+        reg = self.deps.register
+        if reg is None:
+            return
+        start = next_night_start(now, self.cfg.window)
+        if self.register_state["start"] == start or now < start - REGISTER_LEAD:
+            return
+        self.register_state = {"start": start, "ok": False}
+        try:
+            res = reg(db, self.cfg.apply)
+            self.register_state["ok"] = True
+            log.info("register done: %s", json.dumps(res, sort_keys=True, default=str))
+        except Exception as e:
+            log.error("register failed (%s: %s); no demotes tonight", type(e).__name__, e)
+
+    def _resolve_disk(self, r):
+        """The one disk path for a row, or None (logged once per pass)."""
+        found = disk_paths(r.get("lib_path") or "", self.cfg.path_map)
+        if len(found) == 1:
+            return found[0]
+        key = r.get("lib_path")
+        if key not in self.skipped_paths:
+            self.skipped_paths.add(key)
+            log.warning("skipping %s: lib_path maps to %d disk paths, need exactly 1 (%s)",
+                        r["id"], len(found), key)
+        return None
+
     # ---- the pass
 
     def run_pass(self, wait: bool = False) -> dict:
@@ -477,6 +579,8 @@ class Runner:
     def _pass(self, now, wait):
         db = self.db()
         cfg, st = self.cfg, self.state
+        self.skipped_paths = set()
+        self._register(db, now)
         data, complete = self._read_plex(now)
         items = data["items"]
         if items is None:
@@ -495,7 +599,10 @@ class Runner:
         for it in items:
             by_rk_item[str(it["ratingKey"])] = it
             for f in it.get("files") or []:
-                path_rk[map_path(f, cfg.path_map)] = str(it["ratingKey"])
+                cands = [d + f[len(sp):] for sp, d in cfg.path_map
+                         if f == sp or f.startswith(sp + "/")]
+                for c in cands or [f]:
+                    path_rk[c] = str(it["ratingKey"])
         rows_by_rk: dict = {}
         id_to_rk = {}
         for r in rows:
@@ -528,7 +635,7 @@ class Runner:
         for rk, rs in rows_by_rk.items():
             if any(r["state"] in ACTIVE_STATES for r in rs):
                 offloaded_rks.add(rk)
-            elif all(r["state"] == "whole" and r.get("sha256") for r in rs):
+            elif all(r["state"] == "whole" for r in rs):
                 it = by_rk_item.get(rk)
                 sec = str((it or {}).get("section") or "").strip().lower()
                 if it is not None and sec not in never:
@@ -563,6 +670,14 @@ class Runner:
         for r in rows:  # an offload a crash left half done is resumed, not restarted
             if r["state"] == "offloading":
                 dcands.insert(0, r)
+        self.disk = {}
+        usable = []
+        for r in dcands:
+            d = self._resolve_disk(r)
+            if d is not None:
+                self.disk[r["id"]] = d
+                usable.append(r)
+        dcands = usable
         block = self._demote_block(now)
         n = self._tonight(now)
         tried = n.setdefault("tried", []) if n is not None else []
@@ -576,7 +691,8 @@ class Runner:
                 if used + size > cfg.demote_bytes_per_night:
                     break
                 used += size
-                log.info("plan: demote %s id=%s (idle, %d bytes)", r["lib_path"], r["id"], size)
+                log.info("plan: demote %s id=%s (idle, %d bytes)", self.disk[r["id"]], r["id"],
+                         size)
         else:
             with self.mu:
                 self.demote_todo = deque(r["id"] for r in todo)
@@ -584,7 +700,9 @@ class Runner:
 
         self.counts = {"promotes_planned": len(pjobs), "promotes_running": len(self.promote_running),
                        "demotes_planned": len(todo), "demote_blocked": block,
-                       "plex_complete": complete, "night_bytes": (n or {}).get("bytes", 0)}
+                       "plex_complete": complete, "night_bytes": (n or {}).get("bytes", 0),
+                       "slot_timeouts": self.slot_timeouts,
+                       "paths_skipped": len(self.skipped_paths)}
         if complete:
             self.last_ok = now
         if wait:
@@ -718,19 +836,24 @@ class Runner:
             return
         size = int(row.get("size") or 0)
         resume = row["state"] == "offloading"
+        disk = self.disk.get(id)
+        if disk is None:
+            log.info("demote %s skipped: no single disk path", id)
+            return
+        row["lib_path"] = disk
         if n["bytes"] + size > cfg.demote_bytes_per_night:
             log.info("demote %s skipped: would pass the night's cap", id)
             return
         if not resume:
             try:
-                ls = os.lstat(row["lib_path"])
+                ls = os.lstat(disk)
             except OSError as e:
                 log.warning("demote %s skipped: cannot stat L (%s)", id, type(e).__name__)
                 return
-            if os.path.islink(row["lib_path"]) or ls.st_nlink != 1:
+            if os.path.islink(disk) or ls.st_nlink != 1:
                 log.info("demote %s skipped: L is a symlink or has other hardlinks", id)
                 return
-            g = self.deps.gate(row["lib_path"])
+            g = self.deps.gate(disk)
             if g != "free":
                 log.info("demote %s skipped: glacier gate says %s", id, g)
                 return
@@ -739,11 +862,14 @@ class Runner:
                 log.info("demote %s skipped: qualify failed: %s", id, ",".join(q.reasons))
                 st.log_event(db, id, "qualify_failed", {"reasons": list(q.reasons)})
                 return
-            fields = {k: v for k, v in (q.fields or {}).items()
-                      if k in ("nzb_path", "nzb_path2", "remote_path", "restore_score",
-                               "restore_note")}
-            st.upsert(db, {"id": id, **fields, "last_check_ts": now})
+            cols = set(getattr(st, "COLUMNS", None) or FALLBACK_COLUMNS) - set(PROTECTED_COLUMNS)
+            fields = {k: v for k, v in (q.fields or {}).items() if k in cols}
+            fields.setdefault("last_check_ts", now)
+            if not st.update_if(db, id, "whole", **fields):
+                log.info("demote %s dropped: row changed during qualify", id)
+                return
             row = st.get(db, id)
+            row["lib_path"] = disk
             block = self._demote_block(self.clock())  # qualify takes a while
             if block or row.get("rating_key") in self.desired_rks:
                 log.info("demote %s dropped after qualify: %s", id, block or "wanted again")
@@ -838,6 +964,9 @@ def main(argv=None, env=None, deps=None) -> int:
     except ValueError as e:
         log.error("config: %s", e)
         return 2
+    if not cfg.apply and not cfg.gate_path_map:
+        log.warning("TIERING_GATE_PATH_MAP is not set: the glacier gate would read every "
+                    "file as free (APPLY refuses to start without it)")
     lock = acquire_lock(cfg.db)
     if lock is None:
         log.error("another runner holds the lock for %s", cfg.db)

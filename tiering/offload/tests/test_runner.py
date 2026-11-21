@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import logging
 import os
@@ -45,6 +46,10 @@ class Clock:
 
 
 class FakeState:
+    COLUMNS = ("id", "lib_path", "stub_path", "remote_path", "size", "sha256", "nzb_path",
+               "nzb_path2", "state", "restore_score", "restore_note", "last_check_ts",
+               "rating_key", "updated_ts", "created_ts")
+
     def __init__(self, clock):
         self.rows, self.events, self.mu, self.clock = {}, [], threading.Lock(), clock
 
@@ -64,6 +69,16 @@ class FakeState:
         with self.mu:
             self.rows.setdefault(row["id"], {}).update(row)
 
+    def update_if(self, db, id, expect_state, **f):
+        with self.mu:
+            r = self.rows.get(id)
+            if r is None or r["state"] != expect_state:
+                return False
+            bad = [k for k in f if k not in self.COLUMNS]
+            assert not bad, bad
+            r.update(f, updated_ts=self.clock())
+            return True
+
     def list_files(self, db, state=None):
         with self.mu:
             return [dict(r) for r in self.rows.values() if state in (None, r["state"])]
@@ -81,6 +96,7 @@ class World:
         self.fail = set()
         self.calls = []
         self.delay = 0.0
+        self.demoted_rows = {}
         self.promote_result = {}
         self.gate_answer = "free"
         self.qualify_ok = True
@@ -129,13 +145,16 @@ class World:
     def _demote(self, db, row, apply):
         assert apply
         self.calls.append(("demote", row["id"]))
+        self.demoted_rows[row["id"]] = dict(row)
         self.state.set_state(db, row["id"], "offloaded")
         return Res(True, "offloaded")
 
     def _qualify(self, row):
         self.calls.append(("qualify", row["id"]))
         return Q(self.qualify_ok, [] if self.qualify_ok else ["no_exact_nzb"],
-                 {"nzb_path": "/n.nzb", "remote_path": "r"})
+                 {"nzb_path": "/n.nzb", "remote_path": "r", "sha256": "ff" * 32,
+                  "nzb_path2": "/n2.nzb", "restore_score": 2, "restore_note": "ok",
+                  "steps": {"x": 1}})
 
     # builders
     def movie(self, rk, section="Movies", added=0, path=None):
@@ -487,7 +506,7 @@ def test_config_defaults_and_overrides(tmp_path):
     assert c.hot.new_days == 30 and c.hot.idle_days == 60 and c.hot.near_end_eps == 3
     assert c.alerts == str(tmp_path / "alerts.jsonl") and c.http == "127.0.0.1:8471"
     c = Config.from_env({"TIERING_DB": str(tmp_path / "t.db"), "TIERING_APPLY": "1",
-                         "TIERING_NEVER_SECTIONS": "A, B", "TIERING_KEEP_4K": "1",
+                         "TIERING_GATE_PATH_MAP": "/a=/data/a", "TIERING_NEVER_SECTIONS": "A, B", "TIERING_KEEP_4K": "1",
                          "TIERING_MAX_STREAM_KBPS": "9000", "TIERING_DEMOTE_GB_PER_NIGHT": "1.5"})
     assert c.apply and c.hot.never_sections == ("A", "B") and c.hot.keep_4k
     assert c.hot.max_stream_kbps == 9000 and c.demote_bytes_per_night == int(1.5 * GB)
@@ -519,3 +538,204 @@ def test_pass_seconds_sets_interval(tmp_path, monkeypatch):
     w.runner.sleep = lambda s: (sleeps.append(s), w.runner.stop.set())
     w.runner.run_forever()
     assert sleeps == [2.5]
+
+
+# ---- follow-up fixes
+
+
+def test_qualified_row_reaches_ops_with_sha256(w):
+    w.row("a", 1, w.movie(1), "whole")
+    w.state.rows["a"]["sha256"] = None
+    w.run()
+    assert w.ops("demote") == ["a"]
+    got = w.demoted_rows["a"]
+    assert got["sha256"] == "ff" * 32 and got["nzb_path"] == "/n.nzb"
+    assert got["nzb_path2"] == "/n2.nzb" and got["remote_path"] == "r"
+    assert got["restore_score"] == 2 and got["restore_note"] == "ok"
+    assert "steps" not in w.state.rows["a"]
+
+
+def test_apply_needs_gate_path_map(tmp_path):
+    env = {"TIERING_DB": str(tmp_path / "t.db"), "TIERING_APPLY": "1"}
+    with pytest.raises(ValueError, match="TIERING_GATE_PATH_MAP"):
+        Config.from_env(env)
+    with pytest.raises(ValueError):
+        Config.from_env({**env, "TIERING_GATE_PATH_MAP": " , "})
+    assert runner.main(["--once"], env=env, deps=object()) == 2
+    c = Config.from_env({**env, "TIERING_GATE_PATH_MAP": "/mnt/a=/data/a"})
+    assert c.gate_path_map == [("/mnt/a", "/data/a")]
+    assert Config.from_env({"TIERING_DB": env["TIERING_DB"]}).apply is False
+
+
+def test_disk_paths():
+    pairs = runner.parse_path_map("/share=/d1,/share=/d2")
+    have = {"/d1/a.mkv", "/d2/b.mkv", "/d1/b.mkv"}
+    ex = have.__contains__
+    assert runner.disk_paths("/share/a.mkv", pairs, ex) == ["/d1/a.mkv"]
+    assert runner.disk_paths("/share/b.mkv", pairs, ex) == ["/d1/b.mkv", "/d2/b.mkv"]
+    assert runner.disk_paths("/share/none.mkv", pairs, ex) == []
+    assert runner.disk_paths("/d2/b.mkv", pairs, ex) == ["/d2/b.mkv"]  # already a disk path
+    assert runner.disk_paths("/elsewhere/x", pairs, ex) == []
+    assert runner.disk_paths("/anything", [], ex) == ["/anything"]
+
+
+def test_demote_uses_disk_path_and_skips_ambiguous(tmp_path, monkeypatch, caplog):
+    d1, d2 = tmp_path / "d1", tmp_path / "d2"
+    for d in (d1, d2):
+        d.mkdir()
+    pm = runner.parse_path_map(f"/share={d1},/share={d2}")
+    w = World(tmp_path, monkeypatch, path_map=pm)
+    (d1 / "one.mkv").write_text("x")
+    (d1 / "two.mkv").write_text("x")
+    (d2 / "two.mkv").write_text("x")
+    for i, name in enumerate(("one", "two", "gone"), 1):
+        w.items.append({"ratingKey": str(i), "type": "movie", "addedAt": 0, "section": "Movies",
+                        "files": [f"/share/{name}.mkv"]})
+        w.state.rows[name] = dict(id=name, rating_key=str(i), lib_path=f"/share/{name}.mkv",
+                                  state="whole", size=GB, sha256="aa", updated_ts=0)
+    with caplog.at_level(logging.WARNING, logger="tiering.runner"):
+        w.run()
+    assert w.ops("demote") == ["one"]
+    assert w.demoted_rows["one"]["lib_path"] == str(d1 / "one.mkv")
+    assert ("gate", str(d1 / "one.mkv")) in w.calls
+    skipped = [r for r in caplog.records if "skipping" in r.getMessage()]
+    assert len(skipped) == 2
+
+
+def test_register_runs_once_a_night_before_window(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, clock_t=NOON)
+    calls = []
+    w.runner.deps.register = lambda db, apply: calls.append(apply) or {"new": 0}
+    w.row("a", 1, w.movie(1), "whole")
+    w.run()
+    assert calls == []  # 12:00 is more than an hour before 02:00
+    w.clock.t = datetime(2026, 3, 11, 1, 30).timestamp()
+    w.run()
+    w.run()
+    assert calls == [True]
+    w.clock.t = datetime(2026, 3, 11, 3, 0).timestamp()
+    w.run()
+    assert calls == [True] and w.ops("demote") == ["a"]
+    w.clock.t = datetime(2026, 3, 12, 1, 30).timestamp()
+    w.run()
+    assert calls == [True, True]
+
+
+def test_register_failure_skips_the_nights_demotes(tmp_path, monkeypatch, caplog):
+    w = World(tmp_path, monkeypatch, clock_t=NIGHT)
+
+    def boom(db, apply):
+        raise RuntimeError("arr down")
+    w.runner.deps.register = boom
+    w.row("a", 1, w.movie(1), "whole")
+    with caplog.at_level(logging.ERROR, logger="tiering.runner"):
+        w.run()
+    assert w.ops("demote") == [] and w.ops("qualify") == []
+    assert any("register failed" in r.getMessage() for r in caplog.records)
+
+
+def test_register_dry_run_passes_apply_false(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, apply=False)
+    calls = []
+    w.runner.deps.register = lambda db, apply: calls.append(apply) or {}
+    w.row("a", 1, w.movie(1), "whole")
+    w.run()
+    assert calls == [False] and w.ops("demote") == []
+    assert w.ops("qualify") == []
+
+
+def test_slot_timeout_alerts_once_per_id_per_night_and_counts(tmp_path, monkeypatch):
+    ev = tmp_path / "events.jsonl"
+    w = World(tmp_path, monkeypatch, events=str(ev))
+    w.row("s", 1, w.movie(1), "offloaded")
+
+    def put(t, i="s"):
+        with open(ev, "a") as fh:
+            fh.write(json.dumps({"ts": t, "id": i, "ev": "slot_timeout"}) + "\n")
+    put(NIGHT - 5)
+    put(NIGHT - 4)
+    put(NIGHT - 3, "t")
+    c = w.run()
+    assert c["slot_timeouts"] == 3
+    kinds = [json.loads(line) for line in open(w.cfg.alerts)]
+    assert sorted(k["id"] for k in kinds) == ["s", "t"]
+    assert all(k["kind"] == "slot_timeout" for k in kinds)
+    assert w.state.rows["s"]["state"] == "offloaded"
+    put(NIGHT - 2)
+    c = w.run()
+    assert c["slot_timeouts"] == 1 and len(open(w.cfg.alerts).readlines()) == 2
+    w.clock.t = NIGHT + 86400
+    put(NIGHT + 86400 - 1)
+    w.run()
+    assert len(open(w.cfg.alerts).readlines()) == 3
+
+
+def _fake_intake(monkeypatch, calls):
+    import types
+    pkg = runner.__package__
+
+    def mk(name, **attrs):
+        m = types.ModuleType(f"{pkg}.{name}")
+        m.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, f"{pkg}.{name}", m)
+
+    class Cfg:
+        @staticmethod
+        def from_env(name, env=None):
+            return None if name == "secondary" and "NO_SECONDARY" in (env or {}) else name
+
+    mk("nntp_stat", ProviderCfg=Cfg, Checker=lambda cfg: ("checker", cfg))
+    mk("newznab", load_indexers=lambda raw: [("idx", raw)],
+       NewznabClient=lambda ix: ("indexers", ix))
+    mk("altmount", WebDavReader=lambda: "reader",
+       ImportClient=lambda reader=None: ("importer", reader))
+    mk("qualify", qualify=lambda row, **kw: (calls.append((row, kw)), "result")[1])
+
+
+def test_wiring_builds_clients_from_env(tmp_path, monkeypatch):
+    from offload import wiring
+    calls = []
+    _fake_intake(monkeypatch, calls)
+    env = {"TIERING_DB": str(tmp_path / "t.db"), "NEWZNAB_INDEXERS": "[]"}
+    fn = wiring.qualify_from_env(env)
+    assert fn({"id": "a"}) == "result"
+    row, kw = calls[0]
+    assert kw["stat_primary"] == ("checker", "primary")
+    assert kw["stat_secondary"] == ("checker", "secondary")
+    assert kw["reader"] == "reader" and kw["importer"] == ("importer", "reader")
+    assert kw["indexers"] == ("indexers", [("idx", "[]")])
+    assert kw["archive_dir"] == str(tmp_path / "nzb")
+    env["TIERING_NZB_DIR"] = "/x/nzb"
+    wiring.qualify_from_env(env)({"id": "b"})
+    assert calls[1][1]["archive_dir"] == "/x/nzb"
+    with pytest.raises(wiring.WiringError):
+        wiring.qualify_from_env({**env, "NO_SECONDARY": "1"})
+
+
+def test_default_factory_is_wiring(tmp_path, monkeypatch):
+    from offload import wiring
+    monkeypatch.delenv("TIERING_QUALIFY_FACTORY", raising=False)
+    monkeypatch.setattr(wiring, "qualify_from_env", lambda env=None: "built")
+    _fake_intake(monkeypatch, [])
+    import types
+    for name in ("ops", "state"):
+        monkeypatch.setitem(sys.modules, f"{runner.__package__}.{name}",
+                            types.ModuleType(f"{runner.__package__}.{name}"))
+    cfg = Config(db=str(tmp_path / "t.db"), gate_path_map=[("/a", "/b")])
+    deps = runner.load_deps(cfg)
+    assert deps.qualify == "built" and deps.register is not None
+
+
+_HAVE_INTAKE = all(importlib.util.find_spec(f"offload.{m}") for m in
+                   ("qualify", "nntp_stat", "newznab", "altmount", "register"))
+
+
+@pytest.mark.skipif(not _HAVE_INTAKE, reason="tiering-intake (#82) is not merged yet")
+def test_wiring_against_real_intake_modules(tmp_path, monkeypatch):
+    from offload import wiring
+    env = {"TIERING_DB": str(tmp_path / "t.db"), "NNTP_PRIMARY_HOST": "p.example",
+           "NNTP_SECONDARY_HOST": "s.example", "NEWZNAB_INDEXERS": "[]",
+           "ALTMOUNT_URL": "http://altmount.example", "ALTMOUNT_API_KEY": "k"}
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert callable(wiring.qualify_from_env(env))
