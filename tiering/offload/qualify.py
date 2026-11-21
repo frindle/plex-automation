@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from xml.etree.ElementTree import ParseError
 
 from .altmount import AltMountError
-from .newznab import (BadRelease, GrabBudgetSpent, IndexersUnavailable, ItemFailed, NewznabError, archive_nzb, nzb_segment_ids, parse_resolution,
+from .newznab import (BadRelease, GrabBudgetSpent, IndexersUnavailable, ItemFailed, NewznabError, NotNzb, archive_nzb, nzb_segment_ids, parse_resolution,
                       read_archived, title_matches)
 from .nntp_stat import NntpUnavailable
 
@@ -226,8 +226,20 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
         except BadRelease:
             dead += 1  # known to have no NZB: no restore path, and no grab was spent
             continue
+        except NotNzb:
+            # one page that is no NZB may be a maintenance page: only a strike, so the
+            # path is unchecked. Dead once the strike confirms (no NZB on two nights)
+            if indexers.is_bad(rel):
+                dead += 1
+            else:
+                unsure = True
+            fails += 1
+            if fails >= MAX_FAILED_GRABS:
+                unsure = True  # the rest were not asked
+                break
+            continue
         except ItemFailed:
-            dead += 1  # no NZB behind the listing: as good as a dead one
+            dead += 1  # the indexer says the item is gone (300, 404, 410): a dead one
             fails += 1
             if fails >= MAX_FAILED_GRABS:
                 unsure = True  # the rest were not asked
@@ -261,7 +273,7 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
     elif unsure:
         note = "restore path unchecked (an indexer or NZB did not answer)"
     elif dead:
-        note = f"alternatives found but their articles are missing ({dead})"
+        note = f"alternatives found but none can be restored: no NZB or articles gone ({dead})"
     elif below:
         note = f"only below-floor alternatives ({below}), floor {floor}p"
     else:
@@ -357,6 +369,17 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
                     unsure = True  # known to have no NZB: no grab was spent, so no failed try
                     items += 1
                     continue
+                except NotNzb:
+                    # one page that is no NZB may be the indexer's maintenance page: not the
+                    # row's fault until the strike confirms on a second night
+                    unsure = True
+                    if indexers.is_bad(rel):
+                        items += 1
+                    else:
+                        others = True
+                    fails += 1
+                    if fails >= MAX_FAILED_GRABS:
+                        break
                 except ItemFailed:
                     unsure = True
                     items += 1
