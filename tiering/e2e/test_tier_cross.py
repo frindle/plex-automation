@@ -102,8 +102,8 @@ def test_zeroed_chunk_is_never_written_into_the_file(stack):
     assert os.lstat(row["stub_path"]).st_ino == stub_before[0]
     got, failed = stack.filled(row["id"])
     assert failed and bad not in got
-    assert any(a.get("kind") in ("promote_failed", "bad_chunk") for a in stack.alerts()), \
-        stack.alerts()
+    S.wait_until(lambda: any(a.get("kind") in ("promote_failed", "bad_chunk")
+                             for a in stack.alerts()), 20, what="an alert for the bad chunk")
     # head and tail are still served, and the good chunks still check out
     with open(row["stub_path"], "rb") as s, open(os.path.join(stack.remote, f["remote"]),
                                                  "rb") as r:
