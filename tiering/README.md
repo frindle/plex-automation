@@ -82,14 +82,14 @@ Env for the intake clients (the design is in `OFFLOAD_DESIGN.md`):
 
 ## Offload runner (deploy)
 
-`python -m offload.runner` is the long-running process that applies the hot set (see `OFFLOAD_DESIGN.md`). It is a dry run unless `TIERING_APPLY=1`. With `TIERING_APPLY=1` it refuses to start without `TIERING_GATE_PATH_MAP` and `TIERFS_STUB_ROOTS`.
+`python -m offload.runner` is the long-running process that applies the hot set (see `OFFLOAD_DESIGN.md`). It is a dry run unless `TIERING_APPLY=1`. With `TIERING_APPLY=1` it refuses to start without `TIERING_GATE_PATH_MAP`, `TIERFS_STUB_ROOTS`, `TIERFS_EVENTS` (its directory must exist), `TIERFS_MOUNT` and `TIERFS_MANIFESTS`, and unless every disk prefix in `TIERING_PATH_MAP` is covered by a `TIERING_GATE_PATH_MAP` entry. A disk path no gate entry covers is never sent to the gate and counts as not free.
 
 `lib_path` in the database is the share path, the one Plex reports. The runner and ops resolve the disk path at the moment they need it, and a file that is not on exactly one disk is skipped and logged.
 
 Container requirements:
 - `pid: host`. Plex reads through Unraid's user share, so only the shfs daemon's open file descriptor shows that a file is in use. The runner has to see host processes to find it.
 - `cap_add: SYS_PTRACE`, so it can read `/proc/<pid>/fd` of those processes.
-- `TIERING_PROC_CANARY`: the `comm` of the media server process, which must be visible from the runner (`Plex Media Serv`: the kernel cuts `comm` to 15 characters, so write it cut). If it is unset or not visible, the open-file check says "not clear" and ops refuses to demote, so a container that does not see host processes cannot demote.
+- `TIERING_PROC_CANARY`: a comma list of `comm` names, every one of which must be visible from the runner: the media server (`Plex Media Serv`, the kernel cuts `comm` to 15 characters, so write it cut) and the user-share daemon (`shfs`). If it is unset or any name is not visible, the open-file check says "not clear" and ops refuses to demote, so a container that does not see host processes cannot demote.
 - Two kinds of mount: the share at the path Plex uses (so `lib_path` reads) and each `/mnt/diskN` (where file operations run, never through the share's FUSE layer).
 
 ```yaml
@@ -107,7 +107,8 @@ services:
     environment:
       TIERING_DB: /state/tiering.db
       TIERING_APPLY: "0"                       # "1" to apply
-      TIERING_PROC_CANARY: "Plex Media Serv"
+      TIERING_PROC_CANARY: "Plex Media Serv,shfs"
+      TZ: Area/City                            # the demote window is local time: set your zone
       TIERING_PATH_MAP: /media=/mnt/disk1/media,/media=/mnt/disk2/media
       TIERING_ARR_PATH_MAP: /tv=/media/tv,/movies=/media/movies
       TIERING_GATE_PATH_MAP: /mnt/disk1/media=/data/media,/mnt/disk2/media=/data/media
@@ -123,7 +124,9 @@ Path settings, each a comma list:
 - `TIERING_GATE_PATH_MAP`: `disk_prefix=deluge_prefix`, the disk path in the torrent client's namespace. Several disk prefixes may map to one client prefix.
 - `TIERFS_STUB_ROOTS`: one stub directory per disk (`/mnt/disk1/.stubs,/mnt/disk2/.stubs`). Ops picks the one on the same disk as the file.
 
-Alerts go to `TIERING_ALERTS` (JSON lines): `bad_chunk`, `slot_timeout`, `promote_failed`, `demote_failed`, `register_failed`, and once per id `promote_short_remote` and `takeover_orphan`. A register with errors, or with missing or ambiguous files over 5% of the files it listed, blocks that night's demotes.
+`TIERING_DEMOTE_WINDOW` is local time in the container, so set `TZ` (without it the window runs in UTC).
+
+Alerts go to `TIERING_ALERTS` (JSON lines): `bad_chunk`, `slot_timeout`, `promote_failed`, `promote_retrying` (3 failures in a row; retries back off from 5 minutes, doubling to 6 hours), `promote_worker_died`, `demote_failed`, `register_failed`, `history_shrunk`, and once per id `promote_short_remote`, `takeover_orphan`, `l_missing` and `promote_stuck`. A row flagged by the weekly check is promoted whether or not the hot set wants it. `/healthz` reports `worker_deaths` and `stuck_promotes`. The runner keeps its own last-play time per title in the state DB; when Plex's play history is empty or over 20% shorter than last time it refuses that night's demotes (after a deliberate purge, `DELETE FROM kv WHERE key='history_count'`). A register with errors, or with missing or ambiguous files over 5% of the files it listed, blocks that night's demotes.
 
 ## Tests (run on a Linux test box)
 ```

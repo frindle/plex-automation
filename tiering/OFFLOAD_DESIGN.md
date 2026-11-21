@@ -179,6 +179,8 @@ Offload step 3 hashes `L` again in the read that builds the chunk list. If that 
 - An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`, `nzb_path`, `nzb_path2`, `restore_score`, `restore_note`, `remote_path` and the head/tail facts.
 - It never deletes a row. A path the arrs no longer list is logged.
 - The runner fills `rating_key`, `kind` and `is4k` from Plex.
+- The result is a dict with these int counts: `listed`, `missing_local`, `ambiguous`, `errors`, `new`, `updated`, `unchanged`, `skipped_state`, `unlisted`, and `applied` (bool). `listed` is the number of files the arrs listed.
+- The runner fails closed on the result. It blocks that night's demotes when the result is not a dict, lacks `listed`, `missing_local`, `ambiguous` or `errors`, holds a non-int there, has `errors > 0` or `listed == 0`, or when `missing_local + ambiguous` is over 5% of `listed`. It alerts `register_failed`.
 - `lib_path` is the share path (see "Path namespaces"). `TIERING_ARR_PATH_MAP` maps arr paths to share paths when they differ. Size and mtime come from the resolved disk path.
 
 ### Weekly

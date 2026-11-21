@@ -170,6 +170,9 @@ def test_N5_dir_fsync_after_exchange_before_step4_offload(tmp_path, monkeypatch)
     monkeypatch.setattr(ops, "punch_hole", lambda *a: (seq.append(("punch",)), rp(*a))[1])
     monkeypatch.setattr(st, "set_state",
                         lambda db, i, s, **f: (seq.append(("state", s, f.get("step"))), rs(db, i, s, **f))[1])
+    ru = st.update_if  # the offload steps are compare-and-set writes now
+    monkeypatch.setattr(st, "update_if", lambda db, i, e, **f: (
+        seq.append(("state", f.get("state", e), f.get("step"))), ru(db, i, e, **f))[1])
     assert env.offload().ok
     i, j = seq.index(("exchange", env.lib)), seq.index(("punch",))
     mid = seq[i:j]
