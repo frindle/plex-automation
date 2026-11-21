@@ -609,8 +609,24 @@ class Stack:
         for f in (fs or self.files.values()):
             assert os.path.lexists(f["disk"]), f"{f['key']}: L is missing"
             got = self.read_through(f)
-            assert got == f["sha256"], f"{f['key']}: content changed ({self.state_of(f)})"
+            assert got == f["sha256"], (f"{f['key']}: content changed ({self.state_of(f)}): got {got}\n"
+                                        + self.why_changed(f))
             assert os.stat(f["disk"]).st_size == f["size"], f"{f['key']}: size changed"
+
+    def why_changed(self, f) -> str:
+        """Where the bytes read through L first differ from the remote copy."""
+        if not self.real:
+            return ""
+        cmp = os.path.join(self.root, "bgcmp")
+        if not os.path.exists(cmp):
+            shutil.copy(shutil.which("cmp"), cmp)
+        r = subprocess.run([cmp, f["disk"], os.path.join(self.remote, f["remote"])],
+                           capture_output=True, timeout=120)
+        row = self.row(f) or {}
+        return (f"cmp: {r.stdout.decode(errors='replace').strip()} "
+                f"{r.stderr.decode(errors='replace').strip()}\n"
+                f"head_len={row.get('head_len')} tail_len={row.get('tail_len')} "
+                f"size={row.get('size')} remote_path={row.get('remote_path')}\n" + self.log_tail(15))
 
     # ---- tierfs
 
@@ -640,7 +656,7 @@ class Stack:
         shutil.copy(shutil.which("sha256sum"), self.bgsum)
         env = self.env(TIERFS_POLL="500ms", TIERFS_WAIT_S=os.environ.get("E2E_WAIT_S", "30"),
                        TIERFS_HTTP=f"127.0.0.1:{self.tierfs_http}", TIERFS_MAX_STREAMS="4",
-                       TIERFS_BACKGROUND_COMMS="Plex Media Scan,bgsum")
+                       TIERFS_BACKGROUND_COMMS="Plex Media Scan,bgsum,bgcmp")
         log = open(os.path.join(self.state, "tierfs.log"), "ab")
         self.tierfs = subprocess.Popen([TIERFS_BIN], env=env, stdout=log, stderr=log)
         self.procs.append(self.tierfs)
