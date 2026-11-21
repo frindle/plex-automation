@@ -1,0 +1,870 @@
+"""The offload runner: one long-running process that applies the hot set.
+
+See tiering/OFFLOAD_DESIGN.md, "Runner". Every pass reads Plex and the tierfs
+events, computes the hot set, then promotes what is wanted at once and demotes
+what is idle, only inside the night window.
+
+  python -m offload.runner --once     one pass, then exit (cron, testing)
+  python -m offload.runner            loop, one pass every 60 s
+
+Dry run unless TIERING_APPLY=1: every planned action is logged and nothing
+that changes a file is called.
+
+state.py, ops.py and qualify.py are not imported at module level. They are
+reached through a `Deps` object (see `load_deps`), so tests can inject fakes.
+"""
+from __future__ import annotations
+
+import fcntl
+import importlib
+import json
+import logging
+import os
+import signal
+import sys
+import threading
+import time
+import traceback
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable
+
+from . import hotset, plex_watch
+
+log = logging.getLogger("tiering.runner")
+
+DAY = 86400.0
+GB = 10**9
+PASS_INTERVAL = 60.0
+RETRY_DELAY = 300.0
+ACTIVE_STATES = ("offloaded", "promoting")
+
+
+# --------------------------------------------------------------------------
+# config
+
+
+def parse_path_map(spec: str) -> list[tuple[str, str]]:
+    """"plexprefix=localprefix[,...]" -> pairs, longest plex prefix first."""
+    pairs = []
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError("TIERING_PATH_MAP entries look like plexprefix=localprefix")
+        a, b = part.split("=", 1)
+        pairs.append((a.strip().rstrip("/"), b.strip().rstrip("/")))
+    return sorted(pairs, key=lambda p: -len(p[0]))
+
+
+def map_path(path: str, pairs) -> str:
+    for plex, local in pairs:
+        if path == plex or path.startswith(plex + "/"):
+            return local + path[len(plex):]
+    return path
+
+
+def parse_window(spec: str) -> tuple[int, int]:
+    """"HH:MM-HH:MM" -> (start, end) in minutes after local midnight."""
+    try:
+        a, b = spec.split("-")
+        out = []
+        for t in (a, b):
+            h, m = t.strip().split(":")
+            h, m = int(h), int(m)
+            if not ((0 <= h < 24 and 0 <= m < 60) or (h == 24 and m == 0)):
+                raise ValueError
+            out.append(h * 60 + m)
+    except ValueError:
+        raise ValueError(f"bad TIERING_DEMOTE_WINDOW {spec!r}; expected HH:MM-HH:MM") from None
+    if out[0] == out[1]:
+        raise ValueError("TIERING_DEMOTE_WINDOW start and end are equal")
+    return out[0], out[1]
+
+
+def night_start(now: float, window: tuple[int, int]) -> float | None:
+    """Start (epoch) of the local night `now` is in, or None outside the window.
+    Handles windows that cross midnight."""
+    s, e = window
+    dt = datetime.fromtimestamp(now)
+    mins = dt.hour * 60 + dt.minute
+    day = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    if s < e:
+        if not (s <= mins < e):
+            return None
+        return (day + timedelta(minutes=s)).timestamp()
+    if mins >= s:
+        return (day + timedelta(minutes=s)).timestamp()
+    if mins < e:
+        return (day - timedelta(days=1) + timedelta(minutes=s)).timestamp()
+    return None
+
+
+def _flag(v) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass
+class Config:
+    db: str
+    tierfs_mount: str = ""
+    manifests: str = ""
+    events: str = ""
+    stub_root: str = ""
+    apply: bool = False
+    promote_concurrency: int = 2
+    window: tuple = (120, 360)
+    demote_bytes_per_night: int = 200 * GB
+    path_map: list = field(default_factory=list)
+    alerts: str = ""
+    http: str = "127.0.0.1:8471"
+    pass_seconds: float = PASS_INTERVAL
+    hot: hotset.Cfg = field(default_factory=hotset.Cfg)
+
+    @classmethod
+    def from_env(cls, env=None) -> "Config":
+        e = os.environ if env is None else env
+        db = e.get("TIERING_DB", "")
+        if not db:
+            raise ValueError("TIERING_DB must be set")
+        d = hotset.Cfg()
+        hot = hotset.Cfg(
+            new_days=float(e.get("TIERING_NEW_DAYS") or d.new_days),
+            idle_days=float(e.get("TIERING_IDLE_DAYS") or d.idle_days),
+            near_end_eps=int(e.get("TIERING_NEAR_END_EPS") or d.near_end_eps),
+            max_stream_kbps=int(e.get("TIERING_MAX_STREAM_KBPS") or 0),
+            keep_4k=_flag(e.get("TIERING_KEEP_4K")),
+            never_sections=tuple(s.strip() for s in
+                                 (e.get("TIERING_NEVER_SECTIONS", "Adult")).split(",") if s.strip()),
+        )
+        return cls(
+            db=db,
+            tierfs_mount=e.get("TIERFS_MOUNT", "").rstrip("/"),
+            manifests=e.get("TIERFS_MANIFESTS", ""),
+            events=e.get("TIERFS_EVENTS", ""),
+            stub_root=e.get("TIERING_STUB_ROOT", ""),
+            apply=e.get("TIERING_APPLY") == "1",
+            promote_concurrency=max(1, int(e.get("TIERING_PROMOTE_CONCURRENCY") or 2)),
+            window=parse_window(e.get("TIERING_DEMOTE_WINDOW") or "02:00-06:00"),
+            demote_bytes_per_night=int(float(e.get("TIERING_DEMOTE_GB_PER_NIGHT") or 200) * GB),
+            path_map=parse_path_map(e.get("TIERING_PATH_MAP", "")),
+            alerts=e.get("TIERING_ALERTS") or os.path.join(
+                os.path.dirname(os.path.abspath(db)), "alerts.jsonl"),
+            http=e.get("TIERING_HTTP") or "127.0.0.1:8471",
+            pass_seconds=float(e.get("TIERING_PASS_SECONDS") or PASS_INTERVAL),
+            hot=hot,
+        )
+
+
+# --------------------------------------------------------------------------
+# logging: never let the Plex token reach a log line
+
+
+class Redact(logging.Filter):
+    def filter(self, record):
+        tok = os.environ.get("PLEX_TOKEN", "")
+        if not tok:
+            return True
+        msg = record.getMessage()
+        if record.exc_info:
+            record.exc_text = "".join(traceback.format_exception(*record.exc_info))
+            record.exc_info = None
+        if tok in msg:
+            record.msg, record.args = msg.replace(tok, "***"), ()
+        if record.exc_text and tok in record.exc_text:
+            record.exc_text = record.exc_text.replace(tok, "***")
+        return True
+
+
+log.addFilter(Redact())
+
+
+# --------------------------------------------------------------------------
+# dependencies (state, ops, qualify, glacier gate)
+
+
+@dataclass
+class Deps:
+    """state: module-like with open_db/get/set_state/upsert/list_files/log_event.
+    promote(db, row, apply) and demote(db, row, apply) return an ops `Result`.
+    qualify(row) returns an object with .ok, .reasons and .fields.
+    gate(lib_path) returns "free", "pause" or "wait"; only "free" may be demoted."""
+    state: object
+    promote: Callable
+    demote: Callable
+    qualify: Callable
+    gate: Callable
+
+
+def _http_gate(cfg: Config):
+    """Glacier gate over the tiering API (TIERING_API). Anything but an
+    explicit "free" is "wait". TIERING_GATE_PATH_MAP="local=gate,..." maps
+    paths into the namespace the gate knows."""
+    import urllib.request
+    api = os.environ.get("TIERING_API", "").rstrip("/")
+    pairs = parse_path_map(os.environ.get("TIERING_GATE_PATH_MAP", ""))
+
+    def gate(path):
+        if not api:
+            return "wait"
+        try:
+            req = urllib.request.Request(
+                api + "/tiering/torrent-gate?format=tsv",
+                data=map_path(path, pairs).encode(), method="POST",
+                headers={"Content-Type": "text/plain"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                first = r.read().decode("utf-8", "replace").splitlines()
+            return first[0].split("\t")[0].strip() if first else "wait"
+        except (OSError, ValueError):
+            return "wait"
+    return gate
+
+
+def load_deps(cfg: Config) -> Deps:
+    """Wire the real modules. Imported here so the runner imports without them."""
+    from . import altmount, ops
+    from . import state as st
+
+    reader = altmount.WebDavReader()
+
+    def promote(db, row, apply):
+        return ops.promote(db, row["id"], reader, apply=apply, manifest_dir=cfg.manifests)
+
+    def demote(db, row, apply):
+        return ops.demote(db, row, stub_root=cfg.stub_root, manifest_dir=cfg.manifests,
+                          tierfs_mount=cfg.tierfs_mount, apply=apply)
+
+    factory = os.environ.get("TIERING_QUALIFY_FACTORY", "")
+    if factory:
+        mod, _, fn = factory.partition(":")
+        qualify = getattr(importlib.import_module(mod), fn)()
+    else:
+        def qualify(row):
+            from .qualify import QualifyResult
+            return QualifyResult(False, ["qualify is not wired (set TIERING_QUALIFY_FACTORY)"])
+    return Deps(st, promote, demote, qualify, _http_gate(cfg))
+
+
+# --------------------------------------------------------------------------
+# tierfs bad_chunk events
+
+
+class BadChunkScanner:
+    """Tails the tierfs event file (and rotated copies on the first look or
+    after a rotation) for `bad_chunk` events."""
+
+    def __init__(self, path):
+        self.path, self.ino, self.pos = path, None, 0
+
+    @staticmethod
+    def _read(p, start):
+        try:
+            with open(p, "rb") as fh:
+                fh.seek(start)
+                data = fh.read()
+        except OSError:
+            return [], start
+        cut = data.rfind(b"\n") + 1
+        out = []
+        for line in data[:cut].splitlines():
+            try:
+                e = json.loads(line)
+                if e.get("ev") == "bad_chunk" and e.get("id"):
+                    out.append({"id": str(e["id"]), "ts": float(e.get("ts") or 0),
+                                "offset": e.get("offset")})
+            except (ValueError, TypeError, AttributeError):
+                continue
+        return out, start + cut
+
+    def scan(self):
+        if not self.path:
+            return []
+        try:
+            s = os.stat(self.path)
+        except OSError:
+            return []
+        out = []
+        if self.ino != s.st_ino or s.st_size < self.pos:
+            for i in (3, 2, 1):
+                out += self._read(f"{self.path}.{i}", 0)[0]
+            self.ino, self.pos = s.st_ino, 0
+        ev, self.pos = self._read(self.path, self.pos)
+        return out + ev
+
+
+# --------------------------------------------------------------------------
+# the runner
+
+
+class Runner:
+    def __init__(self, cfg: Config, deps: Deps, clock=time.time, sleep=time.sleep):
+        self.cfg, self.deps, self.clock, self.sleep = cfg, deps, clock, sleep
+        self.state = deps.state
+        self.stop = threading.Event()
+        self.mu = threading.Lock()
+        self.promote_todo: deque = deque()
+        self.demote_todo: deque = deque()
+        self.promote_running: set = set()
+        self.promote_workers = 0
+        self.demote_worker = False
+        self.threads: list = []
+        self._rows: dict = {}
+        self.retry_after: dict = {}
+        self.desired_rks: set = set()
+        self.complete = False
+        self.pending_bad: dict = {}
+        self.scanner = BadChunkScanner(cfg.events)
+        self._db = None
+        self.night = self._load_night()
+        self.last_pass = None
+        self.last_ok = None
+        self.passes = 0
+        self.errors = 0
+        self.counts: dict = {}
+        self.heartbeat_path = cfg.db + ".heartbeat"
+
+    # ---- small helpers
+
+    def _open(self):
+        return self.state.open_db(self.cfg.db)
+
+    def db(self):
+        if self._db is None:
+            self._db = self._open()
+        return self._db
+
+    def _night_file(self):
+        return self.cfg.db + ".night.json"
+
+    def _load_night(self):
+        try:
+            with open(self._night_file()) as fh:
+                d = json.load(fh)
+            return {"start": float(d["start"]), "bytes": int(d["bytes"]),
+                    "failed": bool(d["failed"])}
+        except (OSError, ValueError, KeyError, TypeError):
+            return {"start": None, "bytes": 0, "failed": False}
+
+    def _save_night(self):
+        if not self.cfg.apply:
+            return
+        tmp = f"{self._night_file()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(self.night, fh)
+        os.replace(tmp, self._night_file())
+
+    def _tonight(self, now):
+        """The night record for now (reset when a new night begins), or None."""
+        start = night_start(now, self.cfg.window)
+        if start is None:
+            return None
+        with self.mu:
+            if self.night["start"] != start:
+                self.night = {"start": start, "bytes": 0, "failed": False}
+                self._save_night()
+            return self.night
+
+    def _alert(self, kind, id, **detail):
+        rec = {"ts": self.clock(), "kind": kind, "id": id, **detail}
+        log.error("ALERT %s id=%s %s", kind, id, json.dumps(detail, sort_keys=True, default=str))
+        try:
+            with open(self.cfg.alerts, "a") as fh:
+                fh.write(json.dumps(rec, sort_keys=True, default=str) + "\n")
+        except OSError as e:
+            log.error("cannot write alerts file: %s", type(e).__name__)
+
+    def _note_failure(self, now):
+        n = self._tonight(now)
+        if n is not None:
+            with self.mu:
+                n["failed"] = True
+                self._save_night()
+
+    def _demote_block(self, now) -> str:
+        """Why demotes may not run right now, or "" when they may."""
+        if night_start(now, self.cfg.window) is None:
+            return "outside the demote window"
+        if not self.complete:
+            return "a Plex read failed this pass"
+        n = self._tonight(now)
+        if n["failed"]:
+            return "a hash check failed tonight"
+        if self.promote_todo or self.promote_running:
+            return "a promote is pending"
+        if n["bytes"] >= self.cfg.demote_bytes_per_night:
+            return "the night's byte cap is reached"
+        if self.cfg.apply and not self.cfg.stub_root:
+            return "TIERING_STUB_ROOT is not set"
+        return ""
+
+    # ---- reading the world
+
+    def _read_plex(self, now):
+        """Returns (data dict, complete flag). `items` is None when unreadable."""
+        idle = self.cfg.hot.idle_days * DAY
+        ok = True
+        data = {}
+        for name, fn in (("items", lambda: plex_watch.library_items()),
+                         ("plays", lambda: plex_watch.play_history(now - idle)),
+                         ("progress", lambda: plex_watch.in_progress()),
+                         ("sessions", lambda: plex_watch.sessions()),
+                         ("deck", lambda: plex_watch.on_deck())):
+            try:
+                data[name] = fn()
+            except Exception as e:
+                ok = False
+                data[name] = None if name == "items" else []
+                log.error("plex read %s failed: %s: %s", name, type(e).__name__, e)
+        return data, ok
+
+    # ---- reconcile and bad chunks
+
+    def _reconcile(self, db, rows, now):
+        for row in rows:
+            if row["state"] != "offloaded" or row["id"] in self.promote_running:
+                continue
+            lib = row.get("lib_path")
+            ext = os.path.splitext(lib or "")[1]
+            want = f"{self.cfg.tierfs_mount}/{row['id']}{ext}"
+            try:
+                got = os.readlink(lib)
+            except (OSError, TypeError):
+                got = None
+            if got == want:
+                continue
+            if not self.cfg.apply:
+                log.warning("dry run: would mark %s failed, L replaced (%s)", row["id"], lib)
+                continue
+            self.state.set_state(db, row["id"], "failed", restore_note="L replaced")
+            self.state.log_event(db, row["id"], "l_replaced", {"lib_path": lib})
+            log.warning("%s: L replaced, no longer managed", row["id"])
+
+    def _bad_chunks(self, db, now):
+        for ev in self.scanner.scan():
+            self.pending_bad[ev["id"]] = ev
+        for id, ev in list(self.pending_bad.items()):
+            row = self.state.get(db, id)
+            if row is None or row["state"] not in ("offloaded", "promoting", "offloading") \
+                    or ev["ts"] <= (row.get("updated_ts") or 0):
+                del self.pending_bad[id]
+                continue
+            if id in self.promote_running:
+                continue
+            del self.pending_bad[id]
+            note = f"bad_chunk at offset {ev['offset']}"
+            self._note_failure(now)
+            if not self.cfg.apply:
+                log.error("dry run: would fail %s: %s", id, note)
+                continue
+            self.state.set_state(db, id, "failed", restore_note=note)
+            self.state.log_event(db, id, "bad_chunk", {"offset": ev["offset"]})
+            self._alert("bad_chunk", id, offset=ev["offset"], lib_path=row.get("lib_path"))
+
+    # ---- the pass
+
+    def run_pass(self, wait: bool = False) -> dict:
+        now = self.clock()
+        self.last_pass = now
+        self.passes += 1
+        try:
+            return self._pass(now, wait)
+        finally:
+            self._heartbeat(now)
+
+    def _pass(self, now, wait):
+        db = self.db()
+        cfg, st = self.cfg, self.state
+        data, complete = self._read_plex(now)
+        items = data["items"]
+        if items is None:
+            self.complete = False
+            self.promote_todo.clear()
+            self.demote_todo.clear()
+            raise RuntimeError("library read failed; pass skipped")
+
+        rows = st.list_files(db)
+        self._reconcile(db, rows, now)
+        self._bad_chunks(db, now)
+        rows = st.list_files(db)
+
+        path_rk = {}
+        by_rk_item = {}
+        for it in items:
+            by_rk_item[str(it["ratingKey"])] = it
+            for f in it.get("files") or []:
+                path_rk[map_path(f, cfg.path_map)] = str(it["ratingKey"])
+        rows_by_rk: dict = {}
+        id_to_rk = {}
+        for r in rows:
+            rk = path_rk.get(r.get("lib_path")) or r.get("rating_key")
+            if rk is None:
+                continue
+            rk = str(rk)
+            if cfg.apply and r.get("rating_key") != rk:
+                st.upsert(db, {"id": r["id"], "rating_key": rk})
+            r["rating_key"] = rk
+            rows_by_rk.setdefault(rk, []).append(r)
+            id_to_rk[r["id"]] = rk
+
+        synced = {}
+        if cfg.events:
+            try:
+                synced = plex_watch.read_tierfs_events(
+                    cfg.events, now - cfg.hot.idle_days * DAY, id_to_rk)
+            except Exception as e:
+                complete = False
+                log.error("tierfs events read failed: %s", type(e).__name__)
+        plays = list(data["plays"] or [])
+        for p in data["progress"] or []:
+            plays.append({**p, "viewedAt": p.get("viewedAt") or now})
+
+        desired = hotset.desired_whole(items, plays, data["sessions"] or [],
+                                       data["deck"] or [], synced, now, cfg.hot)
+        never = {s.lower() for s in cfg.hot.never_sections}
+        offloaded_rks, whole_rks = set(), set()
+        for rk, rs in rows_by_rk.items():
+            if any(r["state"] in ACTIVE_STATES for r in rs):
+                offloaded_rks.add(rk)
+            elif all(r["state"] == "whole" and r.get("sha256") for r in rs):
+                it = by_rk_item.get(rk)
+                sec = str((it or {}).get("section") or "").strip().lower()
+                if it is not None and sec not in never:
+                    whole_rks.add(rk)
+        acts = hotset.plan_actions(desired, offloaded_rks, whole_rks, now)
+
+        # ---- promotes
+        order = self._order_promotes([a for a in acts if a.kind == "promote"],
+                                     by_rk_item, data["sessions"] or [])
+        pjobs = []
+        for a in order:
+            for r in sorted(rows_by_rk[a.rating_key], key=lambda r: r["id"]):
+                if r["state"] in ACTIVE_STATES:
+                    pjobs.append((a, r))
+        for a, r in pjobs:
+            log.info("plan: promote %s rk=%s id=%s (%s)", r["lib_path"], a.rating_key,
+                     r["id"], a.reason)
+        with self.mu:
+            self.complete = complete
+            self.desired_rks = set(desired)
+            self.promote_todo = deque(r["id"] for _, r in pjobs)
+            self._rows = {r["id"]: r for _, r in pjobs}
+        if cfg.apply:
+            self._spawn_promote_workers()
+
+        # ---- demotes
+        dcands = []
+        for a in acts:
+            if a.kind == "demote":
+                for r in sorted(rows_by_rk[a.rating_key], key=lambda r: r["id"]):
+                    dcands.append(r)
+        for r in rows:  # an offload a crash left half done is resumed, not restarted
+            if r["state"] == "offloading":
+                dcands.insert(0, r)
+        block = self._demote_block(now)
+        n = self._tonight(now)
+        tried = n.setdefault("tried", []) if n is not None else []
+        todo = [] if block else [r for r in dcands if r["id"] not in tried]
+        if block:
+            log.info("demotes skipped: %s", block)
+        if not cfg.apply:
+            used = n["bytes"] if n else 0
+            for r in todo:
+                size = int(r.get("size") or 0)
+                if used + size > cfg.demote_bytes_per_night:
+                    break
+                used += size
+                log.info("plan: demote %s id=%s (idle, %d bytes)", r["lib_path"], r["id"], size)
+        else:
+            with self.mu:
+                self.demote_todo = deque(r["id"] for r in todo)
+            self._spawn_demote_worker()
+
+        self.counts = {"promotes_planned": len(pjobs), "promotes_running": len(self.promote_running),
+                       "demotes_planned": len(todo), "demote_blocked": block,
+                       "plex_complete": complete, "night_bytes": (n or {}).get("bytes", 0)}
+        if complete:
+            self.last_ok = now
+        if wait:
+            self.join()
+        return self.counts
+
+    @staticmethod
+    def _order_promotes(acts, by_rk, sessions):
+        """Live-session items first, then the rest of those seasons in episode
+        order, then everything else (plan order)."""
+        live = [str(s["ratingKey"]) for s in sessions if s.get("ratingKey") is not None]
+        want = {a.rating_key: a for a in acts}
+        out, seen = [], set()
+
+        def take(rk):
+            if rk in want and rk not in seen:
+                seen.add(rk)
+                out.append(want[rk])
+
+        for rk in sorted(live):
+            take(rk)
+        for rk in sorted(live):
+            it = by_rk.get(rk) or {}
+            if it.get("type") != "episode":
+                continue
+            show, sn = it.get("grandparentRatingKey"), it.get("parentIndex")
+            eps = [e for e in by_rk.values() if e.get("type") == "episode"
+                   and e.get("grandparentRatingKey") == show and e.get("parentIndex") == sn]
+            for e in sorted(eps, key=lambda e: (e.get("index") is None, e.get("index") or 0,
+                                                str(e["ratingKey"]))):
+                take(str(e["ratingKey"]))
+        for a in acts:
+            take(a.rating_key)
+        return out
+
+    # ---- workers
+
+    def _spawn(self, target):
+        t = threading.Thread(target=target, daemon=True)
+        self.threads = [x for x in self.threads if x.is_alive()] + [t]
+        t.start()
+
+    def join(self):
+        for t in list(self.threads):
+            t.join()
+
+    def _spawn_promote_workers(self):
+        with self.mu:
+            n = min(self.cfg.promote_concurrency - self.promote_workers, len(self.promote_todo))
+            self.promote_workers += max(n, 0)
+        for _ in range(max(n, 0)):
+            self._spawn(self._promote_worker)
+
+    def _next_promote(self):
+        with self.mu:
+            now = self.clock()
+            while self.promote_todo:
+                id = self.promote_todo.popleft()
+                if id in self.promote_running or self.retry_after.get(id, 0) > now:
+                    continue
+                self.promote_running.add(id)
+                return id, self._rows.get(id)
+            self.promote_workers -= 1
+            return None, None
+
+    def _promote_worker(self):
+        db = self._open()
+        while True:
+            id, row = self._next_promote()
+            if id is None:
+                return
+            try:
+                cur = self.state.get(db, id) or row
+                if cur["state"] not in ACTIVE_STATES:
+                    continue
+                log.info("promote start %s", id)
+                res = self.deps.promote(db, cur, True)
+                self._after(db, id, "promote", res)
+            except Exception as e:
+                log.error("promote %s raised %s: %s", id, type(e).__name__, e)
+                self.retry_after[id] = self.clock() + RETRY_DELAY
+            finally:
+                with self.mu:
+                    self.promote_running.discard(id)
+
+    def _after(self, db, id, what, res):
+        if res.ok:
+            log.info("%s %s done: state=%s", what, id, res.state)
+            return
+        log.warning("%s %s not done: %s (state=%s)", what, id, res.reason, res.state)
+        self.retry_after[id] = self.clock() + RETRY_DELAY
+        if res.state == "failed":
+            self._note_failure(self.clock())
+            self._alert(f"{what}_failed", id, reason=res.reason)
+
+    def _spawn_demote_worker(self):
+        with self.mu:
+            if self.demote_worker or not self.demote_todo:
+                return
+            self.demote_worker = True
+        self._spawn(self._demote_worker)
+
+    def _demote_worker(self):
+        try:
+            db = self._open()
+            while True:
+                with self.mu:
+                    if not self.demote_todo:
+                        return
+                    id = self.demote_todo.popleft()
+                now = self.clock()
+                block = self._demote_block(now)
+                if block:
+                    log.info("demotes stopped: %s", block)
+                    return
+                self._demote_one(db, id, now)
+        except Exception as e:
+            log.error("demote worker raised %s: %s", type(e).__name__, e)
+        finally:
+            with self.mu:
+                self.demote_worker = False
+
+    def _demote_one(self, db, id, now):
+        cfg, st = self.cfg, self.state
+        n = self._tonight(now)
+        row = st.get(db, id)
+        if row is None or row["state"] not in ("whole", "offloading"):
+            return
+        n.setdefault("tried", []).append(id)
+        if row.get("rating_key") in self.desired_rks:
+            return
+        size = int(row.get("size") or 0)
+        resume = row["state"] == "offloading"
+        if n["bytes"] + size > cfg.demote_bytes_per_night:
+            log.info("demote %s skipped: would pass the night's cap", id)
+            return
+        if not resume:
+            try:
+                ls = os.lstat(row["lib_path"])
+            except OSError as e:
+                log.warning("demote %s skipped: cannot stat L (%s)", id, type(e).__name__)
+                return
+            if os.path.islink(row["lib_path"]) or ls.st_nlink != 1:
+                log.info("demote %s skipped: L is a symlink or has other hardlinks", id)
+                return
+            g = self.deps.gate(row["lib_path"])
+            if g != "free":
+                log.info("demote %s skipped: glacier gate says %s", id, g)
+                return
+            q = self.deps.qualify(row)
+            if not q.ok:
+                log.info("demote %s skipped: qualify failed: %s", id, ",".join(q.reasons))
+                st.log_event(db, id, "qualify_failed", {"reasons": list(q.reasons)})
+                return
+            fields = {k: v for k, v in (q.fields or {}).items()
+                      if k in ("nzb_path", "nzb_path2", "remote_path", "restore_score",
+                               "restore_note")}
+            st.upsert(db, {"id": id, **fields, "last_check_ts": now})
+            row = st.get(db, id)
+            block = self._demote_block(self.clock())  # qualify takes a while
+            if block or row.get("rating_key") in self.desired_rks:
+                log.info("demote %s dropped after qualify: %s", id, block or "wanted again")
+                return
+        log.info("demote start %s", id)
+        res = self.deps.demote(db, row, True)
+        self._after(db, id, "demote", res)
+        if res.ok:
+            with self.mu:
+                n["bytes"] += size
+                self._save_night()
+
+    # ---- liveness
+
+    def _heartbeat(self, now):
+        try:
+            tmp = self.heartbeat_path + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write(f"{now:.0f}\n")
+            os.replace(tmp, self.heartbeat_path)
+        except OSError as e:
+            log.warning("cannot write heartbeat: %s", type(e).__name__)
+
+    def health(self) -> dict:
+        return {"last_pass_ts": self.last_pass, "last_ok_pass_ts": self.last_ok,
+                "passes": self.passes, "errors": self.errors, "apply": self.cfg.apply,
+                "counts": dict(self.counts)}
+
+    def run_forever(self):
+        while not self.stop.is_set():
+            try:
+                self.run_pass()
+            except Exception as e:
+                self.errors += 1
+                log.error("pass failed: %s: %s", type(e).__name__, e)
+            self.sleep(self.cfg.pass_seconds)
+
+
+# --------------------------------------------------------------------------
+# process plumbing
+
+
+def acquire_lock(db_path):
+    """Exclusive flock on a file next to the DB. Returns the open file, or None
+    when another instance holds it."""
+    fh = open(db_path + ".lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def start_health_server(runner: Runner, spec: str):
+    host, _, port = spec.rpartition(":")
+    host = host or "127.0.0.1"
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("TIERING_HTTP must be a localhost address")
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.split("?")[0] != "/healthz":
+                self.send_error(404)
+                return
+            body = json.dumps(runner.health(), default=str).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer((host, int(port)), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def main(argv=None, env=None, deps=None) -> int:
+    once = "--once" in (sys.argv[1:] if argv is None else argv)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    handler.addFilter(Redact())
+    root = logging.getLogger()
+    if not root.handlers:
+        root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    try:
+        cfg = Config.from_env(env)
+    except ValueError as e:
+        log.error("config: %s", e)
+        return 2
+    lock = acquire_lock(cfg.db)
+    if lock is None:
+        log.error("another runner holds the lock for %s", cfg.db)
+        return 1
+    try:
+        log.info("runner starting (%s)", "APPLY" if cfg.apply else "dry run")
+        runner = Runner(cfg, deps or load_deps(cfg))
+        if once:
+            try:
+                runner.run_pass(wait=True)
+            except Exception as e:
+                log.error("pass failed: %s: %s", type(e).__name__, e)
+                return 1
+            return 0
+        srv = start_health_server(runner, cfg.http)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: runner.stop.set())
+        runner.sleep = lambda s: runner.stop.wait(s)
+        try:
+            runner.run_forever()
+        finally:
+            srv.shutdown()
+            runner.join()
+        return 0
+    finally:
+        lock.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
