@@ -242,11 +242,21 @@ The inputs are plain dicts shaped like Plex's JSON: `ratingKey`, `grandparentRat
 
 ### Promote order
 
-1. Read the middle through `RemoteReader` one chunk at a time. Check each chunk against the chunk list before it is written into the stub's holes; a mismatch stops the promote at once with `state=failed`, as in step 2. fsync.
+1. Read the middle through `RemoteReader` one chunk at a time.
+   - **Order:** start at the chunk that holds the newest `want` offset for this id and go to the end of the middle, then continue from the start of the middle. A newer `want` outside the next 64 MiB moves the cursor there. Chunks already written are skipped. With no `want`, start at the start of the middle.
+   - **Each chunk:**
+     - check it against the chunk list;
+     - `pwrite` it into the stub's hole and `fdatasync`;
+     - then append its start offset as one decimal line to `${TIERFS_MANIFESTS}/<id>.fill` and flush.
+   - **Resume:** a resumed promote trusts the chunks the fill file already lists.
+   - **API:** `ops.promote(..., want: Callable[[], int | None] | None = None)`. The runner passes `want`; promote calls it before each chunk, and it returns the newest wanted offset for this id, or None.
+   - **Errors:**
+     - a fetch error is retried with backoff for up to `TIERING_PROMOTE_RETRY_S` (default 600) per chunk;
+     - a BLAKE3 mismatch on two fetches stops the promote at once: append `failed <offset>` and set `state=failed`, as in step 2.
 2. Hash the whole stub with SHA-256. If it does not match the manifest, stop: set `state=failed`, keep the symlink, and alert. Nothing is swapped.
 3. Restore the stub's mtime.
 4. Link the stub to `L.tierfs-tmp`, then `rename` it over `L`.
-5. Unlink the stub path, remove the manifest and the chunk list, and set `state=whole`.
+5. Unlink the stub path, remove the manifest, the chunk list and the fill file, and set `state=whole`.
 
 ## Runner (`runner.py`)
 
@@ -255,9 +265,23 @@ Swaps are automatic. One long-running process applies the hot set.
 - **Each pass (every 60 s):**
   - read Plex sessions, play history back to `now - idle_days`, on deck, in progress and the tierfs events;
   - compute `desired_whole`, then `plan_actions`.
-- **Promotes run at once:**
-  - a live session first, then the rest of its season in episode order, then everything else;
-  - at most `TIERING_PROMOTE_CONCURRENCY` (default 2) at a time.
+- **Wanted promotes start within 1 s:**
+  - The runner follows `${TIERFS_EVENTS}` all the time, not only on each pass.
+  - The first `want` for an id starts that file's promote within 1 s. It goes ahead of every other promote and outside `TIERING_PROMOTE_CONCURRENCY`, so a wanted promote never waits in the queue.
+  - Later `want`s for the same id go to the running promote and move its cursor.
+  - A `want` for a row that is neither `offloaded` nor `promoting` is ignored.
+- **Other promotes run at once:**
+  - wanted promotes first, then weekly-flagged rows, then a live session's season in episode order, then everything else;
+  - at most `TIERING_PROMOTE_CONCURRENCY` (default 2) at a time, not counting wanted promotes.
+- **Weekly check:**
+  - The runner calls `weekly.run_weekly` at the start of the demote window when `kv['weekly_last_ts']` is 7 or more days old, and on start-up when it is. It then sets the timestamp.
+  - That night's demotes wait until the check is done.
+  - Flags come only from `weekly_flag` events (`detail.reasons`), read after the cursor `kv['weekly_flag_cursor']`. They never come from `restore_note`, which the next good week overwrites.
+  - A flagged row is promoted whether or not the hot set wants it. Its flag is cleared only when its promote finishes.
+- **Qualify results:**
+  - `nzb_unsure` (a partial search or a spent budget) means "not tonight". The file stays whole, nothing is recorded, and it is tried the next night.
+  - Only `no_exact_nzb` means it is not on usenet.
+  - The runner keeps one `NewznabClient` for its whole life, built with `state_path=${TIERING_NEWZNAB_STATE}` (default `newznab_state.json` next to `TIERING_DB`), so budgets survive restarts.
 - **Demotes run only at night:**
   - only inside `TIERING_DEMOTE_WINDOW` (default `02:00-06:00`, local time);
   - only files that pass `qualify` that night, with the glacier gate "free" and nlink 1;
