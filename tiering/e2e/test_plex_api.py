@@ -21,10 +21,8 @@ SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY", os.devnull)
 
 
 def load(name):
-    spec = importlib.util.spec_from_file_location(name, f"{ROOT}/tiering/offload/{name}.py")
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m
+    sys.path.insert(0, f"{ROOT}/tiering")
+    return importlib.import_module(f"offload.{name}")
 
 
 def note(kind, msg):
