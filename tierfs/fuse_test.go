@@ -75,6 +75,7 @@ func startFuse(t *testing.T, mod func(*Config)) *fuseEnv {
 	cfg := Config{
 		Mount: e.mnt, Manifests: e.mdir, EventsPath: e.events, HTTPAddr: "127.0.0.1:0",
 		PollInterval: time.Hour, // tests call Reload themselves
+		StubRoots:    []string{filepath.Join(root, "stubs")},
 		Remote: RemoteConfig{
 			Base: e.rs.URL, User: testUser, Pass: testPass, ReadAhead: 16 << 20, MaxStreams: 8,
 		},

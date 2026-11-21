@@ -41,6 +41,7 @@ a symlink into the mount, so Plex sees a normal file. The design is in
 |---|---|---|
 | `TIERFS_MOUNT` | required | Where to mount. |
 | `TIERFS_MANIFESTS` | required | Directory of `<id>.json` manifests. |
+| `TIERFS_STUB_ROOTS` | required | Comma list of stub directories. A manifest is skipped unless `stub_path` is exactly `<root>/<id><ext>`. The stub is opened without following links and must be a regular file of the manifest's size. |
 | `TIERFS_REMOTE_BASE` | required | Base URL, for example `http://altmount:8080`. The manifest's `remote_path` is appended. |
 | `TIERFS_REMOTE_USER`, `TIERFS_REMOTE_PASS` | none | Basic auth. Never logged. |
 | `TIERFS_EVENTS` | off | JSONL events file. Rotates at 64 MiB, keeps 3 old files. |
@@ -86,6 +87,7 @@ to the host (and from there to Plex) with `rshared` propagation:
       -v /srv/tierfs/events:/events \
       -e TIERFS_MOUNT=/mnt/tierfs \
       -e TIERFS_MANIFESTS=/manifests \
+      -e TIERFS_STUB_ROOTS=/stubs \
       -e TIERFS_EVENTS=/events/events.jsonl \
       -e TIERFS_REMOTE_BASE=http://altmount:8080 \
       -e TIERFS_REMOTE_USER=user -e TIERFS_REMOTE_PASS=pass \

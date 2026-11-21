@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/zeebo/blake3"
 )
@@ -53,11 +56,13 @@ func (m *Manifest) Validate() error {
 		return errors.New("bad ext")
 	case m.Size <= 0:
 		return errors.New("size must be positive")
-	case m.HeadLen <= 0 || m.TailLen < 0:
+	case m.HeadLen <= 0 || m.TailLen < 0 || m.HeadLen >= m.Size || m.TailLen >= m.Size:
 		return errors.New("bad head_len/tail_len")
-	case m.HeadLen+m.TailLen >= m.Size:
+	case m.HeadLen >= m.Size-m.TailLen: // written so the sum cannot overflow
 		return errors.New("head_len + tail_len must be below size")
-	case m.ChunkSize <= 0 || m.ChunkSize > 256<<20:
+	case m.ID == "ffffffffffffffff" || m.ID == "0000000000000000":
+		return errors.New("reserved id")
+	case m.ChunkSize <= 0 || m.ChunkSize > 16<<20:
 		return errors.New("bad chunk_size")
 	case len(m.ChunksB3) != 64:
 		return errors.New("bad chunks_b3")
@@ -87,65 +92,147 @@ func (m *Manifest) NumChunks() int64 {
 	return (mid + m.ChunkSize - 1) / m.ChunkSize
 }
 
+// fileKey identifies one version of a file on disk. Manifests are written
+// with an atomic rename, so a new write changes the inode.
+type fileKey struct {
+	mtimeNS, size int64
+	ino           uint64
+}
+
+func keyOf(fi os.FileInfo) fileKey {
+	k := fileKey{mtimeNS: fi.ModTime().UnixNano(), size: fi.Size()}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		k.ino = uint64(st.Ino)
+	}
+	return k
+}
+
 type loaded struct {
 	m    *Manifest
-	raw  string
+	ver  string // changes whenever the manifest or its chunk list changes
 	sums [][32]byte
 }
 
+// cached remembers what a previous scan read, so an unchanged manifest or
+// chunk list is neither re-read nor re-hashed.
+type cached struct {
+	jsonKey   fileKey
+	m         *Manifest
+	mErr      string
+	chunkKey  fileKey
+	chunksB3  string
+	sums      [][32]byte
+	chunksErr string
+}
+
+// chunkLoads counts chunk list reads (for tests).
+var chunkLoads atomic.Int64
+
 // loadChunks reads <id>.chunks and checks it against the manifest.
-func loadChunks(dir string, m *Manifest) ([][32]byte, string, error) {
-	b, err := os.ReadFile(filepath.Join(dir, m.ID+".chunks"))
+func loadChunks(dir string, m *Manifest) ([][32]byte, fileKey, error) {
+	chunkLoads.Add(1)
+	f, err := os.Open(filepath.Join(dir, m.ID+".chunks"))
 	if err != nil {
-		return nil, "", fmt.Errorf("chunk list: %w", err)
+		return nil, fileKey{}, fmt.Errorf("chunk list: %w", err)
 	}
-	if int64(len(b)) != 32*m.NumChunks() {
-		return nil, "", fmt.Errorf("chunk list is %d bytes, want %d", len(b), 32*m.NumChunks())
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fileKey{}, fmt.Errorf("chunk list: %w", err)
+	}
+	want := 32 * m.NumChunks()
+	if fi.Size() != want {
+		return nil, fileKey{}, fmt.Errorf("chunk list is %d bytes, want %d", fi.Size(), want)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, want+1))
+	if err != nil || int64(len(b)) != want {
+		return nil, fileKey{}, errors.New("chunk list changed while reading")
 	}
 	if got := blake3.Sum256(b); hex.EncodeToString(got[:]) != strings.ToLower(m.ChunksB3) {
-		return nil, "", errors.New("chunk list does not match chunks_b3")
+		return nil, fileKey{}, errors.New("chunk list does not match chunks_b3")
 	}
 	sums := make([][32]byte, len(b)/32)
 	for i := range sums {
 		copy(sums[i][:], b[i*32:])
 	}
-	return sums, string(b), nil
+	return sums, keyOf(fi), nil
+}
+
+// stubAllowed reports whether path is exactly <root>/<id><ext> for a root.
+func stubAllowed(roots []string, m *Manifest) bool {
+	for _, r := range roots {
+		if m.StubPath == filepath.Join(r, m.Name()) {
+			return true
+		}
+	}
+	return false
 }
 
 // scanManifests reads every <id>.json in dir. Invalid files are reported
-// through bad (file name -> reason) and skipped.
-func scanManifests(dir string) (good map[string]loaded, bad map[string]string, err error) {
+// through bad (file name -> reason) and skipped. prev is the cache from the
+// last scan; the returned cache replaces it.
+func scanManifests(dir string, roots []string, prev map[string]*cached) (good map[string]loaded, bad map[string]string, next map[string]*cached, err error) {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	good = map[string]loaded{}
 	bad = map[string]string{}
+	next = map[string]*cached{}
 	for _, e := range ents {
 		n := e.Name()
 		if e.IsDir() || !strings.HasSuffix(n, ".json") {
 			continue // temp files from atomic writes do not end in .json
 		}
-		raw, err := os.ReadFile(filepath.Join(dir, n))
+		fi, err := e.Info()
 		if err != nil {
 			bad[n] = err.Error()
 			continue
 		}
-		m, err := ParseManifest(raw)
+		c := &cached{jsonKey: keyOf(fi)}
+		if old := prev[n]; old != nil && old.jsonKey == c.jsonKey {
+			c = old
+		} else {
+			raw, err := os.ReadFile(filepath.Join(dir, n))
+			if err != nil {
+				bad[n] = err.Error()
+				continue
+			}
+			m, err := ParseManifest(raw)
+			switch {
+			case err != nil:
+				c.mErr = err.Error()
+			case m.ID+".json" != n:
+				c.mErr = "file name does not match id"
+			default:
+				c.m = m
+			}
+		}
+		next[n] = c
+		if c.mErr != "" {
+			bad[n] = c.mErr
+			continue
+		}
+		m := c.m
+		if !stubAllowed(roots, m) {
+			bad[n] = "stub_path is not <stub root>/<id><ext>"
+			continue
+		}
+		cfi, err := os.Stat(filepath.Join(dir, m.ID+".chunks"))
 		if err != nil {
-			bad[n] = err.Error()
+			bad[n] = "chunk list: " + err.Error()
 			continue
 		}
-		if m.ID+".json" != n {
-			bad[n] = "file name does not match id"
-			continue
+		if c.sums == nil || c.chunkKey != keyOf(cfi) || c.chunksB3 != m.ChunksB3 {
+			sums, key, err := loadChunks(dir, m)
+			if err != nil {
+				bad[n] = err.Error()
+				continue
+			}
+			c.sums, c.chunkKey, c.chunksB3 = sums, key, m.ChunksB3
 		}
-		sums, craw, err := loadChunks(dir, m)
-		if err != nil {
-			bad[n] = err.Error()
-			continue
-		}
-		good[m.Name()] = loaded{m, string(raw) + "\x00" + craw, sums}
+		ver := fmt.Sprintf("%v|%v|%s", c.jsonKey, c.chunkKey, c.chunksB3)
+		good[m.Name()] = loaded{m, ver, c.sums}
 	}
-	return good, bad, nil
+	return good, bad, next, nil
 }

@@ -3,6 +3,7 @@ package tierfs
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,14 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	c.Remote.Base = getenv("TIERFS_REMOTE_BASE")
 	c.Remote.User = getenv("TIERFS_REMOTE_USER")
 	c.Remote.Pass = getenv("TIERFS_REMOTE_PASS")
+	for _, r := range strings.Split(getenv("TIERFS_STUB_ROOTS"), ",") {
+		if r = strings.TrimSpace(r); r != "" {
+			if !filepath.IsAbs(r) {
+				return c, fmt.Errorf("TIERFS_STUB_ROOTS: %q is not absolute", r)
+			}
+			c.StubRoots = append(c.StubRoots, filepath.Clean(r))
+		}
+	}
 	c.AllowOther = getenv("TIERFS_ALLOW_OTHER") != "0"
 	var err error
 	if v := getenv("TIERFS_READAHEAD"); v != "" {
@@ -62,7 +71,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		}
 	}
 	for _, r := range []struct{ name, val string }{
-		{"TIERFS_MOUNT", c.Mount}, {"TIERFS_MANIFESTS", c.Manifests}, {"TIERFS_REMOTE_BASE", c.Remote.Base},
+		{"TIERFS_MOUNT", c.Mount}, {"TIERFS_MANIFESTS", c.Manifests}, {"TIERFS_STUB_ROOTS", strings.Join(c.StubRoots, ",")}, {"TIERFS_REMOTE_BASE", c.Remote.Base},
 	} {
 		if r.val == "" {
 			return c, fmt.Errorf("%s is required", r.name)

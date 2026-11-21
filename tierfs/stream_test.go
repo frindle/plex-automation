@@ -140,7 +140,7 @@ func TestStreamGlobalCap(t *testing.T) {
 	}
 	s2 := r.newStream("b", testRemote, 0, streamTestSize)
 	defer s2.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	if err := s2.readAt(ctx, p, 0); err == nil {
 		t.Fatal("second stream got data while the cap was full")
@@ -338,7 +338,7 @@ func TestEventLogRotates(t *testing.T) {
 
 func TestStatusRefusesNonLocalhost(t *testing.T) {
 	for _, addr := range []string{"0.0.0.0:0", ":0", "192.0.2.1:9"} {
-		s, err := New(Config{Mount: "/x", Manifests: "/y", HTTPAddr: addr, Remote: RemoteConfig{Base: "http://altmount:8080"}})
+		s, err := New(Config{Mount: "/x", Manifests: "/y", HTTPAddr: addr, StubRoots: []string{"/stub"}, Remote: RemoteConfig{Base: "http://altmount:8080"}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -350,7 +350,7 @@ func TestStatusRefusesNonLocalhost(t *testing.T) {
 
 func TestReloadSkipsInvalidAndKeepsOpenSetStable(t *testing.T) {
 	dir := t.TempDir()
-	s, err := New(Config{Mount: "/x", Manifests: dir, Remote: RemoteConfig{Base: "http://altmount:8080"}})
+	s, err := New(Config{Mount: "/x", Manifests: dir, StubRoots: []string{"/stub"}, Remote: RemoteConfig{Base: "http://altmount:8080"}})
 	if err != nil {
 		t.Fatal(err)
 	}

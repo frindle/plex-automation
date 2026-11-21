@@ -7,6 +7,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -29,12 +32,13 @@ type Config struct {
 	HTTPAddr     string
 	AllowOther   bool
 	PollInterval time.Duration
+	StubRoots    []string // stub_path must be exactly <root>/<id><ext>
 	Remote       RemoteConfig
 }
 
 type entry struct {
 	m    *Manifest
-	raw  string
+	ver  string
 	sums [][32]byte
 }
 
@@ -50,14 +54,16 @@ type Server struct {
 	mu       sync.RWMutex
 	entries  map[string]*entry
 	badSeen  map[string]string
+	cache    map[string]*cached
 
-	root    *rootNode
-	fuse    *fuse.Server
-	mounted atomic.Bool
-	httpSrv *http.Server
-	httpLn  net.Listener
-	stop    chan struct{}
-	wg      sync.WaitGroup
+	root      *rootNode
+	fuse      *fuse.Server
+	mounted   atomic.Bool
+	unmounted atomic.Bool
+	httpSrv   *http.Server
+	httpLn    net.Listener
+	stop      chan struct{}
+	wg        sync.WaitGroup
 }
 
 // New builds a server. Nothing is mounted or listening until Start.
@@ -65,6 +71,17 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Mount == "" || cfg.Manifests == "" {
 		return nil, errors.New("mount and manifests directories are required")
 	}
+	if len(cfg.StubRoots) == 0 {
+		return nil, errors.New("at least one stub root is required")
+	}
+	roots := make([]string, 0, len(cfg.StubRoots))
+	for _, r := range cfg.StubRoots {
+		if !filepath.IsAbs(r) {
+			return nil, fmt.Errorf("stub root %q must be absolute", r)
+		}
+		roots = append(roots, filepath.Clean(r))
+	}
+	cfg.StubRoots = roots
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 5 * time.Second
 	}
@@ -79,7 +96,7 @@ func New(cfg Config) (*Server, error) {
 	}
 	return &Server{
 		cfg: cfg, m: m, remote: r, ev: ev,
-		entries: map[string]*entry{}, badSeen: map[string]string{},
+		entries: map[string]*entry{}, badSeen: map[string]string{}, cache: map[string]*cached{},
 		stop: make(chan struct{}),
 	}, nil
 }
@@ -113,6 +130,7 @@ func (s *Server) Start() error {
 			DisableXAttrs: true,
 		},
 	}
+	clearStaleMount(s.cfg.Mount)
 	srv, err := fs.Mount(s.cfg.Mount, s.root, opts)
 	if err != nil {
 		return fmt.Errorf("mount: %w", err)
@@ -147,9 +165,19 @@ func (s *Server) Close() error {
 		cancel()
 	}
 	var err error
-	if s.fuse != nil {
+	if s.fuse != nil && !s.unmounted.Load() {
 		s.mounted.Store(false)
-		err = s.fuse.Unmount()
+		if err = s.fuse.Unmount(); err != nil {
+			// Open files keep the mount busy. Detach it lazily so a stop
+			// signal always ends the process.
+			log.Printf("unmount: %v; detaching lazily", err)
+			if lerr := lazyUnmount(s.cfg.Mount); lerr == nil {
+				err = nil
+			}
+		}
+		if err == nil {
+			s.unmounted.Store(true)
+		}
 	}
 	s.ev.Close()
 	s.remote.Close()
@@ -177,7 +205,7 @@ func (s *Server) poll() {
 func (s *Server) Reload() {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
-	good, bad, err := scanManifests(s.cfg.Manifests)
+	good, bad, next, err := scanManifests(s.cfg.Manifests, s.cfg.StubRoots, s.cache)
 	if err != nil {
 		if s.badSeen[""] != err.Error() {
 			s.badSeen[""] = err.Error()
@@ -186,6 +214,7 @@ func (s *Server) Reload() {
 		return
 	}
 	delete(s.badSeen, "")
+	s.cache = next
 	for n, why := range bad {
 		if s.badSeen[n] != why {
 			s.badSeen[n] = why
@@ -203,7 +232,11 @@ func (s *Server) Reload() {
 	s.mu.Lock()
 	for name, e := range s.entries {
 		l, ok := good[name]
-		if ok && l.raw == e.raw {
+		if ok && l.ver == e.ver {
+			continue
+		}
+		if ok { // rewritten: swap in place, the node looks the entry up by name
+			s.entries[name] = &entry{m: l.m, ver: l.ver, sums: l.sums}
 			continue
 		}
 		if _, isBad := bad[e.m.ID+".json"]; isBad && !ok {
@@ -214,7 +247,7 @@ func (s *Server) Reload() {
 	}
 	for name, l := range good {
 		if _, ok := s.entries[name]; !ok {
-			s.entries[name] = &entry{m: l.m, raw: l.raw, sums: l.sums}
+			s.entries[name] = &entry{m: l.m, ver: l.ver, sums: l.sums}
 			added++
 		}
 	}
@@ -337,7 +370,7 @@ func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	if c := r.GetChild(name); c != nil {
 		return c, 0
 	}
-	n := &fileNode{srv: r.srv, e: e}
+	n := &fileNode{srv: r.srv, name: name}
 	return r.NewInode(ctx, n, fs.StableAttr{Mode: syscall.S_IFREG, Ino: inoOf(e.m.ID)}), 0
 }
 
@@ -352,14 +385,21 @@ func (r *rootNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	return fs.NewListDirStream(list), 0
 }
 
+// fileNode resolves its manifest by name on every call. go-fuse reuses a node
+// for the same inode number, so a node can outlive the entry it was made for
+// (a manifest rewritten, or removed and added again, while a file is open).
 type fileNode struct {
 	fs.Inode
-	srv *Server
-	e   *entry
+	srv  *Server
+	name string
 }
 
 func (f *fileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	fillAttr(&out.Attr, f.e.m)
+	e := f.srv.get(f.name)
+	if e == nil {
+		return syscall.ENOENT
+	}
+	fillAttr(&out.Attr, e.m)
 	out.SetTimeout(kernelTTL)
 	return 0
 }
@@ -368,12 +408,13 @@ func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	if flags&syscall.O_ACCMODE != syscall.O_RDONLY || flags&(syscall.O_TRUNC|syscall.O_APPEND) != 0 {
 		return nil, 0, syscall.EROFS
 	}
-	if f.srv.get(f.e.m.Name()) != f.e { // manifest removed since lookup
+	e := f.srv.get(f.name)
+	if e == nil { // manifest removed since lookup
 		return nil, 0, syscall.ENOENT
 	}
-	h, err := f.srv.openHandle(f.e)
+	h, err := f.srv.openHandle(e)
 	if err != nil {
-		log.Printf("open %s: stub: %v", f.e.m.ID, err)
+		log.Printf("open %s: stub: %v", e.m.ID, err)
 		return nil, 0, syscall.EIO
 	}
 	// Direct I/O makes the kernel pass reads through at the exact offset and
@@ -383,4 +424,34 @@ func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	// false "synced" event) for a tail-only read. It also keeps every read
 	// visible to us, so remote_read events cannot be hidden by cached pages.
 	return h, fuse.FOPEN_DIRECT_IO, 0
+}
+
+// lazyUnmount detaches the mount at once, even with files open.
+func lazyUnmount(mnt string) error {
+	if err := syscall.Unmount(mnt, 0x2); err == nil { // MNT_DETACH
+		return nil
+	}
+	var last error
+	for _, bin := range []string{"fusermount3", "fusermount"} {
+		if p, err := exec.LookPath(bin); err == nil {
+			if last = exec.Command(p, "-uz", mnt).Run(); last == nil {
+				return nil
+			}
+		}
+	}
+	if last == nil {
+		last = errors.New("no way to unmount lazily")
+	}
+	return last
+}
+
+// clearStaleMount removes a dead mount left at mnt by a killed process
+// (stat fails with "transport endpoint is not connected").
+func clearStaleMount(mnt string) {
+	if _, err := os.Stat(mnt); errors.Is(err, syscall.ENOTCONN) {
+		log.Printf("clearing stale mount at %s", mnt)
+		if err := lazyUnmount(mnt); err != nil {
+			log.Printf("clearing stale mount: %v", err)
+		}
+	}
 }

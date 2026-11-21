@@ -27,10 +27,10 @@ type handle struct {
 	ck   *chunkCheck
 	stub *os.File
 
-	mu         sync.Mutex // guards st, warmed, lastErr
+	mu         sync.Mutex // guards st, lastErr
 	st         *stream
-	warmed     bool
 	lastErr    error
+	lastErrAt0 int64 // start of the chunk the last remote error hit
 	lastErrAt  time.Time
 	cur        atomic.Pointer[stream] // mirror of st, so close can cancel without mu
 	closed     atomic.Bool
@@ -41,9 +41,15 @@ type handle struct {
 
 func (s *Server) openHandle(e *entry) (*handle, error) {
 	m := e.m
-	f, err := os.Open(m.StubPath)
+	f, err := os.OpenFile(m.StubPath, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
+	}
+	// The path is a name in an admin-controlled directory, but check what it
+	// really is: a regular file of the size the manifest promises.
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() || fi.Size() != m.Size {
+		f.Close()
+		return nil, errors.New("stub is not a regular file of the manifest's size")
 	}
 	h := &handle{srv: s, m: m, stub: f, ck: &chunkCheck{base: m.HeadLen, size: m.ChunkSize, sums: e.sums}}
 	s.m.OpenHandles.Add(1)
@@ -116,13 +122,17 @@ func (h *handle) maybeWarm(readEnd int64) {
 		return
 	}
 	defer h.mu.Unlock()
-	if h.warmed || h.closed.Load() {
+	if h.closed.Load() {
 		return
 	}
-	h.warmed = true
-	if h.st == nil {
-		h.newStream(h.m.HeadLen)
+	// Start (or restart, if the stream idled out or a seek moved it away) a
+	// stream at the head of the middle. A live stream that already covers it
+	// is left alone.
+	if h.st != nil && h.st.alive() && h.st.covers(h.m.HeadLen) {
+		return
 	}
+	h.dropStream()
+	h.newStream(h.m.HeadLen)
 }
 
 func (h *handle) readMid(ctx context.Context, p []byte, off int64) error {
@@ -131,8 +141,8 @@ func (h *handle) readMid(ctx context.Context, p []byte, off int64) error {
 	if h.closed.Load() {
 		return errHandleClosed
 	}
-	if h.lastErr != nil && time.Since(h.lastErrAt) < failCooldown {
-		return h.lastErr
+	if h.lastErr != nil && time.Since(h.lastErrAt) < failCooldown && h.ck.alignDown(off) == h.lastErrAt0 {
+		return h.lastErr // only the region that just failed fails fast
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		if h.st == nil || !h.st.covers(off) {
@@ -153,7 +163,7 @@ func (h *handle) readMid(ctx context.Context, p []byte, off int64) error {
 		}
 		var bc *badChunkError
 		if ctx.Err() == nil && !errors.As(err, &bc) { // a bad chunk says nothing about other chunks
-			h.lastErr, h.lastErrAt = err, time.Now()
+			h.lastErr, h.lastErrAt, h.lastErrAt0 = err, time.Now(), h.ck.alignDown(off)
 		}
 		return err
 	}

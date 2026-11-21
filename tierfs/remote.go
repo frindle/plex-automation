@@ -21,6 +21,9 @@ import (
 // unitSize is the read unit when a stream has no chunk list to check against.
 const unitSize = 256 << 10
 
+// pieceSize is the read size between watchdog resets.
+const pieceSize = 64 << 10
+
 var (
 	errStreamClosed = errors.New("stream closed")
 	// ErrNoRoom means the stream is full and a new one should be started.
@@ -74,6 +77,9 @@ type Remote struct {
 	client *http.Client
 	sem    chan struct{}
 	m      *Metrics
+
+	actMu  sync.Mutex
+	active map[*stream]struct{}
 }
 
 // NewRemote validates the config and builds the client.
@@ -115,7 +121,7 @@ func NewRemote(cfg RemoteConfig, m *Metrics) (*Remote, error) {
 		IdleConnTimeout:     60 * time.Second,
 		DisableCompression:  true, // ranges must be byte-exact
 	}
-	return &Remote{cfg: cfg, base: u, client: &http.Client{Transport: tr}, sem: make(chan struct{}, cfg.MaxStreams), m: m}, nil
+	return &Remote{cfg: cfg, base: u, client: &http.Client{Transport: tr}, sem: make(chan struct{}, cfg.MaxStreams), m: m, active: map[*stream]struct{}{}}, nil
 }
 
 func (r *Remote) urlFor(remotePath string) string {
@@ -123,6 +129,40 @@ func (r *Remote) urlFor(remotePath string) string {
 	u.Path = strings.TrimRight(r.base.Path, "/") + remotePath
 	u.RawPath = ""
 	return u.String()
+}
+
+// parkedEvictAfter is how long a stream must sit with a full buffer and no
+// reader before another reader may take its slot.
+const parkedEvictAfter = 500 * time.Millisecond
+
+func (r *Remote) track(s *stream) {
+	r.actMu.Lock()
+	r.active[s] = struct{}{}
+	r.actMu.Unlock()
+}
+
+func (r *Remote) untrack(s *stream) {
+	r.actMu.Lock()
+	delete(r.active, s)
+	r.actMu.Unlock()
+}
+
+// evictParked cancels the longest-idle parked stream, if any.
+func (r *Remote) evictParked(waiter *stream) {
+	r.actMu.Lock()
+	defer r.actMu.Unlock()
+	var victim *stream
+	for s := range r.active {
+		if s == waiter || !s.parked.Load() || time.Since(time.Unix(0, s.lastUse.Load())) < parkedEvictAfter {
+			continue
+		}
+		if victim == nil || s.lastUse.Load() < victim.lastUse.Load() {
+			victim = s
+		}
+	}
+	if victim != nil {
+		victim.cancel()
+	}
 }
 
 // Close drops idle connections.
@@ -150,6 +190,9 @@ type stream struct {
 	dataSig chan struct{} // producer -> reader
 	roomSig chan struct{} // reader -> producer
 	lastUse atomic.Int64
+	queued  atomic.Bool   // waiting for a slot under the stream cap
+	parked  atomic.Bool   // buffer full, waiting for the reader
+	recv    atomic.Int64  // bytes received, in pieces, for stall detection
 	done    chan struct{} // closed when the producer goroutine exits
 
 	mu     sync.Mutex
@@ -178,6 +221,13 @@ func (r *Remote) newVerifiedStream(id, remotePath string, start, limit int64, ck
 	s.touch()
 	go s.run()
 	return s
+}
+
+// alive reports whether the stream can still fetch or serve more.
+func (s *stream) alive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err == nil && s.ctx.Err() == nil
 }
 
 func (s *stream) touch() { s.lastUse.Store(time.Now().UnixNano()) }
@@ -268,13 +318,16 @@ func (s *stream) waitRoom() bool {
 		room := s.end-s.maxPos < s.r.cfg.ReadAhead
 		s.mu.Unlock()
 		if room {
+			s.parked.Store(false)
 			return true
 		}
+		s.parked.Store(true)
 		t := time.NewTimer(idle / 4)
 		select {
 		case <-s.roomSig:
 		case <-s.ctx.Done():
 			t.Stop()
+			s.parked.Store(false)
 			return false
 		case <-t.C:
 			if time.Since(time.Unix(0, s.lastUse.Load())) > idle {
@@ -286,17 +339,37 @@ func (s *stream) waitRoom() bool {
 	}
 }
 
+// acquire waits for a slot under the stream cap. While it waits, it asks for
+// streams that are only parked (buffer full, reader gone quiet) to give theirs
+// up, so a paused player cannot starve a new reader.
+func (s *stream) acquire() bool {
+	s.queued.Store(true)
+	defer s.queued.Store(false)
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case s.r.sem <- struct{}{}:
+			s.r.track(s)
+			return true
+		case <-s.ctx.Done():
+			return false
+		case <-t.C:
+			s.r.evictParked(s)
+		}
+	}
+}
+
 func (s *stream) run() {
 	defer close(s.done)
 	defer s.finish(errStreamClosed)
-	select {
-	case s.r.sem <- struct{}{}:
-	case <-s.ctx.Done():
+	if !s.acquire() {
 		return
 	}
 	s.r.m.ActiveStreams.Add(1)
 	defer func() {
 		s.r.m.ActiveStreams.Add(-1)
+		s.r.untrack(s)
 		<-s.r.sem
 	}()
 
@@ -375,8 +448,28 @@ func (s *stream) run() {
 		}
 		n := int(min(unit, s.limit-end))
 		bp := getBuf(n)
+		// The watchdog times each piece, not the whole chunk: a slow remote
+		// that keeps sending is fine, one that stops is cut off.
 		wd := time.AfterFunc(window, cancelReq)
-		_, err := io.ReadFull(body, (*bp)[:n])
+		var err error
+		acc := 0 // bytes since the last watchdog reset
+		for got := 0; got < n && err == nil; {
+			var k int
+			k, err = body.Read((*bp)[got:n])
+			if k > 0 {
+				got += k
+				if acc += k; acc >= pieceSize {
+					wd.Reset(window) // a floor of pieceSize per window
+					s.recv.Add(int64(acc))
+					acc = 0
+				}
+			}
+			if err == io.EOF && got < n {
+				err = io.ErrUnexpectedEOF
+			} else if err == io.EOF {
+				err = nil
+			}
+		}
 		wd.Stop()
 		if err != nil {
 			chunkPool.Put(bp)
@@ -418,6 +511,7 @@ func (s *stream) readAt(ctx context.Context, p []byte, off int64) error {
 	timer := time.NewTimer(stall)
 	defer timer.Stop()
 	lastEnd := int64(-1)
+	lastRecv := int64(-1)
 	for {
 		s.mu.Lock()
 		if off < s.low {
@@ -442,8 +536,9 @@ func (s *stream) readAt(ctx context.Context, p []byte, off int64) error {
 		end := s.end
 		s.mu.Unlock()
 		notify(s.roomSig)
-		if end != lastEnd { // progress resets the stall timer
-			lastEnd = end
+		if rv := s.recv.Load(); end != lastEnd || rv != lastRecv || s.queued.Load() {
+			// progress, or waiting for a slot, resets the stall timer
+			lastEnd, lastRecv = end, rv
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -457,6 +552,11 @@ func (s *stream) readAt(ctx context.Context, p []byte, off int64) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
+			if rv := s.recv.Load(); s.queued.Load() || rv != lastRecv {
+				lastRecv = rv
+				timer.Reset(stall)
+				continue
+			}
 			return errors.New("remote stalled")
 		}
 	}
