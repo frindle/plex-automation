@@ -264,3 +264,15 @@ def test_canary_visible_is_clear(env, monkeypatch):
     finally:
         p.kill()
         p.wait()
+
+
+def test_step3_rehashes_stub_and_refuses_on_mismatch(env):
+    with pytest.raises(Crash):
+        env.offload(after_step=env.hook(2))
+    st.upsert(env.db, {"id": ID, "sha256": "0" * 64})  # stale or wrong stored hash
+    r = env.offload()
+    assert not r.ok and "sha256" in r.reason
+    assert st.get(env.db, ID)["state"] == "failed"
+    assert not os.path.islink(env.lib) and os.path.isfile(env.lib)
+    assert not os.path.lexists(env.manifest) and not os.path.lexists(env.chunks)
+    assert env.read_lib() == env.data

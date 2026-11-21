@@ -16,7 +16,7 @@ COLUMNS = (
     "dev", "ino",
     "rating_key", "kind", "is4k",
     "state", "step", "restore_score", "restore_note",
-    "last_check_ts", "last_ok_ts", "created_ts", "updated_ts",
+    "last_check_ts", "last_stat_ok_ts", "last_ok_ts", "created_ts", "updated_ts",
 )
 
 _SCHEMA = """
@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS files (
     restore_score REAL,
     restore_note TEXT,
     last_check_ts REAL,
+    last_stat_ok_ts REAL,
     last_ok_ts REAL,
     created_ts REAL NOT NULL,
     updated_ts REAL NOT NULL
@@ -80,7 +81,7 @@ def open_db(path) -> sqlite3.Connection:
     ctype = {"year": "INTEGER", "season": "INTEGER", "episode": "INTEGER",
              "dev": "INTEGER", "ino": "INTEGER"}
     for c in ("title", "year", "imdb_id", "tvdb_id", "season", "episode", "release_name",
-              "dev", "ino"):
+              "dev", "ino", "last_stat_ok_ts"):
         if c not in have:  # databases created before these columns existed
             db.execute(f"ALTER TABLE files ADD COLUMN {c} {ctype.get(c, 'TEXT')}")
     db.commit()
@@ -158,6 +159,26 @@ def set_state(db, id, state, **fields) -> None:
         )
     if cur.rowcount != 1:
         raise KeyError(f"no such file id {id!r}")
+
+
+def update_if(db, id, expect_state, **fields) -> bool:
+    """One UPDATE ... WHERE id=? AND state=?. Fields may include state. Returns
+    False, changing nothing, if the row is gone or its state has moved on."""
+    _check_state(expect_state)
+    _check_columns(fields)
+    if "id" in fields or "created_ts" in fields or "updated_ts" in fields:
+        raise ValueError("id, created_ts and updated_ts cannot be set")
+    if fields.get("state") is not None:
+        _check_state(fields["state"])
+    elif "state" in fields:
+        raise ValueError("state cannot be None")
+    sets = {**fields, "updated_ts": time.time()}
+    with db:
+        cur = db.execute(
+            f"UPDATE files SET {', '.join(f'{k}=?' for k in sets)} WHERE id=? AND state=?",
+            [*sets.values(), id, expect_state],
+        )
+    return cur.rowcount == 1
 
 
 def list_files(db, state=None) -> list[dict]:
