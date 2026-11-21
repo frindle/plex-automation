@@ -182,6 +182,7 @@ class NewznabClient:
         self._grabbed: dict[str, int] = {}
         self._sleep, self._clock = sleep, clock
         self._ids_cache: dict[str, frozenset] = {}
+        self._raw: dict[str, bytes] = {}
         self._last_grab: float | None = None
         self._lock = threading.Lock()
         self._opener = urllib.request.build_opener(
@@ -315,12 +316,18 @@ class NewznabClient:
         hit = self._ids_cache.get(rel.link)
         if hit is not None:
             return hit
+        raw = self.fetch_nzb(rel)
         try:
-            ids = nzb_segment_ids(self.fetch_nzb(rel))
+            ids = nzb_segment_ids(raw)
         except ET.ParseError:
             raise NewznabError("bad nzb xml") from None
         self._ids_cache[rel.link] = ids
+        self._raw[rel.link] = raw
         return ids
+
+    def take_raw(self, rel: Release) -> bytes | None:
+        """The NZB bytes ``fetch_ids`` just grabbed for this release, once (else None)."""
+        return self._raw.pop(rel.link, None)
 
 
 def _gunzip_capped(raw: bytes, limit: int) -> bytes:

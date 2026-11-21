@@ -181,7 +181,7 @@ class _AmHandler(_Quiet):
         if ctype.startswith("application/x-www-form-urlencoded"):
             q = urllib.parse.parse_qs(body.decode())
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            if query.get("mode", [""])[0] == "history":
+            if (query.get("mode") or q.get("mode") or [""])[0] == "history":  # upstream qf()
                 return self._history(o, q, query)
             return self._json({"status": False, "error": "bad request"})
         msg = email.message_from_bytes(

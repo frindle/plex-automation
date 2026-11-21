@@ -8,7 +8,7 @@ import pytest
 
 from fakes_intake import FakeAltMount, FakeNewznab, make_nzb
 from test_qualify import IDS, REL, World
-from test_weekly import Env
+from test_weekly import Env, ids_for
 from tiering.offload import altmount as am
 from tiering.offload import newznab as nz
 from tiering.offload import nntp_stat as ns
@@ -59,65 +59,101 @@ def test_grab_budget_comes_from_the_environment(monkeypatch):
     assert "NEWZNAB_GRAB_BUDGET" in nz.__doc__
 
 
-def test_a_search_alone_counts_other_names_without_any_grab():
-    s = FakeNewznab({
-        "own": {"title": REL, "nzb": make_nzb(IDS)},
-        "alt": {"title": "Movie.2020.1080p.WEB-DL-ALT", "nzb": make_nzb(["alt@t"])}})
-    try:
-        ix = nz.NewznabClient([nz.Indexer("one", s.url, "nzkey")], grab_interval=0)
-        sc = q.score_restore(ROW, ix, None, stop_at=1, verify=False)
-        assert sc["count"] == 1 and not sc["unsure"] and s.gets == []
-    finally:
-        s.close()
+def _with_stored_candidate(e, name="Alpha", ids=None):
+    """Give the row an archived restore NZB; ``ids`` are the segments the providers have."""
+    ids = ids if ids is not None else [f"stored-{name}-{i}@t" for i in range(5)]
+    row = next(r for r in e.state.rows.values() if r["title"] == name)
+    row["nzb_path2"] = nz.archive_nzb(make_nzb(ids), str(e.tmp / "arch"), f"{name}.2020.1080p.ALT")
+    for srv in (e.prim, e.sec):
+        srv.ids.update(ids)
+    return row
 
 
-def test_weekly_makes_no_grabs_for_many_rows(tmp_path):
-    e = Env(tmp_path, [f"T{i}" for i in range(10)])
-    try:
-        assert e.run() == []
-        assert e.indexers.grabs == 0 and e.nz.gets == []
-    finally:
-        e.close()
-
-
-def test_weekly_grabs_when_the_known_restore_candidate_is_gone(tmp_path):
+def test_same_message_ids_under_a_different_name_is_no_restore_path(tmp_path):
     e = Env(tmp_path, ["Alpha"])
-    e.nz.releases = {k: v for k, v in e.nz.releases.items() if k.startswith("own-")}  # only ours
+    # the same upload, listed under another name
+    e.nz.releases = {"own": {"title": "Alpha.2020.1080p.BluRay-GRP", "nzb": make_nzb(ids_for("Alpha"))},
+                     "dup": {"title": "Alpha.2020.1080p.WEB-DL-OTHER",
+                             "nzb": make_nzb(ids_for("Alpha"))}}
     try:
         promote = e.run()
         assert [r["promote_reasons"] for r in promote] == [["no_restore_path"]]
-        assert e.indexers.grabs == 1
+        assert e.state.rows[f"{0:016x}"]["restore_score"] == 0
+        assert e.state.rows[f"{0:016x}"].get("nzb_path2") is None
     finally:
         e.close()
 
 
-def test_weekly_with_a_spent_budget_is_unchecked_not_flagged(tmp_path):
+def test_stored_restore_nzb_with_healthy_stat_makes_zero_grabs(tmp_path):
+    e = Env(tmp_path, [f"T{i}" for i in range(5)])
+    for i in range(5):
+        _with_stored_candidate(e, f"T{i}")
+    try:
+        assert e.run() == []
+        assert e.indexers.grabs == 0 and e.nz.gets == []
+        assert all(r["restore_score"] >= 1 for r in e.state.rows.values())
+    finally:
+        e.close()
+
+
+def test_dead_stored_restore_nzb_triggers_a_budgeted_research(tmp_path):
     e = Env(tmp_path, ["Alpha"])
-    e.nz.releases = {k: v for k, v in e.nz.releases.items() if k.startswith("own-")}
+    row = _with_stored_candidate(e)
+    old = row["nzb_path2"]
+    e.prim.ids.discard("stored-Alpha-3@t")  # the stored candidate lost an article
+    try:
+        assert e.run() == []
+        assert 0 < e.indexers.grabs <= 2 and e.nz.gets
+        assert row["nzb_path2"] and row["nzb_path2"] != old  # the verified replacement
+        assert nz.nzb_segment_ids(nz.read_archived(row["nzb_path2"])) == {"alt-Alpha@t"}
+    finally:
+        e.close()
+
+
+def test_dead_stored_nzb_with_a_spent_budget_is_unchecked_not_flagged(tmp_path):
+    e = Env(tmp_path, ["Alpha"])
+    row = _with_stored_candidate(e)
+    e.prim.ids.discard("stored-Alpha-3@t")
     e.indexers = nz.NewznabClient([nz.Indexer("one", e.nz.url, "nzkey")], grab_budget=0)
     try:
         assert e.run() == []
         assert e.nz.gets == []
-        row = e.state.rows[f"{0:016x}"]
-        assert row["restore_score"] == 1  # untouched
-        assert "restore_unsure: 1 files" in e.text()
+        assert row["restore_score"] == 1 and "restore_unsure: 1 files" in e.text()
     finally:
         e.close()
 
 
-def test_weekly_grabs_for_the_monthly_full_read_row(tmp_path):
+def test_stored_nzb_stat_that_cannot_be_asked_is_unchecked(tmp_path):
     e = Env(tmp_path, ["Alpha"])
-    rows = {r["remote_path"]: r["sha256"] for r in e.state.rows.values()}
-
-    class Reader:
-        def sha256_full(self, p):
-            return rows[p]
-
+    _with_stored_candidate(e)
     try:
-        e.run(reader=Reader(), monthly=True)
-        assert 0 < e.indexers.grabs <= 2
+        e.sec.quota = True
+        assert e.run() == []
+        assert e.nz.gets == []
     finally:
         e.close()
+
+
+def test_qualify_archives_the_verified_candidate_as_nzb_path2(tmp_path):
+    w = World(tmp_path)
+    try:
+        r = w.run()
+        assert r.ok
+        p2 = r.fields["nzb_path2"]
+        assert p2 != r.fields["nzb_path"] and p2.startswith(w.archive)
+        assert nz.nzb_segment_ids(nz.read_archived(p2)) == {f"alt{i}@t" for i in range(5)}
+    finally:
+        w.close()
+
+
+def test_qualify_without_a_distinct_candidate_has_no_nzb_path2(tmp_path):
+    w = World(tmp_path, alt_title=None)
+    try:
+        r = w.run()
+        assert not r.ok and r.reasons == ["no_restore_path"]
+        assert "nzb_path2" not in r.fields and r.fields["restore_score"] == 0
+    finally:
+        w.close()
 
 
 # ---------------------------------------------------------------- hostile input
@@ -246,7 +282,7 @@ def test_history_poll_sends_nzo_ids_in_the_query_and_the_key_in_the_body():
         c._add(b"<nzb/>", "x", "job1")
         slot = c._history("job1")
         assert slot and slot["nzo_id"] == "job1"
-        polls = [u for u in a.urls if "mode=history" in u]
+        polls = [u for u in a.urls if "nzo_ids" in u]  # upstream reads it from the query only
         assert polls and all("nzo_ids=job1" in u for u in polls)
         assert not any("apikey" in u for u in a.urls)
         assert c._history("other") is None

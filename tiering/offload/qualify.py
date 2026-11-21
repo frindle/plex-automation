@@ -18,7 +18,8 @@ The source resolution comes from ``is4k`` or the release or file name. When it
 cannot be told, the floor is 1080p.
 
 It does not write to the database. ``QualifyResult.fields`` holds only ``files``
-columns for the caller to store: nzb_path, remote_path, sha256, restore_score,
+columns for the caller to store: nzb_path, nzb_path2 (the archived NZB of the verified
+restore candidate, only when there is one), remote_path, sha256, restore_score,
 restore_note, last_check_ts and last_stat_ok_ts. The result of each step is in
 ``QualifyResult.steps``, which is not a column.
 """
@@ -112,7 +113,7 @@ def _search(indexers, ident: dict):
 
 
 def score_restore(row: dict, indexers, own_ids: frozenset | None,
-                  stop_at: int | None = None, verify: bool = True) -> dict:
+                  stop_at: int | None = None) -> dict:
     """Count releases that could replace this file if the exact upload dies.
 
     ``own_ids`` is the set of message-ids of our NZB. A candidate whose NZB shares
@@ -125,11 +126,8 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
     ``MAX_FAILED_GRABS`` failed grabs the row is unsure and no more are tried; a
     spent grab budget also makes it unsure. Neither is a "no".
 
-    With ``verify=False`` nothing is grabbed: a candidate whose cleaned title differs
-    from the row's own release name is counted as a different upload (a search can
-    not tell more). ``own_ids`` is then not needed.
-
-    Returns {count, floor, best, below_floor, partial, unsure, note}.
+    Returns {count, floor, best, below_floor, partial, unsure, note, candidate}.
+    ``candidate`` is {title, nzb} of the first verified alternative (its NZB bytes), or None.
     ``partial`` means some indexer did not answer; ``unsure`` means ``partial`` or
     some candidate's NZB could not be checked, or ``own_ids`` was not given.
     With ``unsure``, a count of 0 means "not checked", not "no restore path".
@@ -139,7 +137,7 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
     floor = resolution_floor(source_resolution(row))
     found = _search(indexers, ident)
     partial = bool(getattr(found, "partial", False))
-    unsure = partial or (verify and own_ids is None)
+    unsure = partial or own_ids is None
     own_name = _clean(release_name_of(row))
     cands, below = [], 0
     for rel in found:
@@ -150,25 +148,19 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
             below += 1
             continue
         cands.append(rel)
-    cands.sort(key=lambda r: (-r.resolution, _clean(r.title), r.link))
+    # a name that differs from ours is the better bet for a different upload, so it is
+    # tried first; the name never decides, only the message-ids do
+    cands.sort(key=lambda r: (_clean(r.title) == own_name, -r.resolution, _clean(r.title), r.link))
     counted: list[frozenset] = []
     best = 0
     fails = 0
-    if not verify:
-        seen_names: set[str] = set()
-        for rel in cands:
-            nm = _clean(rel.title)
-            if nm == own_name or nm in seen_names:
-                continue
-            seen_names.add(nm)
-            counted.append(frozenset({nm}))
-            best = max(best, rel.resolution)
-        cands = []
+    candidate = None
     for rel in cands if own_ids is not None else ():
         if stop_at and len(counted) >= stop_at:
             break
         try:
             ids = indexers.fetch_ids(rel)
+            raw = indexers.take_raw(rel)  # the NZB just grabbed, so a winner need not be grabbed twice
         except GrabBudgetSpent:
             unsure = True
             continue
@@ -184,6 +176,8 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
             continue  # the same upload as one already counted
         counted.append(ids)
         best = max(best, rel.resolution)
+        if candidate is None and raw:
+            candidate = {"title": rel.title, "nzb": raw}
     count = len(counted)
     if count:
         note = f"{count} alternative(s), best {best}p"
@@ -194,7 +188,7 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
     else:
         note = "no alternative release found"
     return {"count": count, "floor": floor, "best": best, "below_floor": below,
-            "partial": partial, "unsure": unsure, "note": note}
+            "partial": partial, "unsure": unsure, "note": note, "candidate": candidate}
 
 
 def _find_exact(row: dict, indexers, name: str):
@@ -308,5 +302,11 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
         if sc["unsure"]:
             return fail("restore", "restore_check_unsure", count=0)
         return fail("restore", "no_restore_path", count=0, below_floor=sc["below_floor"])
+    cand = sc.get("candidate")
+    if cand:  # kept beside the primary's NZB: weekly STATs it instead of grabbing again
+        try:
+            fields["nzb_path2"] = archive_nzb(cand["nzb"], archive_dir, cand["title"])
+        except OSError as e:
+            return fail("restore", "restore_archive_failed", error=type(e).__name__)
     steps["restore"] = {"ok": True, "count": sc["count"], "best": sc["best"]}
     return QualifyResult(True, [], fields, steps)

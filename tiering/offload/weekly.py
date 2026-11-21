@@ -22,12 +22,15 @@ check "unchecked", never "no restore path", and unchecked never promotes.
 providers found every segment. An alert is raised for a row whose
 ``last_stat_ok_ts`` is older than 14 days.
 
-Restore-path cost. Searches are free but an NZB grab is the indexers' quota, so the
-weekly check makes no grab in the ordinary case: a search result whose title differs
-from the row's own release counts as another upload. It grabs (``stop_at=1``, within
-the client's per-run budget) only for a row whose known restore path no longer turns
-up in the search, and for the monthly full-read row. A spent budget or a failed grab
-makes the row "unchecked", never "no restore path".
+Restore-path cost. Searches are free but an NZB grab is the indexers' quota. A row
+keeps the NZB of its verified restore candidate in ``nzb_path2`` (qualify fills it).
+While that NZB's segments are all present on both providers the restore path is OK
+and nothing is grabbed. Only when ``nzb_path2`` is missing or has lost articles, and
+for the monthly full-read row, the check searches and verifies candidates by grab and
+message-id (a candidate that shares message-ids with the row's NZB is the same upload,
+whatever its name), within the client's per-run grab budget, and stores the new
+candidate in ``nzb_path2``. A spent budget, a failed grab or a provider that cannot be
+asked makes the row "unchecked", never "no restore path".
 
 Monthly (the first 7 days, or ``monthly=True``) it reads a rotating 5% of the
 offloaded bytes in full through WebDAV and compares the SHA-256. Rows are picked
@@ -50,7 +53,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from .newznab import NewznabError, nzb_segment_ids, read_archived
+from .newznab import NewznabError, archive_nzb, nzb_segment_ids, read_archived
 from .nntp_stat import NntpUnavailable
 from .qualify import score_restore
 
@@ -169,6 +172,23 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                 on_promote(r["entry"])
         return True
 
+    def stat_restore(path: str) -> str:
+        """STAT the stored restore NZB on both providers: ok, missing or unchecked."""
+        for label, fn in providers:
+            if label in dead:
+                return "unchecked"
+            try:
+                out = fn(path)
+            except NntpUnavailable as e:
+                if e.kind in _SOFT:
+                    dead[label] = e.kind
+                return "unchecked"
+            except Exception:  # an unreadable stored NZB is as good as a dead one
+                return "missing"
+            if out["total"] == 0 or out["missing"]:
+                return "missing"
+        return "ok"
+
     for row in rows:
         rid = row["id"]
         att = attempts.setdefault(rid, {})
@@ -225,29 +245,37 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
         # restore path
         if has_nzb:
             try:
-                # a search is free; an NZB grab is the indexers' quota. Grab only for the
-                # monthly full-read row, or when the restore path we knew of is gone.
-                verified = rid in picked
-                if verified:
-                    sc = None
+                prev = row.get("restore_score")
+                extra: dict = {}
+                n2 = row.get("nzb_path2")
+                status = "search"
+                if rid not in picked and n2 and os.path.exists(n2):
+                    status = stat_restore(n2)  # the stored candidate: STAT, no grab
+                if status == "ok":
+                    sc = {"count": max(1, int(prev or 0)), "unsure": False, "partial": False,
+                          "note": "restore path OK: stored alternative, all segments present"}
+                elif status == "unchecked":
+                    sc = {"count": 0, "unsure": True, "partial": False,
+                          "note": "restore path unchecked (a provider could not be asked)"}
                 else:
-                    sc = score_restore(row, indexers, None, stop_at=1, verify=False)
-                    verified = (sc["count"] == 0 and not sc["partial"]
-                                and (row.get("restore_score") or 0) > 0)
-                if verified:
+                    # no stored candidate, or it lost articles: search and verify by grab
+                    # (within the budget) against our own message-ids
                     own = nzb_segment_ids(read_archived(nzb))
                     sc = score_restore(row, indexers, own, stop_at=1)
+                    cand = sc.get("candidate")
+                    if cand:
+                        extra["nzb_path2"] = archive_nzb(cand["nzb"], os.path.dirname(nzb),
+                                                         cand["title"])
                 note = sc["note"]
                 if r["flags"]:
                     note = "promote flagged: " + ", ".join(r["flags"]) + "; " + note
                 if sc["count"] == 0 and sc["unsure"]:
                     r["unchecked"].append("indexers_partial" if sc["partial"] else "restore_unsure")
                 elif sc["count"] == 0:
-                    prev = row.get("restore_score")
                     r["lost"] = prev is None or prev > 0
                     flag(r, "no_restore_path", sc["note"], restore_score=0)
                 else:
-                    write(r, restore_score=sc["count"], restore_note=note)
+                    write(r, restore_score=sc["count"], restore_note=note, **extra)
             except NewznabError:
                 r["unchecked"].append("indexers_unreachable")
             except Exception as e:

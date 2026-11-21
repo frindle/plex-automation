@@ -296,9 +296,10 @@ class ImportClient:
             raise ImportFailed("altmount did not echo the job id")
 
     def _history(self, job_id: str) -> dict | None:
-        # The key goes in the body, never in the URL. AltMount reads ``nzo_ids`` (and
-        # ``mode``) from the query string, so those two are sent there.
-        q = urllib.parse.urlencode({"mode": "history", "output": "json", "nzo_ids": job_id})
+        # The key goes in the body, never in the URL. AltMount reads ``nzo_ids`` from the
+        # query string only (``c.Query``); ``mode`` and ``apikey`` it reads from the query
+        # or the form, and it ignores ``output``.
+        q = urllib.parse.urlencode({"nzo_ids": job_id})
         body = urllib.parse.urlencode({"mode": "history", "output": "json",
                                        "apikey": self._key}).encode()
         conn, resp = self._http.open(
