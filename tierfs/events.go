@@ -91,6 +91,11 @@ func (e *EventLog) EmitBad(id string, offset int64) {
 	e.emit(Event{ID: id, Ev: "bad_chunk", Offset: &offset})
 }
 
+// EmitSlotTimeout records a read that gave up waiting for a stream slot.
+func (e *EventLog) EmitSlotTimeout(id string) {
+	e.emit(Event{ID: id, Ev: "slot_timeout"})
+}
+
 func (e *EventLog) emit(ev Event) {
 	if e == nil {
 		return

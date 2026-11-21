@@ -65,6 +65,11 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		}
 		c.Remote.MaxStreams = n
 	}
+	if v := getenv("TIERFS_SLOT_WAIT"); v != "" {
+		if c.Remote.SlotWait, err = time.ParseDuration(v); err != nil || c.Remote.SlotWait <= 0 {
+			return c, errors.New("TIERFS_SLOT_WAIT must be a positive duration")
+		}
+	}
 	if v := getenv("TIERFS_POLL"); v != "" {
 		if c.PollInterval, err = time.ParseDuration(v); err != nil {
 			return c, fmt.Errorf("TIERFS_POLL: %w", err)

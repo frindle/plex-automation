@@ -300,6 +300,18 @@ func TestParseSizeAndEnv(t *testing.T) {
 	if err != nil || c.Remote.ReadAhead != 16<<20 || c.Remote.MaxStreams != 3 || c.HTTPAddr != "127.0.0.1:9109" || !c.AllowOther {
 		t.Fatalf("bad config %+v, %v", c, err)
 	}
+	if c.Remote.SlotWait != 0 {
+		t.Fatalf("SlotWait should default later, got %v", c.Remote.SlotWait)
+	}
+	env["TIERFS_SLOT_WAIT"] = "5s"
+	if c, err = ConfigFromEnv(func(k string) string { return env[k] }); err != nil || c.Remote.SlotWait != 5*time.Second {
+		t.Fatalf("slot wait: %v %v", c.Remote.SlotWait, err)
+	}
+	env["TIERFS_SLOT_WAIT"] = "0s"
+	if _, err = ConfigFromEnv(func(k string) string { return env[k] }); err == nil {
+		t.Fatal("zero slot wait must be an error")
+	}
+	delete(env, "TIERFS_SLOT_WAIT")
 	delete(env, "TIERFS_MOUNT")
 	if _, err := ConfigFromEnv(func(k string) string { return env[k] }); err == nil {
 		t.Fatal("missing mount must be an error")

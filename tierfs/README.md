@@ -48,6 +48,7 @@ a symlink into the mount, so Plex sees a normal file. The design is in
 | `TIERFS_HTTP` | `127.0.0.1:9109` | `/healthz` and `/metrics`. Must be a localhost address. |
 | `TIERFS_READAHEAD` | `32MiB` | Read-ahead per stream. Accepts `K`, `M`, `G`, `KiB`, `MiB`, `GiB`. |
 | `TIERFS_MAX_STREAMS` | `8` | Open remote streams, all handles together. |
+| `TIERFS_SLOT_WAIT` | `20s` | How long a read waits for a free stream slot. After that it gets EIO and a `{"ev":"slot_timeout","id":...}` event. |
 | `TIERFS_ALLOW_OTHER` | `1` | Let other users (such as Plex) read the mount. Set `0` to turn off. |
 | `TIERFS_POLL` | `5s` | How often manifests are rescanned. `SIGHUP` rescans at once. |
 

@@ -74,6 +74,9 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 					h.srv.m.BadChunks.Add(1)
 					h.srv.ev.EmitBad(m.ID, bc.Offset)
 				}
+				if errors.Is(err, errSlotTimeout) {
+					h.srv.ev.EmitSlotTimeout(m.ID)
+				}
 				log.Printf("read %s: offset %d: %v", m.ID, sg.Off, err)
 				return nil, syscall.EIO
 			}

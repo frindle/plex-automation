@@ -26,6 +26,8 @@ const pieceSize = 64 << 10
 
 var (
 	errStreamClosed = errors.New("stream closed")
+	// errSlotTimeout means no stream slot freed up within SlotWait.
+	errSlotTimeout = errors.New("no stream slot became free in time")
 	// ErrNoRoom means the stream is full and a new one should be started.
 	errOutOfWindow = errors.New("offset outside stream window")
 )
@@ -67,6 +69,7 @@ type RemoteConfig struct {
 	MaxStreams  int           // global cap on open remote streams
 	Window      time.Duration // how long to retry before giving up (EIO)
 	IdleTimeout time.Duration // an unused stream gives up its slot after this
+	SlotWait    time.Duration // how long a reader may wait for a free stream slot (EIO after)
 	BackKeep    int64         // bytes kept behind the reader for reordered reads
 }
 
@@ -103,6 +106,9 @@ func NewRemote(cfg RemoteConfig, m *Metrics) (*Remote, error) {
 	}
 	if cfg.Window <= 0 {
 		cfg.Window = 10 * time.Second
+	}
+	if cfg.SlotWait <= 0 {
+		cfg.SlotWait = 20 * time.Second
 	}
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 30 * time.Second
@@ -347,12 +353,19 @@ func (s *stream) acquire() bool {
 	defer s.queued.Store(false)
 	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
+	limit := time.NewTimer(s.r.cfg.SlotWait)
+	defer limit.Stop()
 	for {
 		select {
 		case s.r.sem <- struct{}{}:
 			s.r.track(s)
 			return true
 		case <-s.ctx.Done():
+			return false
+		case <-limit.C:
+			s.r.m.SlotTimeouts.Add(1)
+			log.Printf("stream %s: no slot after %v; %d of %d streams active", s.id, s.r.cfg.SlotWait, s.r.m.ActiveStreams.Load(), s.r.cfg.MaxStreams)
+			s.finish(errSlotTimeout)
 			return false
 		case <-t.C:
 			s.r.evictParked(s)

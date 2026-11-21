@@ -19,6 +19,7 @@ type Metrics struct {
 	RemoteReqs    atomic.Int64
 	Manifests     atomic.Int64
 	BadChunks     atomic.Int64
+	SlotTimeouts  atomic.Int64
 
 	ttfbCount   atomic.Int64
 	ttfbSumNS   atomic.Int64
@@ -52,6 +53,7 @@ func (m *Metrics) WriteProm(w io.Writer) {
 	g("tierfs_remote_errors_total", "counter", "Failed remote requests and body reads.", m.RemoteErrors.Load())
 	g("tierfs_remote_requests_total", "counter", "Remote HTTP requests started.", m.RemoteReqs.Load())
 	g("tierfs_bad_chunks_total", "counter", "Remote chunks that failed verification.", m.BadChunks.Load())
+	g("tierfs_slot_timeouts_total", "counter", "Reads that gave up waiting for a free stream slot.", m.SlotTimeouts.Load())
 	g("tierfs_manifests", "gauge", "Valid manifests currently loaded.", m.Manifests.Load())
 	const h = "tierfs_remote_ttfb_seconds"
 	fmt.Fprintf(w, "# HELP %s Time to first byte (response headers) of remote requests.\n# TYPE %s histogram\n", h, h)

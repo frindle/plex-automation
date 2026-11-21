@@ -448,10 +448,18 @@ func lazyUnmount(mnt string) error {
 // clearStaleMount removes a dead mount left at mnt by a killed process
 // (stat fails with "transport endpoint is not connected").
 func clearStaleMount(mnt string) {
-	if _, err := os.Stat(mnt); errors.Is(err, syscall.ENOTCONN) {
-		log.Printf("clearing stale mount at %s", mnt)
-		if err := lazyUnmount(mnt); err != nil {
-			log.Printf("clearing stale mount: %v", err)
-		}
+	clearStaleMountWith(mnt, func(p string) error { _, err := os.Stat(p); return err }, lazyUnmount)
+}
+
+// clearStaleMountWith holds the decision: only a dead-transport error from
+// stat triggers an unmount. It reports whether an unmount was attempted.
+func clearStaleMountWith(mnt string, stat func(string) error, unmount func(string) error) bool {
+	if err := stat(mnt); !errors.Is(err, syscall.ENOTCONN) {
+		return false
 	}
+	log.Printf("clearing stale mount at %s", mnt)
+	if err := unmount(mnt); err != nil {
+		log.Printf("clearing stale mount: %v", err)
+	}
+	return true
 }
