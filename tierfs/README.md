@@ -38,11 +38,16 @@ a symlink into the mount, so Plex sees a normal file. The design is in
 ## Waiting reads
 
 Each reader is classified from the FUSE request's pid: its `/proc/<pid>/comm`,
-and its parent's, are compared with `TIERFS_BACKGROUND_COMMS`. A pid that cannot
-be read counts as a player.
+and its parent's, are compared with `TIERFS_BACKGROUND_COMMS`. A `Plex Transcoder`
+is also background when its `/proc/<pid>/cmdline` is one of Plex's analysis jobs:
+loudness (`-f null -`), intro and credits markers (audio written under
+`Transcode/Detection/`) or voice activity (`track-NNNN.wav`). A command line that
+names any other muxer (dash, segment, mp4, ...) is a player. A pid or command
+line that cannot be read counts as a player.
 
-- Background readers (the Plex scanner and its children) keep the remote stream
-  described above.
+- Background readers (the Plex scanner, its children and the analysis jobs) keep
+  the remote stream described above, so they never promote the file and never
+  count as a play.
 - A player's middle read never uses the remote. It comes from the stub, for
   chunks listed in `<id>.fill`, and waits until the chunk is listed. The fill
   file is checked at least every 200 ms.
