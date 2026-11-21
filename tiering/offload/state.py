@@ -77,23 +77,46 @@ def open_db(path) -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
     db.executescript(_SCHEMA)
-    info = {r[1]: (r[2] or "").upper() for r in db.execute("PRAGMA table_info(files)")}
-    have = set(info)
-    ctype = {"year": "INTEGER", "season": "INTEGER", "episode": "INTEGER",
-             "dev": "INTEGER", "ino": "INTEGER", "last_stat_ok_ts": "REAL"}
-    for c in ("title", "year", "imdb_id", "tvdb_id", "season", "episode", "release_name",
-              "dev", "ino", "last_stat_ok_ts"):
-        if c not in have:  # databases created before these columns existed
-            db.execute(f"ALTER TABLE files ADD COLUMN {c} {ctype.get(c, 'TEXT')}")
-    if info.get("last_stat_ok_ts") not in (None, "REAL"):
-        # an earlier migration declared it TEXT: rebuild it as REAL, keeping the values
-        db.execute("ALTER TABLE files RENAME COLUMN last_stat_ok_ts TO last_stat_ok_ts_old")
-        db.execute("ALTER TABLE files ADD COLUMN last_stat_ok_ts REAL")
-        db.execute("UPDATE files SET last_stat_ok_ts = CAST(last_stat_ok_ts_old AS REAL) "
-                   "WHERE last_stat_ok_ts_old IS NOT NULL")
-        db.execute("ALTER TABLE files DROP COLUMN last_stat_ok_ts_old")
-    db.commit()
+    _migrate(db)
     return db
+
+
+def _migrate(db) -> None:
+    """Bring an older database up to date in ONE transaction (BEGIN IMMEDIATE ...
+    COMMIT; sqlite3 would otherwise autocommit each ALTER), so a crash leaves
+    either the old or the new layout. A half-done TEXT->REAL rebuild left by an
+    earlier version (a last_stat_ok_ts_old column) is finished here."""
+    db.commit()
+    saved = db.isolation_level
+    db.isolation_level = None  # explicit: we issue BEGIN/COMMIT ourselves
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            info = {r[1]: (r[2] or "").upper() for r in db.execute("PRAGMA table_info(files)")}
+            ctype = {"year": "INTEGER", "season": "INTEGER", "episode": "INTEGER",
+                     "dev": "INTEGER", "ino": "INTEGER", "last_stat_ok_ts": "REAL"}
+            for c in ("title", "year", "imdb_id", "tvdb_id", "season", "episode",
+                      "release_name", "dev", "ino", "last_stat_ok_ts"):
+                if c not in info:  # databases created before these columns existed
+                    db.execute(f"ALTER TABLE files ADD COLUMN {c} {ctype.get(c, 'TEXT')}")
+                    info[c] = ctype.get(c, "TEXT")
+            if "last_stat_ok_ts_old" not in info and info.get("last_stat_ok_ts") != "REAL":
+                # an earlier migration declared it TEXT: rebuild it as REAL, keeping the values
+                db.execute("ALTER TABLE files RENAME COLUMN last_stat_ok_ts "
+                           "TO last_stat_ok_ts_old")
+                db.execute("ALTER TABLE files ADD COLUMN last_stat_ok_ts REAL")
+                info["last_stat_ok_ts_old"] = "TEXT"
+            if "last_stat_ok_ts_old" in info:  # new or half-done: finish it
+                db.execute("UPDATE files SET last_stat_ok_ts = CAST(last_stat_ok_ts_old AS REAL) "
+                           "WHERE last_stat_ok_ts_old IS NOT NULL AND last_stat_ok_ts IS NULL")
+                db.execute("ALTER TABLE files DROP COLUMN last_stat_ok_ts_old")
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+    finally:
+        db.isolation_level = saved
 
 
 def _check_state(state):

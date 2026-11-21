@@ -28,6 +28,7 @@ from typing import Callable, NamedTuple, Protocol
 
 import blake3
 
+from . import paths
 from . import state as st
 
 log = logging.getLogger("tiering.offload")
@@ -54,6 +55,17 @@ class LayoutError(ValueError):
 
 class OpsError(RuntimeError):
     pass
+
+
+class ShortRead(ConnectionError):
+    """The remote returned fewer bytes than asked."""
+
+    def __init__(self, offset, wanted, got):
+        super().__init__(f"short read at {offset}: wanted {wanted}, got {got}")
+        self.offset = offset
+
+
+SHORT_LIMIT = 3  # consecutive attempts that end short at the same offset
 
 
 class ChunkMismatch(OpsError):
@@ -401,7 +413,65 @@ def scan_open_holders(path, ignore_comm=("tierfs",), ignore_unreadable=False) ->
 
 
 def _is_symlink_to(path, target) -> bool:
-    return os.path.islink(path) and os.readlink(path) == str(target)
+    """path is a symlink into the tierfs mount for this id. Matched on the entry's
+    basename (<id><ext>), as promote does, so a mount spelled another way (a
+    trailing "/.", a bind alias) still counts as ours."""
+    return os.path.islink(path) and os.path.basename(os.readlink(path)) == os.path.basename(
+        str(target))
+
+
+def _norm_mount(p) -> str:
+    return os.path.normpath(os.path.abspath(str(p)))
+
+
+def _path_pairs(path_map):
+    if path_map is None:
+        path_map = os.environ.get("TIERING_PATH_MAP", "")
+    if isinstance(path_map, str):
+        return paths.parse_path_map(path_map)
+    return list(path_map)
+
+
+def _resolve_lib(share, path_map):
+    """(disk_path, "") or ("", refusal). With no map the path is used as is;
+    with one, exactly one existing disk path must come out."""
+    try:
+        pairs = _path_pairs(path_map)
+    except ValueError as e:
+        return "", f"bad TIERING_PATH_MAP: {e}"
+    if not pairs:
+        return str(share), ""
+    cands = paths.disk_paths(share, pairs)
+    if len(cands) != 1:
+        return "", (f"{share}: maps to {len(cands)} disk paths; refusing "
+                    "(a file must be on exactly one disk)")
+    return cands[0], ""
+
+
+def _pick_stub_root(lib, stub_root):
+    """(stub_root, "") or ("", refusal). A given stub_root is used as is (its
+    same-device check stays in _check_fresh). Otherwise TIERFS_STUB_ROOTS is
+    matched by st_dev against the directory of the resolved disk path."""
+    if stub_root:
+        return str(stub_root), ""
+    roots = [r.strip() for r in os.environ.get("TIERFS_STUB_ROOTS", "").split(",") if r.strip()]
+    if not roots:
+        return "", "stub_root not given and TIERFS_STUB_ROOTS unset"
+    try:
+        dev = _dev(os.path.dirname(lib) or ".")
+    except OSError as e:
+        return "", f"cannot stat the directory of L: {e}"
+    match = []
+    for r in roots:
+        try:
+            if _dev(r) == dev:
+                match.append(r)
+        except OSError:
+            continue
+    if len(match) != 1:
+        return "", (f"{len(match)} stub roots in TIERFS_STUB_ROOTS are on the same disk as "
+                    f"{lib}; need exactly one")
+    return match[0], ""
 
 
 def _record(db, id, step, state, hook):
@@ -462,7 +532,7 @@ def offload(
     db,
     row: dict,
     *,
-    stub_root,
+    stub_root=None,
     manifest_dir,
     tierfs_mount,
     apply: bool = False,
@@ -472,17 +542,22 @@ def offload(
     mount_wait: float = 30.0,
     head_frac: float = 0.20,
     after_step: Callable[[int], None] | None = None,
+    path_map=None,
     _demote: bool = False,
 ) -> Result:
-    """Offload one file. Dry run unless apply=True. Re-run to resume."""
+    """Offload one file. Dry run unless apply=True. Re-run to resume.
+    row["lib_path"] is the share path; it is resolved to the disk path here (path_map or
+    TIERING_PATH_MAP) and the database keeps the share path. stub_root defaults to the
+    TIERFS_STUB_ROOTS entry on the same disk as L."""
     id = row.get("id")
     if not id:
         return Result(False, None, 0, "row has no id")
     with _id_lock(db, id) as held:
         if not held:
             return Result(False, None, 0, _BUSY)
-        return _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
-                        open_timeout, open_poll, mount_wait, head_frac, after_step, _demote)
+        return _offload(db, row, stub_root, manifest_dir, _norm_mount(tierfs_mount), apply,
+                        open_check, open_timeout, open_poll, mount_wait, head_frac, after_step,
+                        _demote, path_map)
 
 
 def demote(db, row: dict, **kw) -> Result:
@@ -490,34 +565,59 @@ def demote(db, row: dict, **kw) -> Result:
     return offload(db, row, _demote=True, **kw)
 
 
-def _abort_offload(db, id, reason, lib, stub, manifest_dir, step):
+def _abort_offload(db, id, reason, lib, stub, manifest_dir, step, to_whole=False):
     """Back out before the swap: drop the stub link only if it is another name
-    for a regular L, and remove the manifest and chunk list."""
+    for a regular L, and remove the manifest and chunk list. While L is a
+    symlink into tierfs the manifest stays (tierfs would drop its entry and L
+    would dangle). A stub that is not a name of L is never deleted: it is the
+    only copy of the original, and the row and an event name it."""
+    ours_link = os.path.islink(lib) and os.path.basename(os.readlink(lib)) == os.path.basename(
+        stub)
+    orphan = False
     with contextlib.suppress(OSError):
         ls = os.lstat(lib)
-        if stat_mod.S_ISREG(ls.st_mode) and os.path.lexists(stub) and _same_inode(ls, os.lstat(stub)):
-            os.unlink(stub)
+        if stat_mod.S_ISREG(ls.st_mode) and os.path.lexists(stub):
+            if _same_inode(ls, os.lstat(stub)):
+                os.unlink(stub)
+            else:
+                orphan = True
     _rm_our_symlink(lib + TMP_SUFFIX, id, lib)
-    _rm(manifest_path(manifest_dir, id))
-    _rm(chunks_path(manifest_dir, id))
-    _fail(db, id, reason)
+    if not ours_link:
+        _rm(manifest_path(manifest_dir, id))
+        _rm(chunks_path(manifest_dir, id))
+    if to_whole and not ours_link and not orphan:
+        st.set_state(db, id, "whole", step=0, stub_path=None)
+        st.log_event(db, id, "offload_aborted", {"at_step": step, "reason": reason})
+        return Result(False, "whole", 0, reason)
+    if orphan:
+        reason = (f"{reason}; the original is kept at {stub} (nothing else points at it), "
+                  "and the file at L is unmanaged")
+        st.log_event(db, id, "takeover_orphan", {"stub": stub, "lib": lib, "reason": reason})
+    _fail(db, id, reason, **({"orphan_stub": stub} if orphan else {}))
     return Result(False, "failed", step, reason)
 
 
 def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
-             open_timeout, open_poll, mount_wait, head_frac, after_step, _demote) -> Result:
+             open_timeout, open_poll, mount_wait, head_frac, after_step, _demote,
+             path_map=None) -> Result:
     id = row["id"]
     dbrow = st.get(db, id) or {}
     cur = {**row, **{k: v for k, v in dbrow.items() if v is not None}}
     state = cur.get("state") or "whole"
     step = int(cur.get("step") or 0)
-    lib = cur.get("lib_path")
-    if not lib:
+    share = cur.get("lib_path")  # the share path; the database keeps it
+    if not share:
         return Result(False, state, step, "row has no lib_path")
     if state == "offloaded":
         return Result(True, state, step, "already offloaded", dry_run=not apply)
     if state not in ("whole", "offloading"):
         return Result(False, state, step, f"state {state!r} cannot be offloaded")
+    lib, reason = _resolve_lib(share, path_map)  # every file operation uses the disk path
+    if reason:
+        return Result(False, state, step, reason)
+    stub_root, reason = _pick_stub_root(lib, stub_root)
+    if reason:
+        return Result(False, state, step, reason)
     ext = os.path.splitext(lib)[1]
     stub = os.path.join(str(stub_root), f"{id}{ext}")
     target = os.path.join(str(tierfs_mount), f"{id}{ext}")
@@ -570,7 +670,7 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
                 log.warning("%s: stale %s in the row replaced by the fresh value", id, k)
         facts = {
             **{k: v for k, v in cur.items() if k in st.COLUMNS},
-            "id": id, "lib_path": lib, "stub_path": stub, "remote_path": cur["remote_path"],
+            "id": id, "lib_path": share, "stub_path": stub, "remote_path": cur["remote_path"],
             "size": sc["size"], "mtime_ns": sc["mtime_ns"], "sha256": sc["sha256"],
             "head_len": lay.head_len, "tail_len": lay.tail_len,
             "head_b3": sc["head_b3"], "tail_b3": sc["tail_b3"],
@@ -706,6 +806,11 @@ def _offload_swap(db, cur, lib, stub, tmp, target, manifest_dir, mount_wait, ste
         if not _wait_for(lambda: _mount_serves(target, size), mount_wait):
             return _stall(db, id, "mount_wait",
                           "tierfs does not serve the entry yet; not swapping", "offloading", step)
+        nl = os.lstat(lib).st_nlink
+        if nl != 2:  # L plus the stub link; another name appeared since step 2
+            return _abort_offload(db, id, f"L has {nl} links (expected 2) right before the swap; "
+                                  "offload aborted, the file stays whole",
+                                  lib, stub, manifest_dir, step, to_whole=True)
         if os.path.lexists(tmp):
             if not os.path.islink(tmp):
                 return Result(False, "offloading", step, f"{tmp} exists and is not a symlink")
@@ -767,7 +872,10 @@ def _check_fresh(cur, lib, stub_root, manifest_dir) -> str:
         return f"L has {lst.st_nlink} hardlinks"
     if _dev(str(stub_root)) != lst.st_dev:
         return "stub_root is on a different filesystem than L"
-    _require_real_fs(os.path.dirname(lib) or ".", stub_root, manifest_dir)
+    try:
+        _require_real_fs(os.path.dirname(lib) or ".", stub_root, manifest_dir)
+    except OpsError as e:  # a refusal like the others, also in a dry run
+        return str(e)
     return ""
 
 
@@ -828,6 +936,7 @@ def promote(
     chunk: int = CHUNK,
     manifest_dir=None,
     after_step: Callable[[int], None] | None = None,
+    path_map=None,
 ) -> Result:
     """Fill the stub's middle from the remote (every chunk checked against the
     chunk list), verify sha256, swap it over L. On a mismatch nothing is
@@ -835,7 +944,28 @@ def promote(
     with _id_lock(db, id) as held:
         if not held:
             return Result(False, None, 0, _BUSY)
-        return _promote(db, id, reader, apply, chunk, manifest_dir, after_step)
+        return _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map)
+
+
+def _short_remote(db, id, offset, step):
+    """A short read is transient the first times; the same offset SHORT_LIMIT times in a
+    row means the remote is permanently short: stop (state=failed) and raise an alert."""
+    st.log_event(db, id, "promote_short_read", {"offset": offset})
+    run = 0
+    for e in reversed(st.events(db, id)):
+        if e["kind"] == "promote_short_read" and e["detail"].get("offset") == offset:
+            run += 1
+        else:
+            break
+    if run < SHORT_LIMIT:
+        reason = f"short read at {offset} (attempt {run} of {SHORT_LIMIT})"
+        log.warning("%s: %s", id, reason)
+        return Result(False, "promoting", step, reason)
+    reason = (f"the remote is permanently short at offset {offset} ({run} attempts in a row); "
+              "promote cannot finish, use the restore path")
+    _fail(db, id, reason, offset=offset)
+    st.log_event(db, id, "promote_short_remote", {"offset": offset, "attempts": run})
+    return Result(False, "failed", step, reason)
 
 
 def _swapped(lib, stub, state, step) -> bool:
@@ -855,7 +985,7 @@ def _swapped(lib, stub, state, step) -> bool:
         return step >= 4
 
 
-def _promote(db, id, reader, apply, chunk, manifest_dir, after_step) -> Result:
+def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=None) -> Result:
     row = st.get(db, id)
     if row is None:
         return Result(False, None, 0, "unknown id")
@@ -869,7 +999,10 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step) -> Result:
     manifest_dir = manifest_dir or os.environ.get("TIERFS_MANIFESTS")
     if not manifest_dir:
         return Result(False, state, step, "manifest_dir not given and TIERFS_MANIFESTS unset")
-    lib, stub = row["lib_path"], row["stub_path"]
+    share, stub = row["lib_path"], row["stub_path"]
+    lib, reason = _resolve_lib(share, path_map) if share else ("", "")
+    if reason:
+        return Result(False, state, step, reason)
     size, head_len, tail_len = row["size"], row["head_len"], row["tail_len"]
     mtime_ns = row["mtime_ns"]
     if not (lib and stub and row.get("sha256") and size and head_len and tail_len):
@@ -958,6 +1091,8 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step) -> Result:
         except OpsError as e:  # a refusal about the stub itself: retrying cannot help
             _fail(db, id, f"fill refused: {e}")
             return Result(False, "failed", step, str(e))
+        except ShortRead as e:
+            return _short_remote(db, id, e.offset, step)
         except Exception as e:  # reader trouble is transient: stay resumable
             return _stall(db, id, "promote_read_error", f"{type(e).__name__}: {e}", "promoting", step)
         _record(db, id, 1, "promoting", after_step)
@@ -997,6 +1132,7 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step) -> Result:
             raise OpsError("stub is not the same inode as L; refusing to unlink it")
         os.unlink(stub)
         _point("promote.stub_unlinked")
+    _fsync_dir(os.path.dirname(stub) or ".")  # the unlink is durable before state=whole
     _rm(mpath)
     _point("promote.manifest_removed")
     _rm(cpath)
@@ -1040,7 +1176,10 @@ def _promote_swap(db, row, lib, stub, tmp, ours_symlink):
     _exchange(tmp, lib)
     if os.path.lexists(tmp) and _same_regular(tmp, stub):
         os.unlink(tmp)
-    _fail(db, id, "L was replaced during the swap; swap undone")
+    reason = (f"L was replaced during the swap; swap undone; the original is kept at {stub}, "
+              "and the file at L is unmanaged")
+    st.log_event(db, id, "takeover_orphan", {"stub": stub, "lib": lib, "reason": reason})
+    _fail(db, id, reason, orphan_stub=stub)
     return Result(False, "failed", 3, "L replaced during the swap")
 
 
@@ -1076,7 +1215,7 @@ def _fill_middle(reader, row, stub, lib, chunk, chunk_size, digests):
             n = min(step_len, end - off)
             data = reader.read_range(row["remote_path"], off, n)
             if len(data) != n:
-                raise ConnectionError(f"short read at {off}: wanted {n}, got {len(data)}")
+                raise ShortRead(off, n, len(data))
             for p in range(0, n, chunk_size):  # check every chunk before any byte is written
                 piece = data[p:p + chunk_size]
                 idx = (off + p - start) // chunk_size

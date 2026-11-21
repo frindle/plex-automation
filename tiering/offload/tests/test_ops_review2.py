@@ -64,8 +64,8 @@ def test_fs_type_of_longest_mount():
 def test_N4_union_or_unknown_fs_refused(tmp_path, monkeypatch, bad):
     env = Env(tmp_path)
     monkeypatch.setattr(ops, "_fs_type", lambda p: bad)
-    with pytest.raises(ops.OpsError):
-        env.offload()
+    r = env.offload()  # a refusal Result, not an exception
+    assert not r.ok and "file system" in r.reason
     assert os.path.isfile(env.lib) and not os.path.islink(env.lib)
     assert env.read_lib() == env.data
 
