@@ -227,7 +227,7 @@ def test_full_read_mismatch_flags_and_keeps_old_last_ok(tmp_path):
         t = e.text()
         assert "1 mismatches" in t and "Files marked failed this run: 1." in t
         assert "## Failed files" in t and "- N03: full read hash mismatch" in t
-        assert "restore path: none archived" in t
+        assert oldest["nzb_path2"] and f"restore path: {oldest['nzb_path2']}" in t
         assert ("N03" in t.split("## Alerts")[1].split("##")[0])
     finally:
         e.close()
