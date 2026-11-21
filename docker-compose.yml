@@ -90,6 +90,8 @@ services:
       SEED_RETIRE_DAYS: "${SEED_RETIRE_DAYS:-180}"
       # ...or sooner when idle: no upload in this many days, seeded at least SEED_DAYS (0 = off).
       SEED_IDLE_DAYS: "${SEED_IDLE_DAYS:-14}"
+      # The labeled torrents with the most upload never retire or unseed as stalled (0 = off).
+      SEED_KEEP_TOP_EARNERS: "${SEED_KEEP_TOP_EARNERS:-30}"
       # Glacier disk (disk1) quiet hours; off. HOLD_DISK1_UPGRADES: a finished upgrade download whose old file is
       # on disk1 (per GLACIER_INDEX, never a disk lookup) waits on a hold label until disk1 is up (spin log says so, or
       # inside GLACIER_WINDOW, host local time); meanwhile the new copy is hardlinked into GLACIER_HOLD_ROOT under a "- glacier-tmp" name
