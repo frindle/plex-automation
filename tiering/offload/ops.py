@@ -201,6 +201,79 @@ def _exchange(a: str, b: str) -> None:
         raise OSError(e, f"renameat2(RENAME_EXCHANGE) failed: {os.strerror(e)}", a, b)
 
 
+REAL_FS = frozenset({"xfs", "btrfs", "ext4", "zfs", "tmpfs"})
+
+
+def _unescape_mount(s: str) -> str:
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 4 <= len(s) and s[i + 1:i + 4].isdigit():
+            out.append(chr(int(s[i + 1:i + 4], 8)))
+            i += 4
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def fs_type_of(path, mountinfo: str | None = None) -> str | None:
+    """File system type of the longest mount point that holds `path`, read from
+    /proc/self/mountinfo (or the given text). None if it cannot be determined."""
+    if mountinfo is None:
+        try:
+            with open("/proc/self/mountinfo") as f:
+                mountinfo = f.read()
+        except OSError:
+            return None
+    path = os.path.realpath(str(path))
+    best = None
+    for line in mountinfo.splitlines():
+        left, sep, right = line.partition(" - ")
+        fields = left.split()
+        if not sep or len(fields) < 5 or not right.split():
+            continue
+        mp = _unescape_mount(fields[4])
+        base = mp.rstrip("/")
+        if mp == "/" or path == mp or path.startswith(base + "/"):
+            if best is None or len(mp) >= len(best[0]):  # a later line stacks on top
+                best = (mp, right.split()[0])
+    return best[1] if best else None
+
+
+def _fs_type(path) -> str | None:
+    return fs_type_of(path)
+
+
+def _require_real_fs(*paths) -> None:
+    """Refuse to work through a union or FUSE layer (see "Real file system only")."""
+    for p in paths:
+        t = _fs_type(p)
+        if t is None:
+            raise OpsError(f"{p}: cannot determine the file system type; refusing")
+        if t not in REAL_FS:
+            raise OpsError(f"{p}: file system type {t!r} is not a real disk file system; refusing")
+
+
+def _try_exchange(tmp: str, lib: str) -> None:
+    """_exchange, but a file system without RENAME_EXCHANGE leaves L untouched."""
+    try:
+        _exchange(tmp, lib)
+    except OSError as e:
+        if e.errno in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise OpsError("file system lacks RENAME_EXCHANGE") from e
+        raise
+
+
+def _rm_our_symlink(tmp: str, id: str, lib: str) -> None:
+    """Remove tmp if it is a symlink we made for this id (never a regular file)."""
+    ext = os.path.splitext(lib)[1]
+    with contextlib.suppress(OSError):
+        if os.path.islink(tmp) and os.path.basename(os.readlink(tmp)) == f"{id}{ext}":
+            os.unlink(tmp)
+
+
 def _scan(path, size, head_len, tail_len) -> dict:
     """One sequential read: sha256 of the file, blake3 of head and tail, and
     the chunk list (blake3 per CHUNK_SIZE piece of the middle). Refuses if the
@@ -268,9 +341,10 @@ def scan_open_holders(path, ignore_comm=("tierfs",), ignore_unreadable=False) ->
     """Pids holding `path`'s inode open, from /proc/*/fd. Fails closed:
     - a process whose fd table cannot be read counts as a holder
       (ignore_unreadable=True is for tests running unprivileged);
-    - if TIERING_PROC_CANARY names a process (comm, e.g. the media server)
-      and none is visible, the answer is "not clear" (pid -1), because the
-      scan then cannot see the processes that matter (wrong PID namespace).
+    - TIERING_PROC_CANARY must name a process (comm, e.g. the media server)
+      that is visible; if it is unset or not visible the answer is "not
+      clear" (pid -1), because the scan then cannot see the processes that
+      matter (wrong PID namespace).
     Ignores this process and ignore_comm (tierfs preads head and tail only).
     Needs root or CAP_SYS_PTRACE, and a PID namespace shared with the media
     server."""
@@ -317,7 +391,10 @@ def scan_open_holders(path, ignore_comm=("tierfs",), ignore_unreadable=False) ->
             if _same_inode(s, target):
                 holders.append(pid)
                 break
-    if canary and not seen_canary:
+    if not canary:
+        log.warning("open check: TIERING_PROC_CANARY is not set; cannot call the file clear")
+        holders.append(-1)
+    elif not seen_canary:
         log.warning("open check: canary process %r not visible; cannot call the file clear", canary)
         holders.append(-1)
     return holders
@@ -420,6 +497,7 @@ def _abort_offload(db, id, reason, lib, stub, manifest_dir, step):
         ls = os.lstat(lib)
         if stat_mod.S_ISREG(ls.st_mode) and os.path.lexists(stub) and _same_inode(ls, os.lstat(stub)):
             os.unlink(stub)
+    _rm_our_symlink(lib + TMP_SUFFIX, id, lib)
     _rm(manifest_path(manifest_dir, id))
     _rm(chunks_path(manifest_dir, id))
     _fail(db, id, reason)
@@ -448,9 +526,13 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
 
     if not cur.get("nzb_path"):
         return Result(False, state, step, "row has no nzb_path (the byte-identical release's NZB)")
-    if _demote and not cur.get("sha256"):
-        return Result(False, state, step, "demote needs a verified sha256")
+    if not cur.get("sha256"):
+        return Result(False, state, step, "offload needs the sha256 that qualify wrote")
     if apply:
+        if os.environ.get("TIERING_APPLY") != "1":
+            return Result(False, state, step, "TIERING_APPLY=1 is not set; refusing to apply")
+        if not os.environ.get("TIERING_PROC_CANARY"):
+            return Result(False, state, step, "TIERING_PROC_CANARY is not set; refusing to apply")
         reason = _no_exchange()
         if reason:
             return Result(False, state, step, reason)
@@ -479,9 +561,13 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
             return Result(False, state, step, str(e))
         if (sc["dev"], sc["ino"]) != (lst.st_dev, lst.st_ino):
             return Result(False, state, step, "L changed while hashing")
-        for k in ("sha256", "head_b3", "tail_b3"):
+        if cur["sha256"] != sc["sha256"]:
+            return Result(False, state, step, "sha256 differs from the recorded value; file changed")
+        # head_b3/tail_b3 in the row may be left over from an earlier cycle; with the
+        # same sha256 the fresh values are the truth and replace them below.
+        for k in ("head_b3", "tail_b3"):
             if cur.get(k) and cur[k] != sc[k]:
-                return Result(False, state, step, f"{k} differs from the recorded value; file changed")
+                log.warning("%s: stale %s in the row replaced by the fresh value", id, k)
         facts = {
             **{k: v for k, v in cur.items() if k in st.COLUMNS},
             "id": id, "lib_path": lib, "stub_path": stub, "remote_path": cur["remote_path"],
@@ -522,6 +608,12 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
                 _fail(db, id, "stub path exists and is a different file")
                 return Result(False, "failed", step, "stub path exists and is a different file")
         else:
+            cl = os.lstat(lib)
+            if cl.st_nlink != 1:  # a hardlink appeared (e.g. a cross-seed) while hashing
+                reason = f"L has {cl.st_nlink} hardlinks; offload aborted before linking"
+                st.set_state(db, id, "whole", step=0, stub_path=None)
+                st.log_event(db, id, "offload_aborted", {"at_step": step, "reason": reason})
+                return Result(False, "whole", 0, reason)
             os.link(lib, stub)
             _point("offload.linked")
             _fsync_dir(str(stub_root))
@@ -559,6 +651,7 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
         res = _offload_swap(db, cur, lib, stub, tmp, target, manifest_dir, mount_wait, step)
         if res is not None:
             return res
+        _fsync_dir(os.path.dirname(lib) or ".")
         _record(db, id, 4, "offloading", after_step)
         step = 4
 
@@ -583,6 +676,7 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
     if step < 6:
         if not _is_symlink_to(lib, target):
             return Result(False, "offloading", step, "L is not the tierfs symlink; not punching")
+        _require_real_fs(os.path.dirname(lib) or ".", stub, manifest_dir)
         err = _punch_and_verify(db, id, cur, stub)
         if err:
             return Result(False, "offloading", step, err)
@@ -618,7 +712,7 @@ def _offload_swap(db, cur, lib, stub, tmp, target, manifest_dir, mount_wait, ste
             os.unlink(tmp)
         os.symlink(target, tmp)
         _point("offload.tmp_symlink")
-        _exchange(tmp, lib)  # atomic: L is the symlink, tmp holds whatever was at L
+        _try_exchange(tmp, lib)  # atomic: L is the symlink, tmp holds whatever was at L
         _point("offload.exchanged")
     return _settle_offload_tmp(db, cur, lib, stub, tmp, manifest_dir, step)
 
@@ -632,6 +726,17 @@ def _settle_offload_tmp(db, cur, lib, stub, tmp, manifest_dir, step):
     ok = (stat_mod.S_ISREG(ts.st_mode) and (ts.st_dev, ts.st_ino) == (cur["dev"], cur["ino"])
           and ts.st_size == cur["size"] and ts.st_mtime_ns == cur["mtime_ns"])
     if ok:
+        try:
+            ss = os.lstat(stub)
+        except OSError:
+            ss = None
+        if ss is None or not stat_mod.S_ISREG(ss.st_mode) or (ss.st_dev, ss.st_ino) != (
+                cur["dev"], cur["ino"]):
+            # the stub no longer holds the original: tmp is its last name, keep it
+            _exchange(tmp, lib)
+            _rm_our_symlink(tmp, id, lib)
+            return _abort_offload(db, id, "stub no longer holds the original; swap undone",
+                                  lib, stub, manifest_dir, step)
         os.unlink(tmp)  # one more name for data the stub still holds
         _point("offload.tmp_unlinked")
         return None
@@ -662,6 +767,7 @@ def _check_fresh(cur, lib, stub_root, manifest_dir) -> str:
         return f"L has {lst.st_nlink} hardlinks"
     if _dev(str(stub_root)) != lst.st_dev:
         return "stub_root is on a different filesystem than L"
+    _require_real_fs(os.path.dirname(lib) or ".", stub_root, manifest_dir)
     return ""
 
 
@@ -756,6 +862,8 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step) -> Result:
     state, step = row["state"], int(row.get("step") or 0)
     if state == "whole":
         return Result(True, state, step, "already whole", dry_run=not apply)
+    if apply and os.environ.get("TIERING_APPLY") != "1":
+        return Result(False, state, step, "TIERING_APPLY=1 is not set; refusing to apply")
     if state not in ("offloaded", "promoting", "failed", "offloading"):
         return Result(False, state, step, f"state {state!r} cannot be promoted")
     manifest_dir = manifest_dir or os.environ.get("TIERFS_MANIFESTS")
@@ -788,11 +896,18 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step) -> Result:
                 return Result(True, state, step, "dry run", dry_run=True)
             if os.path.lexists(stub) and _same_inode(os.lstat(stub), ls):
                 os.unlink(stub)
+            _rm_our_symlink(tmp, id, lib)
             _rm(mpath)
             _rm(cpath)
             st.set_state(db, id, "whole", step=0, stub_path=None)
             st.log_event(db, id, "offload_aborted", {"at_step": step})
             return Result(True, "whole", 0, "offload aborted; file is whole")
+        if apply and ours_symlink() and os.path.lexists(tmp):
+            # died between the exchange and the settle: whatever sits at tmp is
+            # either our original (drop the extra link) or an arr upgrade (put it back)
+            res = _settle_offload_tmp(db, row, lib, stub, tmp, manifest_dir, step)
+            if res is not None:
+                return res
 
     swapped = _swapped(lib, stub, state, step)
     if not swapped:
@@ -840,6 +955,9 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step) -> Result:
             _fail(db, id, f"chunk mismatch from the remote at offset {e.offset}; nothing swapped",
                   offset=e.offset)
             return Result(False, "failed", step, "chunk mismatch")
+        except OpsError as e:  # a refusal about the stub itself: retrying cannot help
+            _fail(db, id, f"fill refused: {e}")
+            return Result(False, "failed", step, str(e))
         except Exception as e:  # reader trouble is transient: stay resumable
             return _stall(db, id, "promote_read_error", f"{type(e).__name__}: {e}", "promoting", step)
         _record(db, id, 1, "promoting", after_step)
@@ -866,6 +984,7 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step) -> Result:
         res = _promote_swap(db, row, lib, stub, tmp, ours_symlink)
         if res is not None:
             return res
+        _fsync_dir(os.path.dirname(lib) or ".")
         _record(db, id, 4, "promoting", after_step)
         step = 4
 
@@ -882,7 +1001,8 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step) -> Result:
     _point("promote.manifest_removed")
     _rm(cpath)
     _fsync_dir(os.path.dirname(lib) or ".")
-    st.set_state(db, id, "whole", step=0, stub_path=None, last_ok_ts=time.time())
+    st.set_state(db, id, "whole", step=0, stub_path=None, head_b3=None, tail_b3=None,
+                 last_ok_ts=time.time())
     st.log_event(db, id, "promoted", {})
     if after_step:
         after_step(5)
@@ -896,13 +1016,14 @@ def _promote_swap(db, row, lib, stub, tmp, ours_symlink):
         if not ours_symlink():
             _fail(db, id, "L is not the tierfs symlink at swap time")
             return Result(False, "failed", 3, "L changed before the swap")
+        _require_real_fs(os.path.dirname(lib) or ".", stub)
         if os.path.lexists(tmp):
             if not os.path.islink(tmp) and not _same_inode(os.lstat(tmp), os.lstat(stub)):
                 return Result(False, "promoting", 3, f"{tmp} exists and is not ours")
             os.unlink(tmp)
         os.link(stub, tmp)
         _point("promote.tmp_linked")
-        _exchange(tmp, lib)  # atomic: L is the stub's inode, tmp holds whatever was at L
+        _try_exchange(tmp, lib)  # atomic: L is the stub's inode, tmp holds whatever was at L
         _point("promote.exchanged")
     try:
         ts = os.lstat(tmp)
@@ -955,7 +1076,7 @@ def _fill_middle(reader, row, stub, lib, chunk, chunk_size, digests):
             n = min(step_len, end - off)
             data = reader.read_range(row["remote_path"], off, n)
             if len(data) != n:
-                raise OpsError(f"short read at {off}: wanted {n}, got {len(data)}")
+                raise ConnectionError(f"short read at {off}: wanted {n}, got {len(data)}")
             for p in range(0, n, chunk_size):  # check every chunk before any byte is written
                 piece = data[p:p + chunk_size]
                 idx = (off + p - start) // chunk_size

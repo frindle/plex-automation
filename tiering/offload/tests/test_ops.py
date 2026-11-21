@@ -80,7 +80,8 @@ class Env:
         self.chunks = str(root / "manifests" / f"{ID}.chunks")
         self.db = st.open_db(root / "state.db")
         self.row = {"id": ID, "lib_path": self.lib, "remote_path": "/r/Movie.mkv",
-                    "nzb_path": "/n/Movie.nzb", "rating_key": "1", "kind": "movie"}
+                    "nzb_path": "/n/Movie.nzb", "rating_key": "1", "kind": "movie",
+                    "sha256": self.sha}
         st.upsert(self.db, self.row)
 
     def kw(self, **extra):
@@ -358,9 +359,11 @@ def test_refuse_too_small(env, tmp_path):
     small = str(env.root / "lib" / "small.mkv")
     with open(small, "wb") as f:
         f.write(os.urandom(40 * MIB))
-    st.upsert(env.db, {"id": "f" * 16, "lib_path": small, "remote_path": "/r/s", "nzb_path": "/n/s.nzb"})
+    srow = {"id": "f" * 16, "lib_path": small, "remote_path": "/r/s", "nzb_path": "/n/s.nzb",
+            "sha256": "ab" * 32}
+    st.upsert(env.db, srow)
     before = tree(env.root)
-    r = ops.offload(env.db, {"id": "f" * 16, "lib_path": small, "remote_path": "/r/s", "nzb_path": "/n/s.nzb"}, **env.kw())
+    r = ops.offload(env.db, srow, **env.kw())
     assert not r.ok and "too small" in r.reason
     assert tree(env.root) == before
 
@@ -379,7 +382,7 @@ def test_refuse_missing_remote_path(env):
 
 
 def test_refuse_recorded_hash_mismatch(env):
-    st.upsert(env.db, {"id": ID, "head_b3": "00" * 32})
+    st.upsert(env.db, {"id": ID, "sha256": "00" * 32})  # a stale head_b3 alone no longer blocks
     _refused(env, "changed")
 
 
@@ -551,7 +554,8 @@ def test_demote_after_promote(env):
 
 
 def test_demote_needs_sha_and_nzb_path(env):
-    r = ops.demote(env.db, env.row, **env.kw())
+    st.upsert(env.db, {"id": ID, "sha256": None})
+    r = ops.demote(env.db, {**env.row, "sha256": None}, **env.kw())
     assert not r.ok and "sha256" in r.reason
     row = {**env.row, "sha256": env.sha}
     st.upsert(env.db, {"id": ID, "nzb_path": None, "nzb_path2": "/n/restore.nzb"})
