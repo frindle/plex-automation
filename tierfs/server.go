@@ -375,5 +375,11 @@ func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 		log.Printf("open %s: stub: %v", f.e.m.ID, err)
 		return nil, 0, syscall.EIO
 	}
-	return h, 0, 0
+	// Direct I/O makes the kernel pass reads through at the exact offset and
+	// size the application asked for. With the page cache, a read that starts
+	// near the tail would be rounded down to a page boundary and reach a few
+	// bytes into the middle, and that would cost a remote request (and a
+	// false "synced" event) for a tail-only read. It also keeps every read
+	// visible to us, so remote_read events cannot be hidden by cached pages.
+	return h, fuse.FOPEN_DIRECT_IO, 0
 }

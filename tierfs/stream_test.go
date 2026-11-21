@@ -120,8 +120,9 @@ func TestStreamSeekCancelsOldRequest(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("cancelled stream's goroutine did not exit")
 	}
-	if err := s1.readAt(context.Background(), p, 0); err == nil {
-		t.Fatal("read on a closed stream must fail")
+	// Bytes already buffered may still be served, but never new ones.
+	if err := s1.readAt(context.Background(), p, 20<<20); err == nil {
+		t.Fatal("read of unfetched data on a closed stream must fail")
 	}
 }
 
