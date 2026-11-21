@@ -138,7 +138,7 @@ def in_progress():
 
 
 def read_tierfs_events(path, since_ts, id_to_rk):
-    """Return {ratingKey: latest ts} for ids with a remote_read event at or
+    """Return {ratingKey: latest ts} for ids with a want event at or
     after since_ts. Reads `path` and rotated `path.1`..`path.3`; skips lines
     it cannot parse and files it cannot read."""
     found = {}
@@ -151,7 +151,7 @@ def read_tierfs_events(path, since_ts, id_to_rk):
             for line in fh:
                 try:
                     e = json.loads(line)
-                    if e.get("ev") != "remote_read":
+                    if e.get("ev") != "want":
                         continue
                     ts = float(e["ts"])
                     rk = id_to_rk.get(e.get("id"))

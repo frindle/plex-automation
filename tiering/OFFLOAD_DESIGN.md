@@ -27,7 +27,7 @@ The hot-set code implements these rules.
 - **New import:** whole for `new_days` (30).
 - **Played, synced, on deck or in progress:** whole until `idle_days` (60) after the last play.
 - **TV:** a play or sync of any episode makes its whole season whole. If the episode is one of the last `near_end_eps` (3) of the season, the next season is made whole too. Each season stays whole until `idle_days` after the last play in it.
-- **Synced:** any tierfs `remote_read` event, which is a read past the local head. A Plex download reads the whole file, so this covers sync.
+- **Synced:** any tierfs `want` event, which is a read that waits for data not yet on local disk. A Plex download reads the whole file, so this covers sync.
 
 ## Layout on disk
 
@@ -45,7 +45,7 @@ These names apply to each library file system.
       - `TIERING_PATH_MAP` holds one `share_prefix=disk_prefix` entry per disk.
       - Only candidates that exist count. Zero or several means skip and log.
     - `ops` resolves the path itself, on both demote and promote, and refuses unless there is exactly one disk path. It never writes a disk path into the database. The manifest's `lib_path` may hold the disk path.
-    - `register` stores the arr's path, mapped through `TIERING_ARR_PATH_MAP` (`arr_prefix=share_prefix`) when the arrs see different paths from Plex. Its stat (size and mtime) goes to the resolved disk path.
+    - `register` stores the arr's path, mapped through `TIERING_ARR_PATH_MAP` (`arr_prefix=share_prefix`, optional, identity when unset) when the arrs see different paths from Plex. Its stat (size and mtime) goes to exactly one existing disk candidate from `paths.disk_paths(share, TIERING_PATH_MAP)`, or to the share path itself when `TIERING_PATH_MAP` is unset. Zero candidates count as `missing_local` and several as `ambiguous`; the file is skipped, and the result's `listed`, `missing_local` and `ambiguous` counts let the caller see trouble. An arr path that is under a `TIERING_PATH_MAP` disk prefix is a disk path, never stored as `lib_path`: it is skipped and counted as `disk_path` (map the arr's root with `TIERING_ARR_PATH_MAP`).
     - The runner:
       - matches Plex files to rows by the share path;
       - in reconcile, reads the link at the resolved disk path;
@@ -160,7 +160,12 @@ The `files` table has these columns:
 `qualify` decides whether one whole file may be offloaded tonight.
 - **Same bytes:** it hashes `L` itself with a fresh full read and hashes the remote copy, and both must equal. It never trusts a stored `sha256`. It writes the hash it saw into the row's `sha256`.
 - **Restore path:** another release at or above the quality floor that is a different upload. Any candidate whose NZB shares message-ids with the `nzb_path` NZB is the same upload, whatever its name. Size alone never decides.
+  - Message-ids are compared without `<>` or white space, and case-sensitive.
+  - The candidate's NZB is STATed, every segment on every configured provider, like `nzb_path`'s, before it counts. A candidate with missing articles is not a restore path.
+  - The first candidate that is disjoint and live is archived as `nzb_path2`. `QualifyResult.fields` always carries `nzb_path2`, `None` when there is no such candidate, so a stale one is cleared.
+  - qualify searches once and reuses that search for the exact NZB and for the restore path.
 - **Quality floor:** taken from the source's resolution. When the source resolution is unknown, the floor is 1080p.
+- **Exact NZB: unsure is not a miss.** `no_exact_nzb` means a complete search (every configured indexer answered) found no release with the exact name. Anything less returns `nzb_unsure`, meaning "try later": a partial search (an indexer dropped, out of budget or failing), a spent grab budget, or `MAX_FAILED_GRABS` (3) failed grabs. Neither passes; only `nzb_unsure` is worth a retry tomorrow.
 - **Unsure is a fail:** an indexer or provider that did not answer, or a partial search, never passes.
 - `QualifyResult.fields` holds only `files` columns.
 
@@ -171,15 +176,33 @@ Offload step 3 hashes `L` again in the read that builds the chunk list. If that 
 - `register(db, apply)` runs once a night before the demote window, and the runner calls it.
 - It reads every movie file and episode file from Radarr and Sonarr through their APIs (`RADARR_URL`, `SONARR_URL`, keys from env; more than one Sonarr is a comma list).
 - For each file it upserts a row by `lib_path`. A new row gets a fresh `<id>`, `state=whole`, `size`, `mtime_ns` and the media identity: `title`, `year`, `imdb_id`, `tvdb_id`, `season`, `episode`, and `release_name` (the arr's scene name, else the file name). `sha256` stays empty until qualify fills it.
-- An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`.
+- An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`, `nzb_path`, `nzb_path2`, `restore_score`, `restore_note`, `remote_path` and the head/tail facts.
 - It never deletes a row. A path the arrs no longer list is logged.
 - The runner fills `rating_key`, `kind` and `is4k` from Plex.
+- The result is a dict with these int counts: `listed`, `missing_local`, `ambiguous`, `errors`, `new`, `updated`, `unchanged`, `skipped_state`, `unlisted`, and `applied` (bool). `listed` is the number of files the arrs listed.
+- The runner fails closed on the result. It blocks that night's demotes when the result is not a dict, lacks `listed`, `missing_local`, `ambiguous` or `errors`, holds a non-int there, has `errors > 0` or `listed == 0`, or when `missing_local + ambiguous` is over 5% of `listed`. It alerts `register_failed`.
 - `lib_path` is the share path (see "Path namespaces"). `TIERING_ARR_PATH_MAP` maps arr paths to share paths when they differ. Size and mtime come from the resolved disk path.
 
 ### Weekly
 
 - STAT every segment of each `offloaded` row's `nzb_path`. All found: set `last_check_ts` and `last_stat_ok_ts`. Any missing: flag a promote at once. Unknown (provider or network trouble): set `last_check_ts` only; alert when `last_stat_ok_ts` is older than 14 days.
 - An indexer that fails or answers partly makes the restore-path check "unchecked", never "no restore path". Unchecked never triggers a promote.
+- Restore path: a stored `nzb_path2` is STATed on both providers, and nothing is asked of an indexer while it is live and disjoint from `nzb_path` (weekly checks that locally; `nzb_path2` equal to or overlapping `nzb_path` is never OK). A STAT that fails for a reason other than a provider being unreachable (a disk fault reading the file, say) is "unchecked": it never clears `nzb_path2`. Only an NZB that is not valid or has lost articles is dead. When it is missing, not disjoint, or has lost articles, weekly searches, verifies a candidate by message-id and STAT, and stores it as `nzb_path2`. A candidate that overlaps the dead `nzb_path2` or `nzb_path` never counts. If nothing new and live turns up, weekly flags the loss (alert, event and promote flag) and clears `nzb_path2`; it never reports "OK". When the stored one is known dead but the search for a replacement was incomplete, weekly keeps the path, raises an alert and logs a `restore_nzb_lost` event with `unsure`, and reports the row as unchecked, never OK.
+
+#### Indexer etiquette (paid indexers ban for abuse)
+
+All of it lives in the client, which the runner keeps for weeks, so the caller never resets anything. Budgets are rolling 24-hour windows per indexer.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `NEWZNAB_SEARCH_BUDGET` | 30 | searches per indexer per 24 hours |
+| `NEWZNAB_GRAB_BUDGET` | 10 | NZB grabs per indexer per 24 hours |
+| `NEWZNAB_MIN_INTERVAL_S` | 2 | least seconds between two requests to one indexer |
+| `NEWZNAB_GRAB_INTERVAL` | 1 | least seconds between two NZB grabs |
+
+An indexer is dropped for the rest of the window after 3 errors in a row, and at once on a 429 or a newznab limit error (`<error code="429|500|501">`, also when it comes back as the answer to a grab). It is left alone for the `Retry-After` time, given in seconds or as an HTTP date and not capped; a missing or unreadable value means the whole window. A grab counts as a success only once the bytes are an NZB.
+
+`NewznabClient(state_path=...)` keeps the request times, the error counts and the drops in a JSON file (written atomically), so a restart or redeploy of the runner does not reset the budgets. Without a path they live in memory only. A file that cannot be read is ignored. A spent budget or a dropped indexer makes a check unchecked, never failed. API keys never appear in a repr, log line or exception, and the release link (which holds the key) is never used as the guid.
 - Each row's result is written as soon as it is known, through `update_if(..., expect_state="offloaded")`. A row the runner changed during the run is left alone.
 - The monthly full reads pick by the oldest attempt, not the oldest success, so one bad row cannot use the whole budget. A hash mismatch on a full read is treated like `bad_chunk`: `state=failed` and an alert. Three failed attempts in a row on network errors alert.
 - The report lists `offloaded` rows and every `failed` row with its `restore_note` and restore path.
@@ -219,11 +242,21 @@ The inputs are plain dicts shaped like Plex's JSON: `ratingKey`, `grandparentRat
 
 ### Promote order
 
-1. Read the middle through `RemoteReader` one chunk at a time. Check each chunk against the chunk list before it is written into the stub's holes; a mismatch stops the promote at once with `state=failed`, as in step 2. fsync.
+1. Read the middle through `RemoteReader` one chunk at a time.
+   - **Order:** start at the chunk that holds the newest `want` offset for this id and go to the end of the middle, then continue from the start of the middle. A newer `want` outside the next 64 MiB moves the cursor there. Chunks already written are skipped. With no `want`, start at the start of the middle.
+   - **Each chunk:**
+     - check it against the chunk list;
+     - `pwrite` it into the stub's hole and `fdatasync`;
+     - then append its start offset as one decimal line to `${TIERFS_MANIFESTS}/<id>.fill` and flush.
+   - **Resume:** a resumed promote trusts the chunks the fill file already lists.
+   - **API:** `ops.promote(..., want: Callable[[], int | None] | None = None)`. The runner passes `want`; promote calls it before each chunk, and it returns the newest wanted offset for this id, or None.
+   - **Errors:**
+     - a fetch error is retried with backoff for up to `TIERING_PROMOTE_RETRY_S` (default 600) per chunk;
+     - a BLAKE3 mismatch on two fetches stops the promote at once: append `failed <offset>` and set `state=failed`, as in step 2.
 2. Hash the whole stub with SHA-256. If it does not match the manifest, stop: set `state=failed`, keep the symlink, and alert. Nothing is swapped.
 3. Restore the stub's mtime.
 4. Link the stub to `L.tierfs-tmp`, then `rename` it over `L`.
-5. Unlink the stub path, remove the manifest and the chunk list, and set `state=whole`.
+5. Unlink the stub path, remove the manifest, the chunk list and the fill file, and set `state=whole`.
 
 ## Runner (`runner.py`)
 
@@ -232,9 +265,25 @@ Swaps are automatic. One long-running process applies the hot set.
 - **Each pass (every 60 s):**
   - read Plex sessions, play history back to `now - idle_days`, on deck, in progress and the tierfs events;
   - compute `desired_whole`, then `plan_actions`.
-- **Promotes run at once:**
-  - a live session first, then the rest of its season in episode order, then everything else;
-  - at most `TIERING_PROMOTE_CONCURRENCY` (default 2) at a time.
+- **Wanted promotes start within 1 s:**
+  - The runner follows `${TIERFS_EVENTS}` all the time, not only on each pass.
+  - The first `want` for an id starts that file's promote within 1 s. It goes ahead of every other promote and outside `TIERING_PROMOTE_CONCURRENCY`, so a wanted promote never waits in the queue.
+  - Later `want`s for the same id go to the running promote and move its cursor.
+  - A `want` for a row that is neither `offloaded` nor `promoting` is ignored.
+  - A `want` ignores the retry backoff, because a player is waiting. Wanted attempts on one id are at least 60 s apart (kept in `kv['want_last']`). A row in `state=failed` (for example after two BLAKE3 mismatches) is not retried by a `want`; the fill file's `failed` line already gives the player EIO.
+- **Other promotes run at once:**
+  - wanted promotes first, then weekly-flagged rows, then a live session's season in episode order, then everything else;
+  - at most `TIERING_PROMOTE_CONCURRENCY` (default 2) at a time, not counting wanted promotes.
+- **Weekly check:**
+  - The runner calls `weekly.run_weekly` at the start of the demote window when `kv['weekly_last_ts']` is 7 or more days old, and on start-up when it is. It then sets the timestamp.
+  - That night's demotes wait until the check is done.
+  - If the check fails, the runner alerts `weekly_failed` and retries after an hour. Demotes stay blocked until a check succeeds.
+  - Flags come only from `weekly_flag` events (`detail.reasons`), read after the cursor `kv['weekly_flag_cursor']`. They never come from `restore_note`, which the next good week overwrites.
+  - A flagged row is promoted whether or not the hot set wants it. Its flag is cleared only when its promote finishes.
+- **Qualify results:**
+  - `nzb_unsure` (a partial search or a spent budget) means "not tonight". The file stays whole, nothing is recorded, and it is tried the next night.
+  - Only `no_exact_nzb` means it is not on usenet.
+  - The runner keeps one `NewznabClient` for its whole life, built with `state_path=${TIERING_NEWZNAB_STATE}` (default `newznab_state.json` next to `TIERING_DB`), so budgets survive restarts.
 - **Demotes run only at night:**
   - only inside `TIERING_DEMOTE_WINDOW` (default `02:00-06:00`, local time);
   - only files that pass `qualify` that night, with the glacier gate "free" and nlink 1;

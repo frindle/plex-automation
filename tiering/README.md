@@ -75,6 +75,59 @@ A live run turns Unraid's turbo write on (`mdcmd set md_write_method 1`, reconst
 
 The run aborts if the array is stopped, a parity check/rebuild is running, or another glacier run holds the lock. If the mover is running (its pid file `/var/run/mover.pid`, which Mover Tuning also writes, or a process named `mover`), a live run waits for it to finish, at the start and before each unit, so both share one spin-up; if the move window ends first, the rest waits for the next night. A dry run goes ahead with a warning.
 
+## Offload intake (Python, `tiering/offload`)
+Env for the intake clients (the design is in `OFFLOAD_DESIGN.md`):
+- `TIERING_ARR_PATH_MAP` (`arr_prefix=share_prefix`, optional) maps Radarr/Sonarr paths to share paths; `TIERING_PATH_MAP` (`share_prefix=disk_prefix`, one entry per disk) finds the file to stat. `register` stores the share path.
+- `NEWZNAB_SEARCH_BUDGET` (30 per indexer per 24 hours), `NEWZNAB_GRAB_BUDGET` (10 per 24 hours), `NEWZNAB_MIN_INTERVAL_S` (2) and `NEWZNAB_GRAB_INTERVAL` (1) keep the indexers from banning the account. An indexer is dropped for the window after 3 errors in a row, or on a 429. The client can keep these budgets in a file (`state_path`), so a restart does not reset them.
+
+## Offload runner (deploy)
+
+`python -m offload.runner` is the long-running process that applies the hot set (see `OFFLOAD_DESIGN.md`). It is a dry run unless `TIERING_APPLY=1`. With `TIERING_APPLY=1` it refuses to start without `TIERING_GATE_PATH_MAP`, `TIERFS_STUB_ROOTS`, `TIERFS_EVENTS` (its directory must exist), `TIERFS_MOUNT` and `TIERFS_MANIFESTS`, and unless every disk prefix in `TIERING_PATH_MAP` is covered by a `TIERING_GATE_PATH_MAP` entry. A disk path no gate entry covers is never sent to the gate and counts as not free.
+
+`lib_path` in the database is the share path, the one Plex reports. The runner and ops resolve the disk path at the moment they need it, and a file that is not on exactly one disk is skipped and logged.
+
+Container requirements:
+- `pid: host`. Plex reads through Unraid's user share, so only the shfs daemon's open file descriptor shows that a file is in use. The runner has to see host processes to find it.
+- `cap_add: SYS_PTRACE`, so it can read `/proc/<pid>/fd` of those processes.
+- `TIERING_PROC_CANARY`: a comma list of `comm` names, every one of which must be visible from the runner: the media server (`Plex Media Serv`, the kernel cuts `comm` to 15 characters, so write it cut) and the user-share daemon (`shfs`). If it is unset or any name is not visible, the open-file check says "not clear" and ops refuses to demote, so a container that does not see host processes cannot demote.
+- Two kinds of mount: the share at the path Plex uses (so `lib_path` reads) and each `/mnt/diskN` (where file operations run, never through the share's FUSE layer).
+
+```yaml
+services:
+  tiering-runner:
+    image: plex-automation
+    command: python -m offload.runner
+    pid: host
+    cap_add: [SYS_PTRACE]
+    volumes:
+      - /mnt/user/media:/media                 # the share, at Plex's path
+      - /mnt/disk1:/mnt/disk1
+      - /mnt/disk2:/mnt/disk2
+      - /mnt/cache/appdata/tiering:/state
+    environment:
+      TIERING_DB: /state/tiering.db
+      TIERING_APPLY: "0"                       # "1" to apply
+      TIERING_PROC_CANARY: "Plex Media Serv,shfs"
+      TZ: Area/City                            # the demote window is local time: set your zone
+      TIERING_PATH_MAP: /media=/mnt/disk1/media,/media=/mnt/disk2/media
+      TIERING_ARR_PATH_MAP: /tv=/media/tv,/movies=/media/movies
+      TIERING_GATE_PATH_MAP: /mnt/disk1/media=/data/media,/mnt/disk2/media=/data/media
+      TIERFS_STUB_ROOTS: /mnt/disk1/.stubs,/mnt/disk2/.stubs
+      TIERFS_MOUNT: /tierfs
+      TIERFS_MANIFESTS: /state/manifests
+      TIERFS_EVENTS: /state/events.jsonl
+```
+
+Path settings, each a comma list:
+- `TIERING_PATH_MAP`: `share_prefix=disk_prefix`, one entry per disk; several entries may share one share prefix (`/media=/mnt/disk1/media,/media=/mnt/disk2/media`). Only a candidate that exists counts.
+- `TIERING_ARR_PATH_MAP`: `arr_prefix=share_prefix`, for arrs that see other paths than Plex (`/tv=/media/tv`). Used by register.
+- `TIERING_GATE_PATH_MAP`: `disk_prefix=deluge_prefix`, the disk path in the torrent client's namespace. Several disk prefixes may map to one client prefix.
+- `TIERFS_STUB_ROOTS`: one stub directory per disk (`/mnt/disk1/.stubs,/mnt/disk2/.stubs`). Ops picks the one on the same disk as the file.
+
+`TIERING_DEMOTE_WINDOW` is local time in the container, so set `TZ` (without it the window runs in UTC).
+
+Alerts go to `TIERING_ALERTS` (JSON lines): `bad_chunk`, `slot_timeout`, `promote_failed`, `promote_retrying` (3 failures in a row; retries back off from 5 minutes, doubling to 6 hours), `promote_worker_died`, `demote_failed`, `register_failed`, `weekly_failed`, `history_shrunk`, and once per id `promote_short_remote`, `takeover_orphan`, `l_missing` and `promote_stuck`. A row flagged by the weekly check is promoted whether or not the hot set wants it. The runner follows `TIERFS_EVENTS` all the time: the first `want` for a file starts its promote within 1 second, outside `TIERING_PROMOTE_CONCURRENCY`, and later `want`s move the promote's cursor. A `want` ignores the retry backoff but not more often than every 60 seconds per file, and never retries a `failed` row. The weekly check runs on start-up and at the start of the demote window when the last run is 7 days old (`kv weekly_last_ts`); that night's demotes wait for it, and a failed run alerts and is retried after an hour. Flags come only from `weekly_flag` events (cursor `kv weekly_flag_cursor`) and end when the promote finishes. A qualify result of `nzb_unsure` means not tonight: nothing is written and the file is tried the next night. One Newznab client serves qualify and the weekly check; its budgets live in `TIERING_NEWZNAB_STATE` (default `newznab_state.json` next to `TIERING_DB`), the weekly report in `TIERING_WEEKLY_REPORT` (default `weekly_report.md` there). `/healthz` reports `worker_deaths` and `stuck_promotes`. The runner keeps its own last-play time per title in the state DB; when Plex's play history is empty or over 20% shorter than last time it refuses that night's demotes (after a deliberate purge, `DELETE FROM kv WHERE key='history_count'`). A register with errors, or with missing or ambiguous files over 5% of the files it listed, blocks that night's demotes.
+
 ## Tests (run on a Linux test box)
 ```
 bash tiering/tests/test_glacier.sh        # fake /mnt tree, df and torrent gate stubbed
