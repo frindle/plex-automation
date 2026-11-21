@@ -18,6 +18,9 @@ from offload.runner import Config, Deps, Runner  # noqa: E402
 
 GB = 10**9
 NIGHT = datetime(2026, 3, 10, 3, 0).timestamp()  # inside 02:00-06:00
+GOOD_REGISTER = {"listed": 100, "missing_local": 0, "ambiguous": 0, "errors": 0, "new": 0,
+                 "updated": 0, "unchanged": 100, "skipped_state": 0, "unlisted": 0,
+                 "applied": True}
 NOON = datetime(2026, 3, 10, 12, 0).timestamp()
 
 
@@ -52,6 +55,7 @@ class FakeState:
 
     def __init__(self, clock):
         self.rows, self.evlog, self.mu, self.clock = {}, [], threading.Lock(), clock
+        self.kv, self.plays_seen = {}, {}
 
     def open_db(self, path):
         return self
@@ -86,9 +90,23 @@ class FakeState:
     def log_event(self, db, id, kind, detail):
         self.evlog.append((id, kind, detail))
 
-    def events(self, db, id=None):
-        return [{"id": i, "kind": k, "detail": d} for i, k, d in self.evlog
-                if id in (None, i)]
+    def events(self, db, id=None, after_seq=0):
+        return [{"seq": n, "id": i, "kind": k, "detail": d}
+                for n, (i, k, d) in enumerate(self.evlog, 1)
+                if id in (None, i) and n > after_seq]
+
+    def kv_get(self, db, key, default=None):
+        return self.kv.get(key, default)
+
+    def kv_set(self, db, key, value):
+        self.kv[key] = json.loads(json.dumps(value))
+
+    def last_plays(self, db):
+        return dict(self.plays_seen)
+
+    def merge_last_plays(self, db, plays):
+        for k, v in plays.items():
+            self.plays_seen[str(k)] = max(self.plays_seen.get(str(k), 0), float(v))
 
 
 class World:
@@ -433,7 +451,7 @@ def test_gate_path_map():
     assert runner.gate_path("/mnt/disk1/a.mkv", pairs) == "/data/a.mkv"
     assert runner.gate_path("/mnt/disk2/a.mkv", pairs) == "/data/a.mkv"
     assert runner.gate_path("/mnt/disk2/deep/a.mkv", pairs) == "/deep/a.mkv"
-    assert runner.gate_path("/mnt/disk10/a.mkv", pairs) == "/mnt/disk10/a.mkv"
+    assert runner.gate_path("/mnt/disk10/a.mkv", pairs) is None  # unmapped: never sent to the gate
 
 
 def test_plex_file_paths_match_rows_by_share_path(tmp_path, monkeypatch):
@@ -521,6 +539,8 @@ def test_config_defaults_and_overrides(tmp_path):
     assert c.alerts == str(tmp_path / "alerts.jsonl") and c.http == "127.0.0.1:8471"
     c = Config.from_env({"TIERING_DB": str(tmp_path / "t.db"), "TIERING_APPLY": "1",
                          "TIERING_GATE_PATH_MAP": "/a=/data/a", "TIERFS_STUB_ROOTS": "/d/s",
+                         "TIERFS_EVENTS": str(tmp_path / "ev.jsonl"), "TIERFS_MOUNT": "/tfs",
+                         "TIERFS_MANIFESTS": "/m",
                          "TIERING_NEVER_SECTIONS": "A, B", "TIERING_KEEP_4K": "1",
                          "TIERING_MAX_STREAM_KBPS": "9000", "TIERING_DEMOTE_GB_PER_NIGHT": "1.5"})
     assert c.apply and c.hot.never_sections == ("A", "B") and c.hot.keep_4k
@@ -570,9 +590,14 @@ def test_qualified_row_reaches_ops_with_sha256(w):
     assert "steps" not in w.state.rows["a"]
 
 
+def _TFS(tmp_path):
+    return {"TIERFS_EVENTS": str(tmp_path / "ev.jsonl"), "TIERFS_MOUNT": "/tfs",
+            "TIERFS_MANIFESTS": "/m"}
+
+
 def test_apply_needs_gate_path_map(tmp_path):
     env = {"TIERING_DB": str(tmp_path / "t.db"), "TIERING_APPLY": "1",
-           "TIERFS_STUB_ROOTS": "/mnt/disk1/s"}
+           "TIERFS_STUB_ROOTS": "/mnt/disk1/s", **_TFS(tmp_path)}
     with pytest.raises(ValueError, match="TIERING_GATE_PATH_MAP"):
         Config.from_env(env)
     with pytest.raises(ValueError):
@@ -585,7 +610,7 @@ def test_apply_needs_gate_path_map(tmp_path):
 
 def test_apply_needs_stub_roots(tmp_path):
     env = {"TIERING_DB": str(tmp_path / "t.db"), "TIERING_APPLY": "1",
-           "TIERING_GATE_PATH_MAP": "/mnt/a=/data/a"}
+           "TIERING_GATE_PATH_MAP": "/mnt/a=/data/a", **_TFS(tmp_path)}
     with pytest.raises(ValueError, match="TIERFS_STUB_ROOTS"):
         Config.from_env(env)
     assert runner.main(["--once"], env=env, deps=object()) == 2
@@ -703,10 +728,13 @@ def test_load_deps_passes_path_map_and_no_stub_root(tmp_path, monkeypatch):
 
 
 def test_register_unhealthy_results_block_demotes_and_alert(tmp_path, monkeypatch):
-    cases = [({"errors": 1, "listed": 100}, True), ({"listed": 100, "missing_local": 6}, True),
-             ({"listed": 100, "missing_local": 3, "ambiguous": 3}, True),
-             ({"listed": 100, "missing_local": 5}, False), ({"new": 2}, False), ({}, False),
-             ({"missing_local": 1}, True)]
+    def r(**kw):
+        return {"listed": 100, "missing_local": 0, "ambiguous": 0, "errors": 0, **kw}
+    cases = [(r(errors=1), True), (r(missing_local=6), True),
+             (r(missing_local=3, ambiguous=3), True), (r(missing_local=5), False),
+             (r(), False), ({"new": 2}, True), ({}, True), (r(listed=0), True),
+             ({"missing_local": 1}, True), (None, True), (r(errors=[1]), True),
+             (r(ambiguous="0"), True), (r(missing_local=True), True)]
     for i, (res, bad) in enumerate(cases):
         sub = tmp_path / str(i)
         sub.mkdir()
@@ -738,7 +766,7 @@ def test_ops_events_alert_once_per_id(tmp_path, monkeypatch):
 def test_register_runs_once_a_night_before_window(tmp_path, monkeypatch):
     w = World(tmp_path, monkeypatch, clock_t=NOON)
     calls = []
-    w.runner.deps.register = lambda db, apply: calls.append(apply) or {"new": 0}
+    w.runner.deps.register = lambda db, apply: calls.append(apply) or dict(GOOD_REGISTER)
     w.row("a", 1, w.movie(1), "whole")
     w.run()
     assert calls == []  # 12:00 is more than an hour before 02:00
@@ -770,7 +798,7 @@ def test_register_failure_skips_the_nights_demotes(tmp_path, monkeypatch, caplog
 def test_register_dry_run_passes_apply_false(tmp_path, monkeypatch):
     w = World(tmp_path, monkeypatch, apply=False)
     calls = []
-    w.runner.deps.register = lambda db, apply: calls.append(apply) or {}
+    w.runner.deps.register = lambda db, apply: calls.append(apply) or dict(GOOD_REGISTER)
     w.row("a", 1, w.movie(1), "whole")
     w.run()
     assert calls == [False] and w.ops("demote") == []

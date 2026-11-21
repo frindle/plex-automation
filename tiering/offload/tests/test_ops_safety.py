@@ -266,6 +266,20 @@ def test_canary_visible_is_clear(env, monkeypatch):
         p.wait()
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc")
+def test_canary_list_needs_every_name_visible(env, monkeypatch):
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        comm = open(f"/proc/{p.pid}/comm").read().strip()
+        monkeypatch.setenv("TIERING_PROC_CANARY", f"{comm}, no-such-comm-xyz")
+        assert -1 in ops.scan_open_holders(env.lib, ignore_unreadable=True)
+        monkeypatch.setenv("TIERING_PROC_CANARY", f"{comm},{comm}")
+        assert ops.scan_open_holders(env.lib, ignore_unreadable=True) == []
+    finally:
+        p.kill()
+        p.wait()
+
+
 def test_step3_rehashes_stub_and_refuses_on_mismatch(env):
     with pytest.raises(Crash):
         env.offload(after_step=env.hook(2))
