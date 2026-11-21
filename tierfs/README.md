@@ -69,9 +69,10 @@ to the host (and from there to Plex) with `rshared` propagation:
       -v /srv/tierfs/mnt:/mnt/tierfs:rshared \
       -v /srv/tierfs/manifests:/manifests:ro \
       -v /srv/stubs:/srv/stubs \
+      -v /srv/tierfs/events:/events \
       -e TIERFS_MOUNT=/mnt/tierfs \
       -e TIERFS_MANIFESTS=/manifests \
-      -e TIERFS_EVENTS=/manifests/../events/events.jsonl \
+      -e TIERFS_EVENTS=/events/events.jsonl \
       -e TIERFS_REMOTE_BASE=http://altmount:8080 \
       -e TIERFS_REMOTE_USER=user -e TIERFS_REMOTE_PASS=pass \
       tierfs
