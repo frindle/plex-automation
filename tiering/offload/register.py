@@ -1,0 +1,357 @@
+"""Create and refresh ``whole`` rows from Radarr and Sonarr.
+
+Run once a night before the demote window (the runner calls ``register``).
+
+For every movie file and episode file the arrs list, it upserts a row keyed on
+``lib_path``, which is the share path ("Path namespaces" in OFFLOAD_DESIGN.md): the arr's
+path mapped through TIERING_ARR_PATH_MAP, never a disk path. Size and mtime come from
+the one existing disk candidate of that share path (``resolve``). No candidate counts as
+``missing_local`` and several as ``ambiguous``; the file is skipped and counted, never
+guessed. The result carries ``listed`` (distinct share paths the arrs listed) next to
+those counts so the caller can see trouble. An arr path that is under a
+``TIERING_PATH_MAP`` disk prefix is rewritten to its share path with the reverse of the
+map (``/mnt/disk1/movies/m.mkv`` becomes ``/mnt/user/movies/m.mkv``) and counted as
+``disk_path_mapped``; a disk path no entry covers (an unraid disk or cache mount, or a
+share equal to its disk) is skipped and counted as ``disk_path``. ``lib_path`` never holds
+a disk path:
+
+- a new row gets a fresh random 16-hex ``id``, ``state=whole``, ``size``,
+  ``mtime_ns`` and the media identity (``title``, ``year``, ``imdb_id``,
+  ``tvdb_id``, ``season``, ``episode``, ``release_name``). ``sha256`` stays empty
+  until qualify fills it;
+- an existing row is only touched while ``state=whole``. Its identity fields are
+  refreshed; when the size or mtime differs it takes the new ones and clears
+  ``sha256``, ``head_b3``, ``tail_b3``, ``head_len``, ``tail_len``, ``nzb_path``
+  and ``remote_path``, so qualify finds the NZB of the file that is there now. The write is
+  ``update_if(db, id, "whole", ...)``, so a row the runner moved on is left alone;
+- it never deletes a row. A path the arrs no longer list is logged (only when
+  both Radarr and Sonarr are configured and every arr answered: a missing answer
+  is not a missing file);
+- ``apply=False`` writes nothing and only reports what it would do.
+
+Environment (nothing here is ever logged, including keys and URLs):
+  RADARR_URL, RADARR_API_KEY
+  SONARR_URL, SONARR_API_KEY   a comma list for more than one Sonarr; one key may
+                               be given to be used for all of them
+  TIERING_ARR_PATH_MAP         ``arr_prefix=share_prefix`` pairs, comma separated, the
+                               longest matching prefix wins. Optional: unset means the
+                               arrs report the share path (the one Plex reports)
+  TIERING_PATH_MAP             ``share_prefix=disk_prefix``, one entry per disk (see
+                               paths.py). Used only to find the file to stat; it never
+                               changes the path that is stored. Unset: the share path
+                               itself is stat'ed
+  TIERING_ARR_ALLOW_HTTP=1     allow plain http to an arr that is not on localhost
+                               (a trusted LAN only; the key is sent in a header)
+
+The API key is sent in the ``X-Api-Key`` header, never in a URL. mtime comes from
+the local file: the arrs do not report it.
+
+State functions used: ``by_path``, ``upsert``, ``update_if``, ``list_files``,
+``log_event``.
+"""
+from __future__ import annotations
+
+import http.client
+import json
+import logging
+import os
+import re
+import secrets
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from . import paths
+
+log = logging.getLogger(__name__)
+
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+_LIMIT = 256 * 1024 * 1024
+STALE = ("sha256", "head_b3", "tail_b3", "head_len", "tail_len", "nzb_path", "nzb_path2",
+         "restore_score", "restore_note", "remote_path")
+IDENTITY = ("title", "year", "imdb_id", "tvdb_id", "season", "episode", "release_name")
+
+
+class ArrError(Exception):
+    pass
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **kw):  # the key header must not follow a redirect
+        return None
+
+
+class ArrClient:
+    """Minimal Radarr/Sonarr v3 API client. The key is a header and is never logged."""
+
+    def __init__(self, url: str, key: str, timeout: float = 60.0, allow_http: bool = False):
+        u = urllib.parse.urlsplit(url.strip())
+        if not u.hostname or u.scheme not in ("http", "https"):
+            raise ArrError("bad arr url")
+        if u.scheme == "http" and u.hostname not in _LOCAL_HOSTS and not allow_http:
+            raise ArrError("plain http is only allowed to localhost")
+        if not key:
+            raise ArrError("missing api key")
+        self._base = url.strip().rstrip("/")
+        self._key = key
+        self._timeout = timeout
+        ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        self._opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx), _NoRedirect())
+
+    def __repr__(self) -> str:
+        return "ArrClient()"
+
+    def get(self, path: str, **params):
+        q = urllib.parse.urlencode(params)
+        req = urllib.request.Request(f"{self._base}{path}" + (f"?{q}" if q else ""),
+                                     headers={"X-Api-Key": self._key, "Accept": "application/json"})
+        try:
+            with self._opener.open(req, timeout=self._timeout) as r:
+                raw = r.read(_LIMIT + 1)
+        except urllib.error.HTTPError as e:
+            raise ArrError(f"arr status {e.code}") from None
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            raise ArrError(f"arr unreachable: {type(e).__name__}") from None
+        if len(raw) > _LIMIT:
+            raise ArrError("response too large")
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise ArrError("arr sent bad json") from None
+
+
+def _movie_files(client: ArrClient):
+    for m in client.get("/api/v3/movie"):
+        f = m.get("movieFile") if isinstance(m, dict) else None
+        if not f or not f.get("path"):
+            continue
+        yield {"path": f["path"], "size": f.get("size"), "scene": f.get("sceneName"),
+               "title": m.get("title"), "year": m.get("year") or None,
+               "imdb_id": m.get("imdbId") or None, "tvdb_id": None,
+               "season": None, "episode": None}
+
+
+def _episode_files(client: ArrClient):
+    for s in client.get("/api/v3/series"):
+        sid = s.get("id")
+        if sid is None:
+            continue
+        seen: dict = {}
+        for ep in client.get("/api/v3/episode", seriesId=sid, includeEpisodeFile="true"):
+            f = ep.get("episodeFile")
+            if not f or not f.get("path"):
+                continue
+            key = (ep.get("seasonNumber"), ep.get("episodeNumber"))
+            # a file that holds several episodes is listed once, under the first
+            if f["path"] not in seen or key < seen[f["path"]][0]:
+                seen[f["path"]] = (key, ep, f)
+        for _, ep, f in seen.values():
+            yield {"path": f["path"], "size": f.get("size"), "scene": f.get("sceneName"),
+                   "title": s.get("title"), "year": s.get("year") or None,
+                   "imdb_id": s.get("imdbId") or None, "tvdb_id": s.get("tvdbId") or None,
+                   "season": ep.get("seasonNumber"), "episode": ep.get("episodeNumber")}
+
+
+def map_path(path: str, pairs: list[tuple[str, str]]) -> str:
+    """Map an arr path to the share path; unchanged when no prefix matches."""
+    for src, dst in pairs:
+        if path == src or path.startswith(src + "/"):
+            return dst + path[len(src):]
+    return path
+
+
+def default_resolver(env=None):
+    """``resolve(share_path) -> [disk paths that exist]`` from TIERING_PATH_MAP.
+
+    Unset: the share path itself, when it exists."""
+    e = os.environ if env is None else env
+    spec = (e.get("TIERING_PATH_MAP") or "").strip()
+    if not spec:
+        return lambda p: [os.path.normpath(p)] if os.path.lexists(p) else []
+    pairs = paths.parse_path_map(spec)
+    return lambda p: paths.disk_paths(p, pairs)
+
+
+def _split(raw: str | None) -> list[str]:
+    return [x.strip() for x in (raw or "").split(",") if x.strip()]
+
+
+def clients_from_env(env=None) -> tuple[list[ArrClient], list[ArrClient]]:
+    e = os.environ if env is None else env
+    allow = e.get("TIERING_ARR_ALLOW_HTTP", "") in ("1", "true", "yes")
+
+    def build(url_var: str, key_var: str) -> list[ArrClient]:
+        urls, keys = _split(e.get(url_var)), _split(e.get(key_var))
+        if not urls:
+            return []
+        if len(keys) == 1:
+            keys = keys * len(urls)
+        if len(keys) != len(urls):
+            raise ArrError(f"{key_var} must have one key, or one per url")
+        return [ArrClient(u, k, allow_http=allow) for u, k in zip(urls, keys)]
+
+    return build("RADARR_URL", "RADARR_API_KEY"), build("SONARR_URL", "SONARR_API_KEY")
+
+
+def _entry_row(ent: dict, local: str, size: int, mtime_ns: int) -> dict:
+    scene = (ent.get("scene") or "").strip()
+    release = scene or os.path.splitext(os.path.basename(local))[0]
+    return {"title": ent.get("title"), "year": ent.get("year"), "imdb_id": ent.get("imdb_id"),
+            "tvdb_id": ent.get("tvdb_id"), "season": ent.get("season"),
+            "episode": ent.get("episode"), "release_name": release,
+            "size": size, "mtime_ns": mtime_ns}
+
+
+def _disk_map(env=None) -> list[tuple[str, str]]:
+    e = os.environ if env is None else env
+    return paths.parse_path_map(e.get("TIERING_PATH_MAP"))
+
+
+def _under(path: str, prefix: str) -> bool:
+    return prefix == "/" or path == prefix or path.startswith(prefix.rstrip("/") + "/")
+
+
+_MNT = re.compile(r"^/mnt/([^/]+)")
+_SLASHES = re.compile(r"/{2,}")
+
+
+def clean_path(path: str) -> str:
+    """Repeated slashes collapsed to one and ``/mnt/user0`` (the array without the cache)
+    written as ``/mnt/user``. ``..`` is not resolved."""
+    p = _SLASHES.sub("/", path)
+    if p == "/mnt/user0" or p.startswith("/mnt/user0/"):
+        p = "/mnt/user" + p[len("/mnt/user0"):]
+    return p
+
+
+def is_disk_path(path: str, disk_map: list[tuple[str, str]]) -> bool:
+    """True when the path is not an array path: under a ``disk_map`` disk prefix, or under
+    any ``/mnt/<x>`` other than ``/mnt/user`` (a disk, a named pool, ``/mnt/disks``,
+    ``/mnt/remotes``...) that no map share prefix covers."""
+    norm = os.path.normpath(clean_path(path))
+    if any(_under(norm, d) for _s, d in disk_map):
+        return True
+    if any(_under(norm, sh) for sh, _d in disk_map):
+        return False
+    m = _MNT.match(norm)
+    return bool(m) and m.group(1) != "user"
+
+
+def to_share(path: str, disk_map: list[tuple[str, str]]) -> str:
+    """The share path of a path under a ``disk_map`` disk prefix (the reverse of the map,
+    longest disk prefix first); any other path is returned unchanged."""
+    norm = os.path.normpath(path)
+    best = None
+    for share, disk in disk_map:
+        if _under(norm, disk) and (best is None or len(disk) > len(best[1])):
+            best = (share, disk)
+    if best is None:
+        return path
+    share, disk = best
+    rest = norm if disk == "/" else norm[len(disk):]
+    return (share.rstrip("/") + rest) if share != "/" else rest
+
+
+def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map=None,
+             resolve=None, stat=os.stat, new_id=None, disk_map=None) -> dict:
+    """Sync rows from the arrs. Returns counts; with ``apply=False`` nothing is written.
+
+    ``arr_map`` is ``arr=share,...`` text or a list of pairs (default: TIERING_ARR_PATH_MAP).
+    ``resolve(share_path)`` returns the existing disk paths (default: from TIERING_PATH_MAP).
+    ``disk_map`` is the ``(share, disk)`` pairs (default: TIERING_PATH_MAP). An arr path under
+    a disk prefix is rewritten to its share path and counted as ``disk_path_mapped``; one that
+    no entry can turn into a share path is skipped and counted as ``disk_path``.
+    ``lib_path`` is never a disk path.
+    """
+    if state is None:
+        from . import state as _state
+        state = _state
+    if radarrs is None and sonarrs is None:
+        radarrs, sonarrs = clients_from_env()
+    if arr_map is None:
+        arr_map = os.environ.get("TIERING_ARR_PATH_MAP")
+    pmap = paths.parse_path_map(arr_map) if isinstance(arr_map, str) or arr_map is None \
+        else list(arr_map)
+    resolve = resolve or default_resolver()
+    if disk_map is None:
+        disk_map = _disk_map()
+    new_id = new_id or (lambda: secrets.token_hex(8))
+    out = {"new": 0, "updated": 0, "unchanged": 0, "skipped_state": 0, "listed": 0,
+           "missing_local": 0, "ambiguous": 0, "disk_path": 0,
+           "disk_path_mapped": 0, "unlisted": 0, "errors": 0,
+           "applied": bool(apply)}
+
+    listed: set[str] = set()
+    complete = True
+    sources = [(c, _movie_files) for c in (radarrs or [])] + \
+              [(c, _episode_files) for c in (sonarrs or [])]
+    for client, lister in sources:
+        try:
+            ents = list(lister(client))
+        except ArrError as e:
+            out["errors"] += 1
+            complete = False
+            log.warning("register: an arr did not answer (%s)", e)
+            continue
+        for ent in ents:
+            arr_path = map_path(clean_path(str(ent["path"])), pmap)
+            local = clean_path(to_share(arr_path, disk_map))  # the share path: what is stored
+            if is_disk_path(local, disk_map):
+                # a disk path no map entry can turn into a share path: never stored
+                out["disk_path"] += 1
+                log.warning("register: an arr lists a disk path no map entry covers, skipped")
+                continue
+            if to_share(arr_path, disk_map) != arr_path:
+                out["disk_path_mapped"] += 1
+            if local in listed:
+                continue
+            listed.add(local)
+            out["listed"] += 1
+            cands = list(resolve(local))
+            if len(cands) != 1:
+                out["missing_local" if not cands else "ambiguous"] += 1
+                log.warning("register: %d disk paths for a listed file, skipped", len(cands))
+                continue
+            try:
+                st = stat(cands[0])
+            except OSError:
+                out["missing_local"] += 1
+                continue
+            size = int(st.st_size)  # the real file, not the arr's idea of it
+            want = _entry_row(ent, local, size, st.st_mtime_ns)
+            have = state.by_path(db, local)
+            if have is None:
+                out["new"] += 1
+                if apply:
+                    state.upsert(db, {"id": new_id(), "lib_path": local, "state": "whole",
+                                      **want})
+                continue
+            if have.get("state") != "whole":
+                out["skipped_state"] += 1
+                continue
+            change = {k: v for k, v in want.items()
+                      if k in IDENTITY and v is not None
+                      and (have.get(k) is None or str(have.get(k)) != str(v))}
+            if have.get("size") != size or have.get("mtime_ns") != st.st_mtime_ns:
+                # a changed file is a different release: every fact about the old bytes goes
+                change.update(size=size, mtime_ns=st.st_mtime_ns, **{k: None for k in STALE})
+            if not change:
+                out["unchanged"] += 1
+                continue
+            out["updated"] += 1
+            if apply and not state.update_if(db, have["id"], "whole", **change):
+                out["updated"] -= 1
+                out["skipped_state"] += 1
+
+    if complete and radarrs and sonarrs:  # one arr alone does not list the other's files
+        for row in state.list_files(db):
+            lp = row.get("lib_path")
+            if lp and lp not in listed:
+                out["unlisted"] += 1
+                log.info("register: the arrs no longer list row %s", row.get("id"))
+                if apply:
+                    state.log_event(db, row["id"], "register_unlisted", {})
+    return out

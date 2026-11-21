@@ -75,6 +75,11 @@ A live run turns Unraid's turbo write on (`mdcmd set md_write_method 1`, reconst
 
 The run aborts if the array is stopped, a parity check/rebuild is running, or another glacier run holds the lock. If the mover is running (its pid file `/var/run/mover.pid`, which Mover Tuning also writes, or a process named `mover`), a live run waits for it to finish, at the start and before each unit, so both share one spin-up; if the move window ends first, the rest waits for the next night. A dry run goes ahead with a warning.
 
+## Offload intake (Python, `tiering/offload`)
+Env for the intake clients (the design is in `OFFLOAD_DESIGN.md`):
+- `TIERING_ARR_PATH_MAP` (`arr_prefix=share_prefix`, optional) maps Radarr/Sonarr paths to share paths; `TIERING_PATH_MAP` (`share_prefix=disk_prefix`, one entry per disk) finds the file to stat. `register` stores the share path.
+- `NEWZNAB_SEARCH_BUDGET` (30 per indexer per 24 hours), `NEWZNAB_GRAB_BUDGET` (10 per 24 hours), `NEWZNAB_MIN_INTERVAL_S` (2) and `NEWZNAB_GRAB_INTERVAL` (1) keep the indexers from banning the account. An indexer is dropped for the window after 3 errors in a row, or on a 429. The client can keep these budgets in a file (`state_path`), so a restart does not reset them.
+
 ## Tests (run on a Linux test box)
 ```
 bash tiering/tests/test_glacier.sh        # fake /mnt tree, df and torrent gate stubbed
