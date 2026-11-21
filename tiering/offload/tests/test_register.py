@@ -37,7 +37,7 @@ def arrs(tmp_path):
 def run(st, radarr=None, sonarr=None, apply=True, tmp_path=None, **kw):
     pm = f"/data={tmp_path}/lib" if tmp_path else None
     return rg.register(None, apply, state=st, radarrs=[rg.ArrClient(a.url, a.key) for a in radarr or []],
-                       sonarrs=[rg.ArrClient(a.url, a.key) for a in sonarr or []], path_map=pm, **kw)
+                       sonarrs=[rg.ArrClient(a.url, a.key) for a in sonarr or []], arr_map=pm, **kw)
 
 
 def test_new_movie_row_with_identity_and_path_map(tmp_path, arrs):

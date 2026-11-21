@@ -22,8 +22,10 @@ class Env:
     def __init__(self, tmp_path, names, alts=None):
         self.tmp = tmp_path
         self.names = names
-        self.prim = FakeNntp([i for n in names for i in ids_for(n)])
-        self.sec = FakeNntp([i for n in names for i in ids_for(n)])
+        # the alternatives' articles are on both providers: an alternative must be live
+        live = [i for n in names for i in ids_for(n)] + [f"alt-{n}@t" for n in names]
+        self.prim = FakeNntp(live)
+        self.sec = FakeNntp(live)
         rels = {}
         for n in (alts if alts is not None else names):
             rels[f"alt-{n}"] = {"title": f"{n}.2020.1080p.WEB-DL-ALT", "nzb": make_nzb([f"alt-{n}@t"])}

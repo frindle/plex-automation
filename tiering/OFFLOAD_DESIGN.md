@@ -45,7 +45,7 @@ These names apply to each library file system.
       - `TIERING_PATH_MAP` holds one `share_prefix=disk_prefix` entry per disk.
       - Only candidates that exist count. Zero or several means skip and log.
     - `ops` resolves the path itself, on both demote and promote, and refuses unless there is exactly one disk path. It never writes a disk path into the database. The manifest's `lib_path` may hold the disk path.
-    - `register` stores the arr's path, mapped through `TIERING_ARR_PATH_MAP` (`arr_prefix=share_prefix`) when the arrs see different paths from Plex. Its stat (size and mtime) goes to the resolved disk path.
+    - `register` stores the arr's path, mapped through `TIERING_ARR_PATH_MAP` (`arr_prefix=share_prefix`, optional, identity when unset) when the arrs see different paths from Plex. Its stat (size and mtime) goes to exactly one existing disk candidate from `paths.disk_paths(share, TIERING_PATH_MAP)`, or to the share path itself when `TIERING_PATH_MAP` is unset. Zero candidates count as `missing_local` and several as `ambiguous`; the file is skipped, and the result's `listed`, `missing_local` and `ambiguous` counts let the caller see trouble.
     - The runner:
       - matches Plex files to rows by the share path;
       - in reconcile, reads the link at the resolved disk path;
@@ -160,6 +160,10 @@ The `files` table has these columns:
 `qualify` decides whether one whole file may be offloaded tonight.
 - **Same bytes:** it hashes `L` itself with a fresh full read and hashes the remote copy, and both must equal. It never trusts a stored `sha256`. It writes the hash it saw into the row's `sha256`.
 - **Restore path:** another release at or above the quality floor that is a different upload. Any candidate whose NZB shares message-ids with the `nzb_path` NZB is the same upload, whatever its name. Size alone never decides.
+  - Message-ids are compared without `<>` or white space, and case-sensitive.
+  - The candidate's NZB is STATed, every segment on every configured provider, like `nzb_path`'s, before it counts. A candidate with missing articles is not a restore path.
+  - The first candidate that is disjoint and live is archived as `nzb_path2`. `QualifyResult.fields` always carries `nzb_path2`, `None` when there is no such candidate, so a stale one is cleared.
+  - qualify searches once and reuses that search for the exact NZB and for the restore path.
 - **Quality floor:** taken from the source's resolution. When the source resolution is unknown, the floor is 1080p.
 - **Unsure is a fail:** an indexer or provider that did not answer, or a partial search, never passes.
 - `QualifyResult.fields` holds only `files` columns.
@@ -171,7 +175,7 @@ Offload step 3 hashes `L` again in the read that builds the chunk list. If that 
 - `register(db, apply)` runs once a night before the demote window, and the runner calls it.
 - It reads every movie file and episode file from Radarr and Sonarr through their APIs (`RADARR_URL`, `SONARR_URL`, keys from env; more than one Sonarr is a comma list).
 - For each file it upserts a row by `lib_path`. A new row gets a fresh `<id>`, `state=whole`, `size`, `mtime_ns` and the media identity: `title`, `year`, `imdb_id`, `tvdb_id`, `season`, `episode`, and `release_name` (the arr's scene name, else the file name). `sha256` stays empty until qualify fills it.
-- An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`.
+- An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`, `nzb_path`, `nzb_path2`, `restore_score`, `restore_note`, `remote_path` and the head/tail facts.
 - It never deletes a row. A path the arrs no longer list is logged.
 - The runner fills `rating_key`, `kind` and `is4k` from Plex.
 - `lib_path` is the share path (see "Path namespaces"). `TIERING_ARR_PATH_MAP` maps arr paths to share paths when they differ. Size and mtime come from the resolved disk path.
@@ -180,6 +184,20 @@ Offload step 3 hashes `L` again in the read that builds the chunk list. If that 
 
 - STAT every segment of each `offloaded` row's `nzb_path`. All found: set `last_check_ts` and `last_stat_ok_ts`. Any missing: flag a promote at once. Unknown (provider or network trouble): set `last_check_ts` only; alert when `last_stat_ok_ts` is older than 14 days.
 - An indexer that fails or answers partly makes the restore-path check "unchecked", never "no restore path". Unchecked never triggers a promote.
+- Restore path: a stored `nzb_path2` is STATed on both providers, and nothing is asked of an indexer while it is live and disjoint from `nzb_path` (weekly checks that locally; `nzb_path2` equal to or overlapping `nzb_path` is never OK). When it is missing, not disjoint, or has lost articles, weekly searches, verifies a candidate by message-id and STAT, and stores it as `nzb_path2`. A candidate that overlaps the dead `nzb_path2` or `nzb_path` never counts. If nothing new and live turns up, weekly flags the loss (alert, event and promote flag) and clears `nzb_path2`; it never reports "OK".
+
+#### Indexer etiquette (paid indexers ban for abuse)
+
+All of it lives in the client, which the runner keeps for weeks, so the caller never resets anything. Budgets are rolling 24-hour windows per indexer.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `NEWZNAB_SEARCH_BUDGET` | 30 | searches per indexer per 24 hours |
+| `NEWZNAB_GRAB_BUDGET` | 10 | NZB grabs per indexer per 24 hours |
+| `NEWZNAB_MIN_INTERVAL_S` | 2 | least seconds between two requests to one indexer |
+| `NEWZNAB_GRAB_INTERVAL` | 1 | least seconds between two NZB grabs |
+
+An indexer is dropped for the rest of the window after 3 errors in a row, and at once on a 429 (for the `Retry-After` time when given). A spent budget or a dropped indexer makes a check unchecked, never failed. API keys never appear in a repr, log line or exception, and the release link (which holds the key) is never used as the guid.
 - Each row's result is written as soon as it is known, through `update_if(..., expect_state="offloaded")`. A row the runner changed during the run is left alone.
 - The monthly full reads pick by the oldest attempt, not the oldest success, so one bad row cannot use the whole budget. A hash mismatch on a full read is treated like `bad_chunk`: `state=failed` and an alert. Three failed attempts in a row on network errors alert.
 - The report lists `offloaded` rows and every `failed` row with its `restore_note` and restore path.

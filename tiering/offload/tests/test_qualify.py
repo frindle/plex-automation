@@ -15,7 +15,7 @@ ALT = "Movie.2020.1080p.WEB-DL-ALT"
 
 
 class World:
-    def __init__(self, tmp_path, alt_title=ALT, content=None):
+    def __init__(self, tmp_path, alt_title=ALT, content=None, alt_live=True):
         self.content = content or os.urandom(50_000)
         self.nzb = make_nzb(IDS)
         self.dav = FakeDav({f"/movies/{REL}/{REL}.mkv": self.content})
@@ -24,7 +24,8 @@ class World:
         if alt_title:
             rels["alt"] = {"title": alt_title, "nzb": make_nzb([f"alt{i}@t" for i in range(5)])}
         self.nz = FakeNewznab(rels)
-        self.prim, self.sec = FakeNntp(IDS), FakeNntp(IDS)
+        alt_ids = [f"alt{i}@t" for i in range(5)] if alt_live else []
+        self.prim, self.sec = FakeNntp(IDS + alt_ids), FakeNntp(IDS + alt_ids)
         self.lib = tmp_path / "lib.mkv"
         self.lib.write_bytes(self.content)  # L: what is on disk now
         self.row = {"id": "a" * 16, "lib_path": str(self.lib), "release_name": REL,
@@ -68,7 +69,7 @@ def test_perfect_fixture_passes(world):
     assert set(f) <= set(COLUMNS)  # only files columns
     assert all(s["ok"] for s in r.steps.values())
     assert set(r.steps) == {"nzb", "import", "hash", "stat_secondary", "stat_primary", "restore"}
-    assert world.sec.stats == 40 and world.prim.stats == 40
+    assert world.sec.stats == 45 and world.prim.stats == 45  # 40 plus the alternative's 5
 
 
 def test_wrong_hash_simulating_zero_fill_fails_at_hash(world):

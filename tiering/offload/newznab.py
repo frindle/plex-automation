@@ -10,9 +10,21 @@ TLS is 1.2 or newer. NZB grabs are cached per client and spaced
 ``NEWZNAB_GRAB_INTERVAL`` seconds apart (default 1), because each grab is one
 call against the indexer's daily API allowance.
 
-``NEWZNAB_GRAB_BUDGET`` caps the grabs per indexer per client (one run); default 10.
-When an indexer's budget is spent, ``fetch_nzb`` raises ``GrabBudgetSpent`` and the
-caller treats the check as unsure (unchecked, not failed). Searches are not counted.
+Indexer etiquette (paid indexers ban for abuse). The runner keeps one client for
+weeks, so every budget is a rolling 24-hour window kept inside the client; the caller
+never resets anything.
+
+- ``NEWZNAB_GRAB_BUDGET`` caps NZB grabs per indexer per 24 hours; default 10. When it
+  is spent ``fetch_nzb`` raises ``GrabBudgetSpent``.
+- ``NEWZNAB_SEARCH_BUDGET`` caps searches per indexer per 24 hours; default 30. When it
+  is spent the indexer is skipped (``SearchBudgetSpent``) and the search is partial.
+- ``NEWZNAB_MIN_INTERVAL_S`` is the least time between two requests to one indexer
+  (search or grab); default 2.
+- An indexer is dropped for 24 hours after 3 errors in a row, and at once on a 429
+  (for the ``Retry-After`` time when it gives one, else 24 hours).
+
+A budget that is spent, or an indexer that is dropped, makes a check unsure (unchecked,
+not failed). Message-ids are compared without ``<>`` or white space, and case-sensitive.
 """
 from __future__ import annotations
 
@@ -24,6 +36,7 @@ import json
 import os
 import re
 import ssl
+import collections
 import threading
 import time
 import urllib.error
@@ -43,7 +56,27 @@ class NewznabError(Exception):
 
 
 class GrabBudgetSpent(NewznabError):
-    """The per-run NZB grab budget for this indexer is used up."""
+    """The NZB grab budget for this indexer is used up for the window."""
+
+
+class SearchBudgetSpent(NewznabError):
+    """The search budget for this indexer is used up for the window."""
+
+
+class IndexerDropped(NewznabError):
+    """This indexer is left alone for the rest of the window (errors, or a 429)."""
+
+
+class RateLimited(NewznabError):
+    """The indexer answered 429 (too many requests)."""
+
+    def __init__(self, msg: str = "indexer rate limited", retry_after: float | None = None):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
+WINDOW_S = 24 * 3600.0
+DROP_AFTER_ERRORS = 3
 
 
 def check_url(url: str) -> urllib.parse.SplitResult:
@@ -161,33 +194,101 @@ class SearchResult(list):
         return self.failed > 0
 
 
+def _env_num(name: str, default, cast=float):
+    try:
+        v = cast(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        v = default
+    return v
+
+
+def _retry_after(headers) -> float | None:
+    try:
+        v = headers.get("Retry-After") if headers is not None else None
+        return max(0.0, float(v)) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+_CACHE_ENTRIES = 16
+_CACHE_BYTES = 64 * 1024 * 1024
+
+
 class NewznabClient:
     def __init__(self, indexers: list[Indexer], timeout: float = 30.0,
                  grab_interval: float | None = None, sleep=time.sleep, clock=time.monotonic,
-                 grab_budget: int | None = None):
+                 grab_budget: int | None = None, search_budget: int | None = None,
+                 min_interval: float | None = None):
         self.indexers = list(indexers)
         self.timeout = timeout
         if grab_interval is None:
-            try:
-                grab_interval = float(os.environ.get("NEWZNAB_GRAB_INTERVAL", "1") or 0)
-            except ValueError:
-                grab_interval = 1.0
+            grab_interval = _env_num("NEWZNAB_GRAB_INTERVAL", 1.0)
         self.grab_interval = max(0.0, grab_interval)
         if grab_budget is None:
-            try:
-                grab_budget = int(os.environ.get("NEWZNAB_GRAB_BUDGET", "10"))
-            except ValueError:
-                grab_budget = 10
-        self.grab_budget = max(0, grab_budget)  # per indexer, per client
-        self._grabbed: dict[str, int] = {}
+            grab_budget = _env_num("NEWZNAB_GRAB_BUDGET", 10, int)
+        self.grab_budget = max(0, grab_budget)  # per indexer, per rolling 24 hours
+        if search_budget is None:
+            search_budget = _env_num("NEWZNAB_SEARCH_BUDGET", 30, int)
+        self.search_budget = max(0, search_budget)
+        if min_interval is None:
+            min_interval = _env_num("NEWZNAB_MIN_INTERVAL_S", 2.0)
+        self.min_interval = max(0.0, min_interval)
         self._sleep, self._clock = sleep, clock
-        self._ids_cache: dict[str, frozenset] = {}
-        self._raw: dict[str, bytes] = {}
+        self._spent: dict[tuple[str, str], collections.deque] = {}  # (kind, indexer) -> times
+        self._last_req: dict[str, float] = {}
+        self._errors: dict[str, int] = {}
+        self._dropped_until: dict[str, float] = {}
+        self._cache: collections.OrderedDict = collections.OrderedDict()  # link -> (ids, raw)
+        self._cache_bytes = 0
         self._last_grab: float | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=tls_context()), _SafeRedirect())
         self.grabs = 0
+        self.searches = 0
+
+    # -- etiquette
+    def _take(self, kind: str, name: str, budget: int, exc: type[NewznabError]) -> None:
+        """Count one request against the rolling window, or raise ``exc``."""
+        now = self._clock()
+        q = self._spent.setdefault((kind, name), collections.deque())
+        while q and now - q[0] >= WINDOW_S:
+            q.popleft()
+        if len(q) >= budget:
+            raise exc(f"{kind} budget spent")
+        q.append(now)
+
+    def _gate(self, name: str) -> None:
+        """Refuse a dropped indexer; space requests to one indexer apart."""
+        now = self._clock()
+        until = self._dropped_until.get(name)
+        if until is not None:
+            if now < until:
+                raise IndexerDropped("indexer dropped for the window")
+            del self._dropped_until[name]
+            self._errors[name] = 0
+        last = self._last_req.get(name)
+        if self.min_interval and last is not None:
+            wait = self.min_interval - (now - last)
+            if wait > 0:
+                self._sleep(wait)
+        self._last_req[name] = self._clock()
+
+    def _note(self, name: str, err: NewznabError | None) -> None:
+        """Track consecutive errors; drop the indexer on the third, or at once on a 429."""
+        with self._lock:
+            if err is None:
+                self._errors[name] = 0
+                return
+            if isinstance(err, (IndexerDropped, SearchBudgetSpent, GrabBudgetSpent)):
+                return
+            if isinstance(err, RateLimited):
+                wait = WINDOW_S if err.retry_after is None else min(err.retry_after, WINDOW_S)
+                self._dropped_until[name] = self._clock() + wait
+                return
+            self._errors[name] = self._errors.get(name, 0) + 1
+            if self._errors[name] >= DROP_AFTER_ERRORS:
+                self._dropped_until[name] = self._clock() + WINDOW_S
 
     # -- transport
     def _get(self, ix: Indexer, params: dict, limit: int = 8 * 1024 * 1024) -> bytes:
@@ -205,6 +306,8 @@ class NewznabClient:
                 if want and want.isdigit() and len(data) < int(want) <= limit:
                     raise http.client.IncompleteRead(data, int(want) - len(data))
         except urllib.error.HTTPError as e:
+            if e.code == 429:
+                raise RateLimited("indexer status 429", _retry_after(e.headers)) from None
             raise NewznabError(f"indexer status {e.code}") from None
         except (OSError, ValueError, http.client.HTTPException) as e:
             raise NewznabError(f"indexer unreachable: {type(e).__name__}") from None
@@ -229,15 +332,25 @@ class NewznabClient:
             p["season"] = season
         if episode is not None:
             p["ep"] = episode
-        return self._parse(ix, self._get(ix, p))
+        with self._lock:
+            self._gate(ix.name)
+            self._take("search", ix.name, self.search_budget, SearchBudgetSpent)
+            self.searches += 1
+        try:
+            out = self._parse(ix, self._get(ix, p))
+        except NewznabError as e:
+            self._note(ix.name, e)
+            raise
+        self._note(ix.name, None)
+        return out
 
     def search(self, **kw) -> SearchResult:
         """Search every indexer.
 
-        An indexer that fails is skipped and the result says so: ``.partial`` is
-        true and ``.failed`` counts them. A partial result may lack releases, so
-        "nothing found" in it never means "nothing exists". Raises NewznabError
-        when there are no indexers or every one failed.
+        An indexer that fails (or is dropped, or has spent its budget) is skipped and
+        the result says so: ``.partial`` is true and ``.failed`` counts them. A partial
+        result may lack releases, so "nothing found" in it never means "nothing exists".
+        Raises NewznabError when there are no indexers or every one failed.
         """
         if not self.indexers:
             raise NewznabError("no indexers configured")
@@ -258,6 +371,8 @@ class NewznabClient:
         except ET.ParseError:
             raise NewznabError("indexer sent bad xml") from None
         if root.tag == "error":
+            if root.get("code") == "429":
+                raise RateLimited("indexer error 429")
             raise NewznabError(f"indexer error {root.get('code', '')}")
         out = []
         for it in root.iter("item"):
@@ -287,7 +402,8 @@ class NewznabClient:
                     size = int(a.get("value") or size)
                 elif a.get("name") == "guid" and not guid:
                     guid = a.get("value") or ""
-        return Release(title, guid or link, size, ix.name, parse_resolution(title), link)
+        # the link holds the API key: it is never a fallback for the guid
+        return Release(title, guid, size, ix.name, parse_resolution(title), link)
 
     # -- fetch
     def fetch_nzb(self, rel: Release) -> bytes:
@@ -295,39 +411,57 @@ class NewznabClient:
         if not rel.link:
             raise NewznabError("release has no link")
         with self._lock:
-            if self._grabbed.get(rel.indexer, 0) >= self.grab_budget:
-                raise GrabBudgetSpent("grab budget spent")
-            self._grabbed[rel.indexer] = self._grabbed.get(rel.indexer, 0) + 1
+            self._gate(rel.indexer)
+            self._take("grab", rel.indexer, self.grab_budget, GrabBudgetSpent)
             if self.grab_interval and self._last_grab is not None:
                 wait = self.grab_interval - (self._clock() - self._last_grab)
                 if wait > 0:
                     self._sleep(wait)
             self._last_grab = self._clock()
             self.grabs += 1
-        raw = self._fetch(rel.link, NZB_MAX)
+        try:
+            raw = self._fetch(rel.link, NZB_MAX)
+        except NewznabError as e:
+            self._note(rel.indexer, e)
+            raise
+        self._note(rel.indexer, None)
         if raw[:2] == b"\x1f\x8b":
             raw = _gunzip_capped(raw, NZB_MAX)
         if b"<nzb" not in raw[:2048]:
             raise NewznabError("not an nzb")
         return raw
 
-    def fetch_ids(self, rel: Release) -> frozenset:
-        """Message-ids of a release's NZB. Each link is grabbed once per client."""
-        hit = self._ids_cache.get(rel.link)
-        if hit is not None:
-            return hit
+    def fetch_nzb_ids(self, rel: Release) -> tuple[frozenset, bytes]:
+        """Message-ids and bytes of a release's NZB. A link is grabbed once while it is
+        in the client's small cache; the bytes come back with the ids on every hit."""
+        with self._lock:
+            hit = self._cache.get(rel.link)
+            if hit is not None:
+                self._cache.move_to_end(rel.link)
+                return hit
         raw = self.fetch_nzb(rel)
         try:
             ids = nzb_segment_ids(raw)
         except ET.ParseError:
             raise NewznabError("bad nzb xml") from None
-        self._ids_cache[rel.link] = ids
-        self._raw[rel.link] = raw
-        return ids
+        with self._lock:
+            self._cache[rel.link] = (ids, raw)
+            self._cache_bytes += len(raw)
+            while self._cache and (len(self._cache) > _CACHE_ENTRIES
+                                   or self._cache_bytes > _CACHE_BYTES):
+                _, (_, old) = self._cache.popitem(last=False)
+                self._cache_bytes -= len(old)
+        return ids, raw
+
+    def fetch_ids(self, rel: Release) -> frozenset:
+        """Message-ids of a release's NZB. Each link is grabbed once per client."""
+        return self.fetch_nzb_ids(rel)[0]
 
     def take_raw(self, rel: Release) -> bytes | None:
-        """The NZB bytes ``fetch_ids`` just grabbed for this release, once (else None)."""
-        return self._raw.pop(rel.link, None)
+        """The NZB bytes of a release ``fetch_ids`` has grabbed and still holds, else None."""
+        with self._lock:
+            hit = self._cache.get(rel.link)
+        return hit[1] if hit else None
 
 
 def _gunzip_capped(raw: bytes, limit: int) -> bytes:
@@ -350,12 +484,17 @@ def _gunzip_capped(raw: bytes, limit: int) -> bytes:
     return b"".join(out)
 
 
+def norm_id(mid: str) -> str:
+    """A message-id as compared: no white space, no ``<>``. Case is kept (it is significant)."""
+    return mid.strip().strip("<>").strip()
+
+
 def nzb_segment_ids(nzb_bytes: bytes) -> frozenset[str]:
-    """The set of message-ids in an NZB."""
+    """The set of message-ids in an NZB, normalised with ``norm_id``."""
     ids = set()
     for _, el in ET.iterparse(io.BytesIO(nzb_bytes), events=("end",)):
         if el.tag.rsplit("}", 1)[-1] == "segment":
-            t = (el.text or "").strip()
+            t = norm_id(el.text or "")
             if t:
                 ids.add(t)
             el.clear()

@@ -9,7 +9,10 @@
    is never trusted;
 4. STAT every segment on the secondary and the primary provider: none missing;
 5. restore path: another release of the same title, at least the resolution
-   floor, that is a different upload (it shares no message-id with our NZB).
+   floor, that is a different upload (it shares no message-id with our NZB) and
+   whose every segment is on both providers, like ``nzb_path``'s.
+
+The first search is reused: one search per qualify, however many steps need it.
 
 Row fields it reads:
   lib_path (required), nzb_path, release_name, title, year, imdb_id, tvdb_id,
@@ -19,7 +22,7 @@ cannot be told, the floor is 1080p.
 
 It does not write to the database. ``QualifyResult.fields`` holds only ``files``
 columns for the caller to store: nzb_path, nzb_path2 (the archived NZB of the verified
-restore candidate, only when there is one), remote_path, sha256, restore_score,
+restore candidate; always present, None when there is none, so a stale one is cleared), remote_path, sha256, restore_score,
 restore_note, last_check_ts and last_stat_ok_ts. The result of each step is in
 ``QualifyResult.steps``, which is not a column.
 """
@@ -28,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import tempfile
 import time
 import zlib
 from dataclasses import dataclass, field
@@ -112,13 +116,61 @@ def _search(indexers, ident: dict):
                            episode=ident["episode"])
 
 
+_SOFT = ("auth", "quota")  # a provider that cannot be asked at all
+
+
+def stat_status(path: str, providers, dead: dict | None = None) -> str:
+    """STAT an NZB file on each provider. ``ok``, ``missing`` or ``unchecked``.
+
+    ``providers`` is a list of (label, checker). A provider that cannot be asked makes
+    the answer ``unchecked`` (never ``missing``); with ``dead`` given, one that refused
+    the login or reported a quota is remembered there and not asked again. An NZB that
+    cannot be read, has no segment or lacks any segment is ``missing``.
+    """
+    dead = {} if dead is None else dead
+    for label, fn in providers:
+        if label in dead:
+            return "unchecked"
+        try:
+            out = fn(path)
+        except NntpUnavailable as e:
+            if e.kind in _SOFT:
+                dead[label] = e.kind
+            return "unchecked"
+        except Exception:  # an unreadable NZB is as good as a dead one
+            return "missing"
+        if out["total"] == 0 or out["missing"]:
+            return "missing"
+    return "ok"
+
+
+def stat_nzb_bytes(raw: bytes, providers, tmp_dir: str, dead: dict | None = None) -> str:
+    """``stat_status`` for NZB bytes not archived (yet): through a temp file that is removed."""
+    os.makedirs(tmp_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=tmp_dir, prefix=".stat-", suffix=".nzb")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        return stat_status(tmp, providers, dead)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def score_restore(row: dict, indexers, own_ids: frozenset | None,
-                  stop_at: int | None = None) -> dict:
+                  stop_at: int | None = None, found=None, verify=None) -> dict:
     """Count releases that could replace this file if the exact upload dies.
 
     ``own_ids`` is the set of message-ids of our NZB. A candidate whose NZB shares
     any message-id with it is the same upload, whatever it is called, and does not
     count. Size never decides. Two candidates that share message-ids count once.
+
+    ``found`` is a search result the caller already has (else it searches once).
+    ``verify(raw)`` is called with a disjoint candidate's NZB bytes and says whether its
+    articles are all there: True counts it, False drops it (``dead`` counts these), None
+    means it could not be checked (unsure; no more candidates are tried).
 
     Each candidate that passes the title and floor checks costs one NZB grab
     (cached per client). ``stop_at`` ends the loop once that many are verified, so
@@ -126,7 +178,7 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
     ``MAX_FAILED_GRABS`` failed grabs the row is unsure and no more are tried; a
     spent grab budget also makes it unsure. Neither is a "no".
 
-    Returns {count, floor, best, below_floor, partial, unsure, note, candidate}.
+    Returns {count, floor, best, below_floor, dead, partial, unsure, note, candidate}.
     ``candidate`` is {title, nzb} of the first verified alternative (its NZB bytes), or None.
     ``partial`` means some indexer did not answer; ``unsure`` means ``partial`` or
     some candidate's NZB could not be checked, or ``own_ids`` was not given.
@@ -135,7 +187,8 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
     """
     ident = identity(row)
     floor = resolution_floor(source_resolution(row))
-    found = _search(indexers, ident)
+    if found is None:
+        found = _search(indexers, ident)
     partial = bool(getattr(found, "partial", False))
     unsure = partial or own_ids is None
     own_name = _clean(release_name_of(row))
@@ -154,13 +207,13 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
     counted: list[frozenset] = []
     best = 0
     fails = 0
+    dead = 0
     candidate = None
     for rel in cands if own_ids is not None else ():
         if stop_at and len(counted) >= stop_at:
             break
         try:
-            ids = indexers.fetch_ids(rel)
-            raw = indexers.take_raw(rel)  # the NZB just grabbed, so a winner need not be grabbed twice
+            ids, raw = indexers.fetch_nzb_ids(rel)
         except GrabBudgetSpent:
             unsure = True
             continue
@@ -174,26 +227,36 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
             continue  # the same upload (or nothing to compare)
         if any(ids & c for c in counted):
             continue  # the same upload as one already counted
+        if verify is not None:
+            v = verify(raw)
+            if v is None:
+                unsure = True  # a provider could not be asked: more tries would not help
+                break
+            if not v:
+                dead += 1  # an alternative whose articles are gone is no restore path
+                continue
         counted.append(ids)
         best = max(best, rel.resolution)
-        if candidate is None and raw:
+        if candidate is None:
             candidate = {"title": rel.title, "nzb": raw}
     count = len(counted)
     if count:
         note = f"{count} alternative(s), best {best}p"
     elif unsure:
         note = "restore path unchecked (an indexer or NZB did not answer)"
+    elif dead:
+        note = f"alternatives found but their articles are missing ({dead})"
     elif below:
         note = f"only below-floor alternatives ({below}), floor {floor}p"
     else:
         note = "no alternative release found"
-    return {"count": count, "floor": floor, "best": best, "below_floor": below,
+    return {"count": count, "floor": floor, "best": best, "below_floor": below, "dead": dead,
             "partial": partial, "unsure": unsure, "note": note, "candidate": candidate}
 
 
-def _find_exact(row: dict, indexers, name: str):
+def _find_exact(found, name: str):
     want = _clean(name)
-    for rel in _search(indexers, identity(row)):
+    for rel in found:
         if _clean(rel.title) == want:
             yield rel
 
@@ -215,6 +278,13 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
     fields: dict = {}
     steps: dict = {}
     name = release_name_of(row)
+    memo: list = []
+
+    def searched():
+        """The one search of this qualify, shared by the exact-NZB and restore steps."""
+        if not memo:
+            memo.append(_search(indexers, identity(row)))
+        return memo[0]
 
     def fail(step: str, reason: str, **info) -> QualifyResult:
         steps[step] = {"ok": False, **info}
@@ -229,7 +299,7 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
             steps["nzb"] = {"ok": True, "reused": True}
         else:
             fails = 0
-            for rel in _find_exact(row, indexers, name):
+            for rel in _find_exact(searched(), name):
                 try:
                     nzb_bytes = indexers.fetch_nzb(rel)
                     break
@@ -288,9 +358,18 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
     fields["last_check_ts"] = now
     fields["last_stat_ok_ts"] = now
 
-    # 5. restore path
+    # 5. restore path: a different upload, checked on every provider like nzb_path
+    fields["nzb_path2"] = None  # a stored one belongs to the release that was; set again below
+    providers = (("secondary", stat_secondary), ("primary", stat_primary))
+    dead_providers: dict = {}
+
+    def verify(raw: bytes):
+        r = stat_nzb_bytes(raw, providers, archive_dir, dead_providers)
+        return True if r == "ok" else (False if r == "missing" else None)
+
     try:
-        sc = score_restore(row, indexers, nzb_segment_ids(nzb_bytes), stop_at=3)
+        sc = score_restore(row, indexers, nzb_segment_ids(nzb_bytes), stop_at=1,
+                           found=searched(), verify=verify)
     except _ERRORS as e:
         return fail("restore", "restore_check_failed", error=type(e).__name__)
     if sc["count"] or not sc["unsure"]:  # an unchecked 0 is not a score
@@ -299,14 +378,21 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
     if sc["partial"]:
         return fail("restore", "restore_check_unsure", count=sc["count"])  # unsure is a fail
     if sc["count"] < 1:
+        fields["nzb_path2"] = None
         if sc["unsure"]:
             return fail("restore", "restore_check_unsure", count=0)
         return fail("restore", "no_restore_path", count=0, below_floor=sc["below_floor"])
     cand = sc.get("candidate")
     if cand:  # kept beside the primary's NZB: weekly STATs it instead of grabbing again
         try:
-            fields["nzb_path2"] = archive_nzb(cand["nzb"], archive_dir, cand["title"])
+            path2 = archive_nzb(cand["nzb"], archive_dir, cand["title"])
         except OSError as e:
             return fail("restore", "restore_archive_failed", error=type(e).__name__)
+        if path2 == nzb_path or not nzb_segment_ids(read_archived(path2)).isdisjoint(
+                nzb_segment_ids(nzb_bytes)):
+            fields["restore_note"] = "restore NZB is the same upload"
+            fields["restore_score"] = 0
+            return fail("restore", "no_restore_path", count=0)
+        fields["nzb_path2"] = path2
     steps["restore"] = {"ok": True, "count": sc["count"], "best": sc["best"]}
     return QualifyResult(True, [], fields, steps)

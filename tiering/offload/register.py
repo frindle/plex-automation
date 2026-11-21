@@ -3,7 +3,12 @@
 Run once a night before the demote window (the runner calls ``register``).
 
 For every movie file and episode file the arrs list, it upserts a row keyed on
-``lib_path``:
+``lib_path``, which is the share path ("Path namespaces" in OFFLOAD_DESIGN.md): the arr's
+path mapped through TIERING_ARR_PATH_MAP, never a disk path. Size and mtime come from
+the one existing disk candidate of that share path (``resolve``). No candidate counts as
+``missing_local`` and several as ``ambiguous``; the file is skipped and counted, never
+guessed. The result carries ``listed`` (distinct share paths the arrs listed) next to
+those counts so the caller can see trouble:
 
 - a new row gets a fresh random 16-hex ``id``, ``state=whole``, ``size``,
   ``mtime_ns`` and the media identity (``title``, ``year``, ``imdb_id``,
@@ -23,8 +28,13 @@ Environment (nothing here is ever logged, including keys and URLs):
   RADARR_URL, RADARR_API_KEY
   SONARR_URL, SONARR_API_KEY   a comma list for more than one Sonarr; one key may
                                be given to be used for all of them
-  TIERING_PATH_MAP             ``arr_prefix=local_prefix`` pairs, comma separated,
-                               the longest matching prefix wins
+  TIERING_ARR_PATH_MAP         ``arr_prefix=share_prefix`` pairs, comma separated, the
+                               longest matching prefix wins. Optional: unset means the
+                               arrs report the share path (the one Plex reports)
+  TIERING_PATH_MAP             ``share_prefix=disk_prefix``, one entry per disk (see
+                               paths.py). Used only to find the file to stat; it never
+                               changes the path that is stored. Unset: the share path
+                               itself is stat'ed
   TIERING_ARR_ALLOW_HTTP=1     allow plain http to an arr that is not on localhost
                                (a trusted LAN only; the key is sent in a header)
 
@@ -46,11 +56,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import paths
+
 log = logging.getLogger(__name__)
 
 _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 _LIMIT = 256 * 1024 * 1024
-STALE = ("sha256", "head_b3", "tail_b3", "head_len", "tail_len", "nzb_path", "remote_path")
+STALE = ("sha256", "head_b3", "tail_b3", "head_len", "tail_len", "nzb_path", "nzb_path2",
+         "restore_score", "restore_note", "remote_path")
 IDENTITY = ("title", "year", "imdb_id", "tvdb_id", "season", "episode", "release_name")
 
 
@@ -136,21 +149,24 @@ def _episode_files(client: ArrClient):
                    "season": ep.get("seasonNumber"), "episode": ep.get("episodeNumber")}
 
 
-def parse_path_map(raw: str | None) -> list[tuple[str, str]]:
-    """``a=b,c=d`` to [(a, b), (c, d)], longest source prefix first."""
-    pairs = []
-    for part in (raw or "").split(","):
-        src, sep, dst = part.strip().partition("=")
-        if sep and src.strip():
-            pairs.append((src.strip().rstrip("/"), dst.strip().rstrip("/")))
-    return sorted(pairs, key=lambda p: -len(p[0]))
-
-
-def map_path(path: str, pmap: list[tuple[str, str]]) -> str:
-    for src, dst in pmap:
+def map_path(path: str, pairs: list[tuple[str, str]]) -> str:
+    """Map an arr path to the share path; unchanged when no prefix matches."""
+    for src, dst in pairs:
         if path == src or path.startswith(src + "/"):
             return dst + path[len(src):]
     return path
+
+
+def default_resolver(env=None):
+    """``resolve(share_path) -> [disk paths that exist]`` from TIERING_PATH_MAP.
+
+    Unset: the share path itself, when it exists."""
+    e = os.environ if env is None else env
+    spec = (e.get("TIERING_PATH_MAP") or "").strip()
+    if not spec:
+        return lambda p: [os.path.normpath(p)] if os.path.lexists(p) else []
+    pairs = paths.parse_path_map(spec)
+    return lambda p: paths.disk_paths(p, pairs)
 
 
 def _split(raw: str | None) -> list[str]:
@@ -183,19 +199,27 @@ def _entry_row(ent: dict, local: str, size: int, mtime_ns: int) -> dict:
             "size": size, "mtime_ns": mtime_ns}
 
 
-def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, path_map=None,
-             stat=os.stat, new_id=None) -> dict:
-    """Sync rows from the arrs. Returns counts; with ``apply=False`` nothing is written."""
+def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map=None,
+             resolve=None, stat=os.stat, new_id=None) -> dict:
+    """Sync rows from the arrs. Returns counts; with ``apply=False`` nothing is written.
+
+    ``arr_map`` is ``arr=share,...`` text or a list of pairs (default: TIERING_ARR_PATH_MAP).
+    ``resolve(share_path)`` returns the existing disk paths (default: from TIERING_PATH_MAP).
+    """
     if state is None:
         from . import state as _state
         state = _state
     if radarrs is None and sonarrs is None:
         radarrs, sonarrs = clients_from_env()
-    pmap = parse_path_map(os.environ.get("TIERING_PATH_MAP")) if path_map is None else \
-        (parse_path_map(path_map) if isinstance(path_map, str) else list(path_map))
+    if arr_map is None:
+        arr_map = os.environ.get("TIERING_ARR_PATH_MAP")
+    pmap = paths.parse_path_map(arr_map) if isinstance(arr_map, str) or arr_map is None \
+        else list(arr_map)
+    resolve = resolve or default_resolver()
     new_id = new_id or (lambda: secrets.token_hex(8))
-    out = {"new": 0, "updated": 0, "unchanged": 0, "skipped_state": 0, "missing_local": 0,
-           "unlisted": 0, "errors": 0, "applied": bool(apply)}
+    out = {"new": 0, "updated": 0, "unchanged": 0, "skipped_state": 0, "listed": 0,
+           "missing_local": 0, "ambiguous": 0, "unlisted": 0, "errors": 0,
+           "applied": bool(apply)}
 
     listed: set[str] = set()
     complete = True
@@ -210,12 +234,18 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, path_ma
             log.warning("register: an arr did not answer (%s)", e)
             continue
         for ent in ents:
-            local = map_path(str(ent["path"]), pmap)
+            local = map_path(str(ent["path"]), pmap)  # the share path: what is stored
             if local in listed:
                 continue
             listed.add(local)
+            out["listed"] += 1
+            cands = list(resolve(local))
+            if len(cands) != 1:
+                out["missing_local" if not cands else "ambiguous"] += 1
+                log.warning("register: %d disk paths for a listed file, skipped", len(cands))
+                continue
             try:
-                st = stat(local)
+                st = stat(cands[0])
             except OSError:
                 out["missing_local"] += 1
                 continue

@@ -151,7 +151,7 @@ def test_qualify_without_a_distinct_candidate_has_no_nzb_path2(tmp_path):
     try:
         r = w.run()
         assert not r.ok and r.reasons == ["no_restore_path"]
-        assert "nzb_path2" not in r.fields and r.fields["restore_score"] == 0
+        assert r.fields["nzb_path2"] is None and r.fields["restore_score"] == 0
     finally:
         w.close()
 

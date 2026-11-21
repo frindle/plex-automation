@@ -243,7 +243,9 @@ class _NzHandler(_Quiet):
             return
         o.queries.append({k: v[0] for k, v in q.items() if k != "apikey"})
         if o.fail:
-            self.send_response(500)
+            self.send_response(o.fail_code)
+            if o.retry_after is not None:
+                self.send_header("Retry-After", str(o.retry_after))
             self.end_headers()
             return
         items = []
@@ -269,6 +271,8 @@ class FakeNewznab(_Server):
         self.releases = dict(releases or {})  # guid -> {title, nzb, size?}
         self.queries, self.gets = [], []
         self.fail = False
+        self.fail_code = 500
+        self.retry_after = None
         self.truncate = False
         self.extra_items = ""  # raw XML put in front of the items
         super().__init__(_NzHandler)
@@ -448,7 +452,9 @@ class _ArrHandler(_Quiet):
             return
         q = urllib.parse.parse_qs(u.query)
         if o.fail:
-            self.send_response(500)
+            self.send_response(o.fail_code)
+            if o.retry_after is not None:
+                self.send_header("Retry-After", str(o.retry_after))
             self.end_headers()
             return
         if u.path == "/api/v3/movie":

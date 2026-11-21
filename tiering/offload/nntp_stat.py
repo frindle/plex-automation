@@ -26,9 +26,13 @@ import queue
 import socket
 import ssl
 import threading
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+
+BACKOFF_S = 1.0  # first retry waits this long, then double
+_sleep = time.sleep
 
 
 class NntpUnavailable(Exception):
@@ -148,7 +152,8 @@ class _Conn:
                 code = line[:3]
                 if code == "223":
                     want = ids[i].strip().strip("<>")
-                    got = line.split()[-1].strip("<>") if len(line.split()) > 2 else None
+                    parts = line.split()  # "223 <n> <message-id> [text]"
+                    got = parts[2].strip("<>") if len(parts) > 2 else None
                     if got != want:  # a reply that is not for this id: out of step
                         raise NntpUnavailable("protocol", "stat reply for another id")
                     out[i] = True
@@ -185,7 +190,9 @@ class NntpPool:
 
     def stat_batch(self, ids: list[str], retries: int = 2) -> list[bool]:
         last: NntpUnavailable | None = None
-        for _ in range(retries + 1):
+        for attempt in range(retries + 1):
+            if attempt:  # back off before a retry, outside the connection limit
+                _sleep(BACKOFF_S * 2 ** (attempt - 1))
             with self._sem:
                 try:
                     conn = self._idle.get_nowait()

@@ -159,6 +159,8 @@ class WebDavReader:
                 return int(n)
             except ValueError:
                 raise AltMountError("bad content length") from None
+        except (OSError, http.client.HTTPException) as e:
+            raise AltMountError(f"read failed: {type(e).__name__}") from None
         finally:
             conn.close()
 
@@ -195,6 +197,8 @@ class WebDavReader:
         try:
             self._check(resp, ok=(207,))
             raw = resp.read()
+        except (OSError, http.client.HTTPException) as e:
+            raise AltMountError(f"read failed: {type(e).__name__}") from None
         finally:
             conn.close()
         ns = {"d": "DAV:"}

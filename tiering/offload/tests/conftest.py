@@ -1,6 +1,6 @@
 import pytest
 
-from tiering.offload import ops
+from tiering.offload import nntp_stat, ops
 
 
 @pytest.fixture(autouse=True)
@@ -16,7 +16,14 @@ def _apply_env(monkeypatch):
     monkeypatch.setenv("TIERING_PROC_CANARY", canary)
     monkeypatch.setattr(ops, "_fs_type", lambda p: "xfs")
 
+
 @pytest.fixture(autouse=True)
 def _no_grab_delay(monkeypatch):
     # The real client spaces NZB grabs apart; tests do not wait for that.
     monkeypatch.setenv("NEWZNAB_GRAB_INTERVAL", "0")
+    monkeypatch.setenv("NEWZNAB_MIN_INTERVAL_S", "0")
+
+
+@pytest.fixture(autouse=True)
+def _no_nntp_backoff(monkeypatch):
+    monkeypatch.setattr(nntp_stat, "BACKOFF_S", 0.0)
