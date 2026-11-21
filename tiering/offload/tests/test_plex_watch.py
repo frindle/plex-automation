@@ -58,6 +58,8 @@ class H(BaseHTTPRequestHandler):
             rows = EPS
             if qs.get("inProgress"):
                 rows = [e for e in EPS if e["viewOffset"] > 0]
+                if qs.get("type") != ["4"]:  # without type=4 Plex returns shows, not episodes
+                    rows = [{"ratingKey": 50, "type": "show", "viewOffset": 1}]
             body = page(rows, qs, self.headers)
         elif p == "/status/sessions/history/all":
             rows = [{"ratingKey": 10, "viewedAt": 500}, {"ratingKey": 101, "viewedAt": 900,

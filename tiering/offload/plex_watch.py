@@ -125,10 +125,11 @@ def on_deck():
 def in_progress():
     out = []
     for sec in _sections():
-        if sec.get("type") not in ("movie", "show"):
+        typ = {"movie": 1, "show": 4}.get(sec.get("type"))  # 4 = episodes, not shows
+        if typ is None:
             continue
         path = f"/library/sections/{sec['key']}/all"
-        for r in _paged(path, urlencode({"inProgress": 1})):
+        for r in _paged(path, urlencode({"type": typ, "inProgress": 1})):
             if (r.get("viewOffset") or 0) > 0:
                 out.append({"ratingKey": _s(r.get("ratingKey")),
                             "viewedAt": r.get("lastViewedAt"),
