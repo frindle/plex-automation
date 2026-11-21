@@ -10,7 +10,8 @@ segments needs only a few dozen STATs a second.
 
 Provider settings come from the environment, never from the repo:
   NNTP_PRIMARY_HOST / _PORT / _USER / _PASS / _CONNS   (and the same for SECONDARY)
-  NNTP_<NAME>_TLS=0 turns TLS off (tests only).
+  NNTP_<NAME>_TLS=0 turns TLS off (tests only). It is refused unless the host is
+  127.0.0.1 or localhost. TLS is 1.2 or newer.
 
 Errors that mean "could not ask" (login refused, quota, dropped link) raise
 ``NntpUnavailable`` with a ``kind``. They are never reported as missing
@@ -49,6 +50,11 @@ class ProviderCfg:
     cafile: str | None = None
     timeout: float = 30.0
     batch: int = 100
+
+    def __post_init__(self):
+        # Without TLS the login goes out in cleartext: only the local machine may do that.
+        if not self.tls and self.host not in ("127.0.0.1", "localhost"):
+            raise ValueError("NNTP TLS can only be turned off for 127.0.0.1 or localhost")
 
     def __repr__(self) -> str:  # never show host or credentials
         return f"ProviderCfg(conns={self.conns}, tls={self.tls})"

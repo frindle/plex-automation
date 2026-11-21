@@ -2,7 +2,8 @@ import os
 
 import pytest
 
-from fakes_intake import APIKEY, FakeAltMount, FakeDav, FakeNewznab, FakeNntp, make_nzb, sha
+from fakes_intake import (APIKEY, COLUMNS, FakeAltMount, FakeDav, FakeNewznab, FakeNntp,
+                          make_nzb, sha)
 from tiering.offload import altmount as am
 from tiering.offload import newznab as nz
 from tiering.offload import nntp_stat as ns
@@ -24,8 +25,10 @@ class World:
             rels["alt"] = {"title": alt_title, "nzb": make_nzb([f"alt{i}@t" for i in range(5)])}
         self.nz = FakeNewznab(rels)
         self.prim, self.sec = FakeNntp(IDS), FakeNntp(IDS)
-        self.row = {"id": "a" * 16, "sha256": sha(self.content), "release_name": REL,
-                    "title": "Movie", "year": 2020, "resolution": 1080}
+        self.lib = tmp_path / "lib.mkv"
+        self.lib.write_bytes(self.content)  # L: what is on disk now
+        self.row = {"id": "a" * 16, "lib_path": str(self.lib), "release_name": REL,
+                    "title": "Movie", "year": 2020}
         self.archive = str(tmp_path / "arch")
 
     def run(self, row=None):
@@ -61,8 +64,10 @@ def test_perfect_fixture_passes(world):
     assert f["remote_path"] == f"/movies/{REL}/{REL}.mkv"
     assert f["restore_score"] == 1
     assert "best 1080p" in f["restore_note"] and "127.0.0.1" not in f["restore_note"]
-    assert all(s["ok"] for s in f["steps"].values())
-    assert set(f["steps"]) == {"nzb", "import", "hash", "stat_secondary", "stat_primary", "restore"}
+    assert f["sha256"] == sha(world.content)
+    assert set(f) <= set(COLUMNS)  # only files columns
+    assert all(s["ok"] for s in r.steps.values())
+    assert set(r.steps) == {"nzb", "import", "hash", "stat_secondary", "stat_primary", "restore"}
     assert world.sec.stats == 40 and world.prim.stats == 40
 
 
@@ -80,7 +85,7 @@ def test_one_missing_segment_on_secondary(world):
     world.sec.ids.discard("s17@t")
     r = world.run()
     assert not r.ok and r.reasons == ["missing_segments_secondary"]
-    assert r.fields["steps"]["stat_secondary"]["missing"] == 1
+    assert r.steps["stat_secondary"]["missing"] == 1
     assert world.prim.stats == 0
 
 
@@ -94,7 +99,7 @@ def test_stat_login_refused_is_not_a_pass(world):
     world.sec.refuse_auth = True
     r = world.run()
     assert not r.ok and r.reasons == ["stat_unavailable_secondary"]
-    assert r.fields["steps"]["stat_secondary"]["kind"] == "auth"
+    assert r.steps["stat_secondary"]["kind"] == "auth"
 
 
 def test_no_alternative_release(tmp_path):
@@ -105,7 +110,7 @@ def test_no_alternative_release(tmp_path):
         w.close()
     assert not r.ok and r.reasons == ["no_restore_path"]
     assert r.fields["restore_score"] == 0
-    assert all(r.fields["steps"][k]["ok"] for k in ("hash", "stat_secondary", "stat_primary"))
+    assert all(r.steps[k]["ok"] for k in ("hash", "stat_secondary", "stat_primary"))
 
 
 def test_only_alternative_below_floor(tmp_path):
@@ -115,7 +120,7 @@ def test_only_alternative_below_floor(tmp_path):
     finally:
         w.close()
     assert not r.ok and r.reasons == ["no_restore_path"]
-    assert r.fields["steps"]["restore"]["below_floor"] == 1
+    assert r.steps["restore"]["below_floor"] == 1
     assert "below-floor" in r.fields["restore_note"]
 
 
@@ -138,7 +143,7 @@ def test_existing_archived_nzb_is_reused(world, tmp_path):
     world.nz.releases.pop("exact")  # indexer no longer lists it
     r = world.run({**world.row, "nzb_path": path})
     assert r.ok and r.fields["nzb_path"] == path
-    assert r.fields["steps"]["nzb"]["reused"] is True
+    assert r.steps["nzb"]["reused"] is True
 
 
 # restore floor rules, tested directly
@@ -164,8 +169,7 @@ def idx(*releases):
 def test_resolution_floor(src, alt, expect):
     s, ix = idx((alt, make_nzb(["z@t"])))
     try:
-        row = {"release_name": f"Movie.2020.{src}p.X-GRP", "title": "Movie", "year": 2020,
-               "resolution": src}
+        row = {"release_name": f"Movie.2020.{src}p.X-GRP", "title": "Movie", "year": 2020}
         assert q.score_restore(row, ix, frozenset(IDS))["count"] == expect
     finally:
         s.close()
@@ -178,7 +182,7 @@ def test_same_release_other_indexer_same_nzb_does_not_count_but_different_nzb_do
     s3, ix3 = idx((REL, make_nzb(["other@t"])))
     try:
         both = nz.NewznabClient(ix1.indexers + ix2.indexers)
-        row = {"release_name": REL, "title": "Movie", "year": 2020, "resolution": 1080}
+        row = {"release_name": REL, "title": "Movie", "year": 2020}
         assert q.score_restore(row, both, frozenset(IDS))["count"] == 0
         both = nz.NewznabClient(ix1.indexers + ix3.indexers)
         assert q.score_restore(row, both, frozenset(IDS))["count"] == 1
@@ -193,7 +197,7 @@ def test_duplicate_alternatives_on_two_indexers_count_once():
     s2, ix2 = idx((ALT, n))
     try:
         both = nz.NewznabClient(ix1.indexers + ix2.indexers)
-        row = {"release_name": REL, "title": "Movie", "year": 2020, "resolution": 1080}
+        row = {"release_name": REL, "title": "Movie", "year": 2020}
         assert q.score_restore(row, both, frozenset(IDS))["count"] == 1
     finally:
         s1.close()
@@ -206,7 +210,7 @@ def test_tv_matches_episode_only():
                 ("Show.S01.1080p.WEB.PACK", make_nzb(["c@t"])))
     try:
         row = {"release_name": "Show.S01E02.1080p.BluRay-X", "title": "Show", "season": 1,
-               "episode": 2, "resolution": 1080}
+               "episode": 2}
         sc = q.score_restore(row, ix, frozenset(IDS))
         assert sc["count"] == 1 and sc["best"] == 1080
     finally:

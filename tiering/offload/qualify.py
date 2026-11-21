@@ -4,23 +4,30 @@
 
 1. find or reuse an NZB for the exact release, and archive it;
 2. import it into AltMount;
-3. read the whole file back through WebDAV; its SHA-256 must equal the local one;
+3. hash ``lib_path`` itself with a fresh full read, read the remote copy back
+   through WebDAV, and require the two SHA-256 to be equal. A stored ``sha256``
+   is never trusted;
 4. STAT every segment on the secondary and the primary provider: none missing;
-5. restore path: another release of the same title that is at least the
-   resolution floor.
+5. restore path: another release of the same title, at least the resolution
+   floor, that is a different upload (it shares no message-id with our NZB).
 
-Row fields it reads (all optional except ``sha256``):
-  sha256, nzb_path, release_name, lib_path, title, year, imdb_id, tvdb_id,
-  season, episode, resolution, is4k.
+Row fields it reads:
+  lib_path (required), nzb_path, release_name, title, year, imdb_id, tvdb_id,
+  season, episode, is4k.
+The source resolution comes from ``is4k`` or the release or file name. When it
+cannot be told, the floor is 1080p.
 
-It does not write to the database. ``QualifyResult.fields`` carries what the
-caller should store (nzb_path, remote_path, restore_score, restore_note and the
-result of each step).
+It does not write to the database. ``QualifyResult.fields`` holds only ``files``
+columns for the caller to store: nzb_path, remote_path, sha256, restore_score,
+restore_note, last_check_ts and last_stat_ok_ts. The result of each step is in
+``QualifyResult.steps``, which is not a column.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from xml.etree.ElementTree import ParseError
 
@@ -30,23 +37,27 @@ from .newznab import (NewznabError, archive_nzb, nzb_segment_ids, parse_resoluti
 from .nntp_stat import NntpUnavailable
 
 _ERRORS = (AltMountError, NewznabError, NntpUnavailable, OSError, ParseError)
+_READ = 1 << 20
 
 
 @dataclass
 class QualifyResult:
     ok: bool
     reasons: list[str] = field(default_factory=list)
-    fields: dict = field(default_factory=dict)
+    fields: dict = field(default_factory=dict)  # files columns only
+    steps: dict = field(default_factory=dict)   # per-step detail, for logs
 
 
 def resolution_floor(src_res: int) -> int:
-    """Lowest resolution an alternative may have, given the source's."""
-    return 1080 if src_res >= 1080 else 720
+    """Lowest resolution an alternative may have, given the source's.
+
+    A source below 1080p gets a 720p floor. An unknown source (0) gets 1080p.
+    """
+    return 720 if 0 < src_res < 1080 else 1080
 
 
 def source_resolution(row: dict) -> int:
-    if row.get("resolution"):
-        return int(row["resolution"])
+    """The source's resolution, from ``is4k`` or the name; 0 when unknown."""
     if row.get("is4k"):
         return 2160
     for k in ("release_name", "lib_path"):
@@ -83,7 +94,7 @@ def identity(row: dict) -> dict:
         m = re.search(r"s(\d{1,2})e(\d{1,3})", name, re.I)
         if m:
             season, episode = int(m.group(1)), int(m.group(2))
-    return {"title": title, "year": year, "season": season, "episode": episode,
+    return {"title": title, "year": year or None, "season": season, "episode": episode,
             "imdb_id": row.get("imdb_id"), "tvdb_id": row.get("tvdb_id")}
 
 
@@ -97,46 +108,66 @@ def _search(indexers, ident: dict):
                            episode=ident["episode"])
 
 
-def score_restore(row: dict, indexers, own_ids: frozenset | None = None) -> dict:
-    """Count releases that could replace this file if the exact release dies.
+def score_restore(row: dict, indexers, own_ids: frozenset | None,
+                  stop_at: int | None = None) -> dict:
+    """Count releases that could replace this file if the exact upload dies.
 
-    Returns {count, floor, best, below_floor, note}. ``own_ids`` is the set of
-    message-ids of our NZB: a same-named release on another indexer only counts
-    when its NZB has a different set. The note never names an indexer.
+    ``own_ids`` is the set of message-ids of our NZB. A candidate whose NZB shares
+    any message-id with it is the same upload, whatever it is called, and does not
+    count. Size never decides. Two candidates that share message-ids count once.
+
+    Each candidate that passes the title and floor checks costs one NZB grab
+    (cached per client). ``stop_at`` ends the loop once that many are verified, so
+    a caller that only needs "is there one" pays for as few grabs as it can.
+
+    Returns {count, floor, best, below_floor, partial, unsure, note}.
+    ``partial`` means some indexer did not answer; ``unsure`` means ``partial`` or
+    some candidate's NZB could not be checked, or ``own_ids`` was not given.
+    With ``unsure``, a count of 0 means "not checked", not "no restore path".
+    Raises NewznabError when no indexer answered at all.
     """
     ident = identity(row)
-    own = _clean(release_name_of(row))
     floor = resolution_floor(source_resolution(row))
-    seen: dict[str, int] = {}  # cleaned title -> resolution, qualifying only
-    below = 0
-    for rel in _search(indexers, ident):
+    found = _search(indexers, ident)
+    partial = bool(getattr(found, "partial", False))
+    unsure = partial or own_ids is None
+    cands, below = [], 0
+    for rel in found:
         if not title_matches(rel.title, ident["title"] or "", ident["year"],
                              ident["season"], ident["episode"]):
-            continue
-        key = _clean(rel.title)
-        if key in seen:
             continue
         if rel.resolution < floor:
             below += 1
             continue
-        if key == own:
-            if own_ids is None:
-                continue
-            try:
-                if nzb_segment_ids(indexers.fetch_nzb(rel)) == own_ids:
-                    continue  # the same NZB again
-            except _ERRORS:
-                continue
-        seen[key] = rel.resolution
-    count = len(seen)
-    best = max(seen.values()) if seen else 0
+        cands.append(rel)
+    cands.sort(key=lambda r: (-r.resolution, _clean(r.title), r.link))
+    counted: list[frozenset] = []
+    best = 0
+    for rel in cands if own_ids is not None else ():
+        if stop_at and len(counted) >= stop_at:
+            break
+        try:
+            ids = indexers.fetch_ids(rel)
+        except _ERRORS:
+            unsure = True
+            continue
+        if not ids or ids & own_ids:
+            continue  # the same upload (or nothing to compare)
+        if any(ids & c for c in counted):
+            continue  # the same upload as one already counted
+        counted.append(ids)
+        best = max(best, rel.resolution)
+    count = len(counted)
     if count:
         note = f"{count} alternative(s), best {best}p"
+    elif unsure:
+        note = "restore path unchecked (an indexer or NZB did not answer)"
     elif below:
         note = f"only below-floor alternatives ({below}), floor {floor}p"
     else:
         note = "no alternative release found"
-    return {"count": count, "floor": floor, "best": best, "below_floor": below, "note": note}
+    return {"count": count, "floor": floor, "best": best, "below_floor": below,
+            "partial": partial, "unsure": unsure, "note": note}
 
 
 def _find_exact(row: dict, indexers, name: str):
@@ -146,15 +177,27 @@ def _find_exact(row: dict, indexers, name: str):
             yield rel
 
 
+def sha256_file(path: str) -> str:
+    """SHA-256 of a file, from a fresh read of every byte."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(_READ)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
 def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_secondary,
-            archive_dir: str) -> QualifyResult:
-    fields: dict = {"steps": {}}
-    steps = fields["steps"]
+            archive_dir: str, clock=time.time) -> QualifyResult:
+    fields: dict = {}
+    steps: dict = {}
     name = release_name_of(row)
 
     def fail(step: str, reason: str, **info) -> QualifyResult:
         steps[step] = {"ok": False, **info}
-        return QualifyResult(False, [reason], fields)
+        return QualifyResult(False, [reason], fields, steps)
 
     # 1. exact NZB
     nzb_path = row.get("nzb_path")
@@ -186,12 +229,20 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
     steps["import"] = {"ok": True}
     fields["remote_path"] = remote_path
 
-    # 3. full read
+    # 3. the local file and the remote copy, both read in full now
+    lib_path = row.get("lib_path")
+    if not lib_path:
+        return fail("hash", "no_lib_path")
     try:
-        got = reader.sha256_full(remote_path)
+        local = sha256_file(str(lib_path))
+    except OSError as e:
+        return fail("hash", "local_unreadable", error=type(e).__name__)
+    fields["sha256"] = local
+    try:
+        remote = reader.sha256_full(remote_path)
     except _ERRORS as e:
         return fail("hash", "read_failed", error=type(e).__name__)
-    if got != row.get("sha256"):
+    if remote != local:
         return fail("hash", "hash_mismatch")
     steps["hash"] = {"ok": True}
 
@@ -207,15 +258,23 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
         if res["missing"] or res["total"] == 0:
             return fail(f"stat_{label}", f"missing_segments_{label}", **info)
         steps[f"stat_{label}"] = {"ok": True, **info}
+    now = clock()
+    fields["last_check_ts"] = now
+    fields["last_stat_ok_ts"] = now
 
     # 5. restore path
     try:
-        sc = score_restore(row, indexers, nzb_segment_ids(nzb_bytes))
+        sc = score_restore(row, indexers, nzb_segment_ids(nzb_bytes), stop_at=3)
     except _ERRORS as e:
         return fail("restore", "restore_check_failed", error=type(e).__name__)
-    fields["restore_score"] = sc["count"]
+    if sc["count"] or not sc["unsure"]:  # an unchecked 0 is not a score
+        fields["restore_score"] = sc["count"]
     fields["restore_note"] = sc["note"]
+    if sc["partial"]:
+        return fail("restore", "restore_check_unsure", count=sc["count"])  # unsure is a fail
     if sc["count"] < 1:
+        if sc["unsure"]:
+            return fail("restore", "restore_check_unsure", count=0)
         return fail("restore", "no_restore_path", count=0, below_floor=sc["below_floor"])
     steps["restore"] = {"ok": True, "count": sc["count"], "best": sc["best"]}
-    return QualifyResult(True, [], fields)
+    return QualifyResult(True, [], fields, steps)

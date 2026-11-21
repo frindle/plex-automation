@@ -29,6 +29,7 @@ import http.client
 import json
 import os
 import re
+import ssl
 import time
 import urllib.parse
 import uuid
@@ -36,6 +37,7 @@ import xml.etree.ElementTree as ET
 
 MEDIA_EXTS = (".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".wmv")
 CHUNK = 1 << 20
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 class AltMountError(Exception):
@@ -61,15 +63,24 @@ class _Http:
         u = urllib.parse.urlsplit(base)
         if u.scheme not in ("http", "https") or not u.hostname:
             raise AltMountError("bad base url")
+        if u.scheme == "http" and u.hostname not in _LOCAL_HOSTS:
+            raise AltMountError("plain http is only allowed to localhost")
         self._https = u.scheme == "https"
         self._host = u.hostname
         self._port = u.port or (443 if self._https else 80)
         self._prefix = u.path.rstrip("/")
         self._timeout = timeout
+        self._ctx = None
+        if self._https:
+            self._ctx = ssl.create_default_context()
+            self._ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
     def open(self, method, path, headers=None, body=None):
-        cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
-        conn = cls(self._host, self._port, timeout=self._timeout)
+        if self._https:
+            conn = http.client.HTTPSConnection(self._host, self._port, timeout=self._timeout,
+                                               context=self._ctx)
+        else:
+            conn = http.client.HTTPConnection(self._host, self._port, timeout=self._timeout)
         try:
             conn.request(method, self._prefix + path, body=body, headers=headers or {})
             return conn, conn.getresponse()
@@ -270,9 +281,12 @@ class ImportClient:
             raise ImportFailed("altmount did not echo the job id")
 
     def _history(self, job_id: str) -> dict | None:
-        q = urllib.parse.urlencode({"mode": "history", "output": "json",
-                                    "apikey": self._key, "nzo_ids": job_id})
-        conn, resp = self._http.open("GET", "/sabnzbd/api?" + q)
+        # The key goes in the body, never in the URL.
+        body = urllib.parse.urlencode({"mode": "history", "output": "json",
+                                       "apikey": self._key, "nzo_ids": job_id}).encode()
+        conn, resp = self._http.open(
+            "POST", "/sabnzbd/api",
+            {"Content-Type": "application/x-www-form-urlencoded"}, body)
         data = self._json(resp, conn)
         for s in (data.get("history") or {}).get("slots") or []:
             if s.get("nzo_id") == job_id:

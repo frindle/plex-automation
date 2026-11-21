@@ -156,13 +156,34 @@ class _AmHandler(_Quiet):
         self.end_headers()
         self.wfile.write(b)
 
+    def _history(self, o, q):
+        if q.get("apikey", [""])[0] != o.key:
+            return self._json({"status": False, "error": "Invalid API key"})
+        jid = q.get("nzo_ids", [""])[0]
+        job = o.jobs.get(jid)
+        slots = []
+        if job is not None:
+            job["polls"] += 1
+            if job["polls"] > o.pending_polls:
+                if o.fail:
+                    slots = [{"nzo_id": jid, "status": "Failed", "storage": ""}]
+                else:
+                    slots = [{"nzo_id": jid, "status": "Completed", "storage": o.storage}]
+        self._json({"history": {"slots": slots, "noofslots": len(slots)}})
+
     def do_POST(self):
         o = self.server.owner
+        o.urls.append(self.path)
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n)
+        ctype = self.headers["Content-Type"]
+        if ctype.startswith("application/x-www-form-urlencoded"):
+            q = urllib.parse.parse_qs(body.decode())
+            if q.get("mode", [""])[0] == "history":
+                return self._history(o, q)
+            return self._json({"status": False, "error": "bad request"})
         msg = email.message_from_bytes(
-            b"Content-Type: " + self.headers["Content-Type"].encode() + b"\r\n\r\n" + body,
-            policy=email.policy.HTTP)
+            b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + body, policy=email.policy.HTTP)
         form, upload = {}, None
         for part in msg.iter_parts():
             nm = part.get_param("name", header="content-disposition")
@@ -178,29 +199,16 @@ class _AmHandler(_Quiet):
         o.jobs[form["nzbname"]] = {"polls": 0}
         self._json({"status": True, "nzo_ids": [form["nzbname"]]})
 
-    def do_GET(self):
-        o = self.server.owner
-        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-        if q.get("apikey", [""])[0] != o.key:
-            return self._json({"status": False, "error": "Invalid API key"})
-        jid = q.get("nzo_ids", [""])[0]
-        job = o.jobs.get(jid)
-        slots = []
-        if job is not None:
-            job["polls"] += 1
-            if job["polls"] > o.pending_polls:
-                if o.fail:
-                    slots = [{"nzo_id": jid, "status": "Failed", "storage": ""}]
-                else:
-                    slots = [{"nzo_id": jid, "status": "Completed", "storage": o.storage}]
-        self._json({"history": {"slots": slots, "noofslots": len(slots)}})
+    def do_GET(self):  # the key is never accepted in a URL
+        self.server.owner.urls.append(self.path)
+        self._json({"status": False, "error": "use POST"}, 405)
 
 
 class FakeAltMount(_Server):
     def __init__(self, storage, key=APIKEY, pending_polls=1, fail=False):
         self.key, self.storage = key, storage
         self.pending_polls, self.fail = pending_polls, fail
-        self.uploads, self.jobs = [], {}
+        self.uploads, self.jobs, self.urls = [], {}, []
         super().__init__(_AmHandler)
 
 
@@ -224,6 +232,7 @@ class _NzHandler(_Quiet):
                 self.send_response(404)
                 self.end_headers()
                 return
+            o.gets.append(u.path[5:])
             b = rel["nzb"]
             self.send_response(200)
             self.send_header("Content-Length", str(len(b)))
@@ -244,9 +253,10 @@ class _NzHandler(_Quiet):
                 f'<enclosure url="{o.url}/get/{gid}?apikey={o.key}" length="{len(rel["nzb"])}"/>'
                 f'<newznab:attr name="size" value="{rel.get("size", 1000)}"/></item>')
         body = ('<?xml version="1.0"?><rss xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">'
-                f"<channel>{''.join(items)}</channel></rss>").encode()
+                f"<channel>{o.extra_items}{''.join(items)}</channel></rss>").encode()
         self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
+        # truncate: promise more bytes than are sent, so the client sees an IncompleteRead
+        self.send_header("Content-Length", str(len(body) + (50 if o.truncate else 0)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -255,8 +265,10 @@ class FakeNewznab(_Server):
     def __init__(self, releases=None, key="nzkey"):
         self.key = key
         self.releases = dict(releases or {})  # guid -> {title, nzb, size?}
-        self.queries = []
+        self.queries, self.gets = [], []
         self.fail = False
+        self.truncate = False
+        self.extra_items = ""  # raw XML put in front of the items
         super().__init__(_NzHandler)
 
 
@@ -356,23 +368,111 @@ def self_signed_cert(tmp_path):
 
 # ------------------------------------------------------------------ state fake
 
+COLUMNS = (
+    "id", "lib_path", "stub_path", "remote_path", "size", "mtime_ns", "sha256", "head_len",
+    "tail_len", "head_b3", "tail_b3", "nzb_path", "nzb_path2", "title", "year", "imdb_id",
+    "tvdb_id", "season", "episode", "release_name", "rating_key", "kind", "is4k", "state",
+    "step", "restore_score", "restore_note", "last_check_ts", "last_stat_ok_ts", "last_ok_ts",
+    "created_ts", "updated_ts")
+
+
 class FakeState:
-    """Same function names as state.py. ``db`` is ignored; rows live here."""
+    """The state.py contract (tiering/OFFLOAD_DESIGN.md), in memory. ``db`` is ignored.
+
+    Matches the contract signatures exactly. Unknown columns raise ValueError, as the
+    real module does. ``set_state`` is deliberately absent: the intake code must not
+    call it.
+    """
 
     def __init__(self, rows=None):
         self.rows = {r["id"]: dict(r) for r in (rows or [])}
         self.events = []
+        self.calls = []
+
+    @staticmethod
+    def _check(fields):
+        bad = [k for k in fields if k not in COLUMNS]
+        if bad:
+            raise ValueError(f"unknown column(s): {', '.join(sorted(bad))}")
 
     def list_files(self, db, state=None):
+        self.calls.append("list_files")
         return [dict(r) for r in self.rows.values() if state is None or r.get("state") == state]
 
     def get(self, db, id):
         r = self.rows.get(id)
         return dict(r) if r else None
 
-    def set_state(self, db, id, state, **fields):
-        self.rows[id].update(fields)
-        self.rows[id]["state"] = state
+    def by_path(self, db, lib_path):
+        self.calls.append("by_path")
+        for r in self.rows.values():
+            if r.get("lib_path") == lib_path:
+                return dict(r)
+        return None
+
+    def upsert(self, db, row):
+        self.calls.append("upsert")
+        if not row.get("id"):
+            raise ValueError("row needs an id")
+        self._check(row)
+        cur = self.rows.setdefault(row["id"], {"state": "whole", "is4k": 0, "step": 0})
+        cur.update({k: v for k, v in row.items() if k not in ("state", "is4k", "step") or v is not None})
+
+    def update_if(self, db, id, expect_state, **fields):
+        self.calls.append("update_if")
+        self._check(fields)
+        r = self.rows.get(id)
+        if r is None or r.get("state") != expect_state:
+            return False
+        r.update(fields)
+        r["updated_ts"] = 1
+        return True
 
     def log_event(self, db, id, kind, detail):
+        self.calls.append("log_event")
         self.events.append((id, kind, detail))
+
+
+# ------------------------------------------------------------------ Radarr / Sonarr
+
+class _ArrHandler(_Quiet):
+    def do_GET(self):
+        o = self.server.owner
+        u = urllib.parse.urlsplit(self.path)
+        o.requests.append((u.path, u.query, self.headers.get("X-Api-Key")))
+        if self.headers.get("X-Api-Key") != o.key or "apikey" in u.query.lower():
+            self.send_response(401)
+            self.end_headers()
+            return
+        q = urllib.parse.parse_qs(u.query)
+        if o.fail:
+            self.send_response(500)
+            self.end_headers()
+            return
+        if u.path == "/api/v3/movie":
+            data = o.movies
+        elif u.path == "/api/v3/series":
+            data = o.series
+        elif u.path == "/api/v3/episode":
+            data = o.episodes.get(int(q["seriesId"][0]), [])
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        b = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+
+class FakeArr(_Server):
+    """A Radarr (``movies``) or Sonarr (``series`` and ``episodes``) API on a real socket."""
+
+    def __init__(self, key="arrkey", movies=None, series=None, episodes=None):
+        self.key = key
+        self.movies, self.series = movies or [], series or []
+        self.episodes = episodes or {}  # series id -> list of episode dicts
+        self.requests = []
+        self.fail = False
+        super().__init__(_ArrHandler)

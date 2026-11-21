@@ -3,26 +3,48 @@
 There are no backups, so this is the safety net. For every offloaded row it:
 
 - runs a 100% STAT of the row's NZB on both providers;
-- re-scores the restore path;
-- flags the row for promotion if a segment is missing or the restore count is 0.
+- re-checks the restore path;
+- flags the row for promotion at once if a segment is missing or there is no
+  restore path.
 
-A provider that cannot be asked (login refused, quota, link down) never flags a
-row. The row is reported as "could not be checked" and the provider is not
+Writes. Each result is written to the row as soon as it is known, through
+``state.update_if(db, id, "offloaded", ...)`` and nothing else. If the runner
+moved the row on (or it was deleted) the write returns False, the row is left
+alone and the loop goes on. ``set_state`` is never called, and no row read at the
+start is ever written back whole.
+
+Unknown is not bad. A provider that cannot be asked (login refused, quota, link
+down) never flags a row; it is "could not be checked", and the provider is not
 asked again in that run, so a bad password cannot cause mass promotion or an
-account lock.
+account lock. An indexer that fails or answers only in part makes the restore
+check "unchecked", never "no restore path", and unchecked never promotes.
+``last_check_ts`` is set on every checked row; ``last_stat_ok_ts`` only when both
+providers found every segment. An alert is raised for a row whose
+``last_stat_ok_ts`` is older than 14 days.
 
-Once a month (the first 7 days, or ``monthly=True``) it also reads a rotating
-5% of the offloaded bytes in full through WebDAV and compares the SHA-256.
-Rows are chosen by oldest ``last_ok_ts``, and ``last_ok_ts`` is set only by a
-passing full read, so the rotation moves on every month.
+Restore-path cost. Each candidate costs one NZB grab. The weekly check only needs
+to know "is there at least one other upload", so it stops at the first verified
+one (``stop_at=1``), the client caches grabs per run and spaces them apart.
 
-``run_weekly`` returns the rows to promote. It does not promote anything.
+Monthly (the first 7 days, or ``monthly=True``) it reads a rotating 5% of the
+offloaded bytes in full through WebDAV and compares the SHA-256. Rows are picked
+by the oldest *attempt*, not the oldest success, so a row that always fails
+cannot hold the rotation: the attempt is recorded before the read, in a small
+JSON file next to the report (no column). A hash mismatch is like ``bad_chunk``:
+the row goes to ``state=failed`` and an alert is raised (promoting cannot help,
+the remote copy is bad). Three read errors in a row, or three weekly STAT
+failures in a row, on one row raise an alert.
+
+``run_weekly`` returns the rows flagged for promotion. It promotes nothing; the
+optional ``on_promote(entry)`` is called per row the moment it is flagged.
 """
 from __future__ import annotations
 
 import collections
+import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 from .newznab import NewznabError, nzb_segment_ids, read_archived
@@ -30,6 +52,8 @@ from .nntp_stat import NntpUnavailable
 from .qualify import score_restore
 
 _SOFT = ("auth", "quota")  # reported separately, never flagged
+STALE_DAYS = 14
+STREAK = 3
 
 
 def _title(row: dict) -> str:
@@ -46,11 +70,41 @@ def _human(n: int) -> str:
     return f"{n} B"
 
 
-def _pick_for_full_read(rows: list[dict], frac: float) -> list[dict]:
+def _load_attempts(path: str) -> dict:
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_attempts(path: str, d: dict) -> None:
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _pick_for_full_read(rows: list[dict], frac: float, attempts: dict) -> list[dict]:
+    """Rows for the monthly read: oldest attempt first (never tried comes first)."""
     total = sum(int(r.get("size") or 0) for r in rows)
     budget = total * frac
     picked, used = [], 0
-    for r in sorted(rows, key=lambda r: (r.get("last_ok_ts") or 0, str(r.get("id")))):
+
+    def key(r):
+        a = attempts.get(str(r.get("id")), {})
+        return (a.get("read_ts") or 0, r.get("last_ok_ts") or 0, str(r.get("id")))
+
+    for r in sorted(rows, key=key):
         if picked and used >= budget:
             break
         picked.append(r)
@@ -60,25 +114,67 @@ def _pick_for_full_read(rows: list[dict], frac: float) -> list[dict]:
 
 def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                state=None, reader=None, monthly: bool | None = None,
-               sample_frac: float = 0.05, now: float | None = None) -> list[dict]:
+               sample_frac: float = 0.05, now: float | None = None,
+               alert=None, on_promote=None, attempts_path: str | None = None) -> list[dict]:
     if state is None:
         from . import state as _state
         state = _state
     now = time.time() if now is None else now
     if monthly is None:
         monthly = datetime.fromtimestamp(now, timezone.utc).day <= 7
+    attempts_path = attempts_path or f"{report_path}.attempts.json"
+    attempts = _load_attempts(attempts_path)
 
     rows = state.list_files(db, "offloaded")
     res: dict[str, dict] = {}
     dead: dict[str, str] = {}  # provider label -> kind, once it cannot be asked
     providers = (("primary", stat_primary), ("secondary", stat_secondary))
+    promote: list[dict] = []
+    alerts: list[str] = []
+    full = {"files": 0, "bytes": 0, "mismatch": 0}
+    ran_full = bool(monthly and reader is not None and rows)
+    picked = ({r["id"] for r in _pick_for_full_read(rows, sample_frac, attempts)}
+              if ran_full else set())
+
+    def raise_alert(row: dict, msg: str) -> None:
+        text = f"{_title(row)}: {msg}"
+        alerts.append(text)
+        state.log_event(db, row["id"], "alert", {"msg": msg})
+        if alert is not None:
+            alert(text)
+
+    def write(r: dict, **fields) -> bool:
+        ok = state.update_if(db, r["row"]["id"], "offloaded", **fields)
+        if not ok:
+            r["moved"] = True
+        return ok
+
+    def flag(r: dict, reason: str, detail: str = "", **extra) -> bool:
+        """Mark the row for promotion now: persist the flag, log it, tell the caller."""
+        if reason not in r["flags"]:
+            r["flags"].append(reason)
+        note = "promote flagged: " + ", ".join(r["flags"]) + (f"; {detail}" if detail else "")
+        fields = {"last_check_ts": now, "restore_note": note, **extra}
+        if not write(r, **fields):
+            return False
+        row = r["row"]
+        state.log_event(db, row["id"], "weekly_flag", {"reasons": list(r["flags"])})
+        if r["entry"] is None:
+            r["entry"] = {**row, "promote_reasons": r["flags"]}
+            promote.append(r["entry"])
+            if on_promote is not None:
+                on_promote(r["entry"])
+        return True
 
     for row in rows:
+        rid = row["id"]
+        att = attempts.setdefault(rid, {})
         r = {"row": row, "flags": [], "unchecked": [], "failed": [], "lost": False,
-             "stat_done": 0}
-        res[row["id"]] = r
+             "stat_done": 0, "moved": False, "entry": None, "hash_failed": False}
+        res[rid] = r
         nzb = row.get("nzb_path")
-        if not nzb or not os.path.exists(nzb):
+        has_nzb = bool(nzb and os.path.exists(nzb))
+        if not has_nzb:
             r["unchecked"].append("no_nzb")
         else:
             for label, fn in providers:
@@ -101,59 +197,100 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                     r["failed"].append(f"{label}_empty_nzb")
                     continue
                 r["stat_done"] += 1
-                if out["missing"]:
-                    r["flags"].append(f"missing_segments_{label}")
+                if out["missing"] and not flag(r, f"missing_segments_{label}"):
+                    break  # the runner moved this row on
+        if r["moved"]:
+            continue
+
+        # the STAT result, written as soon as both providers are done
+        upd: dict = {"last_check_ts": now}
+        all_found = (r["stat_done"] == len(providers)
+                     and not any(f.startswith("missing_segments") for f in r["flags"]))
+        if all_found:
+            upd["last_stat_ok_ts"] = now
+            att["stat_net"] = 0
+        elif r["failed"]:
+            att["stat_net"] = int(att.get("stat_net") or 0) + 1
+            if att["stat_net"] >= STREAK:
+                raise_alert(row, f"{att['stat_net']} STAT checks in a row failed")
+        if not write(r, **upd):
+            continue
+        last_ok = row.get("last_stat_ok_ts")
+        if not all_found and (last_ok is None or now - float(last_ok) > STALE_DAYS * 86400):
+            raise_alert(row, f"no complete STAT check in over {STALE_DAYS} days")
 
         # restore path
-        upd: dict = {}
-        try:
-            own = None
-            if nzb and os.path.exists(nzb):
+        if has_nzb:
+            try:
                 own = nzb_segment_ids(read_archived(nzb))
-            sc = score_restore(row, indexers, own)
-            upd["restore_score"], upd["restore_note"] = sc["count"], sc["note"]
-            if sc["count"] == 0:
-                r["flags"].append("no_restore_path")
-                prev = row.get("restore_score")
-                r["lost"] = prev is None or prev > 0
-        except NewznabError:
-            r["unchecked"].append("indexers_unreachable")
-        except Exception as e:
-            r["failed"].append(f"restore_{type(e).__name__}")
-        r["upd"] = upd
+                sc = score_restore(row, indexers, own, stop_at=1)
+                note = sc["note"]
+                if r["flags"]:
+                    note = "promote flagged: " + ", ".join(r["flags"]) + "; " + note
+                if sc["count"] == 0 and sc["unsure"]:
+                    r["unchecked"].append("indexers_partial" if sc["partial"] else "restore_unsure")
+                elif sc["count"] == 0:
+                    prev = row.get("restore_score")
+                    r["lost"] = prev is None or prev > 0
+                    flag(r, "no_restore_path", sc["note"], restore_score=0)
+                else:
+                    write(r, restore_score=sc["count"], restore_note=note)
+            except NewznabError:
+                r["unchecked"].append("indexers_unreachable")
+            except Exception as e:
+                r["failed"].append(f"restore_{type(e).__name__}")
+            if r["moved"]:
+                continue
 
-    # monthly full-read compare
-    full = {"files": 0, "bytes": 0, "mismatch": 0}
-    if monthly and reader is not None and rows:
-        for row in _pick_for_full_read(rows, sample_frac):
-            r = res[row["id"]]
+        # monthly full read
+        if rid in picked:
+            att["read_ts"] = now  # recorded before the read: a failure still moves the rotation on
+            _save_attempts(attempts_path, attempts)
             try:
                 got = reader.sha256_full(row["remote_path"])
             except Exception as e:
                 r["failed"].append(f"full_read_{type(e).__name__}")
-                continue
-            full["files"] += 1
-            full["bytes"] += int(row.get("size") or 0)
-            if got != row.get("sha256"):
-                r["flags"].append("hash_mismatch")
-                full["mismatch"] += 1
+                att["read_net"] = int(att.get("read_net") or 0) + 1
+                state.log_event(db, rid, "full_read_error", {"kind": type(e).__name__})
+                if att["read_net"] >= STREAK:
+                    raise_alert(row, f"{att['read_net']} full reads in a row failed")
             else:
-                r["upd"]["last_ok_ts"] = now
+                att["read_net"] = 0
+                full["files"] += 1
+                full["bytes"] += int(row.get("size") or 0)
+                if not row.get("sha256"):
+                    r["unchecked"].append("no_sha256")
+                elif got == row["sha256"]:
+                    write(r, last_ok_ts=now)
+                else:
+                    full["mismatch"] += 1
+                    r["hash_failed"] = True
+                    if write(r, state="failed",
+                             restore_note="full read hash mismatch; remote copy is bad. "
+                                          + (row.get("restore_note") or "")):
+                        state.log_event(db, rid, "full_read_mismatch", {})
+                        raise_alert(row, "full read hash mismatch, marked failed")
+            if r["moved"]:
+                continue
 
-    # store results, build the lists
-    promote: list[dict] = []
+    live = {r["id"] for r in rows}
+    _save_attempts(attempts_path, {k: v for k, v in attempts.items() if v and k in live})
+
+    # classify for the report
     flagged, unchecked_rows, failed_rows = [], [], []
-    ok = checked = 0
+    ok = checked = moved = hash_failed = 0
     reasons: collections.Counter = collections.Counter()
     for row in rows:
         r = res[row["id"]]
-        flags = list(dict.fromkeys(r["flags"]))
-        if flags:
+        if r["moved"]:
+            moved += 1
+            continue
+        if r["hash_failed"]:
+            hash_failed += 1
+            checked += 1
+        elif r["flags"]:
             checked += 1
             flagged.append(r)
-            promote.append({**row, "promote_reasons": flags})
-            state.log_event(db, row["id"], "weekly_flag", {"reasons": flags})
-            r["upd"].pop("last_ok_ts", None)
         elif r["unchecked"]:
             unchecked_rows.append(r)
             for x in set(r["unchecked"]):
@@ -165,18 +302,20 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
         else:
             checked += 1
             ok += 1
-        state.set_state(db, row["id"], "offloaded", last_check_ts=now, **r["upd"])
 
     lost = sum(1 for r in res.values() if r["lost"])
+    failed_state = state.list_files(db, "failed")
     _write_report(report_path, now=now, rows=rows, checked=checked, ok=ok,
                   flagged=flagged, failed=failed_rows, unchecked=unchecked_rows,
                   reasons=reasons, dead=dead, promote=promote, lost=lost,
-                  monthly=monthly, full=full, ran_full=bool(monthly and reader is not None))
+                  monthly=monthly, full=full, ran_full=ran_full, moved=moved,
+                  hash_failed=hash_failed, alerts=alerts, failed_state=failed_state)
     return promote
 
 
 def _write_report(path, *, now, rows, checked, ok, flagged, failed, unchecked, reasons,
-                  dead, promote, lost, monthly, full, ran_full):
+                  dead, promote, lost, monthly, full, ran_full, moved, hash_failed,
+                  alerts, failed_state):
     total_bytes = sum(int(r.get("size") or 0) for r in rows)
     day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
     L = [f"# Offload weekly check, {day}", ""]
@@ -187,6 +326,8 @@ def _write_report(path, *, now, rows, checked, ok, flagged, failed, unchecked, r
           f"Files flagged: {len(flagged)}.",
           f"Files that failed to check: {len(failed)}.",
           f"Files that could not be checked: {len(unchecked)}.",
+          f"Files marked failed this run: {hash_failed}.",
+          f"Files changed by the runner during the run: {moved}.",
           f"Promotions requested: {len(promote)}.",
           f"Restore paths lost: {lost}.", ""]
     if ran_full:
@@ -201,7 +342,16 @@ def _write_report(path, *, now, rows, checked, ok, flagged, failed, unchecked, r
         L.append(f"The {label} provider {why}. Its checks were skipped and nothing was flagged for it.")
     if dead:
         L.append("")
-    L.append("## Could not be checked")
+    L.append("## Alerts")
+    L += [f"- {a}" for a in alerts] or ["None."]
+    L += ["", "## Failed files (state failed)"]
+    if failed_state:
+        for fr in sorted(failed_state, key=lambda x: _title(x).lower()):
+            L.append(f"- {_title(fr)}: {fr.get('restore_note') or 'no note'}; "
+                     f"restore path: {fr.get('nzb_path2') or 'none archived'}")
+    else:
+        L.append("None.")
+    L += ["", "## Could not be checked"]
     if reasons:
         for k, n in sorted(reasons.items()):
             L.append(f"- {k}: {n} files")
@@ -216,7 +366,7 @@ def _write_report(path, *, now, rows, checked, ok, flagged, failed, unchecked, r
     else:
         L.append("None.")
     L.append("")
-    tmp = f"{path}.tmp"
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
     with open(tmp, "w") as f:
         f.write("\n".join(L))
     os.replace(tmp, path)

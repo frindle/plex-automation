@@ -34,9 +34,9 @@ class Env:
         for k, n in enumerate(names):
             p = nz.archive_nzb(make_nzb(ids_for(n)), str(tmp_path / "arch"), f"{n}.2020.1080p.BluRay-GRP")
             rows.append({"id": f"{k:016x}", "state": "offloaded", "title": n, "year": 2020,
-                         "release_name": f"{n}.2020.1080p.BluRay-GRP", "resolution": 1080,
+                         "release_name": f"{n}.2020.1080p.BluRay-GRP",
                          "nzb_path": p, "size": 1000, "sha256": "x", "remote_path": f"/{n}.mkv",
-                         "restore_score": 1})
+                         "restore_score": 1, "last_stat_ok_ts": DAY15 - 86400})
         self.state = FakeState(rows)
         self.report = str(tmp_path / "report.md")
 
@@ -218,11 +218,17 @@ def test_full_read_mismatch_flags_and_keeps_old_last_ok(tmp_path):
         oldest = e.state.rows[f"{3:016x}"]
         before = oldest["last_ok_ts"]
         rd = SpyReader({oldest["remote_path"]: "0" * 64})
-        promote = e.run(reader=rd, now=DAY3)
-        assert [r["title"] for r in promote] == ["N03"]
-        assert promote[0]["promote_reasons"] == ["hash_mismatch"]
-        assert oldest["last_ok_ts"] == before
-        assert "1 mismatches" in e.text()
+        alerts = []
+        promote = e.run(reader=rd, now=DAY3, alert=alerts.append)
+        assert promote == []  # promoting cannot help: the remote copy is bad
+        assert oldest["state"] == "failed" and oldest["last_ok_ts"] == before
+        assert "hash mismatch" in oldest["restore_note"]
+        assert any("hash mismatch" in a and "N03" in a for a in alerts)
+        t = e.text()
+        assert "1 mismatches" in t and "Files marked failed this run: 1." in t
+        assert "## Failed files" in t and "- N03: full read hash mismatch" in t
+        assert "restore path: none archived" in t
+        assert ("N03" in t.split("## Alerts")[1].split("##")[0])
     finally:
         e.close()
 

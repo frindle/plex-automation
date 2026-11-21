@@ -15,3 +15,8 @@ def _apply_env(monkeypatch):
         canary = "canary-proc"
     monkeypatch.setenv("TIERING_PROC_CANARY", canary)
     monkeypatch.setattr(ops, "_fs_type", lambda p: "xfs")
+
+@pytest.fixture(autouse=True)
+def _no_grab_delay(monkeypatch):
+    # The real client spaces NZB grabs apart; tests do not wait for that.
+    monkeypatch.setenv("NEWZNAB_GRAB_INTERVAL", "0")
