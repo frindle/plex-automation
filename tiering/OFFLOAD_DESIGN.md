@@ -104,6 +104,7 @@ tierfs reads the remote at `${TIERFS_REMOTE_BASE}` + `remote_path`. The credenti
 | `plex_watch.py` | rules | Read-only Plex client and the tierfs event reader. |
 | `altmount.py`, `nntp_stat.py`, `newznab.py` | intake | Clients. `altmount.WebDavReader` implements `RemoteReader`. |
 | `qualify.py`, `weekly.py` | intake | The checks before an offload, the weekly check and the report. |
+| `register.py` | intake | Creates `whole` rows from Radarr and Sonarr. See "Register". |
 | `runner.py` | runner | The long-running loop that applies the hot set. See "Runner". |
 
 Tests go in `tiering/offload/tests/test_<module>*.py` and run under pytest in CI (`.github/workflows/tiering.yml`).
@@ -118,6 +119,9 @@ by_path(db, lib_path) -> dict | None
 by_rating_key(db, rating_key) -> list[dict]
 upsert(db, row: dict) -> None                # keyed on id
 set_state(db, id, state, **fields) -> None   # also sets updated_ts
+update_if(db, id, expect_state, **fields) -> bool  # one UPDATE ... WHERE id=? AND state=?; fields may include
+                                             # state; sets updated_ts; False (no change) if the row is gone or
+                                             # its state moved on. Long jobs (weekly) write through this only.
 list_files(db, state=None) -> list[dict]
 log_event(db, id, kind, detail: dict) -> None
 ```
@@ -133,8 +137,38 @@ The `files` table has these columns:
 - state: `state`, `step` (the last finished step of an offload or promote, so a crash can resume), `restore_score`, `restore_note`;
 - timestamps:
   - `last_check_ts`: the last weekly STAT check, whatever its result;
+  - `last_stat_ok_ts`: the last weekly STAT check that found every segment;
   - `last_ok_ts`: the last full read whose hash matched;
   - `created_ts`, `updated_ts`.
+
+### Qualify
+
+`qualify` decides whether one whole file may be offloaded tonight.
+- **Same bytes:** it hashes `L` itself with a fresh full read and hashes the remote copy, and both must equal. It never trusts a stored `sha256`. It writes the hash it saw into the row's `sha256`.
+- **Restore path:** another release at or above the quality floor that is a different upload. Any candidate whose NZB shares message-ids with the `nzb_path` NZB is the same upload, whatever its name. Size alone never decides.
+- **Quality floor:** taken from the source's resolution. When the source resolution is unknown, the floor is 1080p.
+- **Unsure is a fail:** an indexer or provider that did not answer, or a partial search, never passes.
+- `QualifyResult.fields` holds only `files` columns.
+
+Offload step 3 hashes `L` again in the read that builds the chunk list. If that hash differs from the row's `sha256`, the offload stops and nothing is swapped.
+
+### Register
+
+- `register(db, apply)` runs once a night before the demote window, and the runner calls it.
+- It reads every movie file and episode file from Radarr and Sonarr through their APIs (`RADARR_URL`, `SONARR_URL`, keys from env; more than one Sonarr is a comma list).
+- For each file it upserts a row by `lib_path`. A new row gets a fresh `<id>`, `state=whole`, `size`, `mtime_ns` and the media identity: `title`, `year`, `imdb_id`, `tvdb_id`, `season`, `episode`, and `release_name` (the arr's scene name, else the file name). `sha256` stays empty until qualify fills it.
+- An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`.
+- It never deletes a row. A path the arrs no longer list is logged.
+- The runner fills `rating_key`, `kind` and `is4k` from Plex.
+- `TIERING_PATH_MAP` maps arr paths to local paths, as for Plex.
+
+### Weekly
+
+- STAT every segment of each `offloaded` row's `nzb_path`. All found: set `last_check_ts` and `last_stat_ok_ts`. Any missing: flag a promote at once. Unknown (provider or network trouble): set `last_check_ts` only; alert when `last_stat_ok_ts` is older than 14 days.
+- An indexer that fails or answers partly makes the restore-path check "unchecked", never "no restore path". Unchecked never triggers a promote.
+- Each row's result is written as soon as it is known, through `update_if(..., expect_state="offloaded")`. A row the runner changed during the run is left alone.
+- The monthly full reads pick by the oldest attempt, not the oldest success, so one bad row cannot use the whole budget. A hash mismatch on a full read is treated like `bad_chunk`: `state=failed` and an alert. Three failed attempts in a row on network errors alert.
+- The report lists `offloaded` rows and every `failed` row with its `restore_note` and restore path.
 
 ### RemoteReader
 
@@ -163,7 +197,7 @@ The inputs are plain dicts shaped like Plex's JSON: `ratingKey`, `grandparentRat
    - `qualify` passed, the gate says "free", nlink is 1, and the hot set does not want the file;
    - `TIERING_APPLY=1`, otherwise this is a dry run.
 2. Hardlink `L` to the stub path.
-3. Write the chunk list, then the manifest. The stub is still whole.
+3. In one read of the stub, hash it with SHA-256 and build the chunk list. Stop if the hash differs from the row's `sha256`. Then write the chunk list, then the manifest. The stub is still whole.
 4. Create the symlink at `L.tierfs-tmp`, then `rename` it over `L`. This is atomic.
 5. Wait until no process holds the old inode open. Check `/proc/*/fd`, with a timeout.
 6. Punch holes in the stub, restore its mtime, and check head and tail against `head_b3` and `tail_b3`.
