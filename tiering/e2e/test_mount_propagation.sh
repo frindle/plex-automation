@@ -88,7 +88,7 @@ rec "Plex scanned a library whose file is a symlink into the FUSE mount and crea
 check_range() { # part_key start end
   local got exp
   got=$($PX fetch --part-key "$1" --range "$2-$3" | jq_py "d['sha256']")
-  exp=$(tail -c +$(( $2 + 1 )) "$REMOTE/$ID2.mkv" | head -c $(( $3 - $2 + 1 )) | sha256sum | cut -d' ' -f1)
+  exp=$(dd if="$REMOTE/$ID2.mkv" iflag=skip_bytes,count_bytes skip="$2" count=$(( $3 - $2 + 1 )) status=none | sha256sum | cut -d' ' -f1)
   [ "$got" = "$exp" ] || fail "range $2-$3 sha256 mismatch"
 }
 mid=$(( size2 / 2 ))
