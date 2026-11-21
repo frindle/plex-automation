@@ -277,6 +277,10 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                 if r["flags"]:
                     note = "promote flagged: " + ", ".join(r["flags"]) + "; " + note
                 if sc["count"] == 0 and sc["unsure"]:
+                    if n2_dead:  # known dead, replacement not found yet: keep it, say so
+                        raise_alert(row, "restore NZB is dead and the search for a "
+                                         "replacement was not complete")
+                        state.log_event(db, rid, "restore_nzb_lost", {"unsure": True})
                     if not r["failed"]:  # a row that failed its STAT already says why
                         r["unchecked"].append("indexers_partial" if sc["partial"]
                                               else "restore_unsure")

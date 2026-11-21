@@ -125,7 +125,8 @@ def stat_status(path: str, providers, dead: dict | None = None) -> str:
     ``providers`` is a list of (label, checker). A provider that cannot be asked makes
     the answer ``unchecked`` (never ``missing``); with ``dead`` given, one that refused
     the login or reported a quota is remembered there and not asked again. An NZB that
-    cannot be read, has no segment or lacks any segment is ``missing``.
+    is not valid, has no segment or lacks any segment is ``missing``; any other error
+    reading it (a disk fault, say) is ``unchecked``.
     """
     dead = {} if dead is None else dead
     for label, fn in providers:
@@ -137,8 +138,10 @@ def stat_status(path: str, providers, dead: dict | None = None) -> str:
             if e.kind in _SOFT:
                 dead[label] = e.kind
             return "unchecked"
-        except Exception:  # an unreadable NZB is as good as a dead one
+        except (ParseError, EOFError, zlib.error):  # not an NZB at all: as good as a dead one
             return "missing"
+        except Exception:  # noqa: BLE001  # a read error says nothing about the articles
+            return "unchecked"
         if out["total"] == 0 or out["missing"]:
             return "missing"
     return "ok"
@@ -299,18 +302,23 @@ def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_seconda
             steps["nzb"] = {"ok": True, "reused": True}
         else:
             fails = 0
-            for rel in _find_exact(searched(), name):
+            found = searched()
+            unsure = bool(getattr(found, "partial", False))  # an indexer was not asked
+            for rel in _find_exact(found, name):
                 try:
                     nzb_bytes = indexers.fetch_nzb(rel)
                     break
                 except GrabBudgetSpent:
+                    unsure = True
                     continue
                 except NewznabError:
+                    unsure = True
                     fails += 1
                     if fails >= MAX_FAILED_GRABS:
                         break
             if nzb_bytes is None:
-                return fail("nzb", "no_exact_nzb")
+                # "not on any indexer" only after a complete search; else try again later
+                return fail("nzb", "nzb_unsure" if unsure else "no_exact_nzb")
             nzb_path = archive_nzb(nzb_bytes, archive_dir, name)
             steps["nzb"] = {"ok": True, "reused": False}
     except _ERRORS as e:

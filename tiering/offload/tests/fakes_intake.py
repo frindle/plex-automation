@@ -242,6 +242,12 @@ class _NzHandler(_Quiet):
             self.wfile.write(b)
             return
         o.queries.append({k: v[0] for k, v in q.items() if k != "apikey"})
+        if o.fail and o.fail_body is not None:  # an error page behind a 200
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(o.fail_body)))
+            self.end_headers()
+            self.wfile.write(o.fail_body)
+            return
         if o.fail:
             self.send_response(o.fail_code)
             if o.retry_after is not None:
@@ -273,6 +279,7 @@ class FakeNewznab(_Server):
         self.fail = False
         self.fail_code = 500
         self.retry_after = None
+        self.fail_body = None
         self.truncate = False
         self.extra_items = ""  # raw XML put in front of the items
         super().__init__(_NzHandler)

@@ -28,6 +28,7 @@ not failed). Message-ids are compared without ``<>`` or white space, and case-se
 """
 from __future__ import annotations
 
+import email.utils
 import gzip
 import hashlib
 import http.client
@@ -129,9 +130,12 @@ def load_indexers(raw: str | None = None) -> list[Indexer]:
         return []
     try:
         items = json.loads(raw)
-        return [Indexer(str(i["name"]), str(i["url"]), str(i["apikey"])) for i in items]
+        out = [Indexer(str(i["name"]), str(i["url"]), str(i["apikey"])) for i in items]
     except (ValueError, KeyError, TypeError):
-        raise NewznabError("NEWZNAB_INDEXERS is not a valid list") from None
+        out = None  # raised below: the error that got us here holds the keys
+    if out is None:
+        raise NewznabError("NEWZNAB_INDEXERS is not a valid list")
+    return out
 
 
 _RES = re.compile(r"(?<![0-9])(2160|1080|720|576|480)[pi]?(?![0-9])", re.I)
@@ -202,12 +206,31 @@ def _env_num(name: str, default, cast=float):
     return v
 
 
-def _retry_after(headers) -> float | None:
+def _retry_after(headers, now=time.time) -> float | None:
+    """Seconds an indexer asked us to wait: ``Retry-After`` as a number or an HTTP date.
+    None when it is absent or cannot be read."""
     try:
         v = headers.get("Retry-After") if headers is not None else None
-        return max(0.0, float(v)) if v is not None else None
-    except (TypeError, ValueError):
+    except Exception:  # noqa: BLE001
         return None
+    if v is None:
+        return None
+    v = str(v).strip()
+    try:
+        secs = float(v)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(v)
+            secs = when.timestamp() - now()
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+    if secs != secs or secs in (float("inf"), float("-inf")):
+        return None
+    return max(0.0, secs)
+
+
+# newznab error codes that mean "over a limit" (API or grab limit reached, account trouble)
+_LIMIT_CODES = frozenset({"429", "500", "501"})
 
 
 _CACHE_ENTRIES = 16
@@ -218,7 +241,8 @@ class NewznabClient:
     def __init__(self, indexers: list[Indexer], timeout: float = 30.0,
                  grab_interval: float | None = None, sleep=time.sleep, clock=time.monotonic,
                  grab_budget: int | None = None, search_budget: int | None = None,
-                 min_interval: float | None = None):
+                 min_interval: float | None = None, state_path: str | None = None,
+                 wall=time.time):
         self.indexers = list(indexers)
         self.timeout = timeout
         if grab_interval is None:
@@ -242,10 +266,61 @@ class NewznabClient:
         self._cache_bytes = 0
         self._last_grab: float | None = None
         self._lock = threading.RLock()
+        self._wall = wall  # the clock that survives a restart (state_path only)
+        self._state_path = state_path
+        self._load_state()
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=tls_context()), _SafeRedirect())
         self.grabs = 0
         self.searches = 0
+
+    # -- persistence (optional): the budgets must outlive a restart of the runner
+    def _to_wall(self, t: float) -> float:
+        return self._wall() - (self._clock() - t)
+
+    def _from_wall(self, w: float) -> float:
+        return self._clock() - (self._wall() - w)
+
+    def _load_state(self) -> None:
+        if not self._state_path:
+            return
+        try:
+            with open(self._state_path, encoding="utf-8") as f:
+                d = json.load(f)
+            now = self._wall()
+            for key, times in (d.get("spent") or {}).items():
+                kind, _, name = str(key).partition("|")
+                ts = sorted(float(w) for w in times if now - float(w) < WINDOW_S)
+                if kind in ("grab", "search") and ts:
+                    self._spent[(kind, name)] = collections.deque(self._from_wall(w) for w in ts)
+            for name, w in (d.get("dropped") or {}).items():
+                if float(w) > now:
+                    self._dropped_until[str(name)] = self._from_wall(float(w))
+            for name, n in (d.get("errors") or {}).items():
+                self._errors[str(name)] = int(n)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return  # no file, or an unreadable one: start empty
+
+    def _save_state(self) -> None:
+        if not self._state_path:
+            return
+        now = self._clock()
+        d = {"spent": {f"{k}|{n}": [self._to_wall(t) for t in q if now - t < WINDOW_S]
+                       for (k, n), q in self._spent.items() if q},
+             "dropped": {n: self._to_wall(t) for n, t in self._dropped_until.items() if t > now},
+             "errors": {n: c for n, c in self._errors.items() if c}}
+        tmp = f"{self._state_path}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._state_path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass  # a budget that cannot be saved still holds in memory
 
     # -- etiquette
     def _take(self, kind: str, name: str, budget: int, exc: type[NewznabError]) -> None:
@@ -257,6 +332,7 @@ class NewznabClient:
         if len(q) >= budget:
             raise exc(f"{kind} budget spent")
         q.append(now)
+        self._save_state()
 
     def _gate(self, name: str) -> None:
         """Refuse a dropped indexer; space requests to one indexer apart."""
@@ -267,6 +343,7 @@ class NewznabClient:
                 raise IndexerDropped("indexer dropped for the window")
             del self._dropped_until[name]
             self._errors[name] = 0
+            self._save_state()
         last = self._last_req.get(name)
         if self.min_interval and last is not None:
             wait = self.min_interval - (now - last)
@@ -278,17 +355,21 @@ class NewznabClient:
         """Track consecutive errors; drop the indexer on the third, or at once on a 429."""
         with self._lock:
             if err is None:
-                self._errors[name] = 0
+                if self._errors.get(name):
+                    self._errors[name] = 0
+                    self._save_state()
                 return
             if isinstance(err, (IndexerDropped, SearchBudgetSpent, GrabBudgetSpent)):
                 return
             if isinstance(err, RateLimited):
-                wait = WINDOW_S if err.retry_after is None else min(err.retry_after, WINDOW_S)
+                # the indexer's own Retry-After, however long; without one, the window
+                wait = WINDOW_S if err.retry_after is None else err.retry_after
                 self._dropped_until[name] = self._clock() + wait
-                return
-            self._errors[name] = self._errors.get(name, 0) + 1
-            if self._errors[name] >= DROP_AFTER_ERRORS:
-                self._dropped_until[name] = self._clock() + WINDOW_S
+            else:
+                self._errors[name] = self._errors.get(name, 0) + 1
+                if self._errors[name] >= DROP_AFTER_ERRORS:
+                    self._dropped_until[name] = self._clock() + WINDOW_S
+            self._save_state()
 
     # -- transport
     def _get(self, ix: Indexer, params: dict, limit: int = 8 * 1024 * 1024) -> bytes:
@@ -299,6 +380,8 @@ class NewznabClient:
 
     def _fetch(self, url: str, limit: int) -> bytes:
         check_url(url)
+        err: NewznabError | None = None
+        data = b""
         try:
             with self._opener.open(url, timeout=self.timeout) as r:
                 data = r.read(limit + 1)
@@ -307,10 +390,15 @@ class NewznabClient:
                     raise http.client.IncompleteRead(data, int(want) - len(data))
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                raise RateLimited("indexer status 429", _retry_after(e.headers)) from None
-            raise NewznabError(f"indexer status {e.code}") from None
+                err = RateLimited("indexer status 429", _retry_after(e.headers))
+            else:
+                err = NewznabError(f"indexer status {e.code}")
         except (OSError, ValueError, http.client.HTTPException) as e:
-            raise NewznabError(f"indexer unreachable: {type(e).__name__}") from None
+            err = NewznabError(f"indexer unreachable: {type(e).__name__}")
+        if err is not None:
+            # raised out here, not in the handler: the transport errors name the URL (the
+            # key), and nothing may keep them as __context__
+            raise err
         if len(data) > limit:
             raise NewznabError("response too large")
         return data
@@ -369,11 +457,11 @@ class NewznabClient:
         try:
             root = ET.fromstring(raw)
         except ET.ParseError:
-            raise NewznabError("indexer sent bad xml") from None
+            root = None
+        if root is None:
+            raise NewznabError("indexer sent bad xml")
         if root.tag == "error":
-            if root.get("code") == "429":
-                raise RateLimited("indexer error 429")
-            raise NewznabError(f"indexer error {root.get('code', '')}")
+            raise _error_for(root.get("code", ""))
         out = []
         for it in root.iter("item"):
             try:
@@ -421,14 +509,14 @@ class NewznabClient:
             self.grabs += 1
         try:
             raw = self._fetch(rel.link, NZB_MAX)
+            if raw[:2] == b"\x1f\x8b":
+                raw = _gunzip_capped(raw, NZB_MAX)
+            if b"<nzb" not in raw[:2048]:
+                raise _not_nzb(raw)
         except NewznabError as e:
             self._note(rel.indexer, e)
             raise
-        self._note(rel.indexer, None)
-        if raw[:2] == b"\x1f\x8b":
-            raw = _gunzip_capped(raw, NZB_MAX)
-        if b"<nzb" not in raw[:2048]:
-            raise NewznabError("not an nzb")
+        self._note(rel.indexer, None)  # a success only once the bytes are an NZB
         return raw
 
     def fetch_nzb_ids(self, rel: Release) -> tuple[frozenset, bytes]:
@@ -443,7 +531,9 @@ class NewznabClient:
         try:
             ids = nzb_segment_ids(raw)
         except ET.ParseError:
-            raise NewznabError("bad nzb xml") from None
+            ids = None
+        if ids is None:
+            raise NewznabError("bad nzb xml")
         with self._lock:
             self._cache[rel.link] = (ids, raw)
             self._cache_bytes += len(raw)
@@ -464,10 +554,31 @@ class NewznabClient:
         return hit[1] if hit else None
 
 
+def _error_for(code: str) -> NewznabError:
+    """The exception for a newznab ``<error code=...>`` answer: a limit code is a
+    RateLimited (the indexer is left alone), any other counts as one error."""
+    if code in _LIMIT_CODES:
+        return RateLimited(f"indexer error {code}")
+    return NewznabError(f"indexer error {code}")
+
+
+def _not_nzb(raw: bytes) -> NewznabError:
+    """Why bytes that should be an NZB are not: an indexer's error page or something else."""
+    code = None
+    if b"<error" in raw[:2048]:
+        try:
+            root = ET.fromstring(raw)
+            code = root.get("code", "") if root.tag == "error" else None
+        except ET.ParseError:
+            code = None
+    return NewznabError("not an nzb") if code is None else _error_for(code)
+
+
 def _gunzip_capped(raw: bytes, limit: int) -> bytes:
     """Decompress gzip, refusing to produce more than ``limit`` bytes."""
     d = zlib.decompressobj(31)
     out, total = [], 0
+    bad = False
     try:
         data = raw
         while data:
@@ -477,10 +588,11 @@ def _gunzip_capped(raw: bytes, limit: int) -> bytes:
                 raise NewznabError("nzb too large")
             out.append(chunk)
             data = d.unconsumed_tail
-        if not d.eof:
-            raise NewznabError("bad gzip")
+        bad = not d.eof
     except zlib.error:
-        raise NewznabError("bad gzip") from None
+        bad = True
+    if bad:
+        raise NewznabError("bad gzip")
     return b"".join(out)
 
 

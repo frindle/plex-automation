@@ -15,7 +15,7 @@ from tiering.offload import nntp_stat as ns
 from tiering.offload import qualify as q
 
 ROW = {"release_name": REL, "title": "Movie", "year": 2020}
-REFUSED = b'<?xml version="1.0"?><error code="429" description="grab limit reached"/>'
+REFUSED = b'<?xml version="1.0"?><error code="100" description="not allowed"/>'
 
 
 # ---------------------------------------------------------------- grab cost
