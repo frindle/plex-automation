@@ -1,0 +1,25 @@
+name: Tiering
+
+on:
+  push:
+    branches: [main]
+    paths: ["tiering/**", ".github/workflows/tiering.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["tiering/**", ".github/workflows/tiering.yml"]
+
+jobs:
+  offload-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install pytest ruff blake3
+      # Exit code 5 means no tests were collected yet.
+      - run: |
+          if [ -d tiering/offload ]; then
+            ruff check tiering/offload
+            python -m pytest -q tiering/offload || [ $? -eq 5 ]
+          fi
