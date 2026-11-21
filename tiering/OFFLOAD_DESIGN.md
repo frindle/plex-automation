@@ -39,6 +39,17 @@ These names apply to each library file system.
   - Everything else in the stub is a hole, made with `fallocate(PUNCH_HOLE | KEEP_SIZE)`.
   - The stub's mtime is the original mtime.
 - **Real file system only:** every file operation (link, `renameat2(RENAME_EXCHANGE)`, hole punch, nlink and inode checks) runs on the disk's own mount, never through a union or user-share FUSE layer. Such a layer can report nlink 1 for a hardlinked file and may not support `RENAME_EXCHANGE`. `TIERING_PATH_MAP` maps the share path Plex and the arrs report to the disk path that holds the file. A file that can't be mapped to exactly one disk path is never offloaded.
+  - **Path namespaces:**
+    - `lib_path` in the database is always the share path, the one Plex reports. It is never a disk path, so it stays valid when a whole file moves between disks.
+    - Every file operation resolves `lib_path` to its disk path at that moment.
+      - `TIERING_PATH_MAP` holds one `share_prefix=disk_prefix` entry per disk.
+      - Only candidates that exist count. Zero or several means skip and log.
+    - `ops` resolves the path itself, on both demote and promote, and refuses unless there is exactly one disk path. It never writes a disk path into the database. The manifest's `lib_path` may hold the disk path.
+    - `register` stores the arr's path, mapped through `TIERING_ARR_PATH_MAP` (`arr_prefix=share_prefix`) when the arrs see different paths from Plex. Its stat (size and mtime) goes to the resolved disk path.
+    - The runner:
+      - matches Plex files to rows by the share path;
+      - in reconcile, reads the link at the resolved disk path;
+      - passes the disk path to the glacier gate, which maps it into Deluge's namespace with `TIERING_GATE_PATH_MAP`.
   - The stub root is per disk (`${stub_root}` on the same disk as `L`). `TIERFS_STUB_ROOTS` lists them (comma list). tierfs skips a manifest unless `stub_path` is exactly `<one of those roots>/<id><ext>`, and opens it with `O_NOFOLLOW`, then requires a regular file of the manifest's size.
   - Anything else that moves library files between disks (for example a glacier mover) must skip a symlink that points into `${TIERFS_MOUNT}`.
 - `<id>` is 16 lowercase hex characters. It is random, assigned once, and never reused.
@@ -163,7 +174,7 @@ Offload step 3 hashes `L` again in the read that builds the chunk list. If that 
 - An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`.
 - It never deletes a row. A path the arrs no longer list is logged.
 - The runner fills `rating_key`, `kind` and `is4k` from Plex.
-- `TIERING_PATH_MAP` maps arr paths to local paths, as for Plex.
+- `lib_path` is the share path (see "Path namespaces"). `TIERING_ARR_PATH_MAP` maps arr paths to share paths when they differ. Size and mtime come from the resolved disk path.
 
 ### Weekly
 
