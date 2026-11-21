@@ -270,12 +270,14 @@ Swaps are automatic. One long-running process applies the hot set.
   - The first `want` for an id starts that file's promote within 1 s. It goes ahead of every other promote and outside `TIERING_PROMOTE_CONCURRENCY`, so a wanted promote never waits in the queue.
   - Later `want`s for the same id go to the running promote and move its cursor.
   - A `want` for a row that is neither `offloaded` nor `promoting` is ignored.
+  - A `want` ignores the retry backoff, because a player is waiting. Wanted attempts on one id are at least 60 s apart (kept in `kv['want_last']`). A row in `state=failed` (for example after two BLAKE3 mismatches) is not retried by a `want`; the fill file's `failed` line already gives the player EIO.
 - **Other promotes run at once:**
   - wanted promotes first, then weekly-flagged rows, then a live session's season in episode order, then everything else;
   - at most `TIERING_PROMOTE_CONCURRENCY` (default 2) at a time, not counting wanted promotes.
 - **Weekly check:**
   - The runner calls `weekly.run_weekly` at the start of the demote window when `kv['weekly_last_ts']` is 7 or more days old, and on start-up when it is. It then sets the timestamp.
   - That night's demotes wait until the check is done.
+  - If the check fails, the runner alerts `weekly_failed` and retries after an hour. Demotes stay blocked until a check succeeds.
   - Flags come only from `weekly_flag` events (`detail.reasons`), read after the cursor `kv['weekly_flag_cursor']`. They never come from `restore_note`, which the next good week overwrites.
   - A flagged row is promoted whether or not the hot set wants it. Its flag is cleared only when its promote finishes.
 - **Qualify results:**
