@@ -1,0 +1,43 @@
+name: tierfs
+
+on:
+  push:
+    branches: [main]
+    paths: ["tierfs/**", ".github/workflows/tierfs.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["tierfs/**", ".github/workflows/tierfs.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tierfs
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: tierfs/go.mod
+          cache-dependency-path: tierfs/go.sum
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+      - name: Format and vet
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+      - name: Tests (real FUSE mount)
+        env:
+          TIERFS_REQUIRE_FUSE: "1"
+        run: go test -count=1 -timeout 15m -v ./...
+      - name: Race detector (tests that need no mount)
+        run: go test -race -count=1 -timeout 10m -run 'Split|Manifest|Stream|Remote|Parse|Event|Status|Reload' ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image
+        run: docker build -t tierfs:ci tierfs
