@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from offload import plex_watch, runner  # noqa: E402
+from offload import paths, plex_watch, runner  # noqa: E402
 from offload.runner import Config, Deps, Runner  # noqa: E402
 
 GB = 10**9
@@ -51,7 +51,7 @@ class FakeState:
                "rating_key", "updated_ts", "created_ts")
 
     def __init__(self, clock):
-        self.rows, self.events, self.mu, self.clock = {}, [], threading.Lock(), clock
+        self.rows, self.evlog, self.mu, self.clock = {}, [], threading.Lock(), clock
 
     def open_db(self, path):
         return self
@@ -84,7 +84,11 @@ class FakeState:
             return [dict(r) for r in self.rows.values() if state in (None, r["state"])]
 
     def log_event(self, db, id, kind, detail):
-        self.events.append((id, kind, detail))
+        self.evlog.append((id, kind, detail))
+
+    def events(self, db, id=None):
+        return [{"id": i, "kind": k, "detail": d} for i, k, d in self.evlog
+                if id in (None, i)]
 
 
 class World:
@@ -104,7 +108,7 @@ class World:
         self.mu = threading.Lock()
         (tmp_path / "lib").mkdir(exist_ok=True)
         kw = dict(db=str(tmp_path / "t.db"), tierfs_mount="/tfs", manifests=str(tmp_path),
-                  stub_root=str(tmp_path), apply=True, alerts=str(tmp_path / "alerts.jsonl"),
+                  stub_roots=str(tmp_path), apply=True, alerts=str(tmp_path / "alerts.jsonl"),
                   window=runner.parse_window("02:00-06:00"))
         kw.update(cfgkw)
         self.cfg = Config(**kw)
@@ -358,7 +362,7 @@ def test_dry_run_calls_nothing_mutating(tmp_path, monkeypatch, caplog):
         w.clock.t += 60
         w.run()
     assert w.calls == []
-    assert w.state.rows == before and w.state.events == []
+    assert w.state.rows == before and w.state.evlog == []
     assert "plan: promote" in caplog.text
     assert not os.path.exists(w.cfg.alerts)
 
@@ -424,19 +428,29 @@ def test_lock_prevents_second_instance(tmp_path, monkeypatch):
     second.close()
 
 
-def test_path_map(tmp_path, monkeypatch):
-    pairs = runner.parse_path_map("/data=/mnt/x,/data/deep=/mnt/y")
-    assert runner.map_path("/data/deep/a.mkv", pairs) == "/mnt/y/a.mkv"
-    assert runner.map_path("/data/a.mkv", pairs) == "/mnt/x/a.mkv"
-    assert runner.map_path("/database/a.mkv", pairs) == "/database/a.mkv"
-    w = World(tmp_path, monkeypatch, path_map=runner.parse_path_map(f"/data={tmp_path}/lib"))
+def test_gate_path_map():
+    pairs = runner.parse_gate_map("/mnt/disk1=/data,/mnt/disk2=/data,/mnt/disk2/deep=/deep")
+    assert runner.gate_path("/mnt/disk1/a.mkv", pairs) == "/data/a.mkv"
+    assert runner.gate_path("/mnt/disk2/a.mkv", pairs) == "/data/a.mkv"
+    assert runner.gate_path("/mnt/disk2/deep/a.mkv", pairs) == "/deep/a.mkv"
+    assert runner.gate_path("/mnt/disk10/a.mkv", pairs) == "/mnt/disk10/a.mkv"
+
+
+def test_plex_file_paths_match_rows_by_share_path(tmp_path, monkeypatch):
+    d1 = tmp_path / "d1"
+    d1.mkdir()
+    pm = paths.parse_path_map(f"/share={d1}")
+    w = World(tmp_path, monkeypatch, path_map=pm)
+    os.symlink("/tfs/a.mkv", d1 / "a.mkv")
     w.items.append({"ratingKey": "5", "type": "movie", "addedAt": 0, "section": "Movies",
-                    "files": ["/data/a.mkv"]})
-    w.row("a", None, str(tmp_path / "lib" / "a.mkv"), "offloaded")
+                    "files": ["/share/a.mkv"]})
+    w.state.rows["a"] = dict(id="a", rating_key=None, lib_path="/share/a.mkv",
+                             state="offloaded", size=GB, sha256="aa", updated_ts=0)
     w.deck = [{"ratingKey": "5"}]
     w.run()
     assert w.ops("promote") == ["a"]
     assert w.state.rows["a"]["rating_key"] == "5"
+    assert w.state.rows["a"]["lib_path"] == "/share/a.mkv"
 
 
 def test_token_never_logged(w, monkeypatch, caplog):
@@ -506,7 +520,8 @@ def test_config_defaults_and_overrides(tmp_path):
     assert c.hot.new_days == 30 and c.hot.idle_days == 60 and c.hot.near_end_eps == 3
     assert c.alerts == str(tmp_path / "alerts.jsonl") and c.http == "127.0.0.1:8471"
     c = Config.from_env({"TIERING_DB": str(tmp_path / "t.db"), "TIERING_APPLY": "1",
-                         "TIERING_GATE_PATH_MAP": "/a=/data/a", "TIERING_NEVER_SECTIONS": "A, B", "TIERING_KEEP_4K": "1",
+                         "TIERING_GATE_PATH_MAP": "/a=/data/a", "TIERFS_STUB_ROOTS": "/d/s",
+                         "TIERING_NEVER_SECTIONS": "A, B", "TIERING_KEEP_4K": "1",
                          "TIERING_MAX_STREAM_KBPS": "9000", "TIERING_DEMOTE_GB_PER_NIGHT": "1.5"})
     assert c.apply and c.hot.never_sections == ("A", "B") and c.hot.keep_4k
     assert c.hot.max_stream_kbps == 9000 and c.demote_bytes_per_night == int(1.5 * GB)
@@ -556,7 +571,8 @@ def test_qualified_row_reaches_ops_with_sha256(w):
 
 
 def test_apply_needs_gate_path_map(tmp_path):
-    env = {"TIERING_DB": str(tmp_path / "t.db"), "TIERING_APPLY": "1"}
+    env = {"TIERING_DB": str(tmp_path / "t.db"), "TIERING_APPLY": "1",
+           "TIERFS_STUB_ROOTS": "/mnt/disk1/s"}
     with pytest.raises(ValueError, match="TIERING_GATE_PATH_MAP"):
         Config.from_env(env)
     with pytest.raises(ValueError):
@@ -567,39 +583,156 @@ def test_apply_needs_gate_path_map(tmp_path):
     assert Config.from_env({"TIERING_DB": env["TIERING_DB"]}).apply is False
 
 
-def test_disk_paths():
-    pairs = runner.parse_path_map("/share=/d1,/share=/d2")
-    have = {"/d1/a.mkv", "/d2/b.mkv", "/d1/b.mkv"}
-    ex = have.__contains__
-    assert runner.disk_paths("/share/a.mkv", pairs, ex) == ["/d1/a.mkv"]
-    assert runner.disk_paths("/share/b.mkv", pairs, ex) == ["/d1/b.mkv", "/d2/b.mkv"]
-    assert runner.disk_paths("/share/none.mkv", pairs, ex) == []
-    assert runner.disk_paths("/d2/b.mkv", pairs, ex) == ["/d2/b.mkv"]  # already a disk path
-    assert runner.disk_paths("/elsewhere/x", pairs, ex) == []
-    assert runner.disk_paths("/anything", [], ex) == ["/anything"]
+def test_apply_needs_stub_roots(tmp_path):
+    env = {"TIERING_DB": str(tmp_path / "t.db"), "TIERING_APPLY": "1",
+           "TIERING_GATE_PATH_MAP": "/mnt/a=/data/a"}
+    with pytest.raises(ValueError, match="TIERFS_STUB_ROOTS"):
+        Config.from_env(env)
+    assert runner.main(["--once"], env=env, deps=object()) == 2
+    c = Config.from_env({**env, "TIERFS_STUB_ROOTS": "/mnt/disk1/s,/mnt/disk2/s"})
+    assert c.stub_roots == "/mnt/disk1/s,/mnt/disk2/s"
+    assert Config.from_env({"TIERING_DB": env["TIERING_DB"]}).apply is False
 
 
-def test_demote_uses_disk_path_and_skips_ambiguous(tmp_path, monkeypatch, caplog):
+def _two_disks(tmp_path, monkeypatch, names=("one",)):
     d1, d2 = tmp_path / "d1", tmp_path / "d2"
     for d in (d1, d2):
         d.mkdir()
-    pm = runner.parse_path_map(f"/share={d1},/share={d2}")
+    pm = paths.parse_path_map(f"/share={d1},/share={d2}")
     w = World(tmp_path, monkeypatch, path_map=pm)
-    (d1 / "one.mkv").write_text("x")
-    (d1 / "two.mkv").write_text("x")
-    (d2 / "two.mkv").write_text("x")
-    for i, name in enumerate(("one", "two", "gone"), 1):
+    for i, name in enumerate(names, 1):
         w.items.append({"ratingKey": str(i), "type": "movie", "addedAt": 0, "section": "Movies",
                         "files": [f"/share/{name}.mkv"]})
         w.state.rows[name] = dict(id=name, rating_key=str(i), lib_path=f"/share/{name}.mkv",
                                   state="whole", size=GB, sha256="aa", updated_ts=0)
+    return w, d1, d2
+
+
+def test_demote_keeps_share_path_and_skips_ambiguous(tmp_path, monkeypatch, caplog):
+    w, d1, d2 = _two_disks(tmp_path, monkeypatch, ("one", "two", "gone"))
+    (d1 / "one.mkv").write_text("x")
+    (d1 / "two.mkv").write_text("x")
+    (d2 / "two.mkv").write_text("x")
     with caplog.at_level(logging.WARNING, logger="tiering.runner"):
         w.run()
     assert w.ops("demote") == ["one"]
-    assert w.demoted_rows["one"]["lib_path"] == str(d1 / "one.mkv")
+    assert w.demoted_rows["one"]["lib_path"] == "/share/one.mkv"  # the DB row, unchanged
     assert ("gate", str(d1 / "one.mkv")) in w.calls
+    assert w.state.rows["two"]["state"] == "whole"
     skipped = [r for r in caplog.records if "skipping" in r.getMessage()]
     assert len(skipped) == 2
+
+
+def test_whole_file_moves_between_disks_row_keeps_id(tmp_path, monkeypatch):
+    w, d1, d2 = _two_disks(tmp_path, monkeypatch)
+    (d1 / "one.mkv").write_text("x")
+    seen = []
+    orig = w.runner.deps.gate
+    w.runner.deps.gate = lambda p: (seen.append(p), "wait")[1]
+    w.run()
+    assert seen == [str(d1 / "one.mkv")] and w.ops("demote") == []
+    os.rename(d1 / "one.mkv", d2 / "one.mkv")  # a mover took it to the other disk
+    w.runner.deps.gate = orig
+    w.clock.t += 86400  # the next night; tonight's try is spent
+    w.run()
+    assert w.ops("demote") == ["one"]
+    assert ("gate", str(d2 / "one.mkv")) in w.calls
+    assert w.demoted_rows["one"]["id"] == "one"
+    assert w.demoted_rows["one"]["lib_path"] == "/share/one.mkv"
+    assert list(w.state.rows) == ["one"]
+
+
+def test_duplicate_on_both_disks_is_skipped(tmp_path, monkeypatch):
+    w, d1, d2 = _two_disks(tmp_path, monkeypatch)
+    (d1 / "one.mkv").write_text("x")
+    (d2 / "one.mkv").write_text("x")
+    w.run()
+    assert w.ops("demote") == [] and w.ops("qualify") == []
+    assert w.state.rows["one"]["state"] == "whole"
+
+
+def test_reconcile_does_not_fail_a_row_whose_disk_path_is_unresolved(tmp_path, monkeypatch):
+    w, d1, d2 = _two_disks(tmp_path, monkeypatch, ("gone", "dup", "ok"))
+    for n in ("dup", "ok"):
+        w.state.rows[n]["state"] = "offloaded"
+    w.state.rows["gone"]["state"] = "offloaded"  # on neither disk
+    os.symlink("/tfs/dup.mkv", d1 / "dup.mkv")
+    os.symlink("/tfs/dup.mkv", d2 / "dup.mkv")  # on both
+    os.symlink("/tfs/ok.mkv", d2 / "ok.mkv")
+    w.run()
+    assert w.state.rows["gone"]["state"] == "offloaded"
+    assert w.state.rows["dup"]["state"] == "offloaded"
+    assert w.state.rows["ok"]["state"] == "offloaded"
+    os.unlink(d2 / "ok.mkv")
+    (d2 / "ok.mkv").write_text("replaced")  # resolved, and a real file now
+    w.run()
+    assert w.state.rows["ok"]["state"] == "failed"
+
+
+def test_promote_gets_the_unchanged_row(tmp_path, monkeypatch):
+    w, d1, d2 = _two_disks(tmp_path, monkeypatch)
+    w.state.rows["one"]["state"] = "offloaded"
+    os.symlink("/tfs/one.mkv", d2 / "one.mkv")
+    w.deck = [{"ratingKey": "1"}]
+    w.run()
+    assert w.ops("promote") == ["one"]
+    assert w.state.rows["one"]["lib_path"] == "/share/one.mkv"
+
+
+def test_load_deps_passes_path_map_and_no_stub_root(tmp_path, monkeypatch):
+    import types
+    got = {}
+    pkg = runner.__package__
+    ops = types.ModuleType(f"{pkg}.ops")
+    ops.demote = lambda db, row, **kw: got.update(demote=kw)
+    ops.promote = lambda db, id, reader, **kw: got.update(promote=kw)
+    alt = types.ModuleType(f"{pkg}.altmount")
+    alt.WebDavReader = lambda: "reader"
+    monkeypatch.setitem(sys.modules, f"{pkg}.ops", ops)
+    monkeypatch.setitem(sys.modules, f"{pkg}.altmount", alt)
+    monkeypatch.setitem(sys.modules, f"{pkg}.state", types.ModuleType(f"{pkg}.state"))
+    from offload import wiring
+    monkeypatch.setattr(wiring, "qualify_from_env", lambda env=None: "q")
+    pm = paths.parse_path_map("/share=/d1")
+    deps = runner.load_deps(Config(db=str(tmp_path / "t.db"), path_map=pm, apply=True,
+                                   gate_path_map=[("/a", "/b")], stub_roots="/d1/s"))
+    deps.demote("db", {"id": "x"}, True)
+    deps.promote("db", {"id": "x"}, True)
+    assert got["demote"]["path_map"] == pm and "stub_root" not in got["demote"]
+    assert got["promote"]["path_map"] == pm
+
+
+def test_register_unhealthy_results_block_demotes_and_alert(tmp_path, monkeypatch):
+    cases = [({"errors": 1, "listed": 100}, True), ({"listed": 100, "missing_local": 6}, True),
+             ({"listed": 100, "missing_local": 3, "ambiguous": 3}, True),
+             ({"listed": 100, "missing_local": 5}, False), ({"new": 2}, False), ({}, False),
+             ({"missing_local": 1}, True)]
+    for i, (res, bad) in enumerate(cases):
+        sub = tmp_path / str(i)
+        sub.mkdir()
+        w = World(sub, monkeypatch)
+        w.runner.deps.register = lambda db, apply, res=res: res
+        w.row("a", 1, w.movie(1), "whole")
+        w.run()
+        assert (w.ops("demote") == []) is bad, res
+        alerts = [json.loads(line) for line in open(w.cfg.alerts)] if \
+            os.path.exists(w.cfg.alerts) else []
+        assert bool([a for a in alerts if a["kind"] == "register_failed"]) is bad, res
+
+
+def test_ops_events_alert_once_per_id(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    w.state.evlog.append(("a", "promote_short_remote", {"offset": 5}))
+    w.state.evlog.append(("b", "takeover_orphan", {"stub": "/s/b.mkv"}))
+    w.state.evlog.append(("c", "qualify_failed", {}))
+    w.run()
+    w.state.evlog.append(("a", "promote_short_remote", {"offset": 5}))
+    w.run()
+    got = sorted((a["kind"], a["id"]) for a in map(json.loads, open(w.cfg.alerts)))
+    assert got == [("promote_short_remote", "a"), ("takeover_orphan", "b")]
+    w2 = Runner(w.cfg, w.runner.deps, clock=w.clock, sleep=lambda s: None)  # restart
+    w2.run_pass(wait=True)
+    assert len(open(w.cfg.alerts).readlines()) == 2
 
 
 def test_register_runs_once_a_night_before_window(tmp_path, monkeypatch):

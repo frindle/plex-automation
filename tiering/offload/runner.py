@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
-from . import hotset, plex_watch
+from . import hotset, paths, plex_watch
 
 log = logging.getLogger("tiering.runner")
 
@@ -41,7 +41,9 @@ PASS_INTERVAL = 60.0
 RETRY_DELAY = 300.0
 ACTIVE_STATES = ("offloaded", "promoting")
 REGISTER_LEAD = 3600.0  # register this long before the demote window opens
-PROTECTED_COLUMNS = ("id", "state", "created_ts", "updated_ts")
+PROTECTED_COLUMNS = ("id", "state", "created_ts", "updated_ts", "lib_path")
+REGISTER_BAD_FRAC = 0.05  # missing_local + ambiguous over this share of listed fails register
+ALERT_EVENTS = ("promote_short_remote", "takeover_orphan")  # ops events, alerted once per id
 # Used only when the state module does not export COLUMNS.
 FALLBACK_COLUMNS = ("sha256", "nzb_path", "nzb_path2", "remote_path", "restore_score",
                     "restore_note", "last_check_ts", "last_stat_ok_ts")
@@ -51,48 +53,18 @@ FALLBACK_COLUMNS = ("sha256", "nzb_path", "nzb_path2", "remote_path", "restore_s
 # config
 
 
-def parse_path_map(spec: str) -> list[tuple[str, str]]:
-    """"plexprefix=localprefix[,...]" -> pairs, longest plex prefix first."""
-    pairs = []
-    for part in (spec or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "=" not in part:
-            raise ValueError("TIERING_PATH_MAP entries look like plexprefix=localprefix")
-        a, b = part.split("=", 1)
-        pairs.append((a.strip().rstrip("/"), b.strip().rstrip("/")))
-    return sorted(pairs, key=lambda p: -len(p[0]))
+def parse_gate_map(spec: str) -> list[tuple[str, str]]:
+    """TIERING_GATE_PATH_MAP: `disk_prefix=deluge_prefix` entries, comma separated.
+    Several disk prefixes may map to one Deluge prefix."""
+    return paths.parse_path_map(spec)
 
 
-def map_path(path: str, pairs) -> str:
-    for plex, local in pairs:
-        if path == plex or path.startswith(plex + "/"):
-            return local + path[len(plex):]
+def gate_path(path: str, pairs) -> str:
+    """A disk path in Deluge's namespace (unchanged when no entry matches)."""
+    for disk, deluge in pairs:
+        if path == disk or path.startswith(disk + "/"):
+            return deluge + path[len(disk):]
     return path
-
-
-def disk_paths(path, pairs, exists=os.path.lexists) -> list[str]:
-    """Disk paths a share path can mean, per TIERING_PATH_MAP.
-
-    No map: the path itself. Otherwise every entry whose share prefix matches
-    gives a candidate, and only candidates that exist count. A path already
-    under one of the disk prefixes is a disk path and stays as it is. An empty
-    list means the path maps nowhere."""
-    if not pairs:
-        return [path]
-    cands = []
-    for src, dst in pairs:
-        if path == src or path.startswith(src + "/"):
-            c = dst + path[len(src):]
-            if c not in cands:
-                cands.append(c)
-    if cands:
-        return [c for c in cands if exists(c)]
-    for _, dst in pairs:
-        if path == dst or path.startswith(dst + "/"):
-            return [path] if exists(path) else []
-    return []
 
 
 def parse_window(spec: str) -> tuple[int, int]:
@@ -153,7 +125,7 @@ class Config:
     tierfs_mount: str = ""
     manifests: str = ""
     events: str = ""
-    stub_root: str = ""
+    stub_roots: str = ""
     apply: bool = False
     promote_concurrency: int = 2
     window: tuple = (120, 360)
@@ -181,23 +153,28 @@ class Config:
             never_sections=tuple(s.strip() for s in
                                  (e.get("TIERING_NEVER_SECTIONS", "Adult")).split(",") if s.strip()),
         )
-        gate_map = parse_path_map(e.get("TIERING_GATE_PATH_MAP", ""))
+        gate_map = parse_gate_map(e.get("TIERING_GATE_PATH_MAP", ""))
         apply = e.get("TIERING_APPLY") == "1"
         if apply and not gate_map:
             raise ValueError(
                 "TIERING_APPLY=1 needs TIERING_GATE_PATH_MAP (runner paths to the torrent "
                 "client's /data paths). Without it the glacier gate reads every file as free")
+        stub_roots = e.get("TIERFS_STUB_ROOTS", "")
+        if apply and not [r for r in stub_roots.split(",") if r.strip()]:
+            raise ValueError(
+                "TIERING_APPLY=1 needs TIERFS_STUB_ROOTS (one stub directory per disk; ops "
+                "picks the one on the same disk as the file)")
         return cls(
             db=db,
             tierfs_mount=e.get("TIERFS_MOUNT", "").rstrip("/"),
             manifests=e.get("TIERFS_MANIFESTS", ""),
             events=e.get("TIERFS_EVENTS", ""),
-            stub_root=e.get("TIERING_STUB_ROOT", ""),
+            stub_roots=stub_roots,
             apply=apply,
             promote_concurrency=max(1, int(e.get("TIERING_PROMOTE_CONCURRENCY") or 2)),
             window=parse_window(e.get("TIERING_DEMOTE_WINDOW") or "02:00-06:00"),
             demote_bytes_per_night=int(float(e.get("TIERING_DEMOTE_GB_PER_NIGHT") or 200) * GB),
-            path_map=parse_path_map(e.get("TIERING_PATH_MAP", "")),
+            path_map=paths.parse_path_map(e.get("TIERING_PATH_MAP", "")),
             gate_path_map=gate_map,
             alerts=e.get("TIERING_ALERTS") or os.path.join(
                 os.path.dirname(os.path.abspath(db)), "alerts.jsonl"),
@@ -250,8 +227,8 @@ class Deps:
 
 def _http_gate(cfg: Config):
     """Glacier gate over the tiering API (TIERING_API). Anything but an
-    explicit "free" is "wait". TIERING_GATE_PATH_MAP="local=gate,..." maps
-    paths into the namespace the gate knows."""
+    explicit "free" is "wait". It gets the disk path, mapped into Deluge's
+    namespace by TIERING_GATE_PATH_MAP="disk_prefix=deluge_prefix,..."."""
     import urllib.request
     api = os.environ.get("TIERING_API", "").rstrip("/")
     pairs = cfg.gate_path_map
@@ -262,7 +239,7 @@ def _http_gate(cfg: Config):
         try:
             req = urllib.request.Request(
                 api + "/tiering/torrent-gate?format=tsv",
-                data=map_path(path, pairs).encode(), method="POST",
+                data=gate_path(path, pairs).encode(), method="POST",
                 headers={"Content-Type": "text/plain"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 first = r.read().decode("utf-8", "replace").splitlines()
@@ -280,11 +257,14 @@ def load_deps(cfg: Config) -> Deps:
     reader = altmount.WebDavReader()
 
     def promote(db, row, apply):
-        return ops.promote(db, row["id"], reader, apply=apply, manifest_dir=cfg.manifests)
+        return ops.promote(db, row["id"], reader, apply=apply, manifest_dir=cfg.manifests,
+                           path_map=cfg.path_map)
 
     def demote(db, row, apply):
-        return ops.demote(db, row, stub_root=cfg.stub_root, manifest_dir=cfg.manifests,
-                          tierfs_mount=cfg.tierfs_mount, apply=apply)
+        # lib_path stays the share path; ops resolves the disk path and picks the stub
+        # root from TIERFS_STUB_ROOTS by st_dev.
+        return ops.demote(db, row, manifest_dir=cfg.manifests, tierfs_mount=cfg.tierfs_mount,
+                          apply=apply, path_map=cfg.path_map)
 
     factory = os.environ.get("TIERING_QUALIFY_FACTORY") or \
         f"{__package__}.wiring:qualify_from_env"
@@ -366,6 +346,8 @@ class Runner:
         self.complete = False
         self.pending_bad: dict = {}
         self.slot_alerted: set = set()  # (night start, id)
+        self.ops_alerted: set = set()  # (kind, id), once per id, ever
+        self._seed_alerted()
         self.slot_timeouts = 0  # seen this pass
         self.register_state = {"start": None, "ok": False}
         self.skipped_paths: set = set()
@@ -450,8 +432,6 @@ class Runner:
             return "a promote is pending"
         if n["bytes"] >= self.cfg.demote_bytes_per_night:
             return "the night's byte cap is reached"
-        if self.cfg.apply and not self.cfg.stub_root:
-            return "TIERING_STUB_ROOT is not set"
         if self.deps.register is not None and \
                 not (self.register_state["start"] == night_start(now, self.cfg.window)
                      and self.register_state["ok"]):
@@ -485,16 +465,19 @@ class Runner:
             if row["state"] != "offloaded" or row["id"] in self.promote_running:
                 continue
             lib = row.get("lib_path")
+            disk = self._resolve_disk(row)
+            if disk is None:  # unresolved is not "replaced": never fail the row for it
+                continue
             ext = os.path.splitext(lib or "")[1]
             want = f"{self.cfg.tierfs_mount}/{row['id']}{ext}"
             try:
-                got = os.readlink(lib)
+                got = os.readlink(disk)
             except (OSError, TypeError):
                 got = None
             if got == want:
                 continue
             if not self.cfg.apply:
-                log.warning("dry run: would mark %s failed, L replaced (%s)", row["id"], lib)
+                log.warning("dry run: would mark %s failed, L replaced (%s)", row["id"], disk)
                 continue
             self.state.set_state(db, row["id"], "failed", restore_note="L replaced")
             self.state.log_event(db, row["id"], "l_replaced", {"lib_path": lib})
@@ -548,21 +531,89 @@ class Runner:
         self.register_state = {"start": start, "ok": False}
         try:
             res = reg(db, self.cfg.apply)
-            self.register_state["ok"] = True
-            log.info("register done: %s", json.dumps(res, sort_keys=True, default=str))
         except Exception as e:
             log.error("register failed (%s: %s); no demotes tonight", type(e).__name__, e)
+            self._register_alert(f"{type(e).__name__}: {e}")
+            return
+        bad = self._register_verdict(res)
+        if bad:
+            log.error("register unhealthy (%s); no demotes tonight: %s", bad,
+                      json.dumps(res, sort_keys=True, default=str))
+            self._register_alert(bad, result=res)
+            return
+        self.register_state["ok"] = True
+        log.info("register done: %s", json.dumps(res, sort_keys=True, default=str))
+
+    @staticmethod
+    def _register_verdict(res) -> str:
+        """"" when the register result is healthy. Keys that are missing count as 0."""
+        if not isinstance(res, dict):
+            return ""
+
+        def n(k):
+            try:
+                return int(res.get(k) or 0)
+            except (TypeError, ValueError):
+                return 0
+        if n("errors") > 0:
+            return f"{n('errors')} errors"
+        unmatched = n("missing_local") + n("ambiguous")
+        if unmatched > REGISTER_BAD_FRAC * n("listed"):
+            return f"{unmatched} of {n('listed')} listed files missing or ambiguous"
+        return ""
+
+    def _register_alert(self, why, **detail):
+        if self.cfg.apply:
+            self._alert("register_failed", "register", reason=why, **detail)
+
+    def _seed_alerted(self):
+        """After a restart, ops events already alerted stay alerted."""
+        try:
+            with open(self.cfg.alerts) as fh:
+                for line in fh:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if r.get("kind") in ALERT_EVENTS:
+                        self.ops_alerted.add((r["kind"], str(r.get("id"))))
+        except OSError:
+            pass
+
+    def _ops_events(self, db):
+        """Alert once per id for the ops events promote_short_remote and takeover_orphan."""
+        read = getattr(self.state, "events", None)
+        if not callable(read):
+            return
+        try:
+            evs = read(db)
+        except Exception as e:
+            log.error("cannot read ops events: %s", type(e).__name__)
+            return
+        for e in evs:
+            kind, id = e.get("kind"), str(e.get("id"))
+            if kind not in ALERT_EVENTS or (kind, id) in self.ops_alerted:
+                continue
+            if not self.cfg.apply:
+                log.error("dry run: %s on %s", kind, id)
+                continue
+            self.ops_alerted.add((kind, id))
+            self._alert(kind, id, **(e.get("detail") or {}))
 
     def _resolve_disk(self, r):
-        """The one disk path for a row, or None (logged once per pass)."""
-        found = disk_paths(r.get("lib_path") or "", self.cfg.path_map)
+        """The one disk path for a row's share path, or None (logged once per pass).
+        With no TIERING_PATH_MAP the share path is used as is, as ops does."""
+        lib = r.get("lib_path") or ""
+        if self.cfg.path_map:
+            found = paths.disk_paths(lib, self.cfg.path_map)
+        else:
+            found = [lib] if lib and os.path.lexists(lib) else []
         if len(found) == 1:
             return found[0]
-        key = r.get("lib_path")
-        if key not in self.skipped_paths:
-            self.skipped_paths.add(key)
+        if lib not in self.skipped_paths:
+            self.skipped_paths.add(lib)
             log.warning("skipping %s: lib_path maps to %d disk paths, need exactly 1 (%s)",
-                        r["id"], len(found), key)
+                        r["id"], len(found), lib)
         return None
 
     # ---- the pass
@@ -592,6 +643,7 @@ class Runner:
         rows = st.list_files(db)
         self._reconcile(db, rows, now)
         self._bad_chunks(db, now)
+        self._ops_events(db)
         rows = st.list_files(db)
 
         path_rk = {}
@@ -599,10 +651,7 @@ class Runner:
         for it in items:
             by_rk_item[str(it["ratingKey"])] = it
             for f in it.get("files") or []:
-                cands = [d + f[len(sp):] for sp, d in cfg.path_map
-                         if f == sp or f.startswith(sp + "/")]
-                for c in cands or [f]:
-                    path_rk[c] = str(it["ratingKey"])
+                path_rk[f] = str(it["ratingKey"])  # Plex's path is the share path
         rows_by_rk: dict = {}
         id_to_rk = {}
         for r in rows:
@@ -840,7 +889,6 @@ class Runner:
         if disk is None:
             log.info("demote %s skipped: no single disk path", id)
             return
-        row["lib_path"] = disk
         if n["bytes"] + size > cfg.demote_bytes_per_night:
             log.info("demote %s skipped: would pass the night's cap", id)
             return
@@ -857,7 +905,8 @@ class Runner:
             if g != "free":
                 log.info("demote %s skipped: glacier gate says %s", id, g)
                 return
-            q = self.deps.qualify(row)
+            # qualify reads the file, so it gets the disk path; the DB row keeps the share path
+            q = self.deps.qualify({**row, "lib_path": disk})
             if not q.ok:
                 log.info("demote %s skipped: qualify failed: %s", id, ",".join(q.reasons))
                 st.log_event(db, id, "qualify_failed", {"reasons": list(q.reasons)})
@@ -869,7 +918,6 @@ class Runner:
                 log.info("demote %s dropped: row changed during qualify", id)
                 return
             row = st.get(db, id)
-            row["lib_path"] = disk
             block = self._demote_block(self.clock())  # qualify takes a while
             if block or row.get("rating_key") in self.desired_rks:
                 log.info("demote %s dropped after qualify: %s", id, block or "wanted again")
