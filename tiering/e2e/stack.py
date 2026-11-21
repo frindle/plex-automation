@@ -389,6 +389,7 @@ class Stack:
 
     def start(self, kill_at="", **over):
         assert self.runner is None or self.runner.poll() is not None, "runner already running"
+        self.http_port = free_port()  # a fresh one each start: the last may be taken by now
         env = self.env(E2E_KILL_AT=kill_at, **over)
         log = open(self.log_path, "ab")
         self.runner = subprocess.Popen(
@@ -417,11 +418,17 @@ class Stack:
         assert rc == -signal.SIGKILL, f"runner exited {rc}, not by SIGKILL\n{self.log_tail()}"
 
     def log_tail(self, n=40):
-        try:
-            with open(self.log_path, errors="replace") as fh:
-                return "".join(fh.readlines()[-n:])
-        except OSError:
-            return ""
+        out = ""
+        for name, path in (("runner", self.log_path),
+                           ("tierfs", os.path.join(self.state, "tierfs.log"))):
+            try:
+                with open(path, errors="replace") as fh:
+                    lines = fh.readlines()[-n:]
+            except OSError:
+                continue
+            if lines:
+                out += f"--- {name} log\n" + "".join(lines)
+        return out
 
     def log(self):
         try:
