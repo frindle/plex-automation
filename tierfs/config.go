@@ -75,6 +75,22 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			return c, fmt.Errorf("TIERFS_POLL: %w", err)
 		}
 	}
+	c.BackgroundComms = DefaultBackgroundComms
+	if v := strings.TrimSpace(getenv("TIERFS_BACKGROUND_COMMS")); v != "" {
+		c.BackgroundComms = nil
+		for _, n := range strings.Split(v, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				c.BackgroundComms = append(c.BackgroundComms, n)
+			}
+		}
+	}
+	if v := getenv("TIERFS_WAIT_S"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return c, errors.New("TIERFS_WAIT_S must be a positive number of seconds")
+		}
+		c.WaitTimeout = time.Duration(n) * time.Second
+	}
 	for _, r := range []struct{ name, val string }{
 		{"TIERFS_MOUNT", c.Mount}, {"TIERFS_MANIFESTS", c.Manifests}, {"TIERFS_STUB_ROOTS", strings.Join(c.StubRoots, ",")}, {"TIERFS_REMOTE_BASE", c.Remote.Base},
 	} {

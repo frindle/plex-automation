@@ -23,7 +23,7 @@ type Event struct {
 	Ev          string  `json:"ev"`
 	BytesLocal  int64   `json:"bytes_local"`
 	BytesRemote int64   `json:"bytes_remote"`
-	Offset      *int64  `json:"offset,omitempty"` // bad_chunk: start of the chunk
+	Offset      *int64  `json:"offset,omitempty"` // bad_chunk, want: start of the chunk
 }
 
 // EventLog appends JSON lines to a file and rotates it by size. A nil
@@ -89,6 +89,11 @@ func (e *EventLog) Emit(id, ev string, local, remote int64) {
 // EmitBad records a chunk that failed verification twice.
 func (e *EventLog) EmitBad(id string, offset int64) {
 	e.emit(Event{ID: id, Ev: "bad_chunk", Offset: &offset})
+}
+
+// EmitWant records a player read that needs the chunk at offset.
+func (e *EventLog) EmitWant(id string, offset int64) {
+	e.emit(Event{ID: id, Ev: "want", Offset: &offset})
 }
 
 // EmitSlotTimeout records a read that gave up waiting for a stream slot.

@@ -52,7 +52,8 @@ func rvSetup(t *testing.T, data []byte, base string, rc func(*RemoteConfig), mm 
 	if rc != nil {
 		rc(&cfg)
 	}
-	s, err := New(Config{Mount: "/unused", Manifests: mdir, StubRoots: []string{stubs}, PollInterval: time.Hour, Remote: cfg})
+	proc := fakeProc(t, map[uint32][2]string{scanPid: {"Plex Media Scan", "1"}})
+	s, err := New(Config{Mount: "/unused", Manifests: mdir, StubRoots: []string{stubs}, PollInterval: time.Hour, Remote: cfg, ProcRoot: proc})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +81,7 @@ func (e *rvEnv) read(h *handle, off, n int64) ([]byte, syscall.Errno) {
 	for i := range dest {
 		dest[i] = 0xA5 // poison: any byte not written by tierfs shows up
 	}
-	rr, errno := h.Read(context.Background(), dest, off)
+	rr, errno := h.Read(scanCtx(), dest, off)
 	if errno != 0 {
 		return nil, errno
 	}
