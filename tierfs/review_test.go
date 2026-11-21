@@ -149,7 +149,7 @@ func TestHandleConcurrentSameHandleNeverWrongBytes(t *testing.T) {
 	}
 	wg.Wait()
 	t.Logf("reads=%d wrong=%d bad-chunk-served=%d good-read-failed=%d", total, wrong, badOK, goodFail)
-	if wrong > 0 || badOK > 0 {
+	if wrong > 0 || badOK > 0 || goodFail > 0 {
 		t.Fatalf("returned unverified bytes: wrong=%d badOK=%d", wrong, badOK)
 	}
 }

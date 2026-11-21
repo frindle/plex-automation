@@ -144,7 +144,7 @@ func (h *handle) readMid(ctx context.Context, p []byte, off int64) error {
 	if h.lastErr != nil && time.Since(h.lastErrAt) < failCooldown && h.ck.alignDown(off) == h.lastErrAt0 {
 		return h.lastErr // only the region that just failed fails fast
 	}
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 4; attempt++ {
 		if h.st == nil || !h.st.covers(off) {
 			h.dropStream() // cancels the old request at once
 			h.newStream(off)
@@ -162,6 +162,10 @@ func (h *handle) readMid(ctx context.Context, p []byte, off int64) error {
 			continue // idle timeout or race with a trim: start a fresh stream
 		}
 		var bc *badChunkError
+		if errors.As(err, &bc) && (bc.Offset < h.ck.alignDown(off) || bc.Offset >= off+int64(len(p))) {
+			// The stream ran ahead into a bad chunk this read does not need.
+			continue
+		}
 		if ctx.Err() == nil && !errors.As(err, &bc) { // a bad chunk says nothing about other chunks
 			h.lastErr, h.lastErrAt, h.lastErrAt0 = err, time.Now(), h.ck.alignDown(off)
 		}

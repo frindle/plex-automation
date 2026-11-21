@@ -293,7 +293,7 @@ func TestParseSizeAndEnv(t *testing.T) {
 		t.Error("expected an error")
 	}
 	env := map[string]string{
-		"TIERFS_MOUNT": "/mnt/t", "TIERFS_MANIFESTS": "/m", "TIERFS_REMOTE_BASE": "http://altmount:8080",
+		"TIERFS_MOUNT": "/mnt/t", "TIERFS_MANIFESTS": "/m", "TIERFS_STUB_ROOTS": "/stubs, /stubs2", "TIERFS_REMOTE_BASE": "http://altmount:8080",
 		"TIERFS_READAHEAD": "16MiB", "TIERFS_MAX_STREAMS": "3",
 	}
 	c, err := ConfigFromEnv(func(k string) string { return env[k] })
@@ -303,6 +303,11 @@ func TestParseSizeAndEnv(t *testing.T) {
 	delete(env, "TIERFS_MOUNT")
 	if _, err := ConfigFromEnv(func(k string) string { return env[k] }); err == nil {
 		t.Fatal("missing mount must be an error")
+	}
+	env["TIERFS_MOUNT"] = "/mnt/t"
+	delete(env, "TIERFS_STUB_ROOTS")
+	if _, err := ConfigFromEnv(func(k string) string { return env[k] }); err == nil {
+		t.Fatal("missing stub roots must be an error")
 	}
 }
 
