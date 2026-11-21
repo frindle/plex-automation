@@ -98,7 +98,9 @@ tierfs reads the remote at `${TIERFS_REMOTE_BASE}` + `remote_path`. The credenti
 - **Waiting reads (playback and sync never fail on a slow remote):** a play or a sync makes the file whole anyway, so a Plex player never streams the middle from the remote. Its reads wait for the promote, which fetches each chunk only once.
   - **Reader class:** each FUSE request carries the caller's pid.
     - tierfs reads `/proc/<pid>/comm` and the parent's `comm`, cached per pid. `comm` is cut to 15 characters.
-    - The reader is *background* when either name is in `TIERFS_BACKGROUND_COMMS` (comma list, default `Plex Media Scan`). Every other reader, including a pid it cannot read, is a *player*.
+    - The reader is *background* when either name is in `TIERFS_BACKGROUND_COMMS` (comma list, default `Plex Media Scan`). That covers the scan, match, analysis, deep analysis, chapter thumbnails, credits and voice-activity scanner jobs.
+    - A `Plex Transcoder` started by the server is also *background* when its command line is one of Plex's analysis jobs: loudness (`-f null -`), intro and credits marker audio (written under `Transcode/Detection/`) or voice activity (`track-NNNN.wav`). One that names any other muxer is a client stream or a sync, so a *player*.
+    - Every other reader, including a pid or command line it cannot read, is a *player*.
     - tierfs runs with `pid: host`, so it can see the pids of Plex processes in other containers.
   - **Background reads** use the remote stream below, unchanged, and write `remote_read` as before.
   - **Player reads** of the middle come only from the stub, and only for chunks listed in the fill file `${TIERFS_MANIFESTS}/<id>.fill` (see **Promote order**). A read whose chunks are not listed yet waits:
