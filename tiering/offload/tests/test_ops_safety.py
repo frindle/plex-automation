@@ -222,7 +222,7 @@ def test_promote_zero_remote_fails_on_first_chunk_nothing_written(env):
             return bytes(n)
     r = env.promote(Zero(), chunk=4 * MIB)
     assert not r.ok and r.state == "failed"
-    assert Zero.calls == 1
+    assert Zero.calls == 2  # fetched again once, then failed
     assert os.stat(env.stub).st_blocks * 512 <= 10 * MIB + 32 * MIB + MIB
     assert os.path.islink(env.lib)
 

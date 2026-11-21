@@ -2,6 +2,7 @@ package tierfs
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,13 +13,49 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/zeebo/blake3"
 )
+
+// scanPid is the fake pid that rvSetup's fake /proc marks as the scanner.
+const scanPid = 4242
+
+// fakeProc builds a /proc tree: pid -> {comm, ppid}.
+func fakeProc(t testing.TB, procs map[uint32][2]string) string {
+	t.Helper()
+	root := t.TempDir()
+	for pid, v := range procs {
+		d := filepath.Join(root, strconv.Itoa(int(pid)))
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		os.WriteFile(filepath.Join(d, "status"), []byte(fmt.Sprintf("Name:\t%s\nTgid:\t%d\nPid:\t%d\n", v[0], pid, pid)), 0o644)
+		os.WriteFile(filepath.Join(d, "comm"), []byte(v[0]+"\n"), 0o644)
+		os.WriteFile(filepath.Join(d, "stat"), []byte(fmt.Sprintf("%d (%s) S %s 1 1 0\n", pid, v[0], v[1])), 0o644)
+	}
+	return root
+}
+
+func ctxPid(pid uint32) context.Context {
+	return fuse.NewContext(context.Background(), &fuse.Caller{Pid: pid})
+}
+
+func scanCtx() context.Context { return ctxPid(scanPid) }
+
+// selfComm is this process's comm, as the kernel reports it.
+func selfComm(t testing.TB) string {
+	b, err := os.ReadFile("/proc/self/comm")
+	if err != nil {
+		t.Skip("no /proc")
+	}
+	return strings.TrimRight(string(b), "\n")
+}
 
 const (
 	testUser   = "tester"
@@ -261,4 +298,15 @@ func writeManifest(t testing.TB, dir string, m *Manifest) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// fakeThread adds tid to a fakeProc tree as a thread of tgid, with its own comm.
+func fakeThread(t testing.TB, root string, tid, tgid uint32, comm string) {
+	t.Helper()
+	d := filepath.Join(root, strconv.Itoa(int(tid)))
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(d, "status"), []byte(fmt.Sprintf("Name:\t%s\nTgid:\t%d\nPid:\t%d\n", comm, tgid, tid)), 0o644)
+	os.WriteFile(filepath.Join(d, "comm"), []byte(comm+"\n"), 0o644)
 }

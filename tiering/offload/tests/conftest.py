@@ -8,6 +8,7 @@ def _apply_env(monkeypatch):
     """Apply guards: the env switches are set, and the temp dirs count as a real disk
     file system (tests of the guard patch ops._fs_type again)."""
     monkeypatch.setenv("TIERING_APPLY", "1")
+    monkeypatch.setenv("TIERING_PROMOTE_RETRY_S", "0")  # no in-call retry unless a test asks
     try:  # a process that every PID namespace with /proc can see
         with open("/proc/1/comm") as f:
             canary = f.read().strip()

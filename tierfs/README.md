@@ -35,6 +35,26 @@ a symlink into the mount, so Plex sees a normal file. The design is in
 - At most `TIERFS_MAX_STREAMS` streams are open at once. An unused stream gives
   its slot back after 30 seconds.
 
+## Waiting reads
+
+Each reader is classified from the FUSE request's pid: its `/proc/<pid>/comm`,
+and its parent's, are compared with `TIERFS_BACKGROUND_COMMS`. A pid that cannot
+be read counts as a player.
+
+- Background readers (the Plex scanner and its children) keep the remote stream
+  described above.
+- A player's middle read never uses the remote. It comes from the stub, for
+  chunks listed in `<id>.fill`, and waits until the chunk is listed. The fill
+  file is checked at least every 200 ms.
+- The first wait for an offset writes a `want` event, and a far seek writes a new
+  one. A read 75% of the way through the head writes one for the start of the
+  middle. The promote fetches from the newest want.
+- `failed <offset>` in the fill file gives EIO at once. `TIERFS_WAIT_S` is a
+  no-progress timeout: the read gets EIO only when the fill file has not grown
+  for that long. An interrupted request stops waiting.
+- A handle keeps its stub fd. Once the manifest is removed (the promote is done)
+  every chunk is local.
+
 ## Settings (environment variables)
 
 | Variable | Default | Meaning |
@@ -51,6 +71,8 @@ a symlink into the mount, so Plex sees a normal file. The design is in
 | `TIERFS_SLOT_WAIT` | `20s` | How long a read waits for a free stream slot. After that it gets EIO and a `{"ev":"slot_timeout","id":...}` event. |
 | `TIERFS_ALLOW_OTHER` | `1` | Let other users (such as Plex) read the mount. Set `0` to turn off. |
 | `TIERFS_POLL` | `5s` | How often manifests are rescanned. `SIGHUP` rescans at once. |
+| `TIERFS_BACKGROUND_COMMS` | `Plex Media Scan` | Comma list of process names (`comm`, 15 characters) whose reads, and their children's, keep the remote stream. Every other reader is a player and waits for the promote. |
+| `TIERFS_WAIT_S` | `900` | Seconds a player read waits with no new line in the fill file before it gets EIO. |
 
 Manifests that are invalid are skipped with a log line. If a manifest is
 removed its entry disappears, but handles that are already open keep working.
@@ -58,7 +80,7 @@ removed its entry disappears, but handles that are already open keep working.
 ## Events
 
 One JSON line per event: `{"ts": 1711393377.5, "id": "...", "ev": "open", "bytes_local": 0, "bytes_remote": 0}`.
-`ev` is `open`, `remote_read` (once per handle, on the first byte read from the
+`ev` is `want` (carries `"offset"`: the player needs this part of the file next), `open`, `remote_read` (once per handle, on the first byte read from the
 remote), `close` (carries the totals for the handle) or `bad_chunk` (a chunk
 failed verification twice; it also carries `"offset"`, the chunk's start in the
 file).
@@ -68,6 +90,8 @@ file).
 `/metrics` is Prometheus text: `tierfs_bytes_local_total`,
 `tierfs_bytes_remote_total`, `tierfs_open_handles`, `tierfs_active_streams`,
 `tierfs_remote_errors_total`, `tierfs_remote_requests_total`, `tierfs_bad_chunks_total`,
+`tierfs_waiting_reads`, `tierfs_wait_reads_total`, `tierfs_wait_timeouts_total`,
+`tierfs_wait_failed_total`, `tierfs_want_events_total`,
 `tierfs_manifests` and the histogram `tierfs_remote_ttfb_seconds`.
 
 ## Running it
@@ -81,7 +105,7 @@ to the host (and from there to Plex) with `rshared` propagation:
 
     docker run -d --name tierfs \
       --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-      --network host \
+      --network host --pid host \
       -v /srv/tierfs/mnt:/mnt/tierfs:rshared \
       -v /srv/tierfs/manifests:/manifests:ro \
       -v /srv/stubs:/srv/stubs \
@@ -95,6 +119,10 @@ to the host (and from there to Plex) with `rshared` propagation:
       tierfs
 
 Notes:
+
+- `--pid host` (`pid: host` in compose) is needed so the pid in each FUSE request
+  can be looked up in `/proc`. Without it every reader looks unreadable and is a
+  player.
 
 - The `stub_path` in each manifest must be readable inside the container at the
   same path, so mount the stub directory there.

@@ -34,6 +34,11 @@ type Config struct {
 	PollInterval time.Duration
 	StubRoots    []string // stub_path must be exactly <root>/<id><ext>
 	Remote       RemoteConfig
+
+	BackgroundComms []string      // reader names that keep the remote stream (default "Plex Media Scan")
+	WaitTimeout     time.Duration // player read with no new fill line for this long gets EIO (default 15m)
+	FillPoll        time.Duration // how often a waiting read looks at the fill file (default 100ms, max 200ms)
+	ProcRoot        string        // default /proc
 }
 
 type entry struct {
@@ -49,6 +54,7 @@ type Server struct {
 	m      *Metrics
 	remote *Remote
 	ev     *EventLog
+	class  *classifier
 
 	reloadMu sync.Mutex
 	mu       sync.RWMutex
@@ -85,6 +91,15 @@ func New(cfg Config) (*Server, error) {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 5 * time.Second
 	}
+	if cfg.BackgroundComms == nil {
+		cfg.BackgroundComms = DefaultBackgroundComms
+	}
+	if cfg.WaitTimeout <= 0 {
+		cfg.WaitTimeout = 900 * time.Second
+	}
+	if cfg.FillPoll <= 0 || cfg.FillPoll > 200*time.Millisecond {
+		cfg.FillPoll = 100 * time.Millisecond
+	}
 	m := &Metrics{}
 	r, err := NewRemote(cfg.Remote, m)
 	if err != nil {
@@ -95,7 +110,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("events: %w", err)
 	}
 	return &Server{
-		cfg: cfg, m: m, remote: r, ev: ev,
+		cfg: cfg, m: m, remote: r, ev: ev, class: newClassifier(cfg.ProcRoot, cfg.BackgroundComms),
 		entries: map[string]*entry{}, badSeen: map[string]string{}, cache: map[string]*cached{},
 		stop: make(chan struct{}),
 	}, nil

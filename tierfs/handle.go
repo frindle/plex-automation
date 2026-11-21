@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -37,6 +38,14 @@ type handle struct {
 	local      atomic.Int64
 	remote     atomic.Int64
 	remoteSeen atomic.Bool
+
+	fill    *fillView
+	seekMu  sync.Mutex  // SEEK_DATA/SEEK_HOLE move the stub fd offset
+	allDone atomic.Bool // manifest removed: the stub is the whole file
+	warmed  atomic.Bool // pre-warm want sent
+	wantMu  sync.Mutex
+	hasWant bool
+	lastW   int64
 }
 
 func (s *Server) openHandle(e *entry) (*handle, error) {
@@ -51,7 +60,8 @@ func (s *Server) openHandle(e *entry) (*handle, error) {
 		f.Close()
 		return nil, errors.New("stub is not a regular file of the manifest's size")
 	}
-	h := &handle{srv: s, m: m, stub: f, ck: &chunkCheck{base: m.HeadLen, size: m.ChunkSize, sums: e.sums}}
+	h := &handle{srv: s, m: m, stub: f, ck: &chunkCheck{base: m.HeadLen, size: m.ChunkSize, sums: e.sums},
+		fill: newFillView(filepath.Join(s.cfg.Manifests, m.ID+".fill"))}
 	s.m.OpenHandles.Add(1)
 	s.ev.Emit(m.ID, "open", 0, 0)
 	return h, nil
@@ -62,9 +72,20 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 	m := h.m
 	segs := Split(m.Size, m.HeadLen, m.TailLen, off, int64(len(dest)))
 	var total int64
+	background := h.srv.class.background(ctx)
 	for _, sg := range segs {
 		p := dest[sg.Off-off : sg.Off-off+sg.N]
-		if sg.Kind == Mid {
+		if sg.Kind == Mid && !background {
+			if err := h.readPlayerMid(ctx, p, sg.Off); err != nil {
+				if ctx.Err() != nil {
+					return nil, syscall.EINTR
+				}
+				log.Printf("read %s: offset %d: %v", m.ID, sg.Off, err)
+				return nil, syscall.EIO
+			}
+			h.local.Add(sg.N)
+			h.srv.m.BytesLocal.Add(sg.N)
+		} else if sg.Kind == Mid {
 			if err := h.readMid(ctx, p, sg.Off); err != nil {
 				if ctx.Err() != nil {
 					return nil, syscall.EINTR
@@ -93,7 +114,11 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 			h.local.Add(sg.N)
 			h.srv.m.BytesLocal.Add(sg.N)
 			if sg.Kind == Head {
-				h.maybeWarm(sg.Off + sg.N)
+				if background {
+					h.maybeWarm(sg.Off + sg.N)
+				} else {
+					h.maybeWant(sg.Off + sg.N)
+				}
 			}
 		}
 		total += sg.N

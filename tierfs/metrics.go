@@ -20,6 +20,11 @@ type Metrics struct {
 	Manifests     atomic.Int64
 	BadChunks     atomic.Int64
 	SlotTimeouts  atomic.Int64
+	WaitingReads  atomic.Int64
+	WaitReads     atomic.Int64
+	WaitTimeouts  atomic.Int64
+	WaitFailed    atomic.Int64
+	WantEvents    atomic.Int64
 
 	ttfbCount   atomic.Int64
 	ttfbSumNS   atomic.Int64
@@ -54,6 +59,11 @@ func (m *Metrics) WriteProm(w io.Writer) {
 	g("tierfs_remote_requests_total", "counter", "Remote HTTP requests started.", m.RemoteReqs.Load())
 	g("tierfs_bad_chunks_total", "counter", "Remote chunks that failed verification.", m.BadChunks.Load())
 	g("tierfs_slot_timeouts_total", "counter", "Reads that gave up waiting for a free stream slot.", m.SlotTimeouts.Load())
+	g("tierfs_waiting_reads", "gauge", "Player reads waiting for the promote.", m.WaitingReads.Load())
+	g("tierfs_wait_reads_total", "counter", "Player reads that had to wait for the promote.", m.WaitReads.Load())
+	g("tierfs_wait_timeouts_total", "counter", "Player reads that gave up with no progress in the fill file.", m.WaitTimeouts.Load())
+	g("tierfs_wait_failed_total", "counter", "Player reads failed by a failed line in the fill file.", m.WaitFailed.Load())
+	g("tierfs_want_events_total", "counter", "Want events written.", m.WantEvents.Load())
 	g("tierfs_manifests", "gauge", "Valid manifests currently loaded.", m.Manifests.Load())
 	const h = "tierfs_remote_ttfb_seconds"
 	fmt.Fprintf(w, "# HELP %s Time to first byte (response headers) of remote requests.\n# TYPE %s histogram\n", h, h)
