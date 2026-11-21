@@ -54,6 +54,7 @@ HISTORY_DROP = 0.20  # a Plex history this much shorter than last time is not tr
 WEEKLY_EVERY = 7 * DAY  # the weekly check runs when the last one is this old
 WEEKLY_RETRY = 3600.0  # after a failed weekly check, wait this long before trying again
 FOLLOW_POLL = 0.25  # the tierfs event file is read this often (a want starts a promote within 1 s)
+WANT_SPACING = 60.0  # wanted attempts on one id are at least this far apart
 WANT_FRESH = 900.0  # a want older than this is not a player waiting any more (TIERFS_WAIT_S)
 # Used only when the state module does not export COLUMNS.
 FALLBACK_COLUMNS = ("sha256", "nzb_path", "nzb_path2", "remote_path", "restore_score",
@@ -401,6 +402,7 @@ class Runner:
         self.flagged: set = set()  # ids a weekly_flag event asked to promote
         self.ops_seq = 0  # last events row read for alerts
         self.flag_seq = 0  # last events row read for weekly flags
+        self.want_last: dict = {}  # id -> start of the last wanted attempt (kept in kv)
         self.want_off: dict = {}  # id -> newest offset a player waits at
         self.tail_events: list = []  # bad_chunk and slot_timeout events for the pass
         self.follow_mu = threading.Lock()
@@ -510,6 +512,9 @@ class Runner:
         self.ops_seq = int(self._kv_get(db, "ops_seq", 0) or 0)
         self.flag_seq = int(self._kv_get(db, "weekly_flag_cursor", 0) or 0)
         self.weekly_last = float(self._kv_get(db, "weekly_last_ts", 0) or 0)
+        saved = self._kv_get(db, "want_last", {}) or {}
+        with self.mu:
+            self.want_last = {**{str(k): float(v) for k, v in saved.items()}, **self.want_last}
         self.flagged = set(self._kv_get(db, "flagged", []))
 
     def _demote_block(self, now) -> str:
@@ -699,16 +704,23 @@ class Runner:
         with self.mu:
             if off is not None:
                 self.want_off[id] = off
+            # a player waits: the retry backoff does not apply, only the 60 s spacing
             if not self.cfg.apply or id in self.promote_running or id in self.demote_running \
-                    or self.retry_after.get(id, 0) > now:
+                    or now - self.want_last.get(id, -WANT_SPACING) < WANT_SPACING:
                 return
+            self.want_last[id] = now
             self.promote_running.add(id)
             self.promote_started[id] = now
         self._spawn(lambda: self._want_worker(id))
 
     def _want_worker(self, id):
         try:
-            self._promote_one(self._open(), id, None, wanted=True)
+            db = self._open()
+            with self.mu:
+                saved = {k: v for k, v in self.want_last.items() if self.clock() - v < DAY}
+                self.want_last = dict(saved)
+            self._kv_set(db, "want_last", saved)
+            self._promote_one(db, id, None, wanted=True)
         except Exception as e:
             log.error("wanted promote %s died: %s: %s", id, type(e).__name__, e)
             with self.mu:

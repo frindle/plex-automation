@@ -259,6 +259,43 @@ def test_want_for_a_running_promote_moves_its_cursor_and_stale_or_whole_is_ignor
         r.close()
 
 
+def test_want_during_backoff_starts_then_is_spaced_and_failed_is_ignored(tmp_path, monkeypatch):
+    events = str(tmp_path / "events.jsonl")
+    open(events, "w").close()
+    r = Rig(tmp_path, monkeypatch, events=events)
+    try:
+        rid = st.list_files(r.db)[0]["id"]
+        r.runner.weekly_last = r.clock()
+        r.fail_promote.add(rid)
+
+        def want(off=1):
+            _write_events(events, {"ts": r.clock(), "id": rid, "ev": "want", "offset": off})
+            r.runner._follow_once()
+            r.runner.join()
+        want()
+        assert r.calls == [rid]
+        assert r.runner.retry_after[rid] > r.clock(), "the failure put the row in backoff"
+        r.clock.t += 30
+        want()
+        assert r.calls == [rid], "a second want inside 60 s starts nothing"
+        r.clock.t += 31
+        want()
+        assert r.calls == [rid, rid], "inside the backoff, 60 s on: a want starts at once"
+        assert r.runner.want_last[rid] == r.clock.t
+        assert st.kv_get(r.db, "want_last") == {rid: r.clock.t}
+        # the spacing survives a restart
+        r2 = Runner(r.cfg, r.deps, clock=r.clock, sleep=lambda s: None)
+        r2._load_persisted(r.db)
+        assert r2.want_last == {rid: r.clock.t}
+        # a failed row (two hash mismatches) is not retried by a want
+        assert st.update_if(r.db, rid, "offloaded", state="failed")
+        r.clock.t += 120
+        want()
+        assert r.calls == [rid, rid]
+    finally:
+        r.close()
+
+
 def test_a_promote_without_want_in_its_signature_still_runs(tmp_path, monkeypatch):
     events = str(tmp_path / "events.jsonl")
     open(events, "w").close()
