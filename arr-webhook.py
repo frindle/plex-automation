@@ -11753,11 +11753,13 @@ def _digest_arr_health_html():
 # See glacier_hold.py. The switch defaults off. The index and the spin logger's directory are read
 # as plain files; nothing here ever touches /mnt/disk1 or /mnt/user.
 HOLD_DISK1_UPGRADES = os.environ.get('HOLD_DISK1_UPGRADES', '0').lower() in ('1', 'true', 'yes')
-GLACIER_INDEX = os.environ.get('GLACIER_INDEX', '/data/glacier-index.txt')
+GLACIER_INDEX = os.environ.get('GLACIER_INDEX', '/glacier-spin/glacier-index.txt')
 GLACIER_INDEX_MAX_AGE_DAYS = float(os.environ.get('GLACIER_INDEX_MAX_AGE_DAYS', str(glacier_hold.INDEX_MAX_AGE_DAYS)))
 GLACIER_SPIN_DIR = os.environ.get('GLACIER_SPIN_DIR', '/glacier-spin')
 GLACIER_WINDOW = os.environ.get('GLACIER_WINDOW', glacier_hold.DEFAULT_WINDOW)
 GLACIER_TZ = os.environ.get('GLACIER_TZ', '')           # IANA zone for the window; empty = container local time
+_gpm = os.environ.get('GLACIER_PATH_MAP', '/data:data').split(':', 1)
+GLACIER_PATH_MAP = (_gpm[0], _gpm[1] if len(_gpm) > 1 else '')   # arr container prefix : share prefix
 GLACIER_POLL_S = float(os.environ.get('GLACIER_POLL_S', '15'))
 GLACIER_STATE = os.environ.get('GLACIER_STATE', '/data/glacier_hold_state.json')
 GLACIER_HOLD_LABEL = glacier_hold.HOLD_LABEL
@@ -11930,7 +11932,8 @@ def glacier_tick(now=None, io=None, now_dt=None, sleep=time.sleep):
             prefixes = glacier_hold.load_index(GLACIER_INDEX, now, GLACIER_INDEX_MAX_AGE_DAYS)
             if prefixes:
                 labels = {'sonarr', 'radarr', *[lb.lower() for lb in UPGRADE_LANE_LABELS]}
-                out['hold'] = dict(glacier_hold.hold_pass(io, doc['held'], prefixes, labels, _glacier_checked))
+                out['hold'] = dict(glacier_hold.hold_pass(io, doc['held'], prefixes, labels, _glacier_checked,
+                                                                  path_map=GLACIER_PATH_MAP))
         if out.get('hold') or out.get('release'):
             _write_json_atomic(GLACIER_STATE, doc)
     if any(v for v in out.values()):

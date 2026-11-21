@@ -27,11 +27,13 @@ step that has an effect (the link path is journalled before the link is made), h
 a link is never kept without a hold entry, and startup lists and clears leftovers.
 
 "Is the old file on disk1" is answered from an index file, never from the disks (a lookup can spin the
-disk up). Index format (GLACIER_INDEX): UTF-8 text, one path prefix per line, relative to the share, no
-leading slash, '/' separators, for example `data/Media/TV Shows/Example Show`. Blank lines and lines
-starting with '#' are ignored. A file path is on disk1 when it equals a prefix or lies below one
-(whole path components only). A missing, empty or stale (older than GLACIER_INDEX_MAX_AGE_DAYS, default
-3) index means the hold is inactive.
+disk up). The nightly mover writes it atomically at glacier-index.txt beside the spin-*.tsv files
+(GLACIER_INDEX). Format: UTF-8, one unit per line, sorted and unique, each a path relative to /mnt/diskN
+(no leading slash, '/' separators). Units: TV = the show folder (`data/Media/TV Shows/<Show>`); movies =
+the movie folder; anything else = its first three path parts. A file is on disk1 when its share path
+(container /data/... maps to data/..., setting GLACIER_PATH_MAP) starts with a unit followed by "/". Blank
+and '#' lines are ignored. The file's mtime is the freshness signal: missing, empty or older than
+GLACIER_INDEX_MAX_AGE_DAYS (default 3) means the hold is inactive.
 
 "Disk1 is up" = the newest disk1 row in the spin logger's spin-*.tsv says up (rows are
 `epoch<TAB>disk<TAB>up|down`), or local time is inside the nightly window (GLACIER_WINDOW, 22:00-06:00).
@@ -144,13 +146,26 @@ def load_index(path, now, max_age_days=INDEX_MAX_AGE_DAYS):
     return frozenset(prefixes) if prefixes else None
 
 
-def on_disk1(path, prefixes):
-    """True when the file path (a container path such as /data/Media/...) is at or below an index prefix."""
-    p = _norm(path)
+DEFAULT_PATH_MAP = ('/data', 'data')   # arr container path prefix -> share path prefix
+
+
+def to_share(path, path_map=DEFAULT_PATH_MAP):
+    """Container path (/data/...) to the path relative to the share (data/...). Unmapped paths pass through."""
+    p = (path or '').replace('\\', '/')
+    src = (path_map[0] if path_map else '').rstrip('/')
+    if src and (p == src or p.startswith(src + '/')):
+        p = path_map[1].rstrip('/') + p[len(src):]
+    return _norm(p)
+
+
+def on_disk1(path, prefixes, path_map=DEFAULT_PATH_MAP):
+    """True when the file path starts with a listed unit followed by '/' (whole components; the unit
+    itself is a folder, so a path equal to a unit is not a file in it)."""
+    p = to_share(path, path_map)
     if not p or not prefixes:
         return False
     parts = p.split('/')
-    return any('/'.join(parts[:i]) in prefixes for i in range(1, len(parts) + 1))
+    return any('/'.join(parts[:i]) in prefixes for i in range(1, len(parts)))
 
 
 # ── the stopgap link ──────────────────────────────────────────────────────────
@@ -166,14 +181,14 @@ def is_link_name(name):
     return posixpath.splitext(name)[0].endswith(LINK_MARK)
 
 
-def plan_link(src, old_paths, prefixes):
+def plan_link(src, old_paths, prefixes, path_map=DEFAULT_PATH_MAP):
     """(dst, reason). dst is the hardlink path to make, or None with the reason it is skipped. One old
     file only (a season pack has several), a source that is not itself on disk1, a video extension."""
     if len(old_paths) != 1:
         return None, 'link_skipped_multi'
     if not src or posixpath.splitext(src)[1].lower() not in VIDEO_EXTS:
         return None, 'link_skipped_nosource'
-    if on_disk1(src, prefixes):
+    if on_disk1(src, prefixes, path_map):
         return None, 'link_skipped_src_on_disk1'
     return posixpath.join(posixpath.dirname(old_paths[0]), link_name(src)), None
 
@@ -199,7 +214,7 @@ class Counts(dict):
         self[key] = self.get(key, 0) + n
 
 
-def hold_pass(io, state, prefixes, labels, checked, hold_label=HOLD_LABEL):
+def hold_pass(io, state, prefixes, labels, checked, hold_label=HOLD_LABEL, path_map=DEFAULT_PATH_MAP):
     """Hold finished upgrade downloads whose current file is on disk1, and give each a stopgap link.
     `state` is {hash: entry} and is mutated; io.save(state) persists it and is called BEFORE each step with
     an effect. `checked` is a set of hashes already judged, so each download is looked at once. Returns Counts."""
@@ -236,7 +251,7 @@ def hold_pass(io, state, prefixes, labels, checked, hold_label=HOLD_LABEL):
                 checked.add(h)
                 c.bump('not_upgrade')
                 continue
-            if not any(on_disk1(p, prefixes) for p in paths):
+            if not any(on_disk1(p, prefixes, path_map) for p in paths):
                 checked.add(h)
                 c.bump('old_file_elsewhere')
                 continue
@@ -260,7 +275,7 @@ def hold_pass(io, state, prefixes, labels, checked, hold_label=HOLD_LABEL):
             continue
         checked.add(h)
         c.bump('held')
-        dst, why = plan_link(src, paths, prefixes)
+        dst, why = plan_link(src, paths, prefixes, path_map)
         if why:
             c.bump(why)
             continue

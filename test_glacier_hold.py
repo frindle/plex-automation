@@ -77,7 +77,8 @@ def test_on_disk1_matches_whole_components_only():
     f = lambda p: gh.on_disk1(p, PREFIXES)  # noqa: E731
     assert f('/data/Media/TV Shows/Cold Show/Season 1/e01.mkv')
     assert f('/data/Media/Movies/Cold Movie (2001)/Cold Movie (2001).mkv')
-    assert f('data/Media/TV Shows/Cold Show')
+    assert not f('data/Media/TV Shows/Cold Show')        # the unit itself: only paths below it count
+    assert gh.on_disk1('/mnt/x/Media/TV Shows/Cold Show/e.mkv', PREFIXES, ('/mnt/x', 'data'))   # container to share map
     assert not f('/data/Media/TV Shows/Cold Show 2/Season 1/e01.mkv')  # sibling with the same stem
     assert not f('/data/Media/TV Shows/Warm Show/e01.mkv')
     assert not f('')

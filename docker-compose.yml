@@ -95,7 +95,8 @@ services:
       # inside GLACIER_WINDOW); meanwhile the new copy is hardlinked next to the old one under a "- glacier-tmp" name
       # (needs the /srv/data mount below and PLEX_URL/PLEX_TOKEN) and Plex is asked to scan that folder.
       HOLD_DISK1_UPGRADES: "${HOLD_DISK1_UPGRADES:-0}"
-      GLACIER_INDEX: "${GLACIER_INDEX:-/data/glacier-index.txt}"
+      GLACIER_INDEX: "/glacier-spin/glacier-index.txt"   # written by the nightly mover, same dir as spin-*.tsv
+      GLACIER_PATH_MAP: "${GLACIER_PATH_MAP:-/data:data}"
       GLACIER_SPIN_DIR: "/glacier-spin"
       GLACIER_WINDOW: "${GLACIER_WINDOW:-22:00-06:00}"
       GLACIER_TZ: "${GLACIER_TZ:-}"
@@ -156,7 +157,7 @@ services:
       # Paths /data/X map to RELINK_DATA_ROOT/X.
       - "/mnt/user/data:/srv/data"
       # Glacier wake logger's spin-*.tsv rows, read-only (used only when HOLD_DISK1_UPGRADES is on).
-      - "${GLACIER_SPIN_HOST_DIR:-./data/glacier-spin}:/glacier-spin:ro"
+      - "${GLACIER_SPIN_HOST_DIR:-/mnt/cache/appdata/glacier-wake/data}:/glacier-spin:ro"
 
 networks:
   br0:
