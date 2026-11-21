@@ -27,6 +27,8 @@ jobs:
           diff "$a/SHA256SUMS" "$b/SHA256SUMS"
       - name: Mount propagation smoke test
         run: tiering/e2e/test_mount_propagation.sh
+      - name: Plex API, plex_watch and hotset against a live Plex
+        run: tiering/e2e/test_plex_api.sh
       - name: Plex log on failure
         if: failure()
         run: |
