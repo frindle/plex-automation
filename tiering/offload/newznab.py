@@ -412,11 +412,15 @@ class NewznabClient:
             bad = {}
             for k, w in (d.get("bad") or {}).items():
                 if isinstance(w, (list, tuple)):
-                    first, last = min(float(w[0]), now), min(float(w[1]), now)
+                    first, last = float(w[0]), float(w[1])
                 else:  # a single time: a mark that was confirmed
-                    last = min(float(w), now)
+                    last = float(w)
                     first = last - BAD_CONFIRM_S
-                bad[str(k)] = [min(first, last), last]
+                # a clock set back: move both strikes, so the gap between them (what
+                # confirms the mark) survives the clamp
+                shift = max(0.0, last - now)
+                clamped = clamped or shift > 0
+                bad[str(k)] = [min(first, last) - shift, last - shift]
             attempts = {str(k): (min(float(v[0]), now), int(v[1]))
                         for k, v in (d.get("attempts") or {}).items()}
         except (OSError, ValueError, TypeError, AttributeError, IndexError):

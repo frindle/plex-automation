@@ -92,3 +92,22 @@ def test_G2b_a_release_with_no_nzb_on_every_night_is_still_called_a_miss(tmp_pat
     nights = _nights(tmp_path, 2, 4)
     assert all(reason == "nzb_unsure" for reason, _ in nights[0].values())
     assert all(v == ("no_exact_nzb", "grab_failed") for v in nights[-1].values())
+
+
+# ---------------------------------------------------------------- clock set back
+def test_G7_wall_clock_set_back_keeps_a_confirmed_mark(tmp_path):
+    from fakes_intake import FakeNewznab
+    s = FakeNewznab({"r": {"title": "Movie.2020.1080p.WEB-GRP", "nzb": PAGE}})
+    sp = str(tmp_path / "b.json")
+    mono, wall = Clock(10.0), Clock(5e6)
+    try:
+        ix = _c(s, mono, wall, sp)
+        rel = ix.search_indexer(ix.indexers[0], title="Movie")[0]
+        ix._mark_bad(rel)
+        wall.t += 13 * 3600
+        ix._mark_bad(rel)
+        assert ix.is_bad(rel)
+        wall.t -= 2 * DAY
+        assert _c(s, mono, wall, sp).is_bad(rel)
+    finally:
+        s.close()
