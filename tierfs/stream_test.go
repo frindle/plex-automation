@@ -354,7 +354,9 @@ func TestReloadSkipsInvalidAndKeepsOpenSetStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := buildManifest(300<<20, "/stub/"+testID+".mkv")
+	data := randomData(100<<20+777, 3)
+	m := buildManifest(int64(len(data)), "/stub/"+testID+".mkv")
+	writeChunks(t, dir, m, data)
 	os.WriteFile(filepath.Join(dir, "garbage.json"), []byte("{nope"), 0o644)
 	os.WriteFile(filepath.Join(dir, "ffffffffffffffff.json"), []byte(`{"v":1}`), 0o644)
 	p := writeManifest(t, dir, m)
