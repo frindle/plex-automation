@@ -1,0 +1,18 @@
+# Test override for tiering/e2e/test_tiering_compose.sh, loaded after docker-compose.tiering.yml. br0 becomes a
+# local bridge (on the host it is the LAN network from docker-compose.yml, which this test does not load), the
+# health check runs every few seconds, and arr-webhook (the tiering file only adds a volume to it) is left out.
+services:
+  tiering:
+    healthcheck:
+      interval: 3s
+      start_period: 90s
+  arr-webhook:
+    image: busybox
+    profiles: ["never"]
+
+networks:
+  br0:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24

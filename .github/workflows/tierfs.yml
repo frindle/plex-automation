@@ -34,10 +34,3 @@ jobs:
         run: go test -count=1 -timeout 15m -v ./...
       - name: Race detector (tests that need no mount)
         run: go test -race -count=1 -timeout 10m -run 'Split|Manifest|Stream|Remote|Parse|Event|Status|Reload|Handle|Wait|Reader|Config' ./...
-
-  docker:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build image
-        run: docker build -t tierfs:ci tierfs

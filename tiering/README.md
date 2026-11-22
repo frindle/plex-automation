@@ -77,15 +77,15 @@ The run aborts if the array is stopped, a parity check/rebuild is running, or an
 
 ## Deploy with compose (offload tier)
 
-`docker-compose.tiering.yml` adds two services to the stack: `tierfs` (the FUSE mount) and `tiering-runner` (the offload runner, image built from `tiering/Dockerfile`). It is not loaded until `.env` says so, and the runner is a dry run until `TIERING_APPLY=1`.
+`docker-compose.tiering.yml` adds one service to the stack: `tiering`, a single container (image built from `tiering/Dockerfile`) that runs tierfs (the FUSE mount) and the offload runner. `offload/supervise.py` is its main process: it starts tierfs, waits for its health check, then starts the runner. If the runner exits it is started again after a back-off (10 s, doubling to 5 min) while the mount stays up; if tierfs exits, the runner is stopped and the container exits, so Docker restarts both. `docker stop` stops the runner first, then tierfs, which unmounts. The service is not loaded until `.env` says so, and the runner is a dry run until `TIERING_APPLY=1`.
 
 1. Host, once per array start (User Scripts, "At Startup of Array"): `bash tiering/tierfs-host-mount.sh`. It makes `TIERFS_MOUNT` a shared mount point so the FUSE mount reaches the host.
 2. Make the state folders: `mkdir -p "$TIERING_STATE_DIR"/{manifests,events,nzb}` and one stub folder per media disk (`mkdir /mnt/diskN/.stubs`).
-3. Fill the "Offload tier" block in `.env` (see `.env.example`) and uncomment `COMPOSE_FILE=...`.
-4. Plex and each arr: add a path mapping `TIERFS_MOUNT` -> the same path in the container, access mode **Read Only - Slave**. Library symlinks point at that path, so it must be identical everywhere. A container started before tierfs still gets the mount (slave propagation); one mapped without Slave sees an empty folder and every offloaded file looks broken.
-5. `./update.sh`, then check `docker logs tierfs` and `docker logs tiering-runner`. The dry run logs `plan: demote ...` lines; read a night of them before setting `TIERING_APPLY=1`.
+3. Fill the "Offload tier" block in `.env` (see `.env.example`; `TIERING_IP` is one free address on br0) and uncomment `COMPOSE_FILE=...`.
+4. Plex and each arr: add a path mapping `TIERFS_MOUNT` -> the same path in the container, access mode **Read Only - Slave**. Library symlinks point at that path, so it must be identical everywhere. A container started before tiering still gets the mount (slave propagation); one mapped without Slave sees an empty folder and every offloaded file looks broken.
+5. `./update.sh`, then check `docker logs tiering` (supervisor lines start with `supervise:`). The dry run logs `plan: demote ...` lines; read a night of them before setting `TIERING_APPLY=1`.
 
-To pause offloading, stop only the runner: `docker-compose stop tiering-runner`. Leave tierfs running: offloaded files are read through it, and while it is stopped they do not open. Promote every file back before removing tierfs.
+To pause offloading without touching the mount, create the pause file: `touch "$TIERING_STATE_DIR/runner.paused"`. The runner stops within a second and is not started again; tierfs keeps serving offloaded files, and the health check counts a paused runner as healthy. Delete the file to resume. Do not stop the container to pause: offloaded files do not open while tierfs is down, and a container restart drops any stream reading an offloaded file at that moment. Promote every file back before removing the tier.
 
 Alerts (`alerts.jsonl` in the state folder) are only written to that file and the runner log. Nothing pushes them yet.
 
@@ -106,11 +106,13 @@ Container requirements:
 - `TIERING_PROC_CANARY`: a comma list of `comm` names, every one of which must be visible from the runner: the media server (`Plex Media Serv`, the kernel cuts `comm` to 15 characters, so write it cut) and the user-share daemon (`shfs`). If it is unset or any name is not visible, the open-file check says "not clear" and ops refuses to demote, so a container that does not see host processes cannot demote.
 - Two kinds of mount: the share at the path Plex uses (so `lib_path` reads) and each `/mnt/diskN` (where file operations run, never through the share's FUSE layer).
 
+The shape of these requirements (`docker-compose.tiering.yml` is the real service, which adds tierfs's needs: `/dev/fuse`, `SYS_ADMIN`, `apparmor:unconfined` and the mount itself):
+
 ```yaml
 services:
-  tiering-runner:
+  tiering:
     image: plex-automation
-    command: python -m offload.runner
+    command: python -m offload.supervise
     pid: host
     cap_add: [SYS_PTRACE]
     volumes:

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Makes the tierfs mount directory a shared mount point on the host, so the FUSE
-# mount the tierfs container makes inside it shows up on the host and, from there,
+# mount the tiering container makes inside it shows up on the host and, from there,
 # in Plex and the arrs (which map the same path with slave propagation).
 #
 # Run on the host at array start, before the containers (User Scripts plugin,

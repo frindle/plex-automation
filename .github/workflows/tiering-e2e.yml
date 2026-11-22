@@ -3,7 +3,7 @@ name: tiering-e2e
 on:
   workflow_dispatch:
   pull_request:
-    paths: ["tiering/**", "tierfs/**", ".github/workflows/tiering-e2e.yml"]
+    paths: ["tiering/**", "tierfs/**", "docker-compose.tiering.yml", ".github/workflows/tiering-e2e.yml"]
 
 permissions:
   contents: read
@@ -11,7 +11,7 @@ permissions:
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v7
       - name: Install FUSE, ffmpeg, bindfs
@@ -41,6 +41,8 @@ jobs:
           (cd tierfs && go build -o "$RUNNER_TEMP/tierfs" ./cmd/tierfs)
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" -q install pytest pytest-xdist blake3
+      - name: Build the tiering image (tierfs and the runner)
+        run: docker build -f tiering/Dockerfile -t tiering:e2e .
       - name: Offload tier, real runner, emulated mount
         run: |
           "$RUNNER_TEMP/venv/bin/python" -m pytest --confcutdir=tiering/e2e \
@@ -55,7 +57,23 @@ jobs:
           sudo env E2E_TIERFS_BIN="$RUNNER_TEMP/tierfs" E2E_PLEX=1 \
             "$RUNNER_TEMP/venv/bin/python" -m pytest --confcutdir=tiering/e2e \
             tiering/e2e/test_plex_tierfs.py -q -rxXfEs --tb=short
+      - name: Offload tier, real runner, tierfs in the tiering container (root, FUSE, docker)
+        run: |
+          sudo env E2E_TIERFS_BIN="$PWD/tiering/e2e/tierfs_in_container.sh" \
+            "$RUNNER_TEMP/venv/bin/python" -m pytest --confcutdir=tiering/e2e \
+            tiering/e2e/test_tier_*.py -q -n 4 -rxXfE --tb=short
+      - name: Real Plex through tierfs in the tiering container (root, FUSE, docker)
+        run: |
+          sudo env E2E_TIERFS_BIN="$PWD/tiering/e2e/tierfs_in_container.sh" E2E_PLEX=1 \
+            "$RUNNER_TEMP/venv/bin/python" -m pytest --confcutdir=tiering/e2e \
+            tiering/e2e/test_plex_tierfs.py -q -rxXfEs --tb=short
+      - name: The tiering container under compose (restarts, pause, crash, stop)
+        run: sudo tiering/e2e/test_tiering_compose.sh
       - name: Plex log on failure
         if: failure()
         run: |
           docker logs --tail 100 tiering-e2e-plex 2>&1 || true
+      - name: Remove test containers
+        if: always()
+        run: |
+          docker ps -aq --filter name=tiering-e2e- | xargs -r docker rm -f || true
