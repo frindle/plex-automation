@@ -69,6 +69,7 @@ SHORT_LIMIT = 3  # consecutive attempts that end short at the same offset
 WANT_SPAN = 64 * MIB  # a want inside the next 64 MiB does not move the fill cursor
 DEFAULT_RETRY_S = 600.0
 RETRY_MAX_DELAY = 30.0
+FAILED_HOLD_S = 1.5  # a failed line from a spent retry budget stays this long (tierfs polls every 0.2 s at most)
 _sleep = time.sleep  # tests patch these two
 _mono = time.monotonic
 
@@ -362,8 +363,8 @@ def scan_open_holders(path, ignore_comm=("tierfs",), ignore_unreadable=False) ->
     """Pids holding `path`'s inode open, from /proc/*/fd. Fails closed:
     - a process whose fd table cannot be read counts as a holder
       (ignore_unreadable=True is for tests running unprivileged);
-    - TIERING_PROC_CANARY must name a process (comm, e.g. the media server)
-      that is visible; if it is unset or not visible the answer is "not
+    - TIERING_PROC_CANARY is a comma list of process names (comm, cut to 15
+      characters, e.g. the media server and shfs); every one must be visible; if it is unset or not visible the answer is "not
       clear" (pid -1), because the scan then cannot see the processes that
       matter (wrong PID namespace).
     Ignores this process and ignore_comm (tierfs preads head and tail only).
@@ -371,8 +372,9 @@ def scan_open_holders(path, ignore_comm=("tierfs",), ignore_unreadable=False) ->
     server."""
     target = os.stat(path)
     me = os.getpid()
-    canary = os.environ.get("TIERING_PROC_CANARY") or None
-    seen_canary = False
+    canaries = [c.strip() for c in (os.environ.get("TIERING_PROC_CANARY") or "").split(",")
+                if c.strip()]
+    seen_canary: set = set()
     holders = []
     for name in os.listdir("/proc"):
         if not name.isdigit() or int(name) == me:
@@ -387,8 +389,8 @@ def scan_open_holders(path, ignore_comm=("tierfs",), ignore_unreadable=False) ->
             continue
         except OSError:
             continue  # process went away
-        if canary and comm == canary:
-            seen_canary = True
+        if comm in canaries:
+            seen_canary.add(comm)
         if comm in ignore_comm:
             continue
         try:
@@ -412,11 +414,12 @@ def scan_open_holders(path, ignore_comm=("tierfs",), ignore_unreadable=False) ->
             if _same_inode(s, target):
                 holders.append(pid)
                 break
-    if not canary:
+    if not canaries:
         log.warning("open check: TIERING_PROC_CANARY is not set; cannot call the file clear")
         holders.append(-1)
-    elif not seen_canary:
-        log.warning("open check: canary process %r not visible; cannot call the file clear", canary)
+    elif seen_canary != set(canaries):
+        log.warning("open check: canary process(es) %r not visible; cannot call the file clear",
+                    sorted(set(canaries) - seen_canary))
         holders.append(-1)
     return holders
 
@@ -485,6 +488,19 @@ def _pick_stub_root(lib, stub_root):
 
 def _record(db, id, step, state, hook):
     st.set_state(db, id, state, step=step)
+    if hook is not None:
+        hook(step)
+
+
+class _StateMoved(Exception):
+    """The row is no longer in the state this offload expects (someone failed it)."""
+
+
+def _record_off(db, id, step, hook):
+    """Offload step marker. It only writes while the row is still `offloading`, so a
+    row another thread set to failed (a bad_chunk) is not overwritten."""
+    if not st.update_if(db, id, "offloading", step=step):
+        raise _StateMoved(f"row left state offloading before step {step}")
     if hook is not None:
         hook(step)
 
@@ -564,9 +580,22 @@ def offload(
     with _id_lock(db, id) as held:
         if not held:
             return Result(False, None, 0, _BUSY)
-        return _offload(db, row, stub_root, manifest_dir, _norm_mount(tierfs_mount), apply,
-                        open_check, open_timeout, open_poll, mount_wait, head_frac, after_step,
-                        _demote, path_map)
+        try:
+            return _offload(db, row, stub_root, manifest_dir, _norm_mount(tierfs_mount), apply,
+                            open_check, open_timeout, open_poll, mount_wait, head_frac,
+                            after_step, _demote, path_map)
+        except _StateMoved as e:
+            return _moved(db, id, str(e))
+
+
+def _moved(db, id, reason) -> Result:
+    """Stop an offload whose row was changed under it. Nothing is punched or swapped
+    back: L stays whatever it is (the tierfs symlink over a whole stub)."""
+    cur = st.get(db, id) or {}
+    log.error("%s: %s; offload stopped", id, reason)
+    st.log_event(db, id, "offload_state_moved", {"reason": reason, "state": cur.get("state")})
+    return Result(False, cur.get("state"), int(cur.get("step") or 0),
+                  f"{reason}; stopped without punching")
 
 
 def demote(db, row: dict, **kw) -> Result:
@@ -727,7 +756,7 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
             os.link(lib, stub)
             _point("offload.linked")
             _fsync_dir(str(stub_root))
-        _record(db, id, 2, "offloading", after_step)
+        _record_off(db, id, 2, after_step)
         step = 2
 
     # ---- step 3: chunk list, then manifest (the stub is still whole)
@@ -754,7 +783,7 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
             "chunk_size": CHUNK_SIZE, "chunks_b3": blake3.blake3(chunks_blob).hexdigest(),
         })
         _point("offload.manifest_written")
-        _record(db, id, 3, "offloading", after_step)
+        _record_off(db, id, 3, after_step)
         step = 3
 
     # ---- step 4: symlink at L.tierfs-tmp, exchange it with L, check what came out
@@ -763,7 +792,7 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
         if res is not None:
             return res
         _fsync_dir(os.path.dirname(lib) or ".")
-        _record(db, id, 4, "offloading", after_step)
+        _record_off(db, id, 4, after_step)
         step = 4
 
     # ---- step 5: no process may hold the old inode open
@@ -780,7 +809,7 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
                 return _stall(db, id, "open_handles",
                               f"old inode still open by pids {sorted(holders)}", "offloading", step)
             time.sleep(open_poll)
-        _record(db, id, 5, "offloading", after_step)
+        _record_off(db, id, 5, after_step)
         step = 5
 
     # ---- step 6: re-check, punch holes, restore mtime, verify head and tail
@@ -788,14 +817,19 @@ def _offload(db, row, stub_root, manifest_dir, tierfs_mount, apply, open_check,
         if not _is_symlink_to(lib, target):
             return Result(False, "offloading", step, "L is not the tierfs symlink; not punching")
         _require_real_fs(os.path.dirname(lib) or ".", stub, manifest_dir)
+        now_state = (st.get(db, id) or {}).get("state")
+        if now_state != "offloading":  # failed meanwhile (bad_chunk): the stub stays whole
+            raise _StateMoved(f"row is {now_state!r}, not offloading, at the punch step")
         err = _punch_and_verify(db, id, cur, stub)
         if err:
             return Result(False, "offloading", step, err)
-        _record(db, id, 6, "offloading", after_step)
+        _record_off(db, id, 6, after_step)
         step = 6
 
     # ---- step 7
-    st.set_state(db, id, "offloaded", step=7, last_ok_ts=time.time())
+    if not st.update_if(db, id, "offloading", state="offloaded", step=7,
+                        last_ok_ts=time.time()):
+        raise _StateMoved("row left state offloading before the final write")
     st.log_event(db, id, "offloaded", {"stub": stub})
     if after_step:
         after_step(7)
@@ -1124,7 +1158,15 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
             if res.state == "failed":  # permanent: waiting players must not hang
                 _mark_failed(fpath, e.offset)
             return res
-        except Exception as e:  # reader trouble is transient: stay resumable
+        except Exception as e:  # reader trouble: stay resumable, but tell the waiting players
+            # The retry budget for this chunk is spent. A player is waiting at most
+            # TIERFS_WAIT_S; give it its error now. The row stays `promoting`, so the
+            # line is only a signal for the players waiting at this moment: it is taken
+            # off again after FAILED_HOLD_S, or a later read would fail at once and never
+            # ask for the file (tierfs sends no `want` while a failed line stands).
+            _mark_failed(fpath, head_len)
+            _sleep(FAILED_HOLD_S)
+            _drop_failed_lines(fpath)
             return _stall(db, id, "promote_read_error", f"{type(e).__name__}: {e}", "promoting", step)
         _record(db, id, 1, "promoting", after_step)
         step = 1

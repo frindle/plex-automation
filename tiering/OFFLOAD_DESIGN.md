@@ -28,6 +28,7 @@ The hot-set code implements these rules.
 - **Played, synced, on deck or in progress:** whole until `idle_days` (60) after the last play.
 - **TV:** a play or sync of any episode makes its whole season whole. If the episode is one of the last `near_end_eps` (3) of the season, the next season is made whole too. Each season stays whole until `idle_days` after the last play in it.
 - **Synced:** any tierfs `want` event, which is a player read past the local head (see tierfs, **Waiting reads**). A Plex download reads the whole file, so this covers sync. A background reader's `remote_read` does not count.
+- **Read while whole:** a download or sync of a file that is still whole never touches tierfs, so it leaves no event. The runner notes each whole file's access time (`kv['local_atimes']`, checked every 10 minutes). A later access time is a read and restarts the idle clock like a play or sync. The first sight of a file only notes its time, and the runner's own reads (qualify, promote) are noted again when they end, so they never count. This needs a file system that updates access times; with `relatime` that is at most once a day per file, which is enough for a 60 day clock. Any other reader of a whole file (a Plex analysis task, say) counts too, which only keeps the file whole longer.
 
 ## Layout on disk
 
@@ -196,8 +197,11 @@ Offload step 3 hashes `L` again in the read that builds the chunk list. If that 
 - It reads every movie file and episode file from Radarr and Sonarr through their APIs (`RADARR_URL`, `SONARR_URL`, keys from env; more than one Sonarr is a comma list).
 - For each file it upserts a row by `lib_path`. A new row gets a fresh `<id>`, `state=whole`, `size`, `mtime_ns` and the media identity: `title`, `year`, `imdb_id`, `tvdb_id`, `season`, `episode`, and `release_name` (the arr's scene name, else the file name). `sha256` stays empty until qualify fills it.
 - An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`, `nzb_path`, `nzb_path2`, `restore_score`, `restore_note`, `remote_path` and the head/tail facts.
+- A path that is a symlink into the tierfs mount (`<id><ext>`, with the path's own extension) of a row that lists another path is that row's file after an arr rename. The row's `lib_path` is changed to the new path, so the file can still be promoted, and no new row is made (result count `renamed`). It is refused (`renamed_skipped`, nothing changes) unless the row is `offloaded` or `failed` and its old path no longer holds a link to the same entry (two links mean a copy, not a rename).
 - It never deletes a row. A path the arrs no longer list is logged.
 - The runner fills `rating_key`, `kind` and `is4k` from Plex.
+- The result is a dict with these int counts: `listed`, `missing_local`, `ambiguous`, `errors`, `new`, `updated`, `unchanged`, `skipped_state`, `unlisted`, and `applied` (bool). `listed` is the number of files the arrs listed.
+- The runner fails closed on the result. It blocks that night's demotes when the result is not a dict, lacks `listed`, `missing_local`, `ambiguous` or `errors`, holds a non-int there, has `errors > 0` or `listed == 0`, or when `missing_local + ambiguous` is over 5% of `listed`. It alerts `register_failed`.
 - `lib_path` is the share path (see "Path namespaces"). `TIERING_ARR_PATH_MAP` maps arr paths to share paths when they differ. Size and mtime come from the resolved disk path.
 
 ### Weekly
@@ -272,7 +276,7 @@ The inputs are plain dicts shaped like Plex's JSON: `ratingKey`, `grandparentRat
    - **Resume:** a resumed promote trusts the chunks the fill file already lists.
    - **API:** `ops.promote(..., want: Callable[[], int | None] | None = None)`. The runner passes `want`; promote calls it before each chunk, and it returns the newest wanted offset for this id, or None.
    - **Errors:**
-     - a fetch error is retried with backoff for up to `TIERING_PROMOTE_RETRY_S` (default 600) per chunk;
+     - a fetch error is retried with backoff for up to `TIERING_PROMOTE_RETRY_S` (default 600) per chunk. When that time is spent the promote stops but stays resumable (`state=promoting`), and a `failed <offset>` line is appended to the fill file so a waiting player gets EIO now instead of after `TIERFS_WAIT_S`. The line stays 1.5 s (`FAILED_HOLD_S`, tierfs looks every 0.2 s at most) and is then taken off, because tierfs sends no `want` while a failed line stands and a later read would otherwise fail at once and never ask for the file;
      - a BLAKE3 mismatch on two fetches stops the promote at once: append `failed <offset>` and set `state=failed`, as in step 2.
 2. Hash the whole stub with SHA-256. If it does not match the manifest, stop: set `state=failed`, keep the symlink, and alert. Nothing is swapped.
 3. Restore the stub's mtime.
@@ -291,12 +295,18 @@ Swaps are automatic. One long-running process applies the hot set.
   - The first `want` for an id starts that file's promote within 1 s. It goes ahead of every other promote and outside `TIERING_PROMOTE_CONCURRENCY`, so a wanted promote never waits in the queue.
   - Later `want`s for the same id go to the running promote and move its cursor.
   - A `want` for a row that is neither `offloaded` nor `promoting` is ignored.
+  - A `want` ignores the retry backoff, because a player is waiting. Wanted attempts on one id are at least 60 s apart (kept in `kv['want_last']`). A row in `state=failed` (for example after two BLAKE3 mismatches) is not retried by a `want`; the fill file's `failed` line already gives the player EIO.
 - **Other promotes run at once:**
   - wanted promotes first, then weekly-flagged rows, then a live session's season in episode order, then everything else;
   - at most `TIERING_PROMOTE_CONCURRENCY` (default 2) at a time, not counting wanted promotes.
+- **Play history is checked, never trusted blindly:**
+  - The runner keeps its own record of the last play of every rating key, so a wiped Plex history cannot make a played file look idle.
+  - It also refuses tonight's demotes (alert `history_shrunk`) when Plex's history is much shorter than it should be. "Should be" is the plays it saw last pass (`kv['history_times']`) that are still inside the idle window now, because the window slides and a play that ages out is not a lost play. The check trips when the history holds under 80% of those.
+  - Reset after a deliberate purge: `DELETE FROM kv WHERE key IN ('history_count', 'history_times')`.
 - **Weekly check:**
   - The runner calls `weekly.run_weekly` at the start of the demote window when `kv['weekly_last_ts']` is 7 or more days old, and on start-up when it is. It then sets the timestamp.
   - That night's demotes wait until the check is done.
+  - If the check fails, the runner alerts `weekly_failed` and retries after an hour. Demotes stay blocked until a check succeeds.
   - Flags come only from `weekly_flag` events (`detail.reasons`), read after the cursor `kv['weekly_flag_cursor']`. They never come from `restore_note`, which the next good week overwrites.
   - A flagged row is promoted whether or not the hot set wants it. Its flag is cleared only when its promote finishes.
 - **Qualify results:**
@@ -306,6 +316,7 @@ Swaps are automatic. One long-running process applies the hot set.
 - **Demotes run only at night:**
   - only inside `TIERING_DEMOTE_WINDOW` (default `02:00-06:00`, local time);
   - only files that pass `qualify` that night, with the glacier gate "free" and nlink 1;
+  - the gate and nlink are looked at again right after `qualify` and before the offload starts, because `qualify` reads the whole file and takes minutes: a torrent that began to seed it meanwhile keeps it whole;
   - capped by `TIERING_DEMOTE_GB_PER_NIGHT` (default 200);
   - no demotes on a night when any promote is queued or any hash check has failed.
 - **A `bad_chunk` event:** promoting cannot help, because the remote copy is bad. Set `state=failed`, alert, and list it in the weekly report with its restore path. The file stays a working symlink for the parts that are good.

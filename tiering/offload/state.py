@@ -68,6 +68,14 @@ CREATE TABLE IF NOT EXISTS events (
     detail TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_id ON events(id);
+CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS last_plays (
+    rating_key TEXT PRIMARY KEY,
+    last_ts REAL NOT NULL
+);
 """
 
 
@@ -231,15 +239,44 @@ def log_event(db, id, kind, detail: dict) -> None:
         )
 
 
-def events(db, id=None) -> list[dict]:
-    """Helper (not in the contract) to read events back, oldest first."""
+def events(db, id=None, after_seq=0) -> list[dict]:
+    """Helper (not in the contract) to read events back, oldest first. `after_seq`
+    returns only rows with a larger seq (an incremental read)."""
     if id is None:
-        rows = db.execute("SELECT * FROM events ORDER BY seq").fetchall()
+        rows = db.execute("SELECT * FROM events WHERE seq>? ORDER BY seq", (after_seq,)).fetchall()
     else:
-        rows = db.execute("SELECT * FROM events WHERE id=? ORDER BY seq", (id,)).fetchall()
+        rows = db.execute("SELECT * FROM events WHERE id=? AND seq>? ORDER BY seq",
+                          (id, after_seq)).fetchall()
     out = []
     for r in rows:
         d = dict(r)
         d["detail"] = json.loads(d["detail"])
         out.append(d)
     return out
+
+
+def kv_get(db, key, default=None):
+    r = db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+    return json.loads(r[0]) if r else default
+
+
+def kv_set(db, key, value) -> None:
+    with db:
+        db.execute("INSERT INTO kv (key, value) VALUES (?, ?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (key, json.dumps(value, sort_keys=True)))
+
+
+def last_plays(db) -> dict:
+    """{rating_key: last play time} the runner has seen, kept so a wiped Plex history
+    cannot make a played file look idle."""
+    return {r[0]: r[1] for r in db.execute("SELECT rating_key, last_ts FROM last_plays")}
+
+
+def merge_last_plays(db, plays: dict) -> None:
+    """Keep the larger of the stored and the given time per rating key."""
+    with db:
+        db.executemany(
+            "INSERT INTO last_plays (rating_key, last_ts) VALUES (?, ?) "
+            "ON CONFLICT(rating_key) DO UPDATE SET last_ts=MAX(last_ts, excluded.last_ts)",
+            [(str(k), float(v)) for k, v in plays.items()])

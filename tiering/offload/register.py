@@ -24,6 +24,11 @@ a disk path:
   ``sha256``, ``head_b3``, ``tail_b3``, ``head_len``, ``tail_len``, ``nzb_path``
   and ``remote_path``, so qualify finds the NZB of the file that is there now. The write is
   ``update_if(db, id, "whole", ...)``, so a row the runner moved on is left alone;
+- a path that is a symlink into the tierfs mount (`<id><ext>`) of a row that lists another path
+  is that row's file after an arr rename: the row's ``lib_path`` is changed to the new path
+  (counted as ``renamed``) so it can still be promoted, and no new row is made. It is refused
+  (``renamed_skipped``) when the row is not ``offloaded`` or ``failed``, or the old path still
+  holds a link to the same entry;
 - it never deletes a row. A path the arrs no longer list is logged (only when
   both Radarr and Sonarr are configured and every arr answered: a missing answer
   is not a missing file);
@@ -255,6 +260,50 @@ def to_share(path: str, disk_map: list[tuple[str, str]]) -> str:
     return (share.rstrip("/") + rest) if share != "/" else rest
 
 
+_ID = re.compile(r"^[0-9a-f]{16}$")
+ADOPT_STATES = ("offloaded", "failed")
+
+
+def _tierfs_link_id(path: str, mount: str = "") -> str | None:
+    """The row id when `path` is a symlink to `<mount>/<id><ext>` (the ext being the
+    path's own), else None. With no mount given only the name is checked, as ops does."""
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return None
+    stem, ext = os.path.splitext(os.path.basename(target))
+    if not _ID.match(stem) or ext != os.path.splitext(path)[1]:
+        return None
+    if mount and os.path.normpath(os.path.dirname(target)) != os.path.normpath(mount):
+        return None
+    return stem
+
+
+def _adopt_renamed(state, db, apply, local, cand, resolve, mount, out) -> bool:
+    """`local` is a tierfs symlink of a row that lists another path: the arr renamed an
+    offloaded file. Point the row at the new path so it can still be promoted. Returns
+    True when `local` was dealt with (adopted or refused) and must not get a row of its
+    own. Refuses, and keeps the file as it is, when the row's old path still holds a
+    symlink to the same entry (a copy, not a rename)."""
+    id = _tierfs_link_id(cand, mount)
+    row = state.get(db, id) if id else None
+    if row is None or row.get("lib_path") == local:
+        return False
+    out["renamed_skipped"] += 1  # counted as refused until it is adopted below
+    if row.get("state") not in ADOPT_STATES:
+        return True
+    for old in resolve(row["lib_path"]) if row.get("lib_path") else []:
+        if _tierfs_link_id(old, mount) == id:
+            log.warning("register: two paths hold the tierfs link of row %s, not adopting", id)
+            return True
+    out["renamed_skipped"] -= 1
+    out["renamed"] += 1
+    if apply and not state.update_if(db, id, row["state"], lib_path=local):
+        out["renamed"] -= 1
+        out["renamed_skipped"] += 1
+    return True
+
+
 def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map=None,
              resolve=None, stat=os.stat, new_id=None, disk_map=None) -> dict:
     """Sync rows from the arrs. Returns counts; with ``apply=False`` nothing is written.
@@ -281,7 +330,8 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
     new_id = new_id or (lambda: secrets.token_hex(8))
     out = {"new": 0, "updated": 0, "unchanged": 0, "skipped_state": 0, "listed": 0,
            "missing_local": 0, "ambiguous": 0, "disk_path": 0,
-           "disk_path_mapped": 0, "unlisted": 0, "errors": 0,
+           "disk_path_mapped": 0, "unlisted": 0, "errors": 0, "renamed": 0,
+           "renamed_skipped": 0,
            "applied": bool(apply)}
 
     listed: set[str] = set()
@@ -314,6 +364,9 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
             if len(cands) != 1:
                 out["missing_local" if not cands else "ambiguous"] += 1
                 log.warning("register: %d disk paths for a listed file, skipped", len(cands))
+                continue
+            if _adopt_renamed(state, db, apply, local, cands[0], resolve,
+                              os.environ.get("TIERFS_MOUNT", ""), out):
                 continue
             try:
                 st = stat(cands[0])

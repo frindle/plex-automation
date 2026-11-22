@@ -251,6 +251,25 @@ def test_permanent_short_remote_writes_failed(tmp_path):
     assert str(head) in fill_lines(env)  # what was listed stays listed
 
 
+def test_reader_errors_after_the_retry_budget_write_failed_but_stay_resumable(tmp_path, monkeypatch):
+    """A remote that answers with errors (not bad data) must not leave a waiting player
+    for the whole TIERFS_WAIT_S: the fill file gets a `failed` line for a moment, the row
+    stays `promoting`, the line comes off again (a later read must be able to ask for the
+    file), and the next attempt finishes."""
+    env, head = small(tmp_path)
+    held = []
+    monkeypatch.setattr(ops, "_sleep", lambda d: held.append((d, fill_lines(env))))
+    gone = FakeReader(env.data, fail_times=10**6)
+    r = env.promote(gone)  # TIERING_PROMOTE_RETRY_S is 0 in the tests
+    assert not r.ok and r.state == "promoting"
+    hold = [lines for d, lines in held if d == ops.FAILED_HOLD_S]
+    assert len(hold) == 1 and hold[0] and hold[0][-1] == f"failed {head}", held
+    assert "failed" not in " ".join(fill_lines(env) or []), "a later read must not fail at once"
+    assert st.get(env.db, ID)["state"] == "promoting"
+    assert env.promote().ok  # the remote is back
+    assert not os.path.exists(os.path.join(env.root, "manifests", f"{ID}.fill"))
+
+
 def test_fill_refusal_writes_failed(tmp_path):
     env, head = small(tmp_path)
     os.link(env.stub, env.stub + ".second")  # the stub is no longer a single-link file
