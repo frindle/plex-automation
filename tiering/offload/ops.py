@@ -69,6 +69,7 @@ SHORT_LIMIT = 3  # consecutive attempts that end short at the same offset
 WANT_SPAN = 64 * MIB  # a want inside the next 64 MiB does not move the fill cursor
 DEFAULT_RETRY_S = 600.0
 RETRY_MAX_DELAY = 30.0
+FAILED_HOLD_S = 1.5  # a failed line from a spent retry budget stays this long (tierfs polls every 0.2 s at most)
 _sleep = time.sleep  # tests patch these two
 _mono = time.monotonic
 
@@ -1159,9 +1160,13 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
             return res
         except Exception as e:  # reader trouble: stay resumable, but tell the waiting players
             # The retry budget for this chunk is spent. A player is waiting at most
-            # TIERFS_WAIT_S; give it its error now. The row stays `promoting`, and the
-            # next attempt drops this line and tries again.
+            # TIERFS_WAIT_S; give it its error now. The row stays `promoting`, so the
+            # line is only a signal for the players waiting at this moment: it is taken
+            # off again after FAILED_HOLD_S, or a later read would fail at once and never
+            # ask for the file (tierfs sends no `want` while a failed line stands).
             _mark_failed(fpath, head_len)
+            _sleep(FAILED_HOLD_S)
+            _drop_failed_lines(fpath)
             return _stall(db, id, "promote_read_error", f"{type(e).__name__}: {e}", "promoting", step)
         _record(db, id, 1, "promoting", after_step)
         step = 1
