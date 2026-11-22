@@ -451,6 +451,34 @@ def test_forwarded_for_cannot_fake_loopback(env):
     assert r.status_code == 403
 
 
+def test_plex_dupe_keep_is_open_to_the_lan(env, monkeypatch, tmp_path):
+    monkeypatch.setattr(aw, 'PLEX_DUPE_KEEP_PATH', str(tmp_path / 'keep.json'))
+    assert from_addr('/plex-dupe-keep', '10.1.2.3').status_code == 200
+    assert from_addr('/plex-dupe-keep', '192.168.7.9').status_code == 200
+    r = client().post('/plex-dupe-keep', json={'plex_key': '42'}, environ_overrides={'REMOTE_ADDR': '10.1.2.3'})
+    assert r.status_code == 200 and r.get_json()['ok']
+    assert from_addr('/plex-dupe-keep?plex_key=42', '10.1.2.3', method='DELETE').get_json()['removed'] is True
+
+
+def test_plex_dupe_keep_lan_open_has_limits(env, monkeypatch, tmp_path):
+    monkeypatch.setattr(aw, 'PLEX_DUPE_KEEP_PATH', str(tmp_path / 'keep.json'))
+    assert from_addr('/plex-dupe-keep', '93.184.216.34').status_code == 403          # public peer
+    assert from_addr('/plex-dupe-keep', 'remote-peer').status_code == 403            # unknown peer
+    for h in ('Cf-Connecting-Ip', 'X-Forwarded-For', 'X-Real-Ip', 'Forwarded', 'Cf-Ray'):
+        assert from_addr('/plex-dupe-keep', '172.18.0.5', **{h: '93.184.216.34'}).status_code == 403, h
+    # A form or text POST is what a page on another site could send: not without a credential.
+    r = client().post('/plex-dupe-keep', data='{"plex_key": "1"}', content_type='text/plain',
+                      environ_overrides={'REMOTE_ADDR': '10.1.2.3'})
+    assert r.status_code == 403
+    # Only the listed path: other API routes and action routes still need a credential.
+    assert from_addr(PROTECTED, '10.1.2.3').status_code == 403
+    assert from_addr('/plex-dupe-fix', '10.1.2.3').status_code == 403
+    monkeypatch.setenv('APP_AUTH_LAN_OPEN', '')
+    assert from_addr('/plex-dupe-keep', '10.1.2.3').status_code == 403
+    monkeypatch.setenv('APP_AUTH_LAN_OPEN', '/plex-dupe-keep, /llm-stats')
+    assert from_addr(PROTECTED, '10.1.2.3').status_code == 200
+
+
 def test_loopback_never_opens_action_routes_posts_or_share(env):
     assert from_addr('/retire-seeds?apply=1', '127.0.0.1').status_code == 403
     assert from_addr('/verify-labels', '127.0.0.1').status_code == 403

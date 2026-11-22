@@ -49,6 +49,7 @@ One `before_request` gate (`app_auth.py`) covers every route, including `/share`
 | `CF_ACCESS_AUDS` | Comma-separated AUD tags of the Access applications that may reach this app. |
 | `APP_AUTH_TOKEN_FILE` | File of bearer tokens, one per line (`#` comments). A line is the plain token or `sha256:<hex>` of it (the sha-256 of the token, hex), so a caller such as the Mac can keep its token in its Keychain and only the hash is stored here. Compared in constant time. For scripts and the glacier mover. |
 | `APP_AUTH_BASIC_FILE` | File of `user:password` lines. Accepted on `/webhook/*` only, for Sonarr/Radarr. |
+| `APP_AUTH_LAN_OPEN` | Exact paths a LAN caller may use with no credential, comma separated. Unset means `/plex-dupe-keep`; empty means none. A LAN caller is a private-range socket peer whose request carries no proxy header (`Cf-Connecting-Ip`, `Cf-Ray`, `X-Forwarded-For`, `X-Real-Ip`, `Forwarded`), so tunnel traffic never counts; a `POST` must be JSON. |
 | `ADMIN_EMAIL` | The identity allowed into `/share/admin*`. |
 
 Modes: `off` checks nothing. `log` allows every request but logs each one that `enforce` would refuse (route class, method, path, caller class `loopback`/`lan`/`public`/`unknown` from the socket peer (never the address), which credential was missing; never a secret). `enforce` answers 403.
