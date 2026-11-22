@@ -144,6 +144,84 @@ def test_a_torrent_that_starts_during_qualify_stops_the_demote(w):
     assert len([c for c in w.calls if c[0] == "gate"]) == 2  # before and after qualify
 
 
+EVE = NIGHT - 8 * 3600  # 19:00 the evening before: outside the demote window
+
+
+def _touch_atime(path, t):
+    os.utime(path, (t, os.stat(path).st_mtime))
+
+
+def test_a_read_of_a_whole_file_restarts_its_idle_clock(tmp_path, monkeypatch):
+    """A download or sync of a file that is still whole leaves no tierfs event. Its access
+    time is the record: a read after the first look keeps the file whole."""
+    w = World(tmp_path, monkeypatch, clock_t=EVE)  # outside the window: nothing is demoted
+    path = w.movie(1)
+    w.row("m", 1, path, "whole")
+    _touch_atime(path, EVE - 5000)
+    w.run()  # first look: the access time is noted
+    assert w.ops("demote") == []
+    _touch_atime(path, NIGHT - 100)  # the sync
+    w.clock.t = NIGHT
+    w.run()
+    assert w.ops("demote") == [], "a file read minutes ago must stay whole"
+    assert w.state.plays_seen["1"] == pytest.approx(NIGHT - 100)
+
+
+def test_a_file_nobody_read_is_still_demoted(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, clock_t=EVE)
+    path = w.movie(1)
+    w.row("m", 1, path, "whole")
+    _touch_atime(path, EVE - 5000)
+    w.run()
+    w.clock.t = NIGHT
+    w.run()
+    assert w.ops("demote") == ["m"]
+
+
+def test_a_file_that_appears_between_checks_is_noted_at_once(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, clock_t=EVE)
+    w.run()  # no rows yet: the check has run
+    path = w.movie(1)
+    w.row("m", 1, path, "whole")
+    _touch_atime(path, EVE - 5000)
+    w.clock.t += 5
+    w.run()  # not time for a check, but the file is new to us
+    _touch_atime(path, NIGHT - 100)  # the sync
+    w.clock.t = NIGHT
+    w.run()
+    assert w.ops("demote") == [], "the time of a file that was new must have been noted"
+
+
+def test_a_noted_file_gets_its_access_time_set_back_so_relatime_shows_the_next_read(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, clock_t=EVE)
+    path = w.movie(1)
+    w.row("m", 1, path, "whole")
+    mt = os.stat(path).st_mtime
+    os.utime(path, (mt + 5000, mt))
+    w.run()
+    assert os.stat(path).st_atime <= mt + 1, "the access time must be set back to the modification time"
+    assert os.stat(path).st_mtime == mt
+
+
+def test_our_own_qualify_read_is_not_a_sync(w):
+    path = w.movie(1)
+    w.row("m", 1, path, "whole")
+    _touch_atime(path, NIGHT - 5000)
+    w.qualify_ok = False  # qualify reads the file, then refuses
+    real = w.runner.deps.qualify
+
+    def reading_qualify(row):
+        _touch_atime(path, NIGHT - 50)
+        return real(row)
+
+    w.runner.deps.qualify = reading_qualify
+    w.run()
+    assert ("qualify", "m") in w.calls
+    w.clock.t += runner.ATIME_EVERY + 1
+    db = w.runner.db()
+    assert w.runner._local_reads(db, w.clock.t, w.state.list_files(db), {"m": "1"}) == {}
+
+
 def test_p2_fresh_install_with_no_history_still_demotes(w):
     w.row("m", 1, w.movie(1), "whole")
     w.run()

@@ -28,6 +28,7 @@ The hot-set code implements these rules.
 - **Played, synced, on deck or in progress:** whole until `idle_days` (60) after the last play.
 - **TV:** a play or sync of any episode makes its whole season whole. If the episode is one of the last `near_end_eps` (3) of the season, the next season is made whole too. Each season stays whole until `idle_days` after the last play in it.
 - **Synced:** any tierfs `want` event, which is a player read past the local head (see tierfs, **Waiting reads**). A Plex download reads the whole file, so this covers sync. A background reader's `remote_read` does not count.
+- **Read while whole:** a download or sync of a file that is still whole never touches tierfs, so it leaves no event. The runner notes each whole file's access time (`kv['local_atimes']`, checked every 10 minutes). A later access time is a read and restarts the idle clock like a play or sync. The first sight of a file only notes its time, and the runner's own reads (qualify, promote) are noted again when they end, so they never count. This needs a file system that updates access times; with `relatime` that is at most once a day per file, which is enough for a 60 day clock. Any other reader of a whole file (a Plex analysis task, say) counts too, which only keeps the file whole longer.
 
 ## Layout on disk
 
