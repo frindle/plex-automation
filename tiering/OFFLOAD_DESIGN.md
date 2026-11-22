@@ -312,6 +312,7 @@ Swaps are automatic. One long-running process applies the hot set.
 - **Demotes run only at night:**
   - only inside `TIERING_DEMOTE_WINDOW` (default `02:00-06:00`, local time);
   - only files that pass `qualify` that night, with the glacier gate "free" and nlink 1;
+  - the gate and nlink are looked at again right after `qualify` and before the offload starts, because `qualify` reads the whole file and takes minutes: a torrent that began to seed it meanwhile keeps it whole;
   - capped by `TIERING_DEMOTE_GB_PER_NIGHT` (default 200);
   - no demotes on a night when any promote is queued or any hash check has failed.
 - **A `bad_chunk` event:** promoting cannot help, because the remote copy is bad. Set `state=failed`, alert, and list it in the weekly report with its restore path. The file stays a working symlink for the parts that are good.

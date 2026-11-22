@@ -1275,6 +1275,20 @@ class Runner:
             if block or row.get("rating_key") in self.desired_rks:
                 log.info("demote %s dropped after qualify: %s", id, block or "wanted again")
                 return
+            # qualify read the whole file and takes minutes: a torrent may have started
+            # to seed it, or a link been made, since the first look. Ask again, now.
+            try:
+                ls = os.lstat(disk)
+            except OSError as e:
+                log.warning("demote %s dropped: cannot stat L (%s)", id, type(e).__name__)
+                return
+            if os.path.islink(disk) or ls.st_nlink != 1:
+                log.info("demote %s dropped: L became a symlink or got other hardlinks", id)
+                return
+            g = self.deps.gate(disk)
+            if g != "free":
+                log.info("demote %s dropped after qualify: glacier gate says %s", id, g)
+                return
         log.info("demote start %s", id)
         with self.mu:
             self.demote_running.add(id)
