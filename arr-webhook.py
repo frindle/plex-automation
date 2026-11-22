@@ -1524,6 +1524,41 @@ def _owning_item(items, deluge_path):
     return best
 
 
+def _arr_episode_files(series_id, cache):
+    """Sonarr's episode files for one series, fetched once per pass. Raises on API errors."""
+    key = ('episodefile', series_id)
+    if key not in cache:
+        r = requests.get(f'{SONARR_URL}/api/v3/episodefile', headers={'X-Api-Key': SONARR_API_KEY},
+                         params={'seriesId': series_id}, timeout=30)
+        r.raise_for_status()
+        cache[key] = r.json() or []
+    return cache[key]
+
+
+def _arr_file_paths(item, files):
+    root = (item.get('path') or '').rstrip('/')
+    out = set()
+    for f in files:
+        if f.get('path'):
+            out.add(f['path'])
+        if root and f.get('relativePath'):
+            out.add(f'{root}/{f["relativePath"]}')
+    return out
+
+
+def _arr_tracker_of(local_path, cache):
+    """'Radarr' or 'Sonarr' when that *arr holds local_path as its movie or episode file, else None.
+    Raises on an API error, so a caller that cannot tell keeps the file."""
+    p = _local_to_deluge(local_path)
+    movie = _owning_item(_arr_items('movie', cache), p)
+    if movie and p in _arr_file_paths(movie, [movie.get('movieFile') or {}]):
+        return 'Radarr'
+    series = _owning_item(_arr_items('series', cache), p)
+    if series and series.get('id') is not None and p in _arr_file_paths(series, _arr_episode_files(series['id'], cache)):
+        return 'Sonarr'
+    return None
+
+
 def rar_set_action(rset, cache=None, contents=None):
     """Unpack or delete one library RAR set (Penn, 2026-11-07).
     -> {'action': 'unpack'|'delete'|'skip'|'error', 'reason': str, 'arr': title}
@@ -8263,6 +8298,19 @@ def _dupe_check(entry, keeper, loser, state):
     return None, check
 
 
+def _dupe_arr_tracked(local, cache):
+    """Why a copy the cleanup would delete stays, when Sonarr or Radarr holds it as the file for that
+    episode or movie (deleting it would leave the *arr pointing at nothing, and it would grab the
+    release again). None when no *arr holds it. Fails closed: an *arr API error keeps the file."""
+    try:
+        who = _arr_tracker_of(local, cache)
+    except Exception as e:  # noqa: BLE001
+        return f'skipped: could not ask Sonarr/Radarr whether they track this copy ({type(e).__name__}), next run'
+    if who:
+        return f'skipped: {who} tracks this copy as its file; import the kept copy in {who} first'
+    return None
+
+
 @app.route('/plex-dupe-fix', methods=['POST', 'GET'])
 def plex_dupe_fix():
     if not PLEX_TOKEN:
@@ -8277,6 +8325,7 @@ def plex_dupe_fix():
                    'model_other': 0, 'model_kept': 0, 'pending': 0, 'not_asked': 0},
         'review': [],
     }
+    arr_cache = {}
     # Reuse the scan output rather than duplicating the walk.
     # Flask views return (response, status) tuples — unpack first.
     try:
@@ -8463,6 +8512,8 @@ def plex_dupe_fix():
                             action['result'] = f'file not found at {local} (path map miss?)'
                         elif _same_physical_file(local, _translate_plex_path(keeper.get('file') or '')):
                             action['result'] = 'skipped: same file on disk as the keeper'
+                        elif (tracked := _dupe_arr_tracked(local, arr_cache)):
+                            action['result'] = tracked
                         else:
                             try:
                                 os.remove(local)
