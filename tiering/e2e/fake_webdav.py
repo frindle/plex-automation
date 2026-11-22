@@ -77,9 +77,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _resolve(self):
         rel = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path).strip("/")
-        full = os.path.realpath(os.path.join(self.server.root, rel))
         root = self.server.root
-        if full != root and not full.startswith(root + os.sep):
+        full = os.path.realpath(os.path.join(root, rel))
+        if full == root:
+            return rel, root
+        # One plain prefix test on the resolved path, so a request can never leave the root
+        # (and code scanning can see the guard).
+        if not full.startswith(root + os.sep):
             return rel, None
         return rel, full if os.path.exists(full) else None
 
