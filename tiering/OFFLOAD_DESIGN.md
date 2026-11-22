@@ -295,6 +295,10 @@ Swaps are automatic. One long-running process applies the hot set.
 - **Other promotes run at once:**
   - wanted promotes first, then weekly-flagged rows, then a live session's season in episode order, then everything else;
   - at most `TIERING_PROMOTE_CONCURRENCY` (default 2) at a time, not counting wanted promotes.
+- **Play history is checked, never trusted blindly:**
+  - The runner keeps its own record of the last play of every rating key, so a wiped Plex history cannot make a played file look idle.
+  - It also refuses tonight's demotes (alert `history_shrunk`) when Plex's history is much shorter than it should be. "Should be" is the plays it saw last pass (`kv['history_times']`) that are still inside the idle window now, because the window slides and a play that ages out is not a lost play. The check trips when the history holds under 80% of those.
+  - Reset after a deliberate purge: `DELETE FROM kv WHERE key IN ('history_count', 'history_times')`.
 - **Weekly check:**
   - The runner calls `weekly.run_weekly` at the start of the demote window when `kv['weekly_last_ts']` is 7 or more days old, and on start-up when it is. It then sets the timestamp.
   - That night's demotes wait until the check is done.
