@@ -15,6 +15,10 @@
 # mount made on the host after this container starts shows up inside it. Both
 # are mounted at the SAME absolute path inside the container as on the host,
 # so a symlink in LIB that points into MNT resolves the same way for Plex.
+# PLEX_MNT_OPT replaces rslave: test_plex_tierfs.py passes "rw", since tierfs
+# is already mounted when Plex starts there, and docker refuses rslave on a
+# source that is itself a private mount.
+# PLEX_UID/PLEX_GID default to the sudo caller, so the work dir stays theirs.
 set -euo pipefail
 
 # Pinned by digest: plexinc/pms-docker 1.43.5.11079-b3b13e506 (multi-arch index).
