@@ -147,8 +147,11 @@ def test_a_torrent_that_starts_during_qualify_stops_the_demote(w):
 EVE = NIGHT - 8 * 3600  # 19:00 the evening before: outside the demote window
 
 
-def _touch_atime(path, t):
-    os.utime(path, (t, os.stat(path).st_mtime))
+LANDED = EVE - 30 * 86400  # the file landed a month before: Plex's own analysis is long done
+
+
+def _touch_atime(path, t, landed=LANDED):
+    os.utime(path, (t, landed))
 
 
 def test_a_read_of_a_whole_file_restarts_its_idle_clock(tmp_path, monkeypatch):
@@ -165,6 +168,39 @@ def test_a_read_of_a_whole_file_restarts_its_idle_clock(tmp_path, monkeypatch):
     w.run()
     assert w.ops("demote") == [], "a file read minutes ago must stay whole"
     assert w.state.plays_seen["1"] == pytest.approx(NIGHT - 100)
+
+
+@pytest.mark.parametrize("fresh", ["mtime", "added"])
+def test_plex_analysing_a_new_import_is_not_a_read(tmp_path, monkeypatch, fresh):
+    """Plex reads a new or replaced file for previews and markers soon after it lands. With
+    new_days at 0 that must not hold the file whole for idle_days."""
+    w = World(tmp_path, monkeypatch, clock_t=EVE, hot=runner.hotset.Cfg(new_days=0))
+    path = w.movie(1, added=EVE - 3600 if fresh == "added" else 0)
+    w.row("m", 1, path, "whole")
+    if fresh == "mtime":
+        _touch_atime(path, EVE - 3000, landed=EVE - 3600)  # imported an hour ago
+    else:  # an old file date (an arr set it to the air date), added to Plex an hour ago
+        _touch_atime(path, EVE - 3000)
+    w.run()  # first look: the access time is noted
+    _touch_atime(path, NIGHT - 100, landed=os.stat(path).st_mtime)  # the preview job
+    w.clock.t = NIGHT
+    w.run()
+    assert w.ops("demote") == ["m"], "a read inside the import grace must not keep the file whole"
+    assert "1" not in w.state.plays_seen
+
+
+def test_a_sync_soon_after_the_first_pass_is_a_read(tmp_path, monkeypatch):
+    """Every file gets its row on the first pass after a deploy. A sync of an old file the
+    next day is a read, not an import being analysed."""
+    w = World(tmp_path, monkeypatch, clock_t=EVE)
+    path = w.movie(1, added=EVE - 400 * runner.DAY)
+    w.row("m", 1, path, "whole", created_ts=EVE - 60)
+    _touch_atime(path, EVE - 5000)
+    w.run()
+    _touch_atime(path, NIGHT - 100)  # the sync
+    w.clock.t = NIGHT
+    w.run()
+    assert w.ops("demote") == [], "a sync must keep the file whole"
 
 
 def test_a_file_nobody_read_is_still_demoted(tmp_path, monkeypatch):
