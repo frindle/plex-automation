@@ -13,6 +13,10 @@ case "$M" in /*) ;; *) echo "TIERFS_MOUNT must be an absolute path" >&2; exit 2 
 mkdir -p "$M"
 if ! mountpoint -q "$M"; then
   mount --bind "$M" "$M"
+  # A bind made inside a shared mount joins its parent's peer group, and the FUSE mount
+  # would then reach the host twice: on the bind, and tucked under it on the parent.
+  # Private first, so the shared step below gives it a peer group of its own.
+  mount --make-private "$M"
 fi
 mount --make-rshared "$M"
 findmnt -o TARGET,PROPAGATION "$M"

@@ -19,7 +19,7 @@ env | grep -E '^TIERFS_[A-Z0-9_]*=' > "$ENVF"
 # A bind of the mount point onto itself, made shared: Docker refuses an rshared volume whose source is not on a
 # shared mount, and this is what tierfs-host-mount.sh does on the host. Same file system, so it does not count as
 # a mount for os.path.ismount: the stack still waits for tierfs.
-mount --bind "$M" "$M" && mount --make-rshared "$M" || { echo "tierfs_in_container: cannot share $M" >&2; exit 1; }
+mount --bind "$M" "$M" && mount --make-private "$M" && mount --make-rshared "$M" || { echo "tierfs_in_container: cannot share $M" >&2; exit 1; }
 
 cleanup() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
