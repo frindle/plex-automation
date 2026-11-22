@@ -317,6 +317,27 @@ def test_no_demote_while_a_promote_is_pending(w):
     assert w.ops("demote") == ["d"]
 
 
+def test_no_demote_when_the_promote_finished_before_the_demote_check(w):
+    # the promote worker can finish before run_pass reaches the demote check; the
+    # pass still planned a promote, so its demotes wait for the next pass
+    w.row("p", 1, w.movie(1), "offloaded")
+    w.deck = [{"ratingKey": "1"}]
+    w.row("d", 2, w.movie(2), "whole")
+    orig = w.runner._demote_block
+
+    def late(now, **kw):
+        t0 = time.monotonic()
+        while (w.runner.promote_todo or w.runner.promote_running) and time.monotonic() - t0 < 5:
+            time.sleep(0.001)
+        return orig(now, **kw)
+
+    w.runner._demote_block = late
+    w.run()
+    assert w.ops("promote") == ["p"] and w.ops("demote") == []
+    w.run()
+    assert w.ops("demote") == ["d"]
+
+
 def test_no_demote_after_hash_failure_that_night(w):
     w.row("p", 1, w.movie(1), "offloaded")
     w.deck = [{"ratingKey": "1"}]

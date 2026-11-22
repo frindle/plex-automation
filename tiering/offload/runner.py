@@ -525,8 +525,10 @@ class Runner:
             self.want_last = {**{str(k): float(v) for k, v in saved.items()}, **self.want_last}
         self.flagged = set(self._kv_get(db, "flagged", []))
 
-    def _demote_block(self, now) -> str:
-        """Why demotes may not run right now, or "" when they may."""
+    def _demote_block(self, now, promotes_planned: bool = False) -> str:
+        """Why demotes may not run right now, or "" when they may. promotes_planned:
+        this pass planned a promote, which blocks its demotes even when the promote
+        has already finished by the time this is asked."""
         if night_start(now, self.cfg.window) is None:
             return "outside the demote window"
         if not self.complete:
@@ -536,7 +538,7 @@ class Runner:
             return "a hash check failed tonight"
         if not self.history_ok:
             return "the Plex play history looks wiped or truncated"
-        if self.promote_todo or self.promote_running:
+        if promotes_planned or self.promote_todo or self.promote_running:
             return "a promote is pending"
         if n["bytes"] >= self.cfg.demote_bytes_per_night:
             return "the night's byte cap is reached"
@@ -1133,7 +1135,7 @@ class Runner:
                 self.disk[r["id"]] = d
                 usable.append(r)
         dcands = usable
-        block = self._demote_block(now)
+        block = self._demote_block(now, promotes_planned=bool(pjobs))
         n = self._tonight(now)
         tried = n.setdefault("tried", []) if n is not None else []
         todo = [] if block else [r for r in dcands if r["id"] not in tried]
