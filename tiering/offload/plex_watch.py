@@ -103,8 +103,11 @@ def play_history(since_ts):
         ts = r.get("viewedAt")
         if ts is None or ts < since_ts:
             continue
+        gp = r.get("grandparentRatingKey")
+        if gp is None and str(r.get("grandparentKey") or "").startswith("/library/metadata/"):
+            gp = str(r["grandparentKey"]).rstrip("/").rsplit("/", 1)[-1] or None  # history rows carry grandparentKey
         out.append({"ratingKey": _s(r.get("ratingKey")),
-                    "grandparentRatingKey": _s(r.get("grandparentRatingKey")),
+                    "grandparentRatingKey": _s(gp),
                     "viewedAt": ts, "type": r.get("type")})
     return out
 

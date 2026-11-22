@@ -63,7 +63,8 @@ class H(BaseHTTPRequestHandler):
             body = page(rows, qs, self.headers)
         elif p == "/status/sessions/history/all":
             rows = [{"ratingKey": 10, "viewedAt": 500}, {"ratingKey": 101, "viewedAt": 900,
-                    "grandparentRatingKey": 50}, {"ratingKey": 11, "viewedAt": 100}]
+                    "grandparentRatingKey": 50}, {"ratingKey": 11, "viewedAt": 100},
+                    {"ratingKey": 104, "viewedAt": 800, "type": "episode", "grandparentKey": "/library/metadata/50"}]
             body = page(rows, qs, self.headers)
         elif p == "/status/sessions":
             body = {"MediaContainer": {"Metadata": [
@@ -119,7 +120,8 @@ def test_token_header_only(plex):
 
 def test_history_sessions_deck_progress(plex):
     h = plex_watch.play_history(200)
-    assert [r["ratingKey"] for r in h] == ["10", "101"]
+    assert [r["ratingKey"] for r in h] == ["10", "101", "104"]
+    assert h[2]["grandparentRatingKey"] == "50"  # real history rows only carry grandparentKey
     assert plex_watch.sessions() == [{"ratingKey": "12", "file": "/m/movie2.mkv"}]
     assert plex_watch.on_deck() == [{"ratingKey": "103"}]
     ip = plex_watch.in_progress()

@@ -83,6 +83,21 @@ def test_auto_picks_recent_shows_and_movies_in_progress_and_totals_size():
     assert 'Show A S01E02' in titles and 'Show A S01E04' in titles and 'Show A S01E05' not in titles
 
 
+def test_history_rows_with_only_grandparentKey_still_find_the_show():
+    # Plex play history rows carry grandparentKey ("/library/metadata/<id>"); the move list showed no TV without this.
+    real = [{'type': 'episode', 'grandparentKey': '/library/metadata/10'}, {'type': 'movie', 'grandparentKey': '/library/metadata/99'}]
+    fp = FakePlex({'OWNER': {'history': real, 'leaves': {'10': [ep(i, 1, i, watched=1 if i == 1 else 0) for i in range(1, 8)]}}})
+    titles = [i['title'] for i in run(fp)['items']]
+    assert titles == ['Show A S01E02', 'Show A S01E03', 'Show A S01E04'], titles
+
+
+def test_show_id_prefers_rating_key_and_ignores_odd_keys():
+    assert ML.show_id({'grandparentRatingKey': 7, 'grandparentKey': '/library/metadata/8'}) == '7'
+    assert ML.show_id({'grandparentKey': '/library/metadata/8/'}) == '8'
+    assert ML.show_id({'grandparentKey': '/playlists/8'}) is None
+    assert ML.show_id({}) is None
+
+
 def test_playlist_named_move_takes_episodes_movies_seasons_and_whole_shows_case_insensitive():
     pl = [ep(1, 1, 1), mov(2, 'Pick'), {'ratingKey': 'sh', 'type': 'show'}, {'ratingKey': 'se', 'type': 'season'}]
     world = {'OWNER': {'playlists': {'move': pl, 'Other': [mov(3, 'Nope')]},
