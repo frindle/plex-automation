@@ -101,14 +101,20 @@ file).
 
 ## Running it
 
-Build the image from this directory:
-
-    docker build -t tierfs .
+tierfs runs in the `tiering` container together with the offload runner: the
+image is `tiering/Dockerfile` (built from the repo root), the service is in
+`docker-compose.tiering.yml`, and `tiering/README.md` ("Deploy with compose")
+has the steps. The supervisor there (`tiering/offload/supervise.py`) starts
+tierfs first and stops it last.
 
 The container needs `/dev/fuse` and `SYS_ADMIN`. The mount has to be shared back
-to the host (and from there to Plex) with `rshared` propagation:
+to the host (and from there to Plex) with `rshared` propagation, on a host
+directory that is itself a shared mount point (`tiering/tierfs-host-mount.sh`).
+The standalone shape, for a test (`tiering/e2e/tierfs_in_container.sh` runs it
+like this in CI):
 
-    docker run -d --name tierfs \
+    docker build -f tiering/Dockerfile -t tiering .
+    docker run -d --name tiering \
       --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
       --network host --pid host \
       -v /srv/tierfs/mnt:/mnt/tierfs:rshared \
@@ -121,7 +127,10 @@ to the host (and from there to Plex) with `rshared` propagation:
       -e TIERFS_EVENTS=/events/events.jsonl \
       -e TIERFS_REMOTE_BASE=http://altmount:8080 \
       -e TIERFS_REMOTE_USER=user -e TIERFS_REMOTE_PASS=pass \
-      tierfs
+      -e SUPERVISE_RUNNER='["sleep","infinity"]' \
+      tiering
+
+(`SUPERVISE_RUNNER` replaces the runner, so only tierfs does any work.)
 
 Notes:
 

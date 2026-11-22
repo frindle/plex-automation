@@ -1,72 +1,40 @@
-# Offload tier: tierfs (the FUSE mount offloaded files are read through) and the
-# offload runner. See tiering/README.md, "Deploy with compose".
+# Offload tier: one `tiering` container runs tierfs (the FUSE mount offloaded
+# files are read through) and the offload runner. See tiering/README.md,
+# "Deploy with compose". tiering/offload/supervise.py starts tierfs first,
+# restarts the runner on its own if it exits (the mount stays up), and stops
+# tierfs last. To pause offloading and keep the mount, create
+# ${TIERING_STATE_DIR}/runner.paused; delete it to resume.
 #
 # This file is NOT loaded by default. To turn the tier on, add to .env:
 #   COMPOSE_FILE=docker-compose.yml:docker-compose.tiering.yml
-# update.sh then builds and starts these two with the rest. Remove the line to
-# leave them alone again (stop them first: docker-compose stop tiering-runner tierfs).
+# update.sh then builds and starts it with the rest. Remove the line to leave it
+# alone again (stop it first: docker-compose stop tiering).
 #
 # Every site value comes from .env (see .env.example); nothing here is a secret.
-# ${TIERFS_MOUNT} must be the SAME absolute path on the host, in both containers
-# here, in Plex and in the arrs: library symlinks point at it.
+# ${TIERFS_MOUNT} must be the SAME absolute path on the host, in this container,
+# in Plex and in the arrs: library symlinks point at it.
 
 services:
-  tierfs:
-    build: ./tierfs
-    container_name: tierfs
+  tiering:
+    build:
+      context: .
+      dockerfile: tiering/Dockerfile
+    container_name: tiering
     restart: unless-stopped
-    # The reader class (player or background scan) is read from /proc/<pid>/comm
-    # of the reading process, so tierfs must see host pids.
+    # tierfs reads the reader class (player or background scan) from
+    # /proc/<pid>/comm of the reading process, and Plex reads through the user
+    # share, so only the share daemon's open file shows that a file is in use:
+    # both need host pids, and the runner reads their fd lists (SYS_PTRACE).
     pid: host
     devices:
       - /dev/fuse
     cap_add:
       - SYS_ADMIN
+      - SYS_PTRACE
     security_opt:
       - apparmor:unconfined
-    environment:
-      TIERFS_MOUNT: "${TIERFS_MOUNT:?set TIERFS_MOUNT in .env}"
-      TIERFS_MANIFESTS: "/state/manifests"
-      TIERFS_STUB_ROOTS: "${TIERFS_STUB_ROOTS:?set TIERFS_STUB_ROOTS in .env}"
-      TIERFS_EVENTS: "/state/events/events.jsonl"
-      TIERFS_REMOTE_BASE: "${TIERFS_REMOTE_BASE:?set TIERFS_REMOTE_BASE in .env}"
-      TIERFS_REMOTE_USER: "${TIERFS_REMOTE_USER:-}"
-      TIERFS_REMOTE_PASS: "${TIERFS_REMOTE_PASS:-}"
-      # Seconds a player read waits for the promote before it gets an error.
-      TIERFS_WAIT_S: "${TIERFS_WAIT_S:-900}"
-      # Readers that stream from the remote and never trigger a promote.
-      TIERFS_BACKGROUND_COMMS: "${TIERFS_BACKGROUND_COMMS:-Plex Media Scan}"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9109/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    networks:
-      br0:
-        ipv4_address: "${TIERFS_IP:?set TIERFS_IP in .env}"
-    volumes:
-      # Stubs live on the array disks; tierfs reads them at the paths the runner
-      # wrote into the manifests, so both see the host's /mnt unchanged. Read-only.
-      - "/mnt:/mnt:ro,rslave"
-      # The FUSE mount itself, shared back to the host so Plex and the arrs get it.
-      # The host directory must already be a shared mount point
-      # (tiering/tierfs-host-mount.sh does that at array start).
-      - "${TIERFS_MOUNT:?set TIERFS_MOUNT in .env}:${TIERFS_MOUNT:?set TIERFS_MOUNT in .env}:rshared"
-      - "${TIERING_STATE_DIR:?set TIERING_STATE_DIR in .env}/manifests:/state/manifests:ro"
-      - "${TIERING_STATE_DIR:?set TIERING_STATE_DIR in .env}/events:/state/events"
-
-  tiering-runner:
-    build: ./tiering
-    container_name: tiering-runner
-    restart: unless-stopped
-    depends_on:
-      tierfs:
-        condition: service_healthy
-    # Plex reads through the user share, so only the share daemon's open file shows
-    # that a file is in use: the runner must see host pids and read their fd lists.
-    pid: host
-    cap_add:
-      - SYS_PTRACE
+    # The runner gets up to 60 s to finish, then tierfs up to 20 s to unmount.
+    stop_grace_period: 90s
     environment:
       TZ: "${TIERING_TZ:?set TIERING_TZ in .env}"   # the demote window is local time
       TIERING_DB: "/state/tiering.db"
@@ -93,6 +61,7 @@ services:
       # The torrent gate served by arr-webhook.
       TIERING_API: "${TIERING_API:?set TIERING_API in .env}"
       TIERING_NZB_DIR: "/state/nzb"
+      # tierfs and the runner share these.
       TIERFS_MOUNT: "${TIERFS_MOUNT:?set TIERFS_MOUNT in .env}"
       TIERFS_MANIFESTS: "/state/manifests"
       TIERFS_EVENTS: "/state/events/events.jsonl"
@@ -100,6 +69,10 @@ services:
       TIERFS_REMOTE_BASE: "${TIERFS_REMOTE_BASE:?set TIERFS_REMOTE_BASE in .env}"
       TIERFS_REMOTE_USER: "${TIERFS_REMOTE_USER:-}"
       TIERFS_REMOTE_PASS: "${TIERFS_REMOTE_PASS:-}"
+      # tierfs only: seconds a player read waits for the promote before it gets
+      # an error, and readers that stream from the remote and never trigger one.
+      TIERFS_WAIT_S: "${TIERFS_WAIT_S:-900}"
+      TIERFS_BACKGROUND_COMMS: "${TIERFS_BACKGROUND_COMMS:-Plex Media Scan}"
       PLEX_URL: "${TIERING_PLEX_URL:?set TIERING_PLEX_URL in .env}"
       PLEX_TOKEN: "${PLEX_TOKEN}"
       SONARR_URL: "${TIERING_SONARR_URL:?set TIERING_SONARR_URL in .env}"
@@ -123,13 +96,25 @@ services:
       NNTP_SECONDARY_PORT: "${NNTP_SECONDARY_PORT:-563}"
       NNTP_SECONDARY_USER: "${NNTP_SECONDARY_USER:-}"
       NNTP_SECONDARY_PASS: "${NNTP_SECONDARY_PASS:-}"
+    # Both /healthz endpoints (tierfs and the runner); a paused runner counts as healthy.
+    healthcheck:
+      test: ["CMD", "python", "-m", "offload.supervise", "--health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     networks:
       br0:
-        ipv4_address: "${TIERING_RUNNER_IP:?set TIERING_RUNNER_IP in .env}"
+        ipv4_address: "${TIERING_IP:?set TIERING_IP in .env}"
     volumes:
       # The host's /mnt unchanged: every /mnt/diskN (file operations run on the disk
-      # paths, never through the share) and the tierfs mount as it comes and goes.
+      # paths, never through the share; tierfs reads the stubs there at the paths
+      # in the manifests) and the tierfs mount as it comes and goes.
       - "/mnt:/mnt:rslave"
+      # The FUSE mount itself, shared back to the host so Plex and the arrs get it.
+      # The host directory must already be a shared mount point
+      # (tiering/tierfs-host-mount.sh does that at array start).
+      - "${TIERFS_MOUNT:?set TIERFS_MOUNT in .env}:${TIERFS_MOUNT:?set TIERFS_MOUNT in .env}:rshared"
       # The share at the path Plex reports for it, read-only.
       - "${TIERING_SHARE_HOST:?set TIERING_SHARE_HOST in .env}:${TIERING_SHARE_PLEX:?set TIERING_SHARE_PLEX in .env}:ro,rslave"
       - "${TIERING_STATE_DIR:?set TIERING_STATE_DIR in .env}:/state"

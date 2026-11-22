@@ -324,7 +324,12 @@ def load_deps(cfg: Config) -> Deps:
     qualify = getattr(importlib.import_module(mod), fn)()
     weekly = None
     if not os.environ.get("TIERING_QUALIFY_FACTORY"):  # a custom factory has its own clients
-        weekly = importlib.import_module(f"{__package__}.wiring").weekly_from_env()
+        wiring = importlib.import_module(f"{__package__}.wiring")
+        weekly = wiring.weekly_from_env()
+        if cfg.apply:
+            # The clients are built on first use, so a dry run starts without Usenet set up.
+            # APPLY builds them now: a missing setting stops the start, not the first demote.
+            wiring.check()
 
     def register(db, apply):
         return importlib.import_module(f"{__package__}.register").register(db, apply)
@@ -1526,7 +1531,12 @@ def main(argv=None, env=None, deps=None) -> int:
         return 1
     try:
         log.info("runner starting (%s)", "APPLY" if cfg.apply else "dry run")
-        runner = Runner(cfg, deps or load_deps(cfg))
+        try:
+            deps = deps or load_deps(cfg)
+        except Exception as e:  # a missing or bad setting; the messages name settings, not values
+            log.error("settings: %s: %s", type(e).__name__, e)
+            return 2
+        runner = Runner(cfg, deps)
         if once:
             try:
                 runner.run_pass(wait=True)

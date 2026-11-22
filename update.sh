@@ -61,7 +61,7 @@ dockerfile_unparseable() {
 is_build_input() {
   local f="$1" src
   case "$f" in Dockerfile|docker-compose.yml|.dockerignore) return 0 ;; esac
-  # The offload tier's two images (docker-compose.tiering.yml) are built from these.
+  # The offload tier's image (docker-compose.tiering.yml, tiering/Dockerfile) is built from these.
   case "$f" in docker-compose.tiering.yml|tierfs/*|tiering/Dockerfile|tiering/offload/*) return 0 ;; esac
   while IFS= read -r src; do
     src="${src#./}"; src="${src%/}"

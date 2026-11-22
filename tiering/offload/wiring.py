@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import threading
 
 
 class WiringError(Exception):
@@ -29,6 +30,7 @@ def _mod(name: str):
 
 
 _clients: dict = {}
+_clients_lock = threading.Lock()
 
 
 def _beside_db(e, name: str) -> str:
@@ -62,17 +64,28 @@ class Clients:
 def clients(env=None) -> Clients:
     e = os.environ if env is None else env
     key = tuple(sorted(e.items()))
-    if key not in _clients:
-        _clients[key] = Clients(e)
-    return _clients[key]
+    with _clients_lock:  # the demote worker and the weekly check may ask at the same time
+        if key not in _clients:
+            _clients[key] = Clients(e)
+        return _clients[key]
+
+
+def check(env=None) -> None:
+    """Build the clients now. Raises WiringError, or the client's own error, on a missing
+    setting. The runner calls it at start in APPLY; a dry run never needs the clients."""
+    clients(env)
 
 
 def qualify_from_env(env=None):
-    """Return `qualify(row) -> QualifyResult` with real clients built from env."""
+    """Return `qualify(row) -> QualifyResult` with real clients built from env.
+
+    The clients are built on the first call, not here: a dry run plans demotes without
+    qualifying anything, so it starts before the providers, indexers and AltMount exist."""
     qualify = _mod("qualify")
-    c = clients(env)
+    e = dict(os.environ if env is None else env)
 
     def run(row):
+        c = clients(e)
         return qualify.qualify(row, reader=c.reader, importer=c.importer, indexers=c.indexers,
                                stat_primary=c.stat_primary, stat_secondary=c.stat_secondary,
                                archive_dir=c.archive)
@@ -80,11 +93,13 @@ def qualify_from_env(env=None):
 
 
 def weekly_from_env(env=None):
-    """Return `weekly(db) -> flagged rows`: `weekly.run_weekly` on the shared clients."""
+    """Return `weekly(db) -> flagged rows`: `weekly.run_weekly` on the shared clients,
+    built on the first call like qualify's."""
     weekly = _mod("weekly")
-    c = clients(env)
+    e = dict(os.environ if env is None else env)
 
     def run(db):
+        c = clients(e)
         return weekly.run_weekly(db, stat_primary=c.stat_primary, stat_secondary=c.stat_secondary,
                                  indexers=c.indexers, report_path=c.report, reader=c.reader)
     return run

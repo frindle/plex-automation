@@ -740,6 +740,7 @@ def test_load_deps_passes_path_map_and_no_stub_root(tmp_path, monkeypatch):
     from offload import wiring
     monkeypatch.setattr(wiring, "qualify_from_env", lambda env=None: "q")
     monkeypatch.setattr(wiring, "weekly_from_env", lambda env=None: "w")
+    monkeypatch.setattr(wiring, "check", lambda env=None: None)
     pm = paths.parse_path_map("/share=/d1")
     deps = runner.load_deps(Config(db=str(tmp_path / "t.db"), path_map=pm, apply=True,
                                    gate_path_map=[("/a", "/b")], stub_roots="/d1/s"))
@@ -891,8 +892,56 @@ def test_wiring_builds_clients_from_env(tmp_path, monkeypatch):
     env["TIERING_NZB_DIR"] = "/x/nzb"
     wiring.qualify_from_env(env)({"id": "b"})
     assert calls[1][1]["archive_dir"] == "/x/nzb"
+    # the clients are built on the first call: a missing provider fails there and in check()
+    import types
+    wk = types.ModuleType(f"{runner.__package__}.weekly")
+    wk.run_weekly = lambda db, **kw: []
+    monkeypatch.setitem(sys.modules, f"{runner.__package__}.weekly", wk)
+    bad = {**env, "NO_SECONDARY": "1"}
+    fn = wiring.qualify_from_env(bad)
+    weekly = wiring.weekly_from_env(bad)
     with pytest.raises(wiring.WiringError):
-        wiring.qualify_from_env({**env, "NO_SECONDARY": "1"})
+        fn({"id": "c"})
+    with pytest.raises(wiring.WiringError):
+        weekly("db")
+    with pytest.raises(wiring.WiringError):
+        wiring.check(bad)
+    assert len(calls) == 2
+
+
+def test_dry_run_loads_without_usenet_settings_apply_does_not(tmp_path, monkeypatch):
+    """A dry run never qualifies a file or runs the weekly check, so it starts with no
+    providers, indexers or AltMount API. APPLY checks them at start."""
+    import types
+    from offload import wiring
+    pkg = runner.__package__
+    _fake_intake(monkeypatch, [])
+    mk = types.ModuleType(f"{pkg}.weekly")
+    mk.run_weekly = lambda db, **kw: []
+    monkeypatch.setitem(sys.modules, f"{pkg}.weekly", mk)
+    for name in ("ops", "state"):
+        monkeypatch.setitem(sys.modules, f"{pkg}.{name}", types.ModuleType(f"{pkg}.{name}"))
+    monkeypatch.delenv("TIERING_QUALIFY_FACTORY", raising=False)
+    monkeypatch.setenv("NO_SECONDARY", "1")  # the fake ProviderCfg: no secondary provider
+    monkeypatch.setattr(wiring, "_clients", {})
+    cfg = dict(db=str(tmp_path / "t.db"), gate_path_map=[("/a", "/b")])
+    deps = runner.load_deps(Config(**cfg))
+    assert callable(deps.qualify) and callable(deps.weekly)
+    with pytest.raises(wiring.WiringError):
+        runner.load_deps(Config(**cfg, apply=True))
+
+
+def test_main_reports_a_settings_error_and_exits_2(tmp_path, monkeypatch, caplog):
+    from offload import wiring
+
+    def boom(cfg):
+        raise wiring.WiringError("NNTP_PRIMARY_HOST is not set")
+    monkeypatch.setattr(runner, "load_deps", boom)
+    env = {"TIERING_DB": str(tmp_path / "t.db"), "TIERING_GATE_PATH_MAP": "/a=/b"}
+    with caplog.at_level("ERROR"):
+        assert runner.main(["--once"], env=env) == 2
+    assert "settings: WiringError: NNTP_PRIMARY_HOST is not set" in caplog.text
+    assert runner.acquire_lock(env["TIERING_DB"]) is not None  # the lock was let go
 
 
 def test_default_factory_is_wiring(tmp_path, monkeypatch):
