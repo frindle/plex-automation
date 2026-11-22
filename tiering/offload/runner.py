@@ -690,7 +690,8 @@ class Runner:
         out: dict = {}
         with self.atime_mu:
             seen = self._atimes_load(db)
-            new = {k: v for k, v in seen.items() if k in {r["id"] for r in rows}}
+            ids = {r["id"] for r in rows}
+            new = {k: v for k, v in seen.items() if k in ids}
             busy = self.promote_running | self.demote_running | self.reading
             for r in rows:
                 id = r["id"]
