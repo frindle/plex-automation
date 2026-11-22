@@ -232,3 +232,67 @@ def test_unchanged_rows_are_not_rewritten_when_ids_differ_in_type(tmp_path, arrs
         row["tvdb_id"], row["season"], row["year"] = "55", "1", "2019"
     out = run(st, None, [s], tmp_path=tmp_path)
     assert out["updated"] == 0 and out["unchanged"] == 1
+
+
+# ---- an arr rename of an offloaded file
+
+ID = "0123456789abcdef"
+
+
+def offloaded_row(tmp_path, old_name, **kw):
+    return {"id": ID, "lib_path": f"{tmp_path}/lib/{old_name}", "state": "offloaded",
+            "size": 100, "mtime_ns": 5, "sha256": "a" * 64, **kw}
+
+
+def link(tmp_path, name, ident=ID, ext=".mkv"):
+    p = tmp_path / "lib" / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(f"/tfs/{ident}{ext}", p)
+    return str(p)
+
+
+def test_arr_rename_of_an_offloaded_file_moves_the_row_to_the_new_path(tmp_path, arrs):
+    link(tmp_path, "new.mkv")  # the arr renamed old.mkv (a tierfs symlink) to new.mkv
+    st = FakeState([offloaded_row(tmp_path, "old.mkv")])
+    out = run(st, [arrs(movies=[movie("/data/new.mkv")])], tmp_path=tmp_path)
+    assert out["renamed"] == 1 and out["new"] == 0 and out["renamed_skipped"] == 0
+    assert list(st.rows) == [ID], "no second row for the symlink"
+    assert st.rows[ID]["lib_path"] == f"{tmp_path}/lib/new.mkv"
+    assert st.rows[ID]["state"] == "offloaded" and st.rows[ID]["sha256"] == "a" * 64
+
+
+def test_a_second_link_to_the_same_entry_is_not_adopted(tmp_path, arrs):
+    link(tmp_path, "old.mkv")
+    link(tmp_path, "copy.mkv")  # both names hold the link: a copy, not a rename
+    st = FakeState([offloaded_row(tmp_path, "old.mkv")])
+    out = run(st, [arrs(movies=[movie("/data/copy.mkv")])], tmp_path=tmp_path)
+    assert out["renamed"] == 0 and out["renamed_skipped"] == 1 and out["new"] == 0
+    assert st.rows[ID]["lib_path"] == f"{tmp_path}/lib/old.mkv"
+
+
+def test_only_offloaded_or_failed_rows_are_adopted(tmp_path, arrs):
+    link(tmp_path, "new.mkv")
+    st = FakeState([offloaded_row(tmp_path, "old.mkv", state="promoting")])
+    out = run(st, [arrs(movies=[movie("/data/new.mkv")])], tmp_path=tmp_path)
+    assert out["renamed"] == 0 and out["renamed_skipped"] == 1
+    assert st.rows[ID]["lib_path"] == f"{tmp_path}/lib/old.mkv"
+
+
+def test_a_link_with_another_extension_or_mount_is_not_ours(tmp_path, arrs, monkeypatch):
+    link(tmp_path, "new.mkv", ext=".mp4")
+    st = FakeState([offloaded_row(tmp_path, "old.mkv")])
+    run(st, [arrs(movies=[movie("/data/new.mkv")])], tmp_path=tmp_path)
+    assert st.rows[ID]["lib_path"] == f"{tmp_path}/lib/old.mkv"
+    monkeypatch.setenv("TIERFS_MOUNT", "/elsewhere")
+    os.unlink(tmp_path / "lib" / "new.mkv")
+    link(tmp_path, "new.mkv")
+    run(st, [arrs(movies=[movie("/data/new.mkv")])], tmp_path=tmp_path)
+    assert st.rows[ID]["lib_path"] == f"{tmp_path}/lib/old.mkv"
+
+
+def test_adopting_writes_nothing_on_a_dry_run(tmp_path, arrs):
+    link(tmp_path, "new.mkv")
+    st = FakeState([offloaded_row(tmp_path, "old.mkv")])
+    out = run(st, [arrs(movies=[movie("/data/new.mkv")])], apply=False, tmp_path=tmp_path)
+    assert out["renamed"] == 1
+    assert st.rows[ID]["lib_path"] == f"{tmp_path}/lib/old.mkv"
