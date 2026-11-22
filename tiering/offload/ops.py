@@ -1157,7 +1157,11 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
             if res.state == "failed":  # permanent: waiting players must not hang
                 _mark_failed(fpath, e.offset)
             return res
-        except Exception as e:  # reader trouble is transient: stay resumable
+        except Exception as e:  # reader trouble: stay resumable, but tell the waiting players
+            # The retry budget for this chunk is spent. A player is waiting at most
+            # TIERFS_WAIT_S; give it its error now. The row stays `promoting`, and the
+            # next attempt drops this line and tries again.
+            _mark_failed(fpath, head_len)
             return _stall(db, id, "promote_read_error", f"{type(e).__name__}: {e}", "promoting", step)
         _record(db, id, 1, "promoting", after_step)
         step = 1
