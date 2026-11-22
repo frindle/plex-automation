@@ -118,9 +118,11 @@ def test_remote_gone_gives_the_player_an_error_quickly(stack):
     os.rename(os.path.join(stack.remote, f["remote"]),
               os.path.join(stack.remote, f["remote"]) + ".gone")
     t0 = time.monotonic()
-    with pytest.raises(OSError, match="fill failed"):
+    # the emulator says "fill failed", real tierfs a plain EIO; both are the player's error
+    with pytest.raises(OSError):
         stack.player_read(f, timeout=25)  # TIERING_PROMOTE_RETRY_S is 3 here
     assert time.monotonic() - t0 < 25
+    assert stack.filled(stack.row(f)["id"])[1], "the runner did not record the fill as failed"
     assert os.path.islink(f["disk"])
 
 
