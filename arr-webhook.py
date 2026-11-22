@@ -5328,6 +5328,7 @@ def handle_upgrade_import(data, source):
     log.info(f'{source}: looking for superseded torrents matching "{series_title}" {search_term}')
 
     download_id = (data.get('downloadId') or '').lower()
+    remote = from_remote_client(data)
     try:
         deluge_login()
         ensure_label_exists()
@@ -5337,8 +5338,9 @@ def handle_upgrade_import(data, source):
         # new torrent" abort, so any match miss (special characters, season
         # packs, or a downloadId/infohash mismatch) aborted before it and left
         # the finished torrent silently stuck wearing '-upgrade'.
+        # A seedbox download is not in this Deluge: asking for it only logs a KeyError there.
         flip_result = 'not_found'
-        if download_id:
+        if download_id and not remote:
             flip_result, flip_name = relabel_download_to_base(download_id, source)
             if flip_result == 'flipped':
                 record_activity('relabel', f'{source}: "{flip_name}" upgrade → base after import')
@@ -5350,7 +5352,6 @@ def handle_upgrade_import(data, source):
     # Identify the new torrent to skip it
     # First try downloadId direct hash lookup (most accurate)
     new_torrent_hash = None
-    remote = from_remote_client(data)
     if download_id and download_id in torrents:
         new_torrent_hash = download_id
         log.info(f'{source}: identified new torrent by downloadId: {new_torrent_hash}')
@@ -5502,7 +5503,8 @@ def handle_import_relabel(data, source):
     them. Flip the label back to the base one here, mirroring the
     post-import relabel in handle_upgrade_import."""
     download_id = (data.get('downloadId') or '').lower()
-    if not download_id:
+    # A seedbox download is not in this Deluge: asking for it only logs a KeyError there.
+    if not download_id or from_remote_client(data):
         return
     try:
         deluge_login()

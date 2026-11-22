@@ -70,7 +70,7 @@ def test_remote_import_supersedes_old_home_copy_without_resume(monkeypatch):
     aw.handle_upgrade_import(_radarr_payload(), 'Radarr')
     assert calls['superseded'] == [(OLD, False)]
     assert calls['pushover'] == []                  # no "upgrade tag may be stuck" alert
-    assert calls['flip'] == [NEW]                   # only the early downloadId flip; no fallback on a hash not here
+    assert calls['flip'] == []                      # the seedbox torrent is not in home Deluge: never asked for
 
 
 def test_remote_client_name_is_case_insensitive(monkeypatch):
@@ -101,6 +101,14 @@ def test_remote_season_pack_does_not_spare_the_old_home_pack(monkeypatch):
     calls = _wire(monkeypatch, torrents)
     aw.handle_upgrade_import(_sonarr_pack_payload(), 'Sonarr')
     assert calls['superseded'] == [(old_pack, False)]
+
+
+def test_gap_fill_import_from_seedbox_does_not_ask_home_deluge(monkeypatch):
+    calls = _wire(monkeypatch, HOME)
+    aw.handle_import_relabel({'downloadId': NEW.upper(), 'downloadClient': 'seedbox-deluge'}, 'Radarr')
+    assert calls['flip'] == []
+    aw.handle_import_relabel({'downloadId': NEW.upper(), 'downloadClient': 'Deluge'}, 'Radarr')
+    assert calls['flip'] == [NEW]
 
 
 def test_release_inflight_without_resume_never_resumes(monkeypatch):
