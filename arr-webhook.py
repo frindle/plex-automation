@@ -8078,6 +8078,11 @@ def _torrents_with_basename(torrents, filepath):
     return hits
 
 
+def _plex_file_on_disk(plex_path):
+    """True when a Plex-listed file exists as a regular file in this container's view."""
+    return bool(plex_path) and os.path.isfile(_translate_plex_path(plex_path))
+
+
 def _same_physical_file(a, b):
     """True when two paths are one file (same real path, or the same inode with a
     single link, i.e. two views of one file). Separate hardlinks are not the same."""
@@ -8302,6 +8307,7 @@ def plex_dupe_fix():
         'quality_upgrade': [],
         'wrong_show_attach': [],
         'same_file_ghost': [],
+        'stale_entry': [],
         'kept_by_allowlist': [],
         'unknown': [],
     }
@@ -8337,7 +8343,23 @@ def plex_dupe_fix():
                 'action': 'Plex → item → ⋯ → Refresh Metadata',
             })
             continue
-        media_list = unique_media
+        # Rank only copies that are on disk. Plex keeps listing a file the arr
+        # already replaced until its trash is emptied; if that ghost won the
+        # ranking, the real file would be the one deleted. With fewer than two
+        # real copies there is nothing to remove.
+        on_disk = [(m, _plex_file_on_disk(m.get('file'))) for m in unique_media]
+        present = [m for m, ok in on_disk if ok]
+        if len(present) < 2:
+            plan['stale_entry'].append({
+                'plex_key': plex_key,
+                'title': entry.get('title'),
+                'on_disk': [os.path.basename(m.get('file') or '') for m in present],
+                'missing': [os.path.basename(m.get('file') or '') for m, ok in on_disk if not ok],
+                'action': ('nothing to delete; Plex → Settings → Empty Trash drops the missing copy'
+                           if present else 'no copy found on disk (path map miss?)'),
+            })
+            continue
+        media_list = present
         # Score each Media: (HEVC, resolution_rank, size_gb). Higher wins. Penn always keeps HEVC over any
         # other codec, even a higher-resolution one.
         res_rank = {'4k': 4, '2160': 4, '1080': 3, '720': 2, '576': 1, '480': 1, None: 0}
@@ -8423,7 +8445,11 @@ def plex_dupe_fix():
                 action['result'] = keep_reason
             elif apply:
                 try:
-                    if h and tinfo:
+                    if not _plex_file_on_disk(keeper_file):
+                        # Checked again right before acting: never remove a
+                        # copy while the one being kept is missing.
+                        action['result'] = 'skipped: keeper not on disk'
+                    elif h and tinfo:
                         supersede_torrent(h)
                         action['result'] = f'torrent superseded + moved to {SEEDING_DIR}'
                     else:
@@ -8539,7 +8565,8 @@ def plex_dupe_fix_daily():
         ck = report['checks']
         kept = (ck.get('rule_kept') or 0) + (ck.get('model_kept') or 0)
         summary = (f"{mode}: {c.get('quality_upgrade', 0)} titles, {n_sup} extra copies, "
-                   f"{c.get('same_file_ghost', 0)} ghosts, {len(failures)} failed")
+                   f"{c.get('same_file_ghost', 0)} ghosts, {c.get('stale_entry', 0)} stale, "
+                   f"{len(failures)} failed")
         if kept:
             summary += f', {kept} kept by checks'
         doubts = [f'{ck[k]} {k[6:]}' for k in ('model_different', 'model_unsure', 'model_other') if ck.get(k)]
