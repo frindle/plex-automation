@@ -1,5 +1,6 @@
 """/plex-dupe-fix: only an identical full path is a ghost, a same-name copy never borrows the keeper's torrent,
-the keeper's own file is never deleted, and the daily run writes a report and pushes only on apply failures."""
+the keeper's own file is never deleted, only copies on disk are ranked (a Plex ghost of a replaced file
+never wins and gets the real file deleted), and the daily run writes a report and pushes only on apply failures."""
 import json
 import os
 
@@ -69,6 +70,7 @@ def test_identical_full_path_is_a_ghost(world):
 def test_same_filename_in_two_folders_is_not_a_ghost(world):
     a = '/media/movies/Some Movie (2021)/Some.Movie.2021.1080p.mkv'
     b = '/media/movies2/Some Movie (2021)/Some.Movie.2021.1080p.mkv'
+    _file(world, a), _file(world, b)
     world['entries'] = [{'plex_key': '1', 'title': 'Some Movie', 'media': [_m(a, size=6), _m(b, size=5, mid=2)]}]
     out = _run()
     assert out['counts']['same_file_ghost'] == 0 and out['counts']['quality_upgrade'] == 1
@@ -79,6 +81,7 @@ def test_same_filename_in_two_folders_is_not_a_ghost(world):
 def test_duplicate_keeper_path_never_becomes_a_loser(world):
     keep = '/media/movies/Some Movie (2021)/Some.Movie.2021.2160p.mkv'
     low = '/media/movies/Some Movie (2021)/Some.Movie.2021.720p.mkv'
+    _file(world, keep), _file(world, low)
     world['entries'] = [{'plex_key': '1', 'title': 'Some Movie',
                          'media': [_m(keep, '4k', 40), _m(keep, '4k', 40, 2), _m(low, '720', 2, 3)]}]
     out = _run()
@@ -113,6 +116,7 @@ def test_same_name_copy_without_any_torrent_is_deleted(world):
 def test_different_name_loser_still_uses_basename_torrent_match(world):
     keep = '/media/movies/Some Movie (2021)/Some.Movie.2021.2160p.mkv'
     low = '/media/movies/Some Movie (2021)/Some.Movie.2021.720p.mkv'
+    _file(world, keep), _file(world, low)
     world['torrents'] = {'H2': {'name': 'Some.Movie.2021.720p.mkv', 'save_path': '/data/Downloads/movies',
                                 'label': 'radarr', 'files': []}}
     world['entries'] = [{'plex_key': '1', 'title': 'Some Movie', 'media': [_m(keep, '4k', 40), _m(low, '720', 2, 2)]}]
@@ -190,7 +194,7 @@ def test_daily_defaults_to_dry_and_writes_report(monkeypatch, daily):
     saved = json.loads(daily['report'].read_text())
     assert saved['counts'] == {'quality_upgrade': 1, 'same_file_ghost': 2} and saved['failures'] == []
     assert daily['pushes'] == []
-    assert daily['activity'] == [('plex_dupe_fix', 'dry: 1 titles, 2 extra copies, 2 ghosts, 0 failed')]
+    assert daily['activity'] == [('plex_dupe_fix', 'dry: 1 titles, 2 extra copies, 2 ghosts, 0 stale, 0 failed')]
 
 
 def test_daily_bogus_mode_is_dry(monkeypatch, daily):
@@ -252,6 +256,7 @@ def test_scheduler_runs_daily_fix_and_survives_its_crash(monkeypatch):
 def test_same_name_copy_uses_a_torrent_that_matches_only_its_own_folder(world):
     a = '/media/movies/A/Some.Movie.2021.1080p.mkv'
     b = '/media/movies/B/Some.Movie.2021.1080p.mkv'
+    _file(world, a), _file(world, b)
     world['torrents'] = {
         'HB': {'name': 'B', 'save_path': '/data/Downloads', 'label': 'radarr',
                'files': [{'path': 'B/Some.Movie.2021.1080p.mkv'}]},
@@ -271,3 +276,56 @@ def test_torrent_path_hits_lists_every_match():
     assert aw._torrent_path_hits(t, '/media/Show/f.mkv') == ['X', 'Y']
     assert aw._torrent_path_hits(t, '/d/f.mkv') == ['X']
     assert aw._torrent_path_hits(t, '') == []
+
+
+# ── copies missing from disk (2026-11-20: Plex still listed the WEBRips an upgrade replaced; the bigger ghost
+#    won the ranking and the real Bluray files were deleted) ──
+
+def test_ghost_keeper_never_gets_the_real_file_deleted(world):
+    ghost = '/media/tv/Show/Show.S01E01.1080p.WEBRip.x265.mkv'
+    real = '/media/tv/Show/Show - S01E01 - Pilot Bluray-1080p.mkv'
+    fr = _file(world, real)
+    world['entries'] = [{'plex_key': '1', 'title': 'Show S01E01',
+                         'media': [_m(ghost, size=1.83), _m(real, size=1.12, mid=2)]}]
+    out = _run(apply=True)
+    assert out['counts']['quality_upgrade'] == 0 and out['counts']['stale_entry'] == 1
+    st = out['plan']['stale_entry'][0]
+    assert st['on_disk'] == [os.path.basename(real)] and st['missing'] == [os.path.basename(ghost)]
+    assert fr.exists()
+
+
+def test_no_copy_on_disk_is_stale_and_hints_at_the_path_map(world):
+    a = '/media/movies/M/M.2160p.mkv'
+    b = '/media/movies/M/M.1080p.mkv'
+    world['entries'] = [{'plex_key': '1', 'title': 'M', 'media': [_m(a, '4k', 30), _m(b, size=8, mid=2)]}]
+    out = _run(apply=True)
+    assert out['counts']['quality_upgrade'] == 0
+    assert 'path map' in out['plan']['stale_entry'][0]['action']
+
+
+def test_ghost_is_left_out_of_the_ranking_when_two_real_copies_remain(world):
+    ghost = '/media/movies/M/M.2160p.mkv'
+    mid_q = '/media/movies/M/M.1080p.mkv'
+    low = '/media/movies/M/M.720p.mkv'
+    fm, fl = _file(world, mid_q), _file(world, low)
+    world['entries'] = [{'plex_key': '1', 'title': 'M',
+                         'media': [_m(ghost, '4k', 40), _m(mid_q, '1080', 5, 2), _m(low, '720', 2, 3)]}]
+    out = _run(apply=True)
+    q = out['plan']['quality_upgrade'][0]
+    assert q['keep']['file'] == 'M.1080p.mkv' and [s['file'] for s in q['supersede']] == [low]
+    assert fm.exists() and not fl.exists()
+
+
+def test_keeper_gone_by_delete_time_is_skipped(world, monkeypatch):
+    keep = '/media/movies/M/M.2160p.mkv'
+    low = '/media/movies/M/M.720p.mkv'
+    fk, fl = _file(world, keep), _file(world, low)
+
+    def check_then_vanish(entry, keeper, loser, state):
+        fk.unlink()
+        return None, None
+    monkeypatch.setattr(aw, '_dupe_check', check_then_vanish)
+    world['entries'] = [{'plex_key': '1', 'title': 'M', 'media': [_m(keep, '4k', 40), _m(low, '720', 2, 2)]}]
+    out = _run(apply=True)
+    act = out['plan']['quality_upgrade'][0]['supersede'][0]
+    assert act['result'] == 'skipped: keeper not on disk' and fl.exists()

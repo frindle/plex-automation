@@ -45,7 +45,7 @@ These names apply to each library file system.
       - `TIERING_PATH_MAP` holds one `share_prefix=disk_prefix` entry per disk.
       - Only candidates that exist count. Zero or several means skip and log.
     - `ops` resolves the path itself, on both demote and promote, and refuses unless there is exactly one disk path. It never writes a disk path into the database. The manifest's `lib_path` may hold the disk path.
-    - `register` stores the arr's path, mapped through `TIERING_ARR_PATH_MAP` (`arr_prefix=share_prefix`) when the arrs see different paths from Plex. Its stat (size and mtime) goes to the resolved disk path.
+    - `register` stores the arr's path, mapped through `TIERING_ARR_PATH_MAP` (`arr_prefix=share_prefix`, optional, identity when unset) when the arrs see different paths from Plex. Its stat (size and mtime) goes to exactly one existing disk candidate from `paths.disk_paths(share, TIERING_PATH_MAP)`, or to the share path itself when `TIERING_PATH_MAP` is unset. Zero candidates count as `missing_local` and several as `ambiguous`; the file is skipped, and the result's `listed`, `missing_local` and `ambiguous` counts let the caller see trouble. An arr path that is under a `TIERING_PATH_MAP` disk prefix is rewritten to its share path with the reverse of that map (`/mnt/disk1/movies/m.mkv` becomes `/mnt/user/movies/m.mkv`) and counted as `disk_path_mapped`. A disk path no entry covers (an unraid disk or cache mount, or a share equal to its disk) is skipped and counted as `disk_path`. `lib_path` never holds a disk path: only array paths are stored. `/mnt/user0/...` is rewritten to `/mnt/user/...`; any other `/mnt/<x>/...` that is not `/mnt/user` and is not covered by a map entry (a named pool such as `/mnt/nvme`, `/mnt/disks`, `/mnt/remotes`) is skipped and counted as `disk_path`, also when `TIERING_PATH_MAP` is unset. Repeated slashes are collapsed to one before the path is stored (`..` is not resolved), so `/mnt/user/media//m.mkv` is the same row as `/mnt/user/media/m.mkv`.
     - The runner:
       - matches Plex files to rows by the share path;
       - in reconcile, reads the link at the resolved disk path;
@@ -98,7 +98,9 @@ tierfs reads the remote at `${TIERFS_REMOTE_BASE}` + `remote_path`. The credenti
 - **Waiting reads (playback and sync never fail on a slow remote):** a play or a sync makes the file whole anyway, so a Plex player never streams the middle from the remote. Its reads wait for the promote, which fetches each chunk only once.
   - **Reader class:** each FUSE request carries the caller's pid.
     - tierfs reads `/proc/<pid>/comm` and the parent's `comm`, cached per pid. `comm` is cut to 15 characters.
-    - The reader is *background* when either name is in `TIERFS_BACKGROUND_COMMS` (comma list, default `Plex Media Scan`). Every other reader, including a pid it cannot read, is a *player*.
+    - The reader is *background* when either name is in `TIERFS_BACKGROUND_COMMS` (comma list, default `Plex Media Scan`). That covers the scan, match, analysis, deep analysis, chapter thumbnails, credits and voice-activity scanner jobs.
+    - A `Plex Transcoder` started by the server is also *background* when its command line is one of Plex's analysis jobs: loudness (`-f null -`), intro and credits marker audio (written under `Transcode/Detection/`) or voice activity (`track-NNNN.wav`). One that names any other muxer is a client stream or a sync, so a *player*.
+    - Every other reader, including a pid or command line it cannot read, is a *player*.
     - tierfs runs with `pid: host`, so it can see the pids of Plex processes in other containers.
   - **Background reads** use the remote stream below, unchanged, and write `remote_read` as before.
   - **Player reads** of the middle come only from the stub, and only for chunks listed in the fill file `${TIERFS_MANIFESTS}/<id>.fill` (see **Promote order**). A read whose chunks are not listed yet waits:
@@ -175,7 +177,14 @@ The `files` table has these columns:
 `qualify` decides whether one whole file may be offloaded tonight.
 - **Same bytes:** it hashes `L` itself with a fresh full read and hashes the remote copy, and both must equal. It never trusts a stored `sha256`. It writes the hash it saw into the row's `sha256`.
 - **Restore path:** another release at or above the quality floor that is a different upload. Any candidate whose NZB shares message-ids with the `nzb_path` NZB is the same upload, whatever its name. Size alone never decides.
+  - Message-ids are compared without `<>` or white space, and case-sensitive.
+  - The candidate's NZB is STATed, every segment on every configured provider, like `nzb_path`'s, before it counts. A candidate with missing articles is not a restore path.
+  - The first candidate that is disjoint and live is archived as `nzb_path2`. `QualifyResult.fields` always carries `nzb_path2`, `None` when there is no such candidate, so a stale one is cleared.
+  - qualify searches once and reuses that search for the exact NZB and for the restore path.
 - **Quality floor:** taken from the source's resolution. When the source resolution is unknown, the floor is 1080p.
+- **Exact NZB: unsure is not a miss.** `no_exact_nzb` means a complete search (every configured indexer answered) found no release with the exact name. Anything less returns `nzb_unsure`, meaning "try later": a partial search (an indexer dropped, out of budget or failing), a spent grab budget, or `MAX_FAILED_GRABS` (3) failed grabs. A listing known to have no NZB is skipped without a grab and never counts as a failed grab, so the loop goes on to the next listing. Neither passes; only `nzb_unsure` is worth a retry tomorrow. A search that finds every indexer dropped, out of budget or rate limited is `nzb_unsure` (never `nzb_error`), also in the restore step.
+- **"Try later" is not a permanent state.** When every candidate of a row failed at item level (the indexer says the item is gone, or the listing is known to have no NZB), the row's own fault, that is counted per release name in the client's state file. One body that is no NZB, not yet confirmed on a second night, is not the row's fault: it keeps the streak where it is, so an indexer serving a maintenance page never charges the rows it saw first. On the third night in a row `qualify` returns `no_exact_nzb` (step info `why=grab_failed`). Unsure caused by a spent budget, a dropped indexer or a transport error never counts, and keeps the streak where it is. `oldest_first(rows, indexers)` orders rows by the time of their last attempt (never attempted first), so a spent budget cannot starve the same rows night after night. `qualify` records the attempt on every path (a reused NZB, a failure after the NZB step, any error), not only when it searches.
+- **Restore step: a confirmed "no NZB" is a "no".** An alternative the indexer says is gone (code 300, a 404 or 410), or that is known to have no NZB (its strike confirmed on a second night), counts as dead (`no_restore_path` when nothing else is live). One body that is no NZB is only a strike (it may be a maintenance page), so it makes the check unsure, never dead. A real inability to check (indexers unavailable, grab budget spent, a transport error, `MAX_FAILED_GRABS` reached) is also `restore_check_unsure`.
 - **Unsure is a fail:** an indexer or provider that did not answer, or a partial search, never passes.
 - `QualifyResult.fields` holds only `files` columns.
 
@@ -186,7 +195,7 @@ Offload step 3 hashes `L` again in the read that builds the chunk list. If that 
 - `register(db, apply)` runs once a night before the demote window, and the runner calls it.
 - It reads every movie file and episode file from Radarr and Sonarr through their APIs (`RADARR_URL`, `SONARR_URL`, keys from env; more than one Sonarr is a comma list).
 - For each file it upserts a row by `lib_path`. A new row gets a fresh `<id>`, `state=whole`, `size`, `mtime_ns` and the media identity: `title`, `year`, `imdb_id`, `tvdb_id`, `season`, `episode`, and `release_name` (the arr's scene name, else the file name). `sha256` stays empty until qualify fills it.
-- An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`.
+- An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`, `nzb_path`, `nzb_path2`, `restore_score`, `restore_note`, `remote_path` and the head/tail facts.
 - It never deletes a row. A path the arrs no longer list is logged.
 - The runner fills `rating_key`, `kind` and `is4k` from Plex.
 - `lib_path` is the share path (see "Path namespaces"). `TIERING_ARR_PATH_MAP` maps arr paths to share paths when they differ. Size and mtime come from the resolved disk path.
@@ -195,6 +204,26 @@ Offload step 3 hashes `L` again in the read that builds the chunk list. If that 
 
 - STAT every segment of each `offloaded` row's `nzb_path`. All found: set `last_check_ts` and `last_stat_ok_ts`. Any missing: flag a promote at once. Unknown (provider or network trouble): set `last_check_ts` only; alert when `last_stat_ok_ts` is older than 14 days.
 - An indexer that fails or answers partly makes the restore-path check "unchecked", never "no restore path". Unchecked never triggers a promote.
+- Restore path: a stored `nzb_path2` is STATed on both providers, and nothing is asked of an indexer while it is live and disjoint from `nzb_path` (weekly checks that locally; `nzb_path2` equal to or overlapping `nzb_path` is never OK). A STAT that fails for a reason other than a provider being unreachable (a disk fault reading the file, say) is "unchecked": it never clears `nzb_path2`. Only an NZB that is not valid or has lost articles is dead. When it is missing, not disjoint, or has lost articles, weekly searches, verifies a candidate by message-id and STAT, and stores it as `nzb_path2`. A candidate that overlaps the dead `nzb_path2` or `nzb_path` never counts. If nothing new and live turns up, weekly flags the loss (alert, event and promote flag) and clears `nzb_path2`; it never reports "OK". When the stored one is known dead but the search for a replacement was incomplete, weekly keeps the path, raises an alert and logs a `restore_nzb_lost` event with `unsure`, and reports the row as unchecked, never OK.
+
+#### Indexer etiquette (paid indexers ban for abuse)
+
+All of it lives in the client, which the runner keeps for weeks, so the caller never resets anything. Budgets are rolling 24-hour windows per indexer.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `NEWZNAB_SEARCH_BUDGET` | 30 | searches per indexer per 24 hours |
+| `NEWZNAB_GRAB_BUDGET` | 10 | NZB grabs per indexer per 24 hours |
+| `NEWZNAB_MIN_INTERVAL_S` | 2 | least seconds between two requests to one indexer |
+| `NEWZNAB_GRAB_INTERVAL` | 1 | least seconds between two NZB grabs |
+
+An indexer is dropped for the rest of the window after 3 errors in a row, and at once on a 429 or a newznab limit error (`<error code="429|500|501">`, also when it comes back as the answer to a grab). It is left alone for the `Retry-After` time, given in seconds or as an HTTP date and not capped; a missing or unreadable value means the whole window. A grab counts as a success only once the bytes are an NZB.
+
+`NewznabClient(state_path=...)` keeps the request times, the error counts and the drops in a JSON file (written atomically), so a restart or redeploy of the runner does not reset the budgets. Without a path they live in memory only. A file that cannot be read is ignored. A spent budget or a dropped indexer makes a check unchecked, never failed.
+
+The state file is shared by every client and process that names it: each write takes an `fcntl` lock on `<state_path>.lock`, reloads the file, changes it and writes it back before the lock is let go, so two writers keep one budget. Reads (`is_bad`, `attempt_info`, so `oldest_first` over many rows) use the copy in memory and reload only when the file's mtime, size or inode changed. Times read from the file are clamped to now, and a drop whose save time lies in the future keeps the time that was left counted from now, so a wall clock that went back cannot block an indexer for days. The file also holds the release ids found to have no NZB and the per-row qualify record (see Qualify).
+
+A failure of one item is not the indexer's: a grab answered with newznab code 300 ("no such item"), a 404 or 410, or a body that is no NZB. It does not count toward the 3 errors; the release id (the guid, else a hash of the link) gets a strike. A body that is no NZB may be a maintenance page, so a release is called bad (not grabbed again) only after such answers on two different nights (at least 12 hours apart). A bad mark expires 7 days after its last strike, and a valid NZB clears it at once. When one indexer answers with non-NZB bodies for 4 different releases within an hour without giving one NZB, the indexer is the problem: those strikes are taken back, the indexer is dropped through the usual 24-hour backoff, and the grab raises `IndexerDropped` (so the row is `nzb_unsure`). Transport errors, 5xx and other error codes count as before. When a search finds every indexer dropped, out of budget or rate limited, the client raises `IndexersUnavailable` (a `NewznabError`). API keys never appear in a repr, log line or exception, and the release link (which holds the key) is never used as the guid.
 - Each row's result is written as soon as it is known, through `update_if(..., expect_state="offloaded")`. A row the runner changed during the run is left alone.
 - The monthly full reads pick by the oldest attempt, not the oldest success, so one bad row cannot use the whole budget. A hash mismatch on a full read is treated like `bad_chunk`: `state=failed` and an alert. Three failed attempts in a row on network errors alert.
 - The report lists `offloaded` rows and every `failed` row with its `restore_note` and restore path.

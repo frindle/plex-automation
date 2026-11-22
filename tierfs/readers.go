@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,8 +27,9 @@ type classEntry struct {
 	at         time.Time
 }
 
-// classifier tells background readers (the Plex scanner) from players, using
-// the caller's pid from the FUSE request. A pid it cannot read is a player.
+// classifier tells background readers (the Plex scanner and Plex's analysis
+// transcodes) from players, using the caller's pid from the FUSE request. A pid
+// it cannot read is a player.
 type classifier struct {
 	procRoot string
 	names    map[string]struct{}
@@ -137,9 +139,61 @@ func (c *classifier) classify(tid uint32) bool {
 	}
 	if pp, ok := c.ppid(pid); ok {
 		if pn, ok := c.comm(pp); ok {
-			_, bg := c.names[truncComm(pn)]
-			return bg
+			if _, bg := c.names[truncComm(pn)]; bg {
+				return true
+			}
+		}
+	}
+	if name == transcoderComm {
+		if args, ok := c.cmdline(pid); ok {
+			return analysisJob(args)
 		}
 	}
 	return false
+}
+
+func (c *classifier) cmdline(pid uint32) ([]string, bool) {
+	b, err := os.ReadFile(filepath.Join(c.procRoot, strconv.FormatUint(uint64(pid), 10), "cmdline"))
+	if err != nil || len(b) == 0 {
+		return nil, false
+	}
+	return strings.Split(strings.TrimRight(string(b), "\x00"), "\x00"), true
+}
+
+// transcoderComm is the comm of the Plex Transcoder. Plex Media Server starts
+// it both to stream to a client and for its own analysis jobs, so its command
+// line tells the two apart.
+const transcoderComm = "Plex Transcoder"
+
+// analysisFormats are the muxers Plex's analysis jobs write. Any other -f
+// value (dash, segment, hls, mpegts, mp4, matroska, ...) is a client stream or
+// a sync or optimize conversion.
+var analysisFormats = map[string]bool{"null": true, "flac": true, "wav": true, "s16le": true}
+
+var trackWav = regexp.MustCompile(`^track-\d+\.wav$`)
+
+// analysisJob reports whether a Plex Transcoder command line is one of Plex's
+// analysis jobs, which read the file but send nothing to a client:
+//   - loudness: "-af loudnorm=... -f null -"
+//   - intro and credits markers: mono 8 kHz audio written under .../Transcode/Detection/
+//   - voice activity: 16 kHz mono PCM written to track-NNNN.wav
+//
+// A command line that also names any other muxer is a player, and so is one
+// that matches none of these.
+func analysisJob(args []string) bool {
+	job := false
+	for i, a := range args {
+		if a == "-f" && i+1 < len(args) {
+			if !analysisFormats[args[i+1]] {
+				return false
+			}
+			if args[i+1] == "null" {
+				job = true
+			}
+		}
+		if strings.Contains(a, "/Transcode/Detection/") || trackWav.MatchString(a) {
+			job = true
+		}
+	}
+	return job
 }

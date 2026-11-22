@@ -599,6 +599,16 @@ RADARR_UPG_LABEL  = os.environ.get('RADARR_UPGRADE_LABEL', 'radarr-upgrade')
 RADARR_UPG_PRIORITY_LABEL = os.environ.get('RADARR_UPGRADE_PRIORITY_LABEL', 'radarr-upgrade-recent')
 SEEDING_DIR      = os.environ.get('SEEDING_DIR', '/data/Downloads/Just4Seeding')
 SEED_DAYS        = int(os.environ.get('SEED_DAYS', '21'))
+# The arrs' download clients whose torrents live in ANOTHER Deluge (the seedbox during
+# the soft cutover), by name, comma separated. An import from one of these never has its
+# new torrent in this Deluge, so every matching torrent here is the old copy.
+REMOTE_DOWNLOAD_CLIENTS = {s.strip().lower() for s in
+                           os.environ.get('REMOTE_DOWNLOAD_CLIENTS', 'seedbox-deluge').split(',') if s.strip()}
+
+
+def from_remote_client(data):
+    """True when the arr says this import came from a download client in another Deluge."""
+    return (str((data or {}).get('downloadClient') or '')).strip().lower() in REMOTE_DOWNLOAD_CLIENTS
 # Weekly stalled-seed review (every LABELED torrent, including
 # LIBRARY_SEED_LABEL -- that's the actual intended target; unlabeled/
 # unmanaged torrents are always skipped): a torrent must have seeded at
@@ -1193,7 +1203,7 @@ def _torrent_inflight_state(torrent_hash):
         return None
 
 
-def release_inflight_superseded(torrent_hash, state, progress):
+def release_inflight_superseded(torrent_hash, state, progress, resume=True):
     """A superseded torrent that has NOT finished must be allowed to finish,
     never removed (Penn's policy: the label is `superseded`, lift the speed
     limit, let it download to 100% and seed; cleanup_superseded reaps it after
@@ -1201,7 +1211,8 @@ def release_inflight_superseded(torrent_hash, state, progress):
     max_download_speed that PERSISTS after relabel (the `superseded` label has
     apply_max False), so a 30 KB/s cap would otherwise crawl forever. Clear the
     cap (and the per-torrent connection cap stuck_plan puts on the upgrade lane)
-    and resume a paused torrent. Best-effort: never raises."""
+    and resume a paused torrent (unless resume=False: an import from the
+    seedbox while nothing may download at home). Best-effort: never raises."""
     try:
         session.post(
             f'{DELUGE_URL}/json',
@@ -1209,14 +1220,16 @@ def release_inflight_superseded(torrent_hash, state, progress):
                   'params': [[torrent_hash], {'max_download_speed': -1, 'max_connections': -1}], 'id': 13},
             timeout=10,
         ).raise_for_status()
-        if state == 'Paused':
+        resumed = resume and state == 'Paused'
+        if resumed:
             session.post(
                 f'{DELUGE_URL}/json',
                 json={'method': 'core.resume_torrent', 'params': [[torrent_hash]], 'id': 14},
                 timeout=10,
             ).raise_for_status()
         log.info(f'{torrent_hash}: superseded while incomplete ({state}, {progress:.2f}%) -- '
-                 f'download cap cleared{", resumed" if state == "Paused" else ""}; will finish and seed')
+                 f'download cap cleared{", resumed" if resumed else ""}'
+                 f'{"; will finish and seed" if resume or state != "Paused" else "; left paused (remote import)"}')
         record_activity('supersede-inflight-released',
                         f'torrent {torrent_hash} superseded at {progress:.2f}% ({state}): cap cleared, left to finish')
     except Exception as e:
@@ -1246,7 +1259,7 @@ def is_library_path(deluge_path):
     return False
 
 
-def supersede_torrent(torrent_hash):
+def supersede_torrent(torrent_hash, resume=True):
     # Never removes anything. An incomplete torrent keeps the `superseded`
     # label but has its download cap lifted (and is resumed if paused) so it
     # finishes, seeds, and is reaped by cleanup_superseded after SEED_DAYS.
@@ -1262,7 +1275,7 @@ def supersede_torrent(torrent_hash):
                         f'torrent {torrent_hash} superseded but seeds from the library ({save_path}) -- relabeled only, not moved')
         return
     if inflight is not None:
-        release_inflight_superseded(torrent_hash, *inflight)
+        release_inflight_superseded(torrent_hash, *inflight, resume=resume)
         return
     # Guard the move: core.move_storage on a torrent whose files are already
     # gone does NOT fail — it relocates the now-fileless torrent to SEEDING_DIR,
@@ -5302,9 +5315,17 @@ def handle_upgrade_import(data, source):
     # Identify the new torrent to skip it
     # First try downloadId direct hash lookup (most accurate)
     new_torrent_hash = None
+    remote = from_remote_client(data)
     if download_id and download_id in torrents:
         new_torrent_hash = download_id
         log.info(f'{source}: identified new torrent by downloadId: {new_torrent_hash}')
+    elif remote and download_id:
+        # Downloaded by the seedbox's Deluge (soft cutover): the new torrent is not in
+        # this Deluge at all, so nothing here can be it. Name matching would be wrong
+        # here: for a season pack it would pin the OLD home pack as "new" and spare it.
+        new_torrent_hash = download_id
+        log.info(f'{source}: new torrent {download_id} is on remote client '
+                 f'"{data.get("downloadClient")}"; every matching torrent here is the old copy')
     elif is_season_pack and season_term:
         new_torrent_hash = find_season_pack_hash(title_variants, season_term, torrents)
         if not new_torrent_hash:
@@ -5347,7 +5368,7 @@ def handle_upgrade_import(data, source):
     # Fallback flip: if the new torrent was pinned by filename/season (empty or
     # mismatched downloadId) the early downloadId flip was a no-op — flip the
     # matched hash now. Idempotent with the early attempt.
-    if flip_result != 'flipped':
+    if flip_result != 'flipped' and new_torrent_hash in torrents:
         try:
             relabel_download_to_base(new_torrent_hash, source)
         except Exception as e:
@@ -5415,7 +5436,9 @@ def handle_upgrade_import(data, source):
                     reason = 'quality upgrade'
                 log.info(f'{source}: superseding {torrent_hash} - {name} ({reason})')
                 record_activity('supersede', f'{source}: superseded "{name}" after upgrade import')
-                supersede_torrent(torrent_hash)
+                # Remote import (soft cutover): nothing downloads at home, so an
+                # unfinished old copy here is labeled but never resumed.
+                supersede_torrent(torrent_hash, resume=not remote)
 
     # Event-driven version of /purge-unstarted-superseded: an upgrade import
     # is exactly when stale duplicates pile up, so sweep the superseded
@@ -8055,6 +8078,11 @@ def _torrents_with_basename(torrents, filepath):
     return hits
 
 
+def _plex_file_on_disk(plex_path):
+    """True when a Plex-listed file exists as a regular file in this container's view."""
+    return bool(plex_path) and os.path.isfile(_translate_plex_path(plex_path))
+
+
 def _same_physical_file(a, b):
     """True when two paths are one file (same real path, or the same inode with a
     single link, i.e. two views of one file). Separate hardlinks are not the same."""
@@ -8279,6 +8307,7 @@ def plex_dupe_fix():
         'quality_upgrade': [],
         'wrong_show_attach': [],
         'same_file_ghost': [],
+        'stale_entry': [],
         'kept_by_allowlist': [],
         'unknown': [],
     }
@@ -8314,7 +8343,23 @@ def plex_dupe_fix():
                 'action': 'Plex → item → ⋯ → Refresh Metadata',
             })
             continue
-        media_list = unique_media
+        # Rank only copies that are on disk. Plex keeps listing a file the arr
+        # already replaced until its trash is emptied; if that ghost won the
+        # ranking, the real file would be the one deleted. With fewer than two
+        # real copies there is nothing to remove.
+        on_disk = [(m, _plex_file_on_disk(m.get('file'))) for m in unique_media]
+        present = [m for m, ok in on_disk if ok]
+        if len(present) < 2:
+            plan['stale_entry'].append({
+                'plex_key': plex_key,
+                'title': entry.get('title'),
+                'on_disk': [os.path.basename(m.get('file') or '') for m in present],
+                'missing': [os.path.basename(m.get('file') or '') for m, ok in on_disk if not ok],
+                'action': ('nothing to delete; Plex → Settings → Empty Trash drops the missing copy'
+                           if present else 'no copy found on disk (path map miss?)'),
+            })
+            continue
+        media_list = present
         # Score each Media: (HEVC, resolution_rank, size_gb). Higher wins. Penn always keeps HEVC over any
         # other codec, even a higher-resolution one.
         res_rank = {'4k': 4, '2160': 4, '1080': 3, '720': 2, '576': 1, '480': 1, None: 0}
@@ -8400,7 +8445,11 @@ def plex_dupe_fix():
                 action['result'] = keep_reason
             elif apply:
                 try:
-                    if h and tinfo:
+                    if not _plex_file_on_disk(keeper_file):
+                        # Checked again right before acting: never remove a
+                        # copy while the one being kept is missing.
+                        action['result'] = 'skipped: keeper not on disk'
+                    elif h and tinfo:
                         supersede_torrent(h)
                         action['result'] = f'torrent superseded + moved to {SEEDING_DIR}'
                     else:
@@ -8516,7 +8565,8 @@ def plex_dupe_fix_daily():
         ck = report['checks']
         kept = (ck.get('rule_kept') or 0) + (ck.get('model_kept') or 0)
         summary = (f"{mode}: {c.get('quality_upgrade', 0)} titles, {n_sup} extra copies, "
-                   f"{c.get('same_file_ghost', 0)} ghosts, {len(failures)} failed")
+                   f"{c.get('same_file_ghost', 0)} ghosts, {c.get('stale_entry', 0)} stale, "
+                   f"{len(failures)} failed")
         if kept:
             summary += f', {kept} kept by checks'
         doubts = [f'{ck[k]} {k[6:]}' for k in ('model_different', 'model_unsure', 'model_other') if ck.get(k)]

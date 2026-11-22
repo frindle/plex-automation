@@ -20,6 +20,13 @@ dupe_confirm and torrent_error (FREE_ONLY_KINDS) only ask the free layers in eve
 import_identity answers are cached by pending key for LLM_ANSWER_TTL_H hours (default 24), so a stuck import
 isn't re-asked every pass; dupe_confirm answers are kept 720 hours (LLM_ANSWER_TTL_H_DUPE_CONFIRM); torrent_error answers 24 hours, so the hourly repair run does not re-ask. Hard rules still run on the current facts.
 llm_decide stays the source of truth for the prompt, parsing, MIN_CONFIDENCE and hard rules.
+Claude-only switch: LLM_CLAUDE_ONLY (1/true/yes/on, default off) is for when the free layers are unavailable (for
+example while the local server is offline). With it on and ANTHROPIC_API_KEY set, Claude is the only layer built or
+asked: Unraid, local and paid Darkbloom are ignored even if configured, there is no PENDING wait for free layers,
+and FREE_ONLY_KINDS go to Claude too. The monthly USD cap, the answer caches, the hard rules and MIN_CONFIDENCE
+still apply; over the cap or on Claude errors the rules stand. Shadow mode still never spends paid calls, so with
+Claude-only on it asks nothing (logged once). With the switch on but no ANTHROPIC_API_KEY, a warning is logged once
+and only the rules run (the free layers are not used). /llm-layers reports claude_only.
 """
 
 import hashlib
@@ -586,10 +593,38 @@ def _real_claude_client(key, workspace=''):
     return make
 
 
+_TRUTHY = ('1', 'true', 'yes', 'on')
+_ONCE = set()
+
+
+def claude_only(env):
+    """LLM_CLAUDE_ONLY switch: truthy 1/true/yes/on (case-insensitive), default off."""
+    return (env.get('LLM_CLAUDE_ONLY') or '').strip().lower() in _TRUTHY
+
+
+def _log_once(tag, msg):
+    if tag not in _ONCE:
+        _ONCE.add(tag)
+        _LOG.warning(msg)
+
+
 def build_layers(kind, env, transport=None, http=None, claude_client=None, now=time.time):
-    """Layers configured by env, in order. An explicit transport replaces the whole chain (it is the local layer)."""
+    """Layers configured by env, in order. An explicit transport replaces the whole chain (it is the local layer).
+    With LLM_CLAUDE_ONLY on, only the Claude layer is built (none, with a warning, when there is no key)."""
     if transport is not None:
         return {'local': Layer('local', transport)}
+    if claude_only(env):
+        ckey = (env.get('ANTHROPIC_API_KEY') or '').strip()
+        if not ckey and claude_client is None:
+            _log_once('no-key', 'LLM_CLAUDE_ONLY is on but ANTHROPIC_API_KEY is not set: no LLM layer, rules only')
+            return {}
+        cm = (env.get('LLM_CLAUDE_MODEL') or '').strip() or CLAUDE_MODEL
+        factory = ((lambda: claude_client) if claude_client is not None
+                   else _real_claude_client(ckey, (env.get('ANTHROPIC_WORKSPACE_ID') or '').strip()))
+        spend = get_claude_spend(_claude_spend_path(env), now)
+        cap = claude_monthly_cap(env)
+        return {'claude': Layer('claude', _claude_fn(kind, cm, factory, spend, env), cm,
+                                lambda: spend.skip_reason(cap))}
     if http is None:
         import requests as http
     layers = {}
@@ -677,10 +712,16 @@ def layer_status(env):
     local = bool((env.get('DARKBLOOM_BASE_URL') or '').strip() or (env.get('LLM_DECIDE_URL') or '').strip())
     paid = bool((env.get('DARKBLOOM_CLOUD_API_KEY') or '').strip())
     claude = bool((env.get('ANTHROPIC_API_KEY') or '').strip())
+    only = claude_only(env)
+    if only:
+        unraid = local = paid = False
     kinds, modes = {}, {}
     for kind in sorted(llm_decide.KINDS):
         kmode = modes[kind] = kind_mode(kind, env)
         names = []
+        if only:
+            kinds[kind] = ['claude'] if claude else []
+            continue
         if unraid and kind in ukinds:
             names.append('unraid')
         if local:
@@ -689,7 +730,7 @@ def layer_status(env):
         if free and kmode == 'enforce' and kind not in FREE_ONLY_KINDS:
             names += [n for n, on in (('claude', claude), ('paid', paid)) if on]
         kinds[kind] = names
-    return {'mode': mode, 'modes': modes, 'kinds': kinds,
+    return {'mode': mode, 'modes': modes, 'kinds': kinds, 'claude_only': only,
             'unraid_model': ((env.get('LLM_UNRAID_MODEL') or '').strip() or UNRAID_MODEL) if unraid else None,
             'local_model': ((env.get('LLM_LOCAL_MODEL') or '').strip() or 'auto') if local else None,
             'paid_model': ((env.get('DARKBLOOM_CLOUD_MODEL') or '').strip() or PAID_MODEL) if paid else None,
@@ -1100,7 +1141,8 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
         if mins < wait_min or plex:
             res.update(pending=True, first_pending=ent['attempts'] == 1)
             return res
-    if local is None and unraid is None:
+    co = claude_only(env)
+    if local is None and unraid is None and not (co and 'claude' in layers):
         # Paid layers are only a backup for the free ones (Penn, 2026-11-16). With no free layer configured,
         # nothing is asked and the rules stand.
         res['error'] = 'no free layer configured'
@@ -1127,8 +1169,8 @@ def run_chain(kind, facts, layers, store, now, wait_min, env, hold_http=None):
             res['error'] = err
 
     if res['decision'] is None:
-        # Claude is the first backup, ahead of paid Darkbloom.
-        try_claude('open models failed')
+        # Claude is the first backup, ahead of paid Darkbloom (the only layer, asked at once, in Claude-only).
+        try_claude('claude only' if co else 'open models failed')
     elif weak(res['decision']):
         try_claude('low confidence')
     if res['decision'] is None:
@@ -1169,7 +1211,12 @@ def advise(kind, facts, rules_action, mode=None, transport=None, log_path=None, 
             wait_min = DEFAULT_WAIT_MIN
         path = log_path or env.get('LLM_DECISIONS_LOG', DEFAULT_LOG)
         capped = False
-        if mode == 'shadow' or kind in FREE_ONLY_KINDS:
+        co = claude_only(env)
+        if co and mode == 'shadow':
+            # Claude-only has no free layer to ask, and shadow never pays.
+            _log_once('shadow', 'LLM_CLAUDE_ONLY is on: shadow mode asks no LLM (it never spends paid calls)')
+            layers = {}
+        elif mode == 'shadow' or (kind in FREE_ONLY_KINDS and not co):
             # Shadow changes nothing, so it never pays for an answer (Unraid and local are free); a free-only kind
             # never pays at all.
             layers = {k: v for k, v in layers.items() if k not in ('paid', 'claude')}
