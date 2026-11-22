@@ -103,7 +103,7 @@ def test_resume_trusts_the_fill_file(big):
     r = env.promote(first)
     assert not r.ok and r.state == "promoting"
     done = [o for o, _ in first.calls]
-    assert len(done) == 5 and fill_lines(env) == [str(o) for o in done]
+    assert len(done) == 5 and fill_lines(env) == [str(o) for o in done] + [f"failed {done[0]}"]
     second = FakeReader(env.data)
     r = env.promote(second)
     assert r.ok
@@ -162,7 +162,7 @@ def test_retry_budget_runs_out_and_stays_resumable(big, monkeypatch):
     r = env.promote(FakeReader(env.data, fail_times=10**6))
     assert not r.ok and r.state == "promoting"
     assert sum(sleeps) <= 20 and sleeps[:4] == [1.0, 2.0, 4.0, 8.0]
-    assert fill_lines(env) == []  # nothing was listed
+    assert fill_lines(env) == [f"failed {HEAD}"]  # nothing listed; waiting players get EIO now
     assert env.promote(FakeReader(env.data)).ok
 
 
@@ -249,6 +249,20 @@ def test_permanent_short_remote_writes_failed(tmp_path):
     assert r.state == "failed"
     assert_ends_failed(env, 14 * MIB)
     assert str(head) in fill_lines(env)  # what was listed stays listed
+
+
+def test_reader_errors_after_the_retry_budget_write_failed_but_stay_resumable(tmp_path):
+    """A remote that answers with errors (not bad data) must not leave a waiting player
+    for the whole TIERFS_WAIT_S: the fill file gets a `failed` line, the row stays
+    `promoting`, and the next attempt drops the line and finishes."""
+    env, head = small(tmp_path)
+    gone = FakeReader(env.data, fail_times=10**6)
+    r = env.promote(gone)  # TIERING_PROMOTE_RETRY_S is 0 in the tests
+    assert not r.ok and r.state == "promoting"
+    assert_ends_failed(env, head)
+    assert st.get(env.db, ID)["state"] == "promoting"
+    assert env.promote().ok  # the remote is back
+    assert not os.path.exists(os.path.join(env.root, "manifests", f"{ID}.fill"))
 
 
 def test_fill_refusal_writes_failed(tmp_path):
