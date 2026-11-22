@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import signal
+import stat as stat_mod
 import sys
 import threading
 import time
@@ -56,6 +57,8 @@ WEEKLY_EVERY = 7 * DAY  # the weekly check runs when the last one is this old
 WEEKLY_RETRY = 3600.0  # after a failed weekly check, wait this long before trying again
 FOLLOW_POLL = 0.25  # the tierfs event file is read this often (a want starts a promote within 1 s)
 WANT_SPACING = 60.0  # wanted attempts on one id are at least this far apart
+ATIME_EVERY = 600.0  # whole files are checked for a read this often (a stat of each)
+ATIME_SLACK = 1.0  # an access time this much newer than the one we noted is a read
 WANT_FRESH = 900.0  # a want older than this is not a player waiting any more (TIERFS_WAIT_S)
 # Used only when the state module does not export COLUMNS.
 FALLBACK_COLUMNS = ("sha256", "nzb_path", "nzb_path2", "remote_path", "restore_score",
@@ -412,6 +415,10 @@ class Runner:
         self.weekly_tried = False
         self.weekly_retry_at = 0.0
         self.history_ok = True
+        self.atime_last = None  # when whole files were last checked for a read
+        self.atime_mu = threading.Lock()
+        self.reading: set = set()  # ids this runner is reading itself (qualify, offload)
+        self.own_read: set = set()  # of those, the ones whose file was really read
         self.read_failed: set = set()
         self.history_alerted: set = set()  # night starts
         self._loaded = False
@@ -659,6 +666,90 @@ class Runner:
         for rk, ts in seen.items():
             merged[rk] = max(merged.get(rk, 0), ts)
         return [{"ratingKey": rk, "viewedAt": ts} for rk, ts in merged.items()]
+
+    # ---- reads of local files (a download or sync of a file that is whole)
+
+    def _atimes_load(self, db) -> dict:
+        d = self._kv_get(db, "local_atimes", {})
+        return {str(k): float(v) for k, v in d.items()} if isinstance(d, dict) else {}
+
+    def _local_reads(self, db, now, rows, id_to_rk) -> dict:
+        """{rating key: time} for whole files someone read since we last looked. tierfs sees
+        only reads of an offloaded file; a download or sync of a file that is still whole
+        leaves nothing but its access time. We note each whole file's access time, and a later
+        one is a read, so it restarts the idle clock like a play. Our own reads (qualify,
+        promote) are noted again as they end (`_rebase_atime`) and never count. A first sight
+        of a file only notes its time, at once. A read is looked for every ATIME_EVERY, and only counts
+        when the file system updates access times (relatime does, at most once a day per
+        file, which is enough here)."""
+        # Between checks only a file we have not seen yet is looked at, to note its time:
+        # a file that appears just after a check must not wait a whole interval for it.
+        limited = self.atime_last is not None and now - self.atime_last < ATIME_EVERY
+        if not limited:
+            self.atime_last = now
+        out: dict = {}
+        with self.atime_mu:
+            seen = self._atimes_load(db)
+            new = {k: v for k, v in seen.items() if k in {r["id"] for r in rows}}
+            busy = self.promote_running | self.demote_running | self.reading
+            for r in rows:
+                id = r["id"]
+                if r["state"] != "whole" or id in busy or (limited and id in seen):
+                    continue
+                found = self._find_disk(r)
+                if len(found) != 1:
+                    continue
+                try:
+                    ls = os.lstat(found[0])
+                except OSError:
+                    continue
+                if not stat_mod.S_ISREG(ls.st_mode):
+                    continue
+                at = ls.st_atime
+                base = seen.get(id)
+                if base is not None and at > base + ATIME_SLACK:
+                    rk = id_to_rk.get(id) or r.get("rating_key")
+                    if rk is not None:
+                        out[str(rk)] = max(out.get(str(rk), 0.0), min(at, now))
+                new[id] = self._arm_atime(found[0], ls)
+            if new != seen:
+                self._kv_set(db, "local_atimes", new)
+        for rk, ts in out.items():
+            log.info("a read of a whole file (rk=%s) restarts its idle clock", rk)
+        return out
+
+    def _arm_atime(self, path, ls) -> float:
+        """Put a whole file's access time back to its modification time and return the time
+        to note. relatime only updates an access time that is not newer than the file's
+        change times, so after a read it would ignore the next one for a day; set back, the
+        next read of any kind shows. Only the access time and the change time of the entry
+        move, never its content or modification time. A dry run leaves the file alone."""
+        at = ls.st_atime
+        if at > ls.st_mtime + ATIME_SLACK and self.cfg.apply:
+            try:
+                os.utime(path, ns=(ls.st_mtime_ns, ls.st_mtime_ns))
+                return ls.st_mtime
+            except OSError:
+                pass
+        return at
+
+    def _rebase_atime(self, db, id):
+        """Note a whole file's access time after a read of our own, so it is not mistaken
+        for someone else's."""
+        try:
+            row = self.state.get(db, id)
+            found = self._find_disk(row) if row else []
+            if len(found) != 1:
+                return
+            ls = os.lstat(found[0])
+            if not stat_mod.S_ISREG(ls.st_mode):
+                return
+            with self.atime_mu:
+                cur = self._atimes_load(db)
+                cur[id] = self._arm_atime(found[0], ls)
+                self._kv_set(db, "local_atimes", cur)
+        except Exception as e:
+            log.error("noting an access time failed: %s", type(e).__name__)
 
     # ---- reconcile and bad chunks
 
@@ -967,6 +1058,8 @@ class Runner:
             except Exception as e:
                 complete = False
                 log.error("tierfs events read failed: %s", type(e).__name__)
+        for rk, ts in self._local_reads(db, now, rows, id_to_rk).items():
+            synced[rk] = max(synced.get(rk, 0.0), ts)
         plays = list(data["plays"] or [])
         for p in data["progress"] or []:
             plays.append({**p, "viewedAt": p.get("viewedAt") or now})
@@ -1184,6 +1277,8 @@ class Runner:
         if res.ok:
             log.info("%s %s done: state=%s", what, id, res.state)
             self.fails.pop(id, None)
+            if what == "promote":
+                self._rebase_atime(db, id)  # promote read the whole file itself
             if what == "promote" and id in self.flagged:  # its flag ends with its promote
                 self.flagged.discard(id)
                 self._kv_set(db, "flagged", sorted(self.flagged))
@@ -1222,6 +1317,19 @@ class Runner:
                 self.demote_worker = False
 
     def _demote_one(self, db, id, now):
+        with self.mu:
+            self.reading.add(id)
+        try:
+            self._demote_inner(db, id, now)
+        finally:
+            with self.mu:
+                self.reading.discard(id)
+                read = id in self.own_read
+                self.own_read.discard(id)
+            if read:
+                self._rebase_atime(db, id)  # qualify read the whole file itself
+
+    def _demote_inner(self, db, id, now):
         cfg, st = self.cfg, self.state
         n = self._tonight(now)
         row = st.get(db, id)
@@ -1255,6 +1363,8 @@ class Runner:
                 log.info("demote %s skipped: glacier gate says %s", id, g)
                 return
             # qualify reads the file, so it gets the disk path; the DB row keeps the share path
+            with self.mu:
+                self.own_read.add(id)
             q = self.deps.qualify({**row, "lib_path": disk})
             if not q.ok and any(str(r).endswith("_unsure") for r in q.reasons):
                 # a partial search or a spent budget: not tonight, and nothing is recorded
