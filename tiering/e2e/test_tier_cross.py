@@ -110,8 +110,6 @@ def test_zeroed_chunk_is_never_written_into_the_file(stack):
         assert s.read(S.MIB) == r.read(S.MIB)
 
 
-@defect("#83: a remote that answers with errors (not bad data) never writes `failed` to "
-        "the fill file, so the player hangs for the whole TIERFS_WAIT_S before its error")
 def test_remote_gone_gives_the_player_an_error_quickly(stack):
     """The remote file is gone (every read is a 404). The player must be told within
     the retry time, not left hanging for the full wait."""
@@ -240,8 +238,6 @@ def test_arr_that_reports_a_disk_path_is_stored_as_the_share_path(stack):
     stack.assert_intact()
 
 
-@defect("#82/#83: an arr rename of an offloaded file strands it: the old row is "
-        "l_missing and cannot be promoted, register makes a second row for the symlink")
 def test_arr_rename_of_an_offloaded_file_can_still_be_promoted(stack):
     f = stack.add("m", MOVIE)
     offloaded(stack, f)
@@ -312,9 +308,6 @@ def test_each_watch_restarts_the_idle_clock(stack):
     stack.assert_intact([f])
 
 
-@defect("#83: the history check compares counts inside a sliding idle window. With "
-        "fewer than five plays in the window, one play ageing out reads as 'history "
-        "wiped' and blocks every demote until the kv row is deleted by hand")
 def test_a_play_ageing_out_is_not_a_wiped_history(stack):
     f = stack.add("m", MOVIE)
     offloaded(stack, f)
@@ -348,8 +341,6 @@ def test_new_adult_4k_and_asian_tv(stack):
     stack.assert_intact()
 
 
-@defect("#83: a download or sync of a file that is already local leaves no record, so "
-        "'60 days after the last play or sync' is not kept for synced files")
 def test_sync_of_a_local_file_restarts_the_idle_clock(stack):
     f = stack.add("m", MOVIE)
     stack.gate.down = True  # keep it whole while it is 'synced'
@@ -479,8 +470,6 @@ def test_gate_down_means_no_offload(stack):
     assert stack.state_of(f) == "whole" and not os.path.islink(f["disk"])
 
 
-@defect("#83: the gate is asked once, before the long qualify. A torrent that starts to "
-        "seed the file in place during qualify is not seen and the file is offloaded")
 def test_torrent_that_appears_during_qualify_stops_the_offload(stack):
     f = stack.add("m", MOVIE)
 
