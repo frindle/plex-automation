@@ -893,6 +893,10 @@ def test_wiring_builds_clients_from_env(tmp_path, monkeypatch):
     wiring.qualify_from_env(env)({"id": "b"})
     assert calls[1][1]["archive_dir"] == "/x/nzb"
     # the clients are built on the first call: a missing provider fails there and in check()
+    import types
+    wk = types.ModuleType(f"{runner.__package__}.weekly")
+    wk.run_weekly = lambda db, **kw: []
+    monkeypatch.setitem(sys.modules, f"{runner.__package__}.weekly", wk)
     bad = {**env, "NO_SECONDARY": "1"}
     fn = wiring.qualify_from_env(bad)
     weekly = wiring.weekly_from_env(bad)
