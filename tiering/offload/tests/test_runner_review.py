@@ -100,6 +100,31 @@ def test_p2_drop_threshold(tmp_path, monkeypatch):
         assert (w.ops("demote") == []) is blocked, n
 
 
+def test_a_play_ageing_out_of_the_window_is_not_a_wiped_history(w):
+    """The idle window slides: with one play in it, that play ageing out empties the
+    history without anything being lost, and demotes must go on."""
+    idle = w.cfg.hot.idle_days * 86400
+    w.row("m", 1, w.movie(1), "whole")
+    w.plays = [{"ratingKey": "5", "viewedAt": NIGHT - idle + 600}]  # ten minutes left
+    w.run()
+    w.clock.t += 900  # the play is now outside the window, Plex no longer lists it
+    w.plays = []
+    w.run()
+    assert "history_shrunk" not in kinds(w)
+    assert w.runner.history_ok
+
+
+def test_a_wiped_history_still_blocks_when_the_plays_are_inside_the_window(w):
+    w.row("m", 1, w.movie(1), "whole")
+    w.plays = [{"ratingKey": "5", "viewedAt": NIGHT - 86400}] * 3
+    w.run()
+    w.plays = []
+    w.clock.t += 60
+    w.run()
+    assert "history_shrunk" in kinds(w)
+    assert not w.runner.history_ok
+
+
 def test_p2_fresh_install_with_no_history_still_demotes(w):
     w.row("m", 1, w.movie(1), "whole")
     w.run()

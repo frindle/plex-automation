@@ -51,6 +51,7 @@ BACKOFF_MAX = 6 * 3600.0  # promote retry delay: RETRY_DELAY doubling, capped he
 FAIL_ALERT_AFTER = 3  # failures in a row per id before an alert
 REGISTER_KEYS = ("listed", "missing_local", "ambiguous", "errors")  # required in the result
 HISTORY_DROP = 0.20  # a Plex history this much shorter than last time is not trusted
+HISTORY_EDGE = 120.0  # plays this close to the window edge are not counted as expected
 WEEKLY_EVERY = 7 * DAY  # the weekly check runs when the last one is this old
 WEEKLY_RETRY = 3600.0  # after a failed weekly check, wait this long before trying again
 FOLLOW_POLL = 0.25  # the tierfs event file is read this often (a want starts a promote within 1 s)
@@ -595,6 +596,18 @@ class Runner:
                 log.error("plex read %s failed: %s: %s", name, type(e).__name__, e)
         return data, ok
 
+    def _expected_plays(self, db, now) -> int:
+        """How many plays last pass's history still holds inside the window now. The window
+        slides, so a play that aged out is not a lost play: only the stored plays that are
+        still inside it count. A database from before `history_times` falls back to the
+        stored count."""
+        times = self._kv_get(db, "history_times", None)
+        if not isinstance(times, list):
+            return int(self._kv_get(db, "history_count", 0) or 0)
+        # a little slack at the edge: Plex and this clock may disagree by a pass
+        edge = now - self.cfg.hot.idle_days * DAY + HISTORY_EDGE
+        return sum(1 for t in times if isinstance(t, (int, float)) and t >= edge)
+
     def _own_plays(self, db, now, data, plays, synced):
         """Our own play record per rating key (history, in-progress, sessions, remote reads),
         kept in the state DB. The hot set sees the later of ours and Plex's, so a Plex
@@ -623,21 +636,25 @@ class Runner:
         # the history check: only when Plex's history was read this pass
         self.history_ok = True
         if "plays" not in self.read_failed:
-            n, last = len(data["plays"] or []), int(self._kv_get(db, "history_count", 0) or 0)
-            if last > 0 and n < last * (1 - HISTORY_DROP):
+            times = sorted(float(p["viewedAt"]) for p in data["plays"] or []
+                           if isinstance(p.get("viewedAt"), (int, float)))
+            n = len(data["plays"] or [])
+            expect = self._expected_plays(db, now)
+            if expect > 0 and n < expect * (1 - HISTORY_DROP):
                 self.history_ok = False
                 start = next_night_start(now, self.cfg.window)
                 if start not in self.history_alerted:
                     self.history_alerted.add(start)
-                    msg = (f"Plex play history has {n} entries, was {last}; no demotes until it "
+                    msg = (f"Plex play history has {n} entries, was {expect}; no demotes until it "
                            "recovers. After a deliberate purge, reset with: DELETE FROM kv "
-                           "WHERE key='history_count'")
+                           "WHERE key IN ('history_count', 'history_times')")
                     if self.cfg.apply:
                         self._alert("history_shrunk", "-", reason=msg)
                     else:
                         log.error("dry run: %s", msg)
             else:
                 self._kv_set(db, "history_count", n)
+                self._kv_set(db, "history_times", times)
         merged = dict(stored)
         for rk, ts in seen.items():
             merged[rk] = max(merged.get(rk, 0), ts)
