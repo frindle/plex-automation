@@ -13,7 +13,8 @@ A request passes when it carries any of:
     `sha256:<hex>` of the token, so the caller's token can stay in its own Keychain)
   * HTTP Basic, on /webhook/* only, user:password being a line of APP_AUTH_BASIC_FILE
 /health is always open. /share/dl/<token> is open at the gate: the link token is its credential
-and the route checks it.
+and the route checks it. The APP_AUTH_LAN_OPEN paths (default /plex-dupe-keep) are open to a
+private socket peer that came through no proxy (see _lan_open).
 
 The /share pages take the user's identity from the validated JWT only (jwt_email), never from the
 Cf-Access-Authenticated-User-Email header, which anyone who reaches the port can set.
@@ -283,6 +284,30 @@ def _loopback_report():
             and request.path not in ACTION_ROUTES and route_class(request.path) == 'api')
 
 
+# A request through the Cloudflare tunnel or another proxy also arrives from a private address,
+# so one carrying any of these is never treated as a LAN caller.
+_PROXY_HEADERS = ('Cf-Connecting-Ip', 'Cf-Ray', 'X-Forwarded-For', 'X-Real-Ip', 'Forwarded')
+
+
+def lan_open_paths():
+    """APP_AUTH_LAN_OPEN: exact paths a LAN caller may use without a credential, comma separated.
+    Unset means /plex-dupe-keep; empty means none."""
+    raw = os.environ.get('APP_AUTH_LAN_OPEN')
+    return {p.strip() for p in ('/plex-dupe-keep' if raw is None else raw).split(',') if p.strip()}
+
+
+def _lan_open():
+    """A LAN-open path from a private socket peer that came through no proxy. A POST must be JSON
+    (a page in some browser on the LAN cannot send one across sites without a preflight)."""
+    if request.path not in lan_open_paths() or route_class(request.path) != 'api':
+        return False
+    if any(request.headers.get(h) for h in _PROXY_HEADERS):
+        return False
+    if request.method == 'POST' and not request.is_json:
+        return False
+    return caller_class() in ('lan', 'loopback')
+
+
 def check_credentials():
     """(ok, credential kind or '', what was missing)."""
     cls = route_class(request.path)
@@ -290,6 +315,8 @@ def check_credentials():
         return True, 'open', ''
     if _loopback_report():
         return True, 'loopback', ''
+    if _lan_open():
+        return True, 'lan-open', ''
     claims, jwt_reason = _jwt_state()
     if claims is not None:
         return True, 'jwt', ''
