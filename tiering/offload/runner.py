@@ -679,7 +679,7 @@ class Runner:
         d = self._kv_get(db, "local_atimes", {})
         return {str(k): float(v) for k, v in d.items()} if isinstance(d, dict) else {}
 
-    def _local_reads(self, db, now, rows, id_to_rk) -> dict:
+    def _local_reads(self, db, now, rows, id_to_rk, added=None) -> dict:
         """{rating key: time} for whole files someone read since we last looked. tierfs sees
         only reads of an offloaded file; a download or sync of a file that is still whole
         leaves nothing but its access time. We note each whole file's access time, and a later
@@ -716,9 +716,9 @@ class Runner:
                     continue
                 at = ls.st_atime
                 base = seen.get(id)
-                landed = max(ls.st_mtime, float(r.get("created_ts") or 0))
+                rk = id_to_rk.get(id) or r.get("rating_key")
+                landed = max(ls.st_mtime, float((added or {}).get(str(rk)) or 0))
                 if base is not None and at > base + ATIME_SLACK and at > landed + IMPORT_GRACE:
-                    rk = id_to_rk.get(id) or r.get("rating_key")
                     if rk is not None:
                         out[str(rk)] = max(out.get(str(rk), 0.0), min(at, now))
                 new[id] = self._arm_atime(found[0], ls)
@@ -1068,7 +1068,8 @@ class Runner:
             except Exception as e:
                 complete = False
                 log.error("tierfs events read failed: %s", type(e).__name__)
-        for rk, ts in self._local_reads(db, now, rows, id_to_rk).items():
+        added = {rk: it.get("addedAt") for rk, it in by_rk_item.items()}
+        for rk, ts in self._local_reads(db, now, rows, id_to_rk, added).items():
             synced[rk] = max(synced.get(rk, 0.0), ts)
         plays = list(data["plays"] or [])
         for p in data["progress"] or []:
