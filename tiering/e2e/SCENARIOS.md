@@ -102,6 +102,17 @@ with a bindfs stand-in.
 3. Assert each sha256 equals its original, the number of open remote streams
    never exceeds `TIERFS_MAX_STREAMS`, and tierfs `/healthz` stays OK.
 
+## 11. Plex's own reads (test_plex_tierfs.py)
+
+1. A real Plex scans two whole movies; the runner offloads them.
+2. A forced rescan, then preview thumbnails (`GenerateBIFBehavior=asap` and an
+   analyze), read through the remote: same parts, no `want`, still offloaded.
+3. Plex's marker (`-f flac` to a file) and loudness (`-f null -`) command lines,
+   run by a binary named `Plex Transcoder`: same.
+4. A download through Plex, and a `Plex Transcoder` writing any other muxer, wait
+   for the promote and get every byte; the other file stays offloaded and Plex
+   keeps the same part.
+
 ## Shared assertions after every scenario
 
 - No `L` is missing or dangling.

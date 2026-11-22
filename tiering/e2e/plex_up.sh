@@ -15,6 +15,10 @@
 # mount made on the host after this container starts shows up inside it. Both
 # are mounted at the SAME absolute path inside the container as on the host,
 # so a symlink in LIB that points into MNT resolves the same way for Plex.
+# PLEX_MNT_OPT replaces rslave: test_plex_tierfs.py passes "rw", since tierfs
+# is already mounted when Plex starts there, and docker refuses rslave on a
+# source that is itself a private mount.
+# PLEX_UID/PLEX_GID default to the sudo caller, so the work dir stays theirs.
 set -euo pipefail
 
 # Pinned by digest: plexinc/pms-docker 1.43.5.11079-b3b13e506 (multi-arch index).
@@ -33,13 +37,18 @@ case "${1:-}" in
 <?xml version="1.0" encoding="utf-8"?>
 <Preferences FriendlyName="tiering-e2e" AcceptedEULA="1" GdmEnabled="0" PublishServerOnPlexOnlineKey="0" ManualPortMappingMode="0" EnableIPv6="0" allowedNetworks="127.0.0.1/255.255.255.255" LogDebug="1" ScheduledLibraryUpdatesEnabled="0" ButlerTaskBackupDatabase="0" ButlerTaskOptimizeDatabase="0" ButlerTaskCleanOldBandwidthStats="0" ButlerTaskRefreshLocalMedia="0" ButlerTaskRefreshLibraries="0" ButlerTaskUpgradeMediaAnalysis="0" ButlerTaskDeepMediaAnalysis="0" GenerateBIFBehavior="never" GenerateChapterThumbBehavior="never" disableRemoteSecurity="0" FirstRun="0"/>
 XML
+    if [ "$(id -u)" = 0 ] && [ -n "${SUDO_UID:-}" ]; then
+      chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$work/plexconfig" "$work/plextranscode"
+    fi
     docker rm -f "$NAME" >/dev/null 2>&1 || true
+    # Under sudo, Plex runs as the calling user, not root.
     docker run -d --name "$NAME" --network host \
-      -e TZ=UTC -e PLEX_UID="$(id -u)" -e PLEX_GID="$(id -g)" \
+      -e TZ=UTC -e PLEX_UID="${PLEX_UID:-${SUDO_UID:-$(id -u)}}" \
+      -e PLEX_GID="${PLEX_GID:-${SUDO_GID:-$(id -g)}}" \
       -e ALLOWED_NETWORKS=127.0.0.0/8 \
       -v "$work/plexconfig:/config" -v "$work/plextranscode:/transcode" \
       -v "$lib:$lib:ro" \
-      -v "$mnt:$mnt:rslave" \
+      -v "$mnt:$mnt:${PLEX_MNT_OPT:-rslave}" \
       "$IMAGE" >/dev/null
     here=$(cd "$(dirname "$0")" && pwd)
     python3 "$here/plexctl.py" wait-ready >/dev/null

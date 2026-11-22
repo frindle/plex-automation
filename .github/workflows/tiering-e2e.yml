@@ -50,6 +50,11 @@ jobs:
           sudo env E2E_TIERFS_BIN="$RUNNER_TEMP/tierfs" \
             "$RUNNER_TEMP/venv/bin/python" -m pytest --confcutdir=tiering/e2e \
             tiering/e2e/test_tier_*.py -q -n 4 -rxXfE --tb=short
+      - name: Real Plex through the real tierfs mount (root, FUSE, docker)
+        run: |
+          sudo env E2E_TIERFS_BIN="$RUNNER_TEMP/tierfs" E2E_PLEX=1 \
+            "$RUNNER_TEMP/venv/bin/python" -m pytest --confcutdir=tiering/e2e \
+            tiering/e2e/test_plex_tierfs.py -q -rxXfEs --tb=short
       - name: Plex log on failure
         if: failure()
         run: |
