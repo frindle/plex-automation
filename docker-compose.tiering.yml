@@ -75,9 +75,16 @@ services:
       TIERING_DEMOTE_WINDOW: "${TIERING_DEMOTE_WINDOW:-02:00-06:00}"
       TIERING_DEMOTE_GB_PER_NIGHT: "${TIERING_DEMOTE_GB_PER_NIGHT:-200}"
       TIERING_IDLE_DAYS: "${TIERING_IDLE_DAYS:-60}"
-      TIERING_NEW_DAYS: "${TIERING_NEW_DAYS:-30}"
+      # Days a new import stays whole. 0: an unwatched import is offloaded like any
+      # cold file (the stub keeps its head, so it still starts at once).
+      TIERING_NEW_DAYS: "${TIERING_NEW_DAYS:-0}"
       TIERING_NEAR_END_EPS: "${TIERING_NEAR_END_EPS:-3}"
       TIERING_NEVER_SECTIONS: "${TIERING_NEVER_SECTIONS:-Adult}"
+      TIERING_KEEP_4K: "${TIERING_KEEP_4K:-0}"
+      TIERING_MAX_STREAM_KBPS: "${TIERING_MAX_STREAM_KBPS:-0}"
+      # Promote: seconds a failing chunk fetch is retried, and promotes run at once.
+      TIERING_PROMOTE_RETRY_S: "${TIERING_PROMOTE_RETRY_S:-600}"
+      TIERING_PROMOTE_CONCURRENCY: "${TIERING_PROMOTE_CONCURRENCY:-2}"
       # Every name must be visible from the container or nothing is demoted.
       TIERING_PROC_CANARY: "${TIERING_PROC_CANARY:-Plex Media Serv,shfs}"
       TIERING_PATH_MAP: "${TIERING_PATH_MAP:?set TIERING_PATH_MAP in .env}"

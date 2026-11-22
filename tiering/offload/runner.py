@@ -59,6 +59,10 @@ FOLLOW_POLL = 0.25  # the tierfs event file is read this often (a want starts a 
 WANT_SPACING = 60.0  # wanted attempts on one id are at least this far apart
 ATIME_EVERY = 600.0  # whole files are checked for a read this often (a stat of each)
 ATIME_SLACK = 1.0  # an access time this much newer than the one we noted is a read
+# Plex reads a new or replaced file for its own analysis (previews, intro and credits
+# markers, loudness) soon after it lands. A read this soon after the file's modification
+# time or its first registration is that analysis, not a person.
+IMPORT_GRACE = 3 * DAY
 WANT_FRESH = 900.0  # a want older than this is not a player waiting any more (TIERFS_WAIT_S)
 # Used only when the state module does not export COLUMNS.
 FALLBACK_COLUMNS = ("sha256", "nzb_path", "nzb_path2", "remote_path", "restore_score",
@@ -681,7 +685,9 @@ class Runner:
         leaves nothing but its access time. We note each whole file's access time, and a later
         one is a read, so it restarts the idle clock like a play. Our own reads (qualify,
         promote) are noted again as they end (`_rebase_atime`) and never count. A first sight
-        of a file only notes its time, at once. A read is looked for every ATIME_EVERY, and only counts
+        of a file only notes its time, at once. A read within IMPORT_GRACE of the file's
+        modification time or its row's creation is Plex analysing a new import and is only
+        noted. A read is looked for every ATIME_EVERY, and only counts
         when the file system updates access times (relatime does, at most once a day per
         file, which is enough here)."""
         # Between checks only a file we have not seen yet is looked at, to note its time:
@@ -710,7 +716,8 @@ class Runner:
                     continue
                 at = ls.st_atime
                 base = seen.get(id)
-                if base is not None and at > base + ATIME_SLACK:
+                landed = max(ls.st_mtime, float(r.get("created_ts") or 0))
+                if base is not None and at > base + ATIME_SLACK and at > landed + IMPORT_GRACE:
                     rk = id_to_rk.get(id) or r.get("rating_key")
                     if rk is not None:
                         out[str(rk)] = max(out.get(str(rk), 0.0), min(at, now))
