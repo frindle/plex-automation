@@ -35,6 +35,22 @@ var (
 		"-segment_list", "http://127.0.0.1:32400/video/:/transcode/session/abc/manifest", "chunk-%05d"}
 	syncArgs = []string{tc, "-i", file, "-progressurl", prog, "-codec:0", "libx264", "-f", "mp4",
 		"/transcode/Sync/item.mp4"}
+	// Captured from Plex Media Server 1.43.6 on a real Analyze (homelab job 0168),
+	// paths and ids replaced.
+	previewArgs = []string{tc, "-codec:v", "h264", "-skip_frame:v", "nokey", "-i", file, "-threads", "0",
+		"-nostats", "-q", "3", "-loglevel", "quiet", "-filter_complex",
+		"[0:V:0] fps=fps=0.016667:round=up,scale=w=320:h=240:force_original_aspect_ratio=decrease [out]",
+		"-map", "[out]",
+		"/config/Library/Application Support/Plex Media Server/Media/localhost/d/0f3a9c/Contents/Indexes/tmp/img-%06d.jpg",
+		"-progressurl", prog}
+	marker143Args = []string{tc, "-codec:#0x02", "aac", "-analyzeduration", "20000000", "-probesize", "20000000",
+		"-i", file, "-y", "-nostats", "-loglevel", "quiet", "-loglevel_plex", "error", "-progressurl", prog,
+		"-filter_complex", "[0:#0x02] aresample=async=1:ochl='mono':rematrix_maxval=0.000000dB:first_pts=0:min_hard_comp=0.01:osr=8000[0]",
+		"-map", "[0]", "-codec:0", "flac", "-b:0", "4096k", "-f", "flac", "-map_metadata", "-1",
+		"-map_chapters", "-1", "/transcode/plex-marker-0f3a9c"}
+	scanThumbArgs = []string{tc, "-codec:v", "h264", "-y", "-threads", "44", "-skip_frame", "noref", "-ss", "2093",
+		"-i", file, "-vf", "[in]fps=0.5,scale=w=320:h=320:force_original_aspect_ratio=increase,showinfo[out]",
+		"-vsync", "passthrough", "-f", "image2", "thumb-%05d.jpeg"}
 )
 
 func TestAnalysisJob(t *testing.T) {
@@ -47,6 +63,11 @@ func TestAnalysisJob(t *testing.T) {
 		{"loudness through EAE", loudnessEAEArgs, true},
 		{"intro and credits markers", markerArgs, true},
 		{"voice activity", voiceArgs, true},
+		{"video preview thumbnails (no -f)", previewArgs, true},
+		{"intro and credits markers, 1.43.6 output path", marker143Args, true},
+		{"scan thumbnails", scanThumbArgs, true},
+		{"preview path beside a client stream", append(append([]string{}, previewArgs...), "-f", "dash", "dash"), false},
+		{"wav to stdout", []string{tc, "-i", file, "-f", "wav", "-"}, false},
 		{"client stream with a null side output", dashArgs, false},
 		{"subtitles for a stream", subtitleArgs, false},
 		{"sync conversion", syncArgs, false},

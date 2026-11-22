@@ -168,32 +168,48 @@ const transcoderComm = "Plex Transcoder"
 // analysisFormats are the muxers Plex's analysis jobs write. Any other -f
 // value (dash, segment, hls, mpegts, mp4, matroska, ...) is a client stream or
 // a sync or optimize conversion.
-var analysisFormats = map[string]bool{"null": true, "flac": true, "wav": true, "s16le": true}
+var analysisFormats = map[string]bool{"null": true, "flac": true, "wav": true, "s16le": true, "image2": true}
+
+// audioFormats are written to a file by the marker and voice jobs; written to
+// a pipe they could be a client.
+var audioFormats = map[string]bool{"flac": true, "wav": true, "s16le": true}
 
 var trackWav = regexp.MustCompile(`^track-\d+\.wav$`)
 
 // analysisJob reports whether a Plex Transcoder command line is one of Plex's
 // analysis jobs, which read the file but send nothing to a client:
 //   - loudness: "-af loudnorm=... -f null -"
-//   - intro and credits markers: mono 8 kHz audio written under .../Transcode/Detection/
+//   - intro and credits markers: mono 8 kHz audio, "-f flac" to a file
+//     (under .../Transcode/Detection/ in 1.43)
 //   - voice activity: 16 kHz mono PCM written to track-NNNN.wav
+//   - video preview thumbnails: keyframes to .../Contents/Indexes/tmp/img-%06d.jpg,
+//     with no -f at all
+//   - any "-f image2" output (chapter and scan thumbnails)
 //
 // A command line that also names any other muxer is a player, and so is one
 // that matches none of these.
 func analysisJob(args []string) bool {
-	job := false
+	job, audio, pipe := false, false, false
 	for i, a := range args {
 		if a == "-f" && i+1 < len(args) {
-			if !analysisFormats[args[i+1]] {
+			f := args[i+1]
+			if !analysisFormats[f] {
 				return false
 			}
-			if args[i+1] == "null" {
+			if f == "null" || f == "image2" {
 				job = true
 			}
+			if audioFormats[f] {
+				audio = true
+			}
 		}
-		if strings.Contains(a, "/Transcode/Detection/") || trackWav.MatchString(a) {
+		if a == "-" || strings.HasPrefix(a, "pipe:") {
+			pipe = true
+		}
+		if strings.Contains(a, "/Transcode/Detection/") || strings.Contains(a, "/Contents/Indexes/") ||
+			trackWav.MatchString(a) {
 			job = true
 		}
 	}
-	return job
+	return job || (audio && !pipe)
 }
