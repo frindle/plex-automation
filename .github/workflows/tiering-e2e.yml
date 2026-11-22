@@ -32,6 +32,24 @@ jobs:
         run: tiering/e2e/test_mount_propagation.sh
       - name: Plex API, plex_watch and hotset against a live Plex
         run: tiering/e2e/test_plex_api.sh
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: tierfs/go.mod
+          cache-dependency-path: tierfs/go.sum
+      - name: Build tierfs and the test tools
+        run: |
+          (cd tierfs && go build -o "$RUNNER_TEMP/tierfs" ./cmd/tierfs)
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" -q install pytest pytest-xdist blake3
+      - name: Offload tier, real runner, emulated mount
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -m pytest --confcutdir=tiering/e2e \
+            tiering/e2e/test_tier_*.py -q -n 4 -rxXfE --tb=short
+      - name: Offload tier, real runner, real tierfs mount (root, FUSE)
+        run: |
+          sudo env E2E_TIERFS_BIN="$RUNNER_TEMP/tierfs" \
+            "$RUNNER_TEMP/venv/bin/python" -m pytest --confcutdir=tiering/e2e \
+            tiering/e2e/test_tier_*.py -q -n 4 -rxXfE --tb=short
       - name: Plex log on failure
         if: failure()
         run: |
