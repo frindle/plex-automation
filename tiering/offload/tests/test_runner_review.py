@@ -125,6 +125,25 @@ def test_a_wiped_history_still_blocks_when_the_plays_are_inside_the_window(w):
     assert not w.runner.history_ok
 
 
+def test_a_torrent_that_starts_during_qualify_stops_the_demote(w):
+    """The gate said free before qualify; qualify takes minutes. It is asked again right
+    before the offload, and a file that is no longer free stays whole."""
+    w.row("m", 1, w.movie(1), "whole")
+    real = w.runner.deps.qualify
+
+    def qualify_then_torrent(row):
+        out = real(row)
+        w.gate_answer = "pause"  # a torrent began to seed it meanwhile
+        return out
+
+    w.runner.deps.qualify = qualify_then_torrent
+    w.run()
+    assert ("qualify", "m") in w.calls
+    assert w.ops("demote") == []
+    assert w.state.rows["m"]["state"] == "whole"
+    assert len([c for c in w.calls if c[0] == "gate"]) == 2  # before and after qualify
+
+
 def test_p2_fresh_install_with_no_history_still_demotes(w):
     w.row("m", 1, w.movie(1), "whole")
     w.run()
