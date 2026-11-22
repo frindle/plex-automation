@@ -41,6 +41,11 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setattr(aw, 'supersede_torrent', lambda h: state['superseded'].append(h))
     # Plex paths are written relative to tmp_path in these tests.
     monkeypatch.setattr(aw, '_translate_plex_path', lambda p: str(tmp_path / p.lstrip('/')))
+    # *arr views: local paths are the arr paths here; movies/series/episodefiles come from state['arr'].
+    state['arr'] = {'movie': [], 'series': [], 'episodefile': {}}
+    monkeypatch.setattr(aw, '_local_to_deluge', lambda p: p)
+    monkeypatch.setattr(aw, '_arr_items', lambda kind, cache: state['arr'][kind])
+    monkeypatch.setattr(aw, '_arr_episode_files', lambda sid, cache: state['arr']['episodefile'].get(sid, []))
     state['root'] = tmp_path
     return state
 
@@ -329,3 +334,57 @@ def test_keeper_gone_by_delete_time_is_skipped(world, monkeypatch):
     out = _run(apply=True)
     act = out['plan']['quality_upgrade'][0]['supersede'][0]
     assert act['result'] == 'skipped: keeper not on disk' and fl.exists()
+
+
+def _two_copies(world):
+    a = '/media/movies/Some Movie (2021)/Some.Movie.2021.2160p.mkv'
+    b = '/media/movies/Some Movie (2021)/Some.Movie.2021.720p.mkv'
+    fa, fb = _file(world, a), _file(world, b)
+    world['entries'] = [{'plex_key': '1', 'title': 'Some Movie', 'media': [_m(a, '4k', 40), _m(b, '720', 2, 2)]}]
+    return fa, fb
+
+
+def test_copy_radarr_tracks_is_never_deleted(world):
+    fa, fb = _two_copies(world)
+    world['arr']['movie'] = [{'id': 7, 'path': str(fb.parent), 'movieFile': {'relativePath': fb.name}}]
+    act = _run(apply=True)['plan']['quality_upgrade'][0]['supersede'][0]
+    assert act['result'].startswith('skipped: Radarr tracks this copy') and fb.exists() and fa.exists()
+
+
+def test_copy_is_deleted_when_radarr_tracks_the_kept_one(world):
+    fa, fb = _two_copies(world)
+    world['arr']['movie'] = [{'id': 7, 'path': str(fa.parent), 'movieFile': {'path': str(fa)}}]
+    act = _run(apply=True)['plan']['quality_upgrade'][0]['supersede'][0]
+    assert act['result'].startswith('deleted ') and not fb.exists() and fa.exists()
+
+
+def test_episode_file_sonarr_tracks_is_never_deleted(world):
+    keep = '/media/tv/Show/Season 01/Show.S01E02.1080p.mkv'
+    low = '/media/tv/Show/Season 01/Show.S01E02.720p.mkv'
+    fk, fl = _file(world, keep), _file(world, low)
+    world['entries'] = [{'plex_key': '9', 'title': 'Show', 'media': [_m(keep, '1080', 3), _m(low, '720', 2, 2)]}]
+    world['arr']['series'] = [{'id': 3, 'path': str(world['root'] / 'media/tv/Show')}]
+    world['arr']['episodefile'] = {3: [{'relativePath': 'Season 01/Show.S01E02.1080p.mkv'},
+                                       {'path': str(fl)}]}
+    act = _run(apply=True)['plan']['quality_upgrade'][0]['supersede'][0]
+    assert act['result'].startswith('skipped: Sonarr tracks this copy') and fl.exists() and fk.exists()
+
+
+def test_arr_api_error_keeps_the_file(world, monkeypatch):
+    fa, fb = _two_copies(world)
+
+    def down(kind, cache):
+        raise aw.requests.ConnectionError('down')
+    monkeypatch.setattr(aw, '_arr_items', down)
+    act = _run(apply=True)['plan']['quality_upgrade'][0]['supersede'][0]
+    assert act['result'].startswith('skipped: could not ask Sonarr/Radarr') and fb.exists()
+    assert not act['result'].startswith(aw._DUPE_FIX_FAIL_PREFIXES)
+
+
+def test_arr_tracker_of_reads_the_real_shapes(monkeypatch):
+    monkeypatch.setattr(aw, '_local_to_deluge', lambda p: p.replace('/media/movies', '/data/Media/Movies'))
+    cache = {'movie': [{'id': 1, 'path': '/data/Media/Movies/A (2020)', 'movieFile': {'relativePath': 'A.mkv'}}],
+             'series': []}
+    assert aw._arr_tracker_of('/media/movies/A (2020)/A.mkv', cache) == 'Radarr'
+    assert aw._arr_tracker_of('/media/movies/A (2020)/A.720p.mkv', cache) is None
+    assert aw._arr_tracker_of('/media/movies/B (2020)/A.mkv', cache) is None
