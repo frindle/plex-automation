@@ -96,6 +96,18 @@ def next_unwatched(episodes, n=AUTO_NEXT):
     return [e for e in eps[last + 1:] if int(e.get('viewCount') or 0) == 0][:n]
 
 
+def show_id(row):
+    """The show's ratingKey for an episode row. Play history rows carry grandparentKey ("/library/metadata/<id>"),
+    not always grandparentRatingKey, so fall back to the key's last part."""
+    v = row.get('grandparentRatingKey')
+    if v:
+        return str(v)
+    k = str(row.get('grandparentKey') or '')
+    if k.startswith('/library/metadata/'):
+        return k.rstrip('/').rsplit('/', 1)[-1] or None
+    return None
+
+
 def auto_items(get, token, user, now, days=AUTO_DAYS, nxt=AUTO_NEXT):
     out = []
     since = int(now - days * 86400)
@@ -104,8 +116,9 @@ def auto_items(get, token, user, now, days=AUTO_DAYS, nxt=AUTO_NEXT):
         params['accountID'] = 1
     shows = {}
     for h in _metadata(get('/status/sessions/history/all', params, token)):
-        if h.get('type') == 'episode' and h.get('grandparentRatingKey'):
-            shows.setdefault(str(h['grandparentRatingKey']), True)
+        sid = show_id(h) if h.get('type') == 'episode' else None
+        if sid:
+            shows.setdefault(sid, True)
     for rk in shows:
         for e in next_unwatched(_leaves(get, rk, token), nxt):
             out.append(_entry(e, 'auto', user))
