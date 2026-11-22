@@ -133,7 +133,9 @@ kill -9 "$t"
 until_ 60 "Docker to restart the container" restarted
 until_ 150 "healthy after the restart" is_healthy
 one_live_mount || fail "after the restart the host has $(host_fuse | wc -l) FUSE mounts at $M, or a dead one"
-[ "$(host_fuse)" != "$mount_id" ] || fail "the mount is the old one"
+# Not the mount id: the kernel hands out the lowest free one, so the new mount often gets
+# the old id back. The dead mount fails the ls in one_live_mount; this checks the server.
+[ "$(tierfs_pid)" != "$t" ] || fail "tierfs is the old process"
 until_ 10 "one mount in the probe container" probe_one_mount
 docker exec "$PROBE" ls "$M" >/dev/null || fail "the probe container cannot list $M after the restart"
 ok "a killed tierfs restarts the container; one live mount on the host and in the probe"
