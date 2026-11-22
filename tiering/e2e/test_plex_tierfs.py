@@ -35,8 +35,11 @@ needs_plex = pytest.mark.skipif(
     not (REAL and os.environ.get("E2E_PLEX") == "1" and shutil.which("docker")),
     reason="needs docker and E2E_PLEX=1 as well")
 
-ONE = "Movies/Test Movie One (2001)/Test Movie One (2001).mkv"
+ONE = "Movies/Test Movie One (2001)/Test Movie One (2001).mkv"  # from make_media.sh
 TWO = "Movies/Test Movie Two (2002)/Test Movie Two (2002).mkv"
+# In the library they keep their release names, as a usenet grab does.
+LIB = {ONE: "Movies/Test Movie One (2001)/Test.Movie.One.2001.1080p.WEB-GRP.mkv",
+       TWO: "Movies/Test Movie Two (2002)/Test.Movie.Two.2002.1080p.WEB-GRP.mkv"}
 PLEX_UP = os.path.join(S.HERE, "plex_up.sh")
 
 
@@ -84,7 +87,7 @@ def fake_transcoder(stack):
 def test_plex_transcoder_jobs(stack, media):
     """Plex's preview, marker and loudness jobs read through the remote and never
     promote; the same binary writing a stream (any other muxer) is a player."""
-    f = stack.add("m", ONE, src=media[ONE])
+    f = stack.add("m", LIB[ONE], src=media[ONE])
     offloaded(stack, f)
     lib = f["disk"]
     tx = fake_transcoder(stack)
@@ -160,7 +163,8 @@ def by_file(px):
 @needs_plex
 def test_real_plex(stack, media, real_plex):
     px = real_plex
-    fs = [stack.add("one", ONE, src=media[ONE]), stack.add("two", TWO, src=media[TWO])]
+    fs = [stack.add("one", LIB[ONE], src=media[ONE]),
+          stack.add("two", LIB[TWO], src=media[TWO])]
 
     # 1. Plex knows the files while they are whole.
     px.create_standard(os.path.join(px.lib, "Movies"), os.path.join(px.lib, "TV"))
