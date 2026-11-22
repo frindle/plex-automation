@@ -322,17 +322,22 @@ class Stack:
 
     def add(self, key, rel, *, section="Movies", kind="movie", size=48 * MIB, disk=0,
             show=None, season=None, episode=None, alt=True, added=None, resolution="1080",
-            in_arr=True, in_remote=True):
+            in_arr=True, in_remote=True, src=None):
         """One library file with every stand-in told about it. `rel` is the path under
-        Media/. `alt` adds a second, different upload (the restore path)."""
+        Media/. `alt` adds a second, different upload (the restore path). `src` copies a
+        real media file instead of writing `size` random bytes."""
         disk_path = os.path.join(self.disks[disk], "Media", rel)
         os.makedirs(os.path.dirname(disk_path), exist_ok=True)
-        with open(disk_path, "wb") as fh:
-            left = size
-            while left:
-                b = os.urandom(min(MIB, left))
-                fh.write(b)
-                left -= len(b)
+        if src:
+            shutil.copyfile(src, disk_path)
+            size = os.path.getsize(disk_path)
+        else:
+            with open(disk_path, "wb") as fh:
+                left = size
+                while left:
+                    b = os.urandom(min(MIB, left))
+                    fh.write(b)
+                    left -= len(b)
         old = time.time() - 400 * 86400
         os.utime(disk_path, (old, old))
         release = os.path.splitext(os.path.basename(rel))[0]
