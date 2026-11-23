@@ -7273,6 +7273,7 @@ def delete_paths():
 
     lib_root = os.path.realpath(MOVIES_LIBRARY)
     results = {'deleted': [], 'skipped': [], 'errors': []}
+    playing = stream_guard() if apply_ else (lambda _p: False)
     for p in paths:
         real = os.path.realpath(p)
         if not real.startswith(lib_root + os.sep) and real != lib_root:
@@ -7283,6 +7284,9 @@ def delete_paths():
             continue
         if not apply_:
             results['deleted'].append({'path': p, 'action': 'would delete'})
+            continue
+        if playing(real):
+            results['skipped'].append({'path': p, 'reason': 'playing now (or Plex unreadable); try again later'})
             continue
         try:
             os.remove(real)
@@ -8327,6 +8331,7 @@ def plex_dupe_fix():
     if not PLEX_TOKEN:
         return jsonify({'ok': False, 'error': 'no PLEX_TOKEN'}), 400
     apply = request.args.get('apply', '').lower() in ('1', 'true', 'yes')
+    playing = None                   # stream guard, read from Plex once on the first delete
     check_state = {
         'mode': _dupe_confirm_mode(),
         'ask': apply or request.args.get('llm', '').lower() in ('1', 'true', 'yes'),
@@ -8503,6 +8508,8 @@ def plex_dupe_fix():
                                     'check by hand')
             elif keep_reason:
                 action['result'] = keep_reason
+            elif apply and (playing := playing or stream_guard())(fpath):
+                action['result'] = 'skipped: playing now; next run'
             elif apply:
                 try:
                     if not _plex_file_on_disk(keeper_file):
@@ -9936,10 +9943,14 @@ def orphan_scan():
         else:
             return jsonify({'ok': False, 'error': f'unknown mode: {mode}'}), 400
 
-    deleted = 0
+    deleted = skipped_playing = 0
     if delete:
+        playing = stream_guard()
         for cat in to_delete_buckets:
             for o in buckets[cat]:
+                if playing(o['path']):
+                    skipped_playing += 1
+                    continue
                 try:
                     os.remove(o['path'])
                     deleted += 1
@@ -9958,6 +9969,7 @@ def orphan_scan():
         'counts': {k: len(v) for k, v in buckets.items()},
         'sizes_gb': {k: _gb(v) for k, v in buckets.items()},
         'deleted': deleted,
+        'skipped_playing': skipped_playing,
         'buckets': buckets,
     }), 200
 
@@ -11816,6 +11828,9 @@ class ArrHealthIO:
     def record(self, category, summary):
         record_activity(category, summary)
 
+    def busy(self, path):
+        return stream_busy([path])
+
     def file_mtime(self, path):
         local = _relink_path(path)   # arr '/data/X' -> RELINK_DATA_ROOT/X inside this container
         if not local:
@@ -12128,7 +12143,7 @@ def glacier_tick(now=None, io=None, now_dt=None, sleep=time.sleep):
         up, why = glacier_hold.disk1_up(GLACIER_SPIN_DIR, GLACIER_WINDOW, now_dt or _glacier_now_dt())
         if doc['held'] and (up or not HOLD_DISK1_UPGRADES):
             out['release'] = dict(glacier_hold.release_pass(io, doc['held'], sleep=sleep,
-                                                            keep=lambda h, _e: watch_gate(h) is not None))
+                                                            keep=_glacier_keep))
             _glacier_checked.clear()
         elif HOLD_DISK1_UPGRADES and not up:
             prefixes = glacier_hold.load_index(GLACIER_INDEX, now, GLACIER_INDEX_MAX_AGE_DAYS)
@@ -12552,6 +12567,44 @@ def watch_gate(h, now=None):
         return None
     _watch_log('gate', {'wait_' + why: 1}, h)
     return why
+
+
+# ── Stream guard ──────────────────────────────────────────────────────────────
+# Anything that deletes or pulls a library file out from under Plex asks first. A file a viewer is on (a live
+# session, or seen in one within WATCH_HOLD_QUIET_MIN) is left alone and tried again on a later pass.
+# STREAM_GUARD=on (default) | off.
+STREAM_GUARD = (os.environ.get('STREAM_GUARD') or 'on').strip().lower() != 'off'
+
+
+def stream_guard(fail_closed=True):
+    """A predicate path -> True while a viewer is on that file, from one read of Plex's sessions. When Plex
+    cannot be read every path is busy if `fail_closed`, else none is."""
+    if not STREAM_GUARD:
+        return lambda _p: False
+    try:
+        sessions = _watch_io().sessions()
+    except Exception:  # noqa: BLE001
+        sessions = None if fail_closed else []
+    with _watch_lock:
+        seen = dict(_watch_doc.get('seen') or {})
+    now = time.time()
+    return lambda p: watch_hold.busy([p], sessions, seen, now, WATCH_CFG.quiet_s)
+
+
+def stream_busy(paths, fail_closed=True):
+    playing = stream_guard(fail_closed)
+    return any(playing(p) for p in paths or () if p)
+
+
+def _glacier_keep(h, entry):
+    """Glacier release waits while watch hold wants the download held, or while a viewer is on its stopgap
+    link (dropping the link would end their stream). Plex unreadable: release as usual."""
+    if watch_gate(h) is not None:
+        return True
+    if entry.get('link') and stream_busy([entry['link']], fail_closed=False):
+        _watch_log('guard', {'glacier_link_playing': 1}, h)
+        return True
+    return False
 
 
 def watch_on_grab(data, source, sleep=time.sleep):

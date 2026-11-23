@@ -108,6 +108,8 @@ services:
       # Invisible upgrades (README, Watch hold): no import while someone streams the item; resume points mapped
       # onto the new copy by its sound, audio/subtitle choices carried over. dry = reads and logs only.
       WATCH_HOLD: "${WATCH_HOLD:-dry}"
+      # Nothing deletes or unlinks a library file someone is playing (README, Stream guard).
+      STREAM_GUARD: "${STREAM_GUARD:-on}"
       UNRAID_OLLAMA_URL: "${UNRAID_OLLAMA_URL:-}"
       LLM_UNRAID_MODEL: "${LLM_UNRAID_MODEL:-}"
       LLM_UNRAID_KINDS: "${LLM_UNRAID_KINDS:-}"

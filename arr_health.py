@@ -358,6 +358,9 @@ def broken_files_pass(io, state, now, apply=False):
         if not rec['monitored'] and not in_deluge:
             b['outcome'] = 'left alone (not monitored)'
             continue
+        if getattr(io, 'busy', None) is not None and io.busy(path):
+            b['outcome'] = 'waiting: someone is playing it'
+            continue
         try:
             if in_deluge:
                 io.deluge_recheck(h)
