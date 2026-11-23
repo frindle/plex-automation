@@ -338,3 +338,37 @@ def test_adopting_writes_nothing_on_a_dry_run(tmp_path, arrs):
     out = run(st, [arrs(movies=[movie("/data/new.mkv")])], apply=False, tmp_path=tmp_path)
     assert out["renamed"] == 1
     assert st.rows[ID]["lib_path"] == f"{tmp_path}/lib/old.mkv"
+
+
+def test_pool_paths_swaps_the_disk_for_each_pool():
+    there = {"/mnt/cache/media/tv/e.mkv", "/mnt/nvme/tv/e.mkv"}
+    dm = [("/mnt/user/media", "/mnt/disk1/media"), ("/mnt/user/media", "/mnt/disk2/media")]
+    assert rg.pool_paths("/mnt/user/media/tv/e.mkv", dm, ["cache", "nvme"], exists=there.__contains__) \
+        == ["/mnt/cache/media/tv/e.mkv"]  # the same pool copy from both disks is one path
+    assert rg.pool_paths("/mnt/user/media/tv/e.mkv", [("/mnt/user/media", "/mnt/disk1")], ["nvme"],
+                         exists=lambda p: p == "/mnt/nvme/tv/e.mkv") == ["/mnt/nvme/tv/e.mkv"]
+    assert rg.pool_paths("/mnt/user/other/e.mkv", dm, ["cache"], exists=lambda p: True) == []
+    assert rg.pool_paths("/mnt/user/media/e.mkv", [("/mnt/user/media", "/srv/a")], ["cache"],
+                         exists=lambda p: True) == []  # a disk prefix not under /mnt gives none
+
+
+def test_pool_names_skips_disks_and_share_mounts(tmp_path):
+    for n in ("disk1", "disk12", "user", "user0", "disks", "remotes", "addons", "rootshare", "cache", "nvme"):
+        (tmp_path / n).mkdir()
+    (tmp_path / "afile").write_text("x")
+    assert rg.pool_names(env={}, mnt=str(tmp_path)) == ["cache", "nvme"]
+    assert rg.pool_names(env={"TIERING_POOLS": " fast, cache "}, mnt=str(tmp_path)) == ["fast", "cache"]
+    assert rg.pool_names(env={}, mnt=str(tmp_path / "nope")) == []
+
+
+def test_a_new_file_still_on_a_pool_is_counted_on_pool_not_missing(tmp_path, arrs):
+    mk(tmp_path, "here.mkv")
+    r = arrs(movies=[movie("/data/here.mkv"), movie("/data/new.mkv"), movie("/data/gone.mkv")])
+    st = FakeState()
+    pooled = {f"{tmp_path}/lib/new.mkv"}
+    out = run(st, [r], tmp_path=tmp_path, on_pool=pooled.__contains__)
+    assert (out["listed"], out["new"], out["on_pool"], out["missing_local"]) == (3, 1, 1, 1), out
+    assert [os.path.basename(x["lib_path"]) for x in st.rows.values()] == ["here.mkv"]
+    mk(tmp_path, "new.mkv")  # the mover put it on the array: registered on the next pass
+    out = run(st, [r], tmp_path=tmp_path, on_pool=lambda p: False)
+    assert (out["new"], out["on_pool"], out["missing_local"]) == (1, 0, 1), out

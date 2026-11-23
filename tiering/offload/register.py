@@ -6,8 +6,9 @@ For every movie file and episode file the arrs list, it upserts a row keyed on
 ``lib_path``, which is the share path ("Path namespaces" in OFFLOAD_DESIGN.md): the arr's
 path mapped through TIERING_ARR_PATH_MAP, never a disk path. Size and mtime come from
 the one existing disk candidate of that share path (``resolve``). No candidate counts as
-``missing_local`` and several as ``ambiguous``; the file is skipped and counted, never
-guessed. The result carries ``listed`` (distinct share paths the arrs listed) next to
+``on_pool`` when the file is on a pool (cache) instead, waiting for the mover (it is
+registered the night after the mover puts it on the array), else as ``missing_local``;
+several count as ``ambiguous``. The file is skipped and counted, never guessed. The result carries ``listed`` (distinct share paths the arrs listed) next to
 those counts so the caller can see trouble. An arr path that is under a
 ``TIERING_PATH_MAP`` disk prefix is rewritten to its share path with the reverse of the
 map (``/mnt/disk1/movies/m.mkv`` becomes ``/mnt/user/movies/m.mkv``) and counted as
@@ -205,6 +206,47 @@ def default_resolver(env=None):
     return lambda p: paths.disk_paths(p, pairs)
 
 
+_NOT_POOLS = ("user", "user0", "disks", "remotes", "addons", "rootshare")
+
+
+def pool_names(env=None, mnt: str = "/mnt") -> list[str]:
+    """The pools (cache drives) to look on: TIERING_POOLS (a comma list of names) when set,
+    else every ``/mnt/<x>`` directory that is not a disk, a user share mount, ``disks``,
+    ``remotes``, ``addons`` or ``rootshare``."""
+    e = os.environ if env is None else env
+    spec = (e.get("TIERING_POOLS") or "").strip()
+    if spec:
+        return _split(spec)
+    try:
+        names = os.listdir(mnt)
+    except OSError:
+        return []
+    return sorted(n for n in names if not n.startswith("disk") and n not in _NOT_POOLS
+                  and os.path.isdir(os.path.join(mnt, n)))
+
+
+def pool_paths(share_path: str, disk_map: list[tuple[str, str]], pools: list[str],
+               exists=os.path.lexists) -> list[str]:
+    """The existing pool copies of a share path: each disk path ``disk_map`` gives for it,
+    with ``/mnt/<disk>`` swapped for ``/mnt/<pool>``. A disk prefix not under ``/mnt/<x>``
+    gives none."""
+    norm = os.path.normpath(share_path)
+    out: list[str] = []
+    for share, disk in disk_map:
+        if not _under(norm, share):
+            continue
+        parts = disk.split("/")  # "", "mnt", "<disk>", <inner>...
+        if len(parts) < 3 or parts[0] or parts[1] != "mnt" or not parts[2]:
+            continue
+        inner = "/".join(parts[3:])
+        rest = norm if share == "/" else norm[len(share.rstrip("/")):]
+        for pool in pools:
+            cand = os.path.normpath(f"/mnt/{pool}/{inner}/{rest}")
+            if cand not in out and exists(cand):
+                out.append(cand)
+    return out
+
+
 def _split(raw: str | None) -> list[str]:
     return [x.strip() for x in (raw or "").split(",") if x.strip()]
 
@@ -330,7 +372,7 @@ def _adopt_renamed(state, db, apply, local, cand, resolve, mount, out) -> bool:
 
 
 def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map=None,
-             resolve=None, stat=os.stat, new_id=None, disk_map=None) -> dict:
+             resolve=None, stat=os.stat, new_id=None, disk_map=None, on_pool=None) -> dict:
     """Sync rows from the arrs. Returns counts; with ``apply=False`` nothing is written.
 
     ``arr_map`` is ``arr=share,...`` text or a list of pairs (default: TIERING_ARR_PATH_MAP).
@@ -338,7 +380,8 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
     ``disk_map`` is the ``(share, disk)`` pairs (default: TIERING_PATH_MAP). An arr path under
     a disk prefix is rewritten to its share path and counted as ``disk_path_mapped``; one that
     no entry can turn into a share path is skipped and counted as ``disk_path``.
-    ``lib_path`` is never a disk path.
+    ``lib_path`` is never a disk path. ``on_pool(share_path)`` says whether a file with no
+    disk copy is on a pool (default: ``pool_paths`` over ``pool_names()``).
     """
     if state is None:
         from . import state as _state
@@ -353,8 +396,11 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
     if disk_map is None:
         disk_map = _disk_map()
     new_id = new_id or (lambda: secrets.token_hex(8))
+    if on_pool is None:
+        pools = pool_names()
+        on_pool = lambda p: bool(pools) and bool(pool_paths(p, disk_map, pools))  # noqa: E731
     out = {"new": 0, "updated": 0, "unchanged": 0, "skipped_state": 0, "listed": 0,
-           "missing_local": 0, "ambiguous": 0, "disk_path": 0,
+           "missing_local": 0, "on_pool": 0, "ambiguous": 0, "disk_path": 0,
            "disk_path_mapped": 0, "unlisted": 0, "errors": 0, "renamed": 0,
            "renamed_skipped": 0,
            "applied": bool(apply)}
@@ -386,6 +432,9 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
             listed.add(local)
             out["listed"] += 1
             cands = list(resolve(local))
+            if not cands and on_pool(local):
+                out["on_pool"] += 1  # new, the mover has not put it on the array yet
+                continue
             if len(cands) != 1:
                 out["missing_local" if not cands else "ambiguous"] += 1
                 log.warning("register: %d disk paths for a listed file, skipped", len(cands))
