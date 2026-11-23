@@ -213,8 +213,10 @@ def test_ready_caps():
     cfg = wh.Cfg('on', max_hours=48)
     old = entry_with(snap={'kid': KID}, done_at=NOW - 49 * 3600)
     assert wh.ready(old, {}, [], NOW, cfg) == (True, 'max_hours')
-    assert wh.ready(old, {}, PAUSED, NOW, cfg) == (True, 'max_hours')
+    assert wh.ready(old, {}, PAUSED, NOW, cfg) == (False, 'recent')    # never under a paused stream either
     assert wh.ready(old, {}, PLAYING, NOW, cfg) == (False, 'playing')  # never under a playing stream
+    assert wh.ready(old, {'rk:100': NOW - 300}, [], NOW, cfg) == (False, 'recent')   # stopped 5 min ago
+    assert wh.ready(old, {'rk:100': NOW - 700}, [], NOW, cfg) == (True, 'max_hours')
     stuck = entry_with(snap={'kid': KID}, done_at=None, since=NOW - 10 * 86400)
     assert wh.ready(stuck, {}, [], NOW, cfg) == (True, 'max_hours')    # never seen finished: a longer cap
     stale = dict(KID, viewed_at=NOW - 60 * 86400)
