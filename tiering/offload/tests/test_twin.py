@@ -14,7 +14,6 @@ from tiering.offload import state as st
 from tiering.offload.tests.test_ops import ID, MIB, Env, FakeReader
 from tiering.offload.tests.test_qualify import REL, World
 from tiering.offload.tests.test_weekly import Env as WeeklyEnv
-from tiering.offload.tests.test_weekly import ids_for
 
 PRIMARY, TWIN = "/r/Movie.mkv", "/r2/Movie.mkv"
 CS = 4 * MIB
