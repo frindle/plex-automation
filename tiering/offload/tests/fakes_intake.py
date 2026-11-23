@@ -386,7 +386,7 @@ def self_signed_cert(tmp_path):
 COLUMNS = (
     "id", "lib_path", "stub_path", "remote_path", "size", "mtime_ns", "sha256", "head_len",
     "tail_len", "head_b3", "tail_b3", "nzb_path", "nzb_path2", "twin_nzb_path",
-    "twin_remote_path", "title", "year", "imdb_id",
+    "twin_remote_path", "play_ms", "title", "year", "imdb_id",
     "tvdb_id", "season", "episode", "release_name", "rating_key", "kind", "is4k", "state",
     "step", "restore_score", "restore_note", "last_check_ts", "last_stat_ok_ts", "last_ok_ts",
     "created_ts", "updated_ts")

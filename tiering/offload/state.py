@@ -11,7 +11,7 @@ STATES = ("whole", "offloading", "offloaded", "promoting", "failed", "never")
 COLUMNS = (
     "id", "lib_path", "stub_path", "remote_path",
     "size", "mtime_ns", "sha256", "head_len", "tail_len", "head_b3", "tail_b3",
-    "nzb_path", "nzb_path2", "twin_nzb_path", "twin_remote_path",
+    "nzb_path", "nzb_path2", "twin_nzb_path", "twin_remote_path", "play_ms",
     "title", "year", "imdb_id", "tvdb_id", "season", "episode", "release_name",
     "dev", "ino",
     "rating_key", "kind", "is4k",
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS files (
     nzb_path2 TEXT,
     twin_nzb_path TEXT,
     twin_remote_path TEXT,
+    play_ms INTEGER,
     title TEXT,
     year INTEGER,
     imdb_id TEXT,
@@ -104,10 +105,11 @@ def _migrate(db) -> None:
         try:
             info = {r[1]: (r[2] or "").upper() for r in db.execute("PRAGMA table_info(files)")}
             ctype = {"year": "INTEGER", "season": "INTEGER", "episode": "INTEGER",
-                     "dev": "INTEGER", "ino": "INTEGER", "last_stat_ok_ts": "REAL"}
+                     "dev": "INTEGER", "ino": "INTEGER", "last_stat_ok_ts": "REAL",
+                     "play_ms": "INTEGER"}
             for c in ("title", "year", "imdb_id", "tvdb_id", "season", "episode",
                       "release_name", "dev", "ino", "last_stat_ok_ts",
-                      "twin_nzb_path", "twin_remote_path"):
+                      "twin_nzb_path", "twin_remote_path", "play_ms"):
                 if c not in info:  # databases created before these columns existed
                     db.execute(f"ALTER TABLE files ADD COLUMN {c} {ctype.get(c, 'TEXT')}")
                     info[c] = ctype.get(c, "TEXT")

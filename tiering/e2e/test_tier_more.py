@@ -22,19 +22,23 @@ def test_a_fifth_of_the_file_stays_local_at_the_front(stack):
 
 
 def test_head_holds_twenty_minutes_of_play(stack):
-    """The head holds at least 20 minutes of play, by Plex's play time: a 45-minute
-    file keeps 20/45 of itself; a 22-minute one, or one Plex has no play time for,
-    stays whole."""
+    """The head holds at least 20 minutes of play, by Plex's play time, else the one the
+    arr measured from the file: a 45-minute file keeps 20/45 of itself, a 50-minute one
+    Plex has no time for keeps 20/50. Under 30 minutes (a half-hour show), or with no
+    play time from either, a file stays whole."""
     mid = stack.add("mid", MOVIES[1], size=90 * S.MIB, minutes=45)
-    short = stack.add("short", MOVIES[2], size=60 * S.MIB, minutes=22)
+    short = stack.add("short", MOVIES[2], size=60 * S.MIB, minutes=25, arr_minutes=60)
     unknown = stack.add("unknown", MOVIES[3], size=60 * S.MIB, minutes=None)
+    by_arr = stack.add("by_arr", MOVIES[0], size=100 * S.MIB, minutes=None, arr_minutes=50)
     stack.start()
-    stack.wait_state(mid, "offloaded", timeout=120)
-    row = stack.row(mid)
-    want = -(-mid["size"] * 20 // 45)
-    assert want <= row["head_len"] < want + S.CHUNK, (row["head_len"], want)
+    stack.wait_state([mid, by_arr], "offloaded", timeout=120)
+    for f, of in ((mid, 45), (by_arr, 50)):
+        want = -(-f["size"] * 20 // of)
+        assert want <= stack.row(f)["head_len"] < want + S.CHUNK, (f["key"], want)
     S.wait_until(lambda: "demotes skipped by the head rule" in stack.log(), 60,
                  what="the head rule to skip the short and the unknown file")
+    log = stack.log()
+    assert "under 30 minutes of play 1" in log and "no play time from Plex or the arr" in log
     assert stack.state_of(short) == "whole" and stack.state_of(unknown) == "whole"
     assert not os.path.islink(short["disk"]) and not os.path.islink(unknown["disk"])
     stack.assert_intact()

@@ -9,7 +9,8 @@ come from environment variables or a config file that is not committed.
 ## Goal
 
 The library keeps every file at its path, size and mtime. A file that is
-offloaded keeps its first 20 minutes of play (at least 20% of the file) and its last 32 MB on local disk. The middle is
+offloaded keeps its first 20 minutes of play (at least 20% of the file) and its last 32 MB on local disk; a file under
+30 minutes of play is never offloaded. The middle is
 read from Usenet through AltMount's WebDAV. Plex is not told anything changed.
 
 ## Rules for what stays whole
@@ -54,10 +55,11 @@ These names apply to each library file system.
   - The stub root is per disk (`${stub_root}` on the same disk as `L`). `TIERFS_STUB_ROOTS` lists them (comma list). tierfs skips a manifest unless `stub_path` is exactly `<one of those roots>/<id><ext>`, and opens it with `O_NOFOLLOW`, then requires a regular file of the manifest's size.
   - Anything else that moves library files between disks (for example a glacier mover) must skip a symlink that points into `${TIERFS_MOUNT}`.
 - `<id>` is 16 lowercase hex characters. It is random, assigned once, and never reused.
-- `head_len` is `ceil(size * head_frac)`. The runner sets `head_frac` per file so the head holds at least `TIERING_HEAD_MIN_S` (default 1200, 20 minutes) of play: `head_frac = max(0.20, TIERING_HEAD_MIN_S * 1000 / duration_ms)`, with the play time from Plex (the part's `duration`, else the media's, else the item's).
-  - A file Plex gives no play time for is not offloaded ("no play time from Plex").
+- `head_len` is `ceil(size * head_frac)`. The runner sets `head_frac` per file so the head holds at least `TIERING_HEAD_MIN_S` (default 1200, 20 minutes) of play: `head_frac = max(0.20, TIERING_HEAD_MIN_S * 1000 / duration_ms)`, with the play time from Plex (the part's `duration`, else the media's, else the item's), else `play_ms`, the play time Radarr or Sonarr measured from the file (`mediaInfo.runTime`). A show's listed slot length is never used: it runs longer than the file and would shrink the head.
+  - A file neither gives a play time for is not offloaded ("no play time from Plex or the arr").
+  - A file under `TIERING_MIN_PLAY_S` (default 1800, 30 minutes) of play is not offloaded ("under 30 minutes of play"): a half-hour show stays whole.
   - A file whose `head_frac` would pass 0.80 is not offloaded ("too short for a 20-minute head"): it would save too little.
-  - Examples: a 2-hour film keeps 20%, a 45-minute episode about 44%; a 22-minute episode stays whole.
+  - Examples: a 2-hour film keeps 20%, a 45-minute episode about 44%; a 22- or 29-minute episode stays whole.
   - The layout is chosen only on a fresh demote. A resumed demote keeps the `head_len` in its manifest.
   - It is rounded up to a 1 MiB boundary.
   - `tail_len` is 32 MiB plus `size mod 1 MiB`, so the middle starts and ends on 1 MiB boundaries. Page-rounded tail reads then never reach into the middle.
@@ -171,6 +173,7 @@ The `files` table has these columns:
   - `nzb_path2`: the archived NZB of the restore-path release, which is a different release at or above the quality floor. It may be empty when the restore path is only known from a search.
   - `twin_nzb_path`, `twin_remote_path`: the twin, a second upload of the very same bytes (see Qualify), and where AltMount serves it. A promote reads it when the first copy fails. Both are empty when there is none.
 - media identity, filled from the arr when the row is created and used by qualify and weekly to search: `title`, `year`, `imdb_id`, `tvdb_id`, `season`, `episode`, `release_name`;
+- `play_ms`: the play time the arr measured from the file (`mediaInfo.runTime`), used for the head when Plex has none. Empty until the arr has scanned the file;
 - Plex facts: `rating_key`, `kind` (movie or episode), `is4k`;
 - state: `state`, `step` (the last finished step of an offload or promote, so a crash can resume), `restore_score`, `restore_note`;
 - timestamps:
@@ -202,7 +205,7 @@ Offload step 3 hashes `L` again in the read that builds the chunk list. If that 
 
 - `register(db, apply)` runs once a night before the demote window, and the runner calls it.
 - It reads every movie file and episode file from Radarr and Sonarr through their APIs (`RADARR_URL`, `SONARR_URL`, keys from env; more than one Sonarr is a comma list).
-- For each file it upserts a row by `lib_path`. A new row gets a fresh `<id>`, `state=whole`, `size`, `mtime_ns` and the media identity: `title`, `year`, `imdb_id`, `tvdb_id`, `season`, `episode`, and `release_name` (the arr's scene name, else the file name). `sha256` stays empty until qualify fills it.
+- For each file it upserts a row by `lib_path`. A new row gets a fresh `<id>`, `state=whole`, `size`, `mtime_ns` and the media identity: `title`, `year`, `imdb_id`, `tvdb_id`, `season`, `episode`, and `release_name` (the arr's scene name, else the file name), and `play_ms` from the arr's `mediaInfo.runTime`. A later arr answer with a run time refreshes `play_ms`; a changed file takes the new file's or none. `sha256` stays empty until qualify fills it.
 - An existing row only gets its identity fields refreshed while `state=whole`. When the arr's size or mtime differs from a `whole` row's, it updates them and clears `sha256`, `nzb_path`, `nzb_path2`, `restore_score`, `restore_note`, `remote_path` and the head/tail facts.
 - A path that is a symlink into the tierfs mount (`<id><ext>`, with the path's own extension) of a row that lists another path is that row's file after an arr rename. The row's `lib_path` is changed to the new path, so the file can still be promoted, and no new row is made (result count `renamed`). It is refused (`renamed_skipped`, nothing changes) unless the row is `offloaded` or `failed` and its old path no longer holds a link to the same entry (two links mean a copy, not a rename).
 - It never deletes a row. A path the arrs no longer list is logged.

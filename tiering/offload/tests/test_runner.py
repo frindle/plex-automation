@@ -439,17 +439,23 @@ def test_head_is_twenty_minutes_of_play_or_twenty_percent(tmp_path, monkeypatch,
     w.runner.deps = dataclasses.replace(w.runner.deps, demote=demote)
     w.row("long", 1, _timed_movie(w, 1, 150), "whole")  # 20 min is 13 %: the 20 % floor
     w.row("mid", 2, _timed_movie(w, 2, 45), "whole")  # 20 min is 44 %
-    w.row("short", 3, _timed_movie(w, 3, 22), "whole")  # 20 min is 91 %: not worth it
-    w.row("unknown", 4, _timed_movie(w, 4, 0), "whole")  # Plex has no play time
+    w.row("short", 3, _timed_movie(w, 3, 22), "whole")  # a half-hour show: stays whole
+    w.row("unknown", 4, _timed_movie(w, 4, 0), "whole")  # no play time from anyone
+    w.row("arr", 5, _timed_movie(w, 5, 0), "whole")  # Plex has none, the arr measured 60 min
+    w.state.rows["arr"]["play_ms"] = 60 * 60 * 1000
+    w.row("both", 6, _timed_movie(w, 6, 25), "whole")  # Plex's 25 min wins over the arr's
+    w.state.rows["both"]["play_ms"] = 60 * 60 * 1000
     with caplog.at_level(logging.INFO, logger="tiering.runner"):
         w.run()
     assert heads["long"] == pytest.approx(0.20)
     assert heads["mid"] == pytest.approx(20 / 45)
-    assert "short" not in heads and "unknown" not in heads
-    assert ("demotes skipped by the head rule: no play time from Plex (the head is sized by it) 1, "
-            "too short for a 20-minute head 1") in caplog.text
+    assert heads["arr"] == pytest.approx(20 / 60)
+    assert not {"short", "unknown", "both"} & set(heads)
+    assert ("demotes skipped by the head rule: no play time from Plex or the arr (the head is "
+            "sized by it) 1, under 30 minutes of play 2") in caplog.text
     assert "demote short skipped" not in caplog.text, "one line a pass, not one per file"
-    assert w.ops("qualify") == ["long", "mid"], "a file that cannot be offloaded is not qualified"
+    assert w.ops("qualify") == ["long", "mid", "arr"], \
+        "a file that cannot be offloaded is not qualified"
 
 
 def test_head_minutes_follow_the_setting(tmp_path, monkeypatch):
@@ -460,11 +466,26 @@ def test_head_minutes_follow_the_setting(tmp_path, monkeypatch):
         heads[row["id"]] = head_frac
         return Res(True, "offloaded")
     w.runner.deps = dataclasses.replace(w.runner.deps, demote=demote)
-    w.row("ep", 1, _timed_movie(w, 1, 22), "whole")
+    w.row("ep", 1, _timed_movie(w, 1, 45), "whole")
     w.run()
-    assert heads["ep"] == pytest.approx(10 / 22)
+    assert heads["ep"] == pytest.approx(10 / 45)
     assert Config.from_env({"TIERING_DB": "/x", "TIERING_HEAD_MIN_S": "900"}).head_min_s == 900.0
     assert Config.from_env({"TIERING_DB": "/x"}).head_min_s == 1200.0
+    assert Config.from_env({"TIERING_DB": "/x"}).min_play_s == 1800.0
+    assert Config.from_env({"TIERING_DB": "/x", "TIERING_MIN_PLAY_S": "1500"}).min_play_s == 1500.0
+
+
+def test_min_play_follows_the_setting(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, min_play_s=1200.0)
+    heads = {}
+
+    def demote(db, row, apply, head_frac=None):
+        heads[row["id"]] = head_frac
+        return Res(True, "offloaded")
+    w.runner.deps = dataclasses.replace(w.runner.deps, demote=demote)
+    w.row("ep", 1, _timed_movie(w, 1, 26), "whole")
+    w.run()
+    assert heads["ep"] == pytest.approx(20 / 26)
 
 
 # ---------------------------------------------------------------- failures
