@@ -33,8 +33,11 @@ candidate that shares message-ids with ``nzb_path``, or with a dead ``nzb_path2`
 never counted, whatever its name), STATs the candidate on every provider before it
 counts, and stores it in ``nzb_path2``. If nothing new and live is found the loss is
 flagged (an alert and a promote), ``nzb_path2`` is cleared, and the row is never
-reported OK. A spent budget, a dropped indexer, a failed grab or a provider that cannot
-be asked makes the row "unchecked", never "no restore path".
+reported OK. The row's twin (``twin_nzb_path``, the same bytes on a second upload that a
+promote reads when the first copy fails) is STATed the same way and dropped, with a
+``twin_lost`` event, once an article of it is gone. A spent budget, a dropped indexer,
+a failed grab or a provider that cannot be asked makes the row "unchecked", never "no
+restore path".
 
 Monthly (the first 7 days, or ``monthly=True``) it reads a rotating 5% of the
 offloaded bytes in full through WebDAV and compares the SHA-256. Rows are picked
@@ -228,6 +231,15 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                 raise_alert(row, f"{att['stat_net']} STAT checks in a row failed")
         if not write(r, **upd):
             continue
+
+        # the twin (the same bytes on a second upload, read by a promote when the first
+        # copy fails): STATed like the restore NZB, dropped once an article is gone
+        tw = row.get("twin_nzb_path")
+        if tw and (stat_restore(tw) if os.path.exists(tw) else "missing") == "missing":
+            if not write(r, twin_nzb_path=None, twin_remote_path=None):
+                continue
+            state.log_event(db, rid, "twin_lost", {})
+            r["twin_lost"] = True
         last_ok = row.get("last_stat_ok_ts")
         if not all_found and (last_ok is None or now - float(last_ok) > STALE_DAYS * 86400):
             raise_alert(row, f"no complete STAT check in over {STALE_DAYS} days")
@@ -366,18 +378,20 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
             ok += 1
 
     lost = sum(1 for r in res.values() if r["lost"])
+    twins_lost = sum(1 for r in res.values() if r.get("twin_lost"))
+    twins = sum(1 for r in rows if r.get("twin_nzb_path")) - twins_lost
     failed_state = state.list_files(db, "failed")
     _write_report(report_path, now=now, rows=rows, checked=checked, ok=ok,
                   flagged=flagged, failed=failed_rows, unchecked=unchecked_rows,
                   reasons=reasons, dead=dead, promote=promote, lost=lost,
-                  monthly=monthly, full=full, ran_full=ran_full, moved=moved,
-                  hash_failed=hash_failed, alerts=alerts, failed_state=failed_state)
+                  twins=twins, twins_lost=twins_lost, monthly=monthly, full=full,
+                  ran_full=ran_full, moved=moved, hash_failed=hash_failed, alerts=alerts, failed_state=failed_state)
     return promote
 
 
 def _write_report(path, *, now, rows, checked, ok, flagged, failed, unchecked, reasons,
                   dead, promote, lost, monthly, full, ran_full, moved, hash_failed,
-                  alerts, failed_state):
+                  alerts, failed_state, twins=0, twins_lost=0):
     total_bytes = sum(int(r.get("size") or 0) for r in rows)
     day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
     L = [f"# Offload weekly check, {day}", ""]
@@ -391,7 +405,9 @@ def _write_report(path, *, now, rows, checked, ok, flagged, failed, unchecked, r
           f"Files marked failed this run: {hash_failed}.",
           f"Files changed by the runner during the run: {moved}.",
           f"Promotions requested: {len(promote)}.",
-          f"Restore paths lost: {lost}.", ""]
+          f"Restore paths lost: {lost}.",
+          f"Files with a twin (a second upload of the same bytes): {twins}; "
+          f"twins lost this run: {twins_lost}.", ""]
     if ran_full:
         L += [f"Full read check: {full['files']} files, {_human(full['bytes'])}, "
               f"{full['mismatch']} mismatches.", ""]

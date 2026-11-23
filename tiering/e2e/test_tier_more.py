@@ -74,3 +74,42 @@ def test_four_files_read_at_once(stack):
     assert got == {f["key"]: f["sha256"] for f in fs}
     stack.wait_state(fs, "whole", timeout=60)
     assert stack.leftovers() == []
+
+
+# ------------------------------------------------------------------ the twin
+
+def twin_offloaded(stack, **over):
+    """One file with a twin, offloaded. Returns the file, its row, and the local path of
+    the copy the row reads first."""
+    f = stack.add("m", MOVIES[0], twin=True)
+    stack.start(**over)
+    stack.wait_state(f, "offloaded", timeout=120)
+    row = stack.row(f)
+    assert row["twin_remote_path"] and row["twin_nzb_path"], "qualify kept no twin"
+    assert row["twin_remote_path"] != row["remote_path"]
+    assert row["twin_nzb_path"] != row["nzb_path"]
+    return f, row, row["remote_path"].lstrip("/")
+
+
+def test_the_upload_is_gone_and_the_twin_serves_the_player(stack):
+    """The first copy is gone (every read a 404). The player still gets every byte, and
+    the file comes back whole from the twin, inside the retry time of one copy."""
+    f, row, first = twin_offloaded(stack, TIERING_PROMOTE_SWITCH_S=1)
+    os.rename(os.path.join(stack.remote, first), os.path.join(stack.remote, first) + ".gone")
+    assert stack.player_read(f, timeout=60) == f["sha256"]
+    stack.wait_state(f, "whole", timeout=60)
+    assert not os.path.islink(f["disk"])
+    stack.assert_intact()
+    assert stack.leftovers() == []
+
+
+def test_bad_bytes_on_the_upload_come_from_the_twin(stack):
+    """Scenario 4 with a twin: one chunk of the first copy is zeros. That chunk is read
+    from the twin, and the file ends whole instead of failed."""
+    f, row, first = twin_offloaded(stack)
+    bad = row["head_len"] + S.CHUNK
+    stack.zero(f, bad, bad + S.CHUNK, rel=first)
+    assert stack.player_read(f, timeout=60) == f["sha256"]
+    stack.wait_state(f, "whole", timeout=60)
+    stack.assert_intact()
+    assert not any(a.get("kind") in ("promote_failed", "bad_chunk") for a in stack.alerts())
