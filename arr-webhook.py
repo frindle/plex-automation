@@ -28,6 +28,7 @@ import arr_health
 import deluge_trim
 import stuck_plan
 import glacier_hold
+import watch_hold
 import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -1065,7 +1066,7 @@ def _ensure_deluge_label(label):
             log.warning(f'ensure_label({label}) failed: {e}')
 
 def set_torrent_label(torrent_hash, label):
-    if _glacier_label_guard(torrent_hash, label):
+    if _glacier_label_guard(torrent_hash, label) or _watch_label_guard(torrent_hash, label):
         return
     _ensure_deluge_label(label)
     resp = session.post(
@@ -3551,8 +3552,8 @@ def cleanup_stalled_seeds(dry_run=False):
         for h, info in torrents.items():
             if not (info.get('label') or '').strip():
                 continue  # unlabeled/unmanaged torrent -- not ours to touch
-            if (info.get('label') or '') == GLACIER_HOLD_LABEL:
-                continue  # waiting on disk1; the hold pass puts it back
+            if (info.get('label') or '') in (GLACIER_HOLD_LABEL, WATCH_HOLD_LABEL):
+                continue  # waiting on disk1 or a viewer; the hold pass puts it back
             if info.get('state') in ('Queued', 'Downloading', 'Checking', 'Allocating'):
                 continue
             uploaded = info.get('total_uploaded', 0)
@@ -6246,7 +6247,7 @@ def verify_and_fix_labels(services=('radarr', 'sonarr')):
         torrents = get_all_torrents(force=True)
         if not torrents:
             return fixed
-        held = _glacier_held_hashes()      # a download held for disk1 keeps its hold label
+        held = _glacier_held_hashes() | _watch_held_hashes()   # a held download keeps its hold label
         torrents = {h: t for h, t in torrents.items() if h not in held}
 
         if 'radarr' in services:
@@ -6719,11 +6720,13 @@ def radarr_webhook():
     log.info(f'Radarr event: {event} | isUpgrade: {data.get("isUpgrade")} | downloadId: {data.get("downloadId")}')
     if event == 'Grab':
         threading.Thread(target=glacier_on_grab, args=(data, 'Radarr'), daemon=True).start()
+        threading.Thread(target=watch_on_grab, args=(data, 'Radarr'), daemon=True).start()
         threading.Thread(target=handle_grab, args=(data, 'Radarr'), daemon=True).start()
         threading.Thread(target=refresh_metadata_on_grab, args=(data, 'Radarr'), daemon=True).start()
     elif event == 'Download':
         if data.get('isUpgrade'):
             threading.Thread(target=handle_upgrade_import, args=(data, 'Radarr'), daemon=True).start()
+            threading.Thread(target=watch_on_import, args=(data, 'Radarr'), daemon=True).start()
         else:
             # Gap-fill imports arrive with isUpgrade=false but may wear an
             # -upgrade label from the grab throttle — flip it back.
@@ -6805,6 +6808,7 @@ def sonarr_webhook():
     log.info(f'Sonarr event: {event} | isUpgrade: {data.get("isUpgrade")} | downloadId: {data.get("downloadId")}')
     if event == 'Grab':
         threading.Thread(target=glacier_on_grab, args=(data, 'Sonarr'), daemon=True).start()
+        threading.Thread(target=watch_on_grab, args=(data, 'Sonarr'), daemon=True).start()
         threading.Thread(target=handle_grab, args=(data, 'Sonarr'), daemon=True).start()
         threading.Thread(target=refresh_metadata_on_grab, args=(data, 'Sonarr'), daemon=True).start()
     elif event == 'SeriesAdd':
@@ -6813,6 +6817,7 @@ def sonarr_webhook():
     elif event == 'Download':
         if data.get('isUpgrade'):
             threading.Thread(target=handle_upgrade_import, args=(data, 'Sonarr'), daemon=True).start()
+            threading.Thread(target=watch_on_import, args=(data, 'Sonarr'), daemon=True).start()
         else:
             # Gap-fill imports arrive with isUpgrade=false but may wear an
             # -upgrade label from the grab throttle — flip it back.
@@ -7029,7 +7034,7 @@ def purge_non_radarr():
         s.strip().lower() for s in
         request.args.get('keep', 'radarr,radarr-upgrade,superseded').split(',')
         if s.strip()
-    } | {GLACIER_HOLD_LABEL}
+    } | {GLACIER_HOLD_LABEL, WATCH_HOLD_LABEL}
     # A torrent is treated as "broken" when its progress is below this
     # threshold. Default 100 (anything not fully downloaded). Pass
     # ?broken_below=1 to only sweep the truly-never-started zeros while
@@ -7431,7 +7436,8 @@ def _auto_rescue(service, dry_run=False):
         return {'ok': False, 'error': f'deluge fetch failed: {e}'}
     stuck = []
     triggered = []
-    skipped_reasons = {'not_labeled': 0, 'not_complete': 0, 'no_grab': 0, 'already_imported': 0, 'max_attempts': 0, 'library': 0}
+    skipped_reasons = {'not_labeled': 0, 'not_complete': 0, 'no_grab': 0, 'already_imported': 0, 'max_attempts': 0, 'library': 0,
+                       'watch_hold': 0}
     active_hashes = set()
     for h, info in torrents.items():
         if (info.get('label') or '').lower() not in labels:
@@ -7495,6 +7501,9 @@ def _auto_rescue(service, dry_run=False):
             _rescue_gave_up.discard(h)
             continue
         active_hashes.add(h)
+        if not dry_run and watch_gate(h):
+            skipped_reasons['watch_hold'] += 1   # someone is watching the old copy, or it is being mapped
+            continue
         attempts = _rescue_attempts.get(h, 0)
         if attempts >= AUTO_RESCUE_MAX_ATTEMPTS:
             skipped_reasons['max_attempts'] += 1
@@ -12118,7 +12127,8 @@ def glacier_tick(now=None, io=None, now_dt=None, sleep=time.sleep):
         io.doc = doc
         up, why = glacier_hold.disk1_up(GLACIER_SPIN_DIR, GLACIER_WINDOW, now_dt or _glacier_now_dt())
         if doc['held'] and (up or not HOLD_DISK1_UPGRADES):
-            out['release'] = dict(glacier_hold.release_pass(io, doc['held'], sleep=sleep))
+            out['release'] = dict(glacier_hold.release_pass(io, doc['held'], sleep=sleep,
+                                                            keep=lambda h, _e: watch_gate(h) is not None))
             _glacier_checked.clear()
         elif HOLD_DISK1_UPGRADES and not up:
             prefixes = glacier_hold.load_index(GLACIER_INDEX, now, GLACIER_INDEX_MAX_AGE_DAYS)
@@ -12197,6 +12207,427 @@ def glacier_scheduler():
         except Exception as e:  # noqa: BLE001
             log.error(f'[glacier] tick failed: {type(e).__name__}')
         time.sleep(GLACIER_POLL_S)
+
+
+# ── Watch hold: invisible upgrades (see watch_hold.py) ───────────────────────
+# WATCH_HOLD=off|dry|on (default dry: reads and logs only). Logs carry counts and infohashes only.
+WATCH_CFG = watch_hold.Cfg(mode=os.environ.get('WATCH_HOLD', watch_hold.DEFAULT_MODE),
+                           quiet_min=os.environ.get('WATCH_HOLD_QUIET_MIN', watch_hold.QUIET_MIN),
+                           stale_days=os.environ.get('WATCH_HOLD_STALE_DAYS', watch_hold.STALE_DAYS),
+                           max_hours=os.environ.get('WATCH_HOLD_MAX_HOURS', watch_hold.MAX_HOURS),
+                           at_pct=os.environ.get('WATCH_HOLD_AT_PCT', watch_hold.AT_PCT))
+WATCH_HOLD_LABEL = watch_hold.HOLD_LABEL
+WATCH_STATE = os.environ.get('WATCH_HOLD_STATE', '/data/watch_hold_state.json')
+WATCH_POLL_S = float(os.environ.get('WATCH_HOLD_POLL_S', '15'))
+WATCH_DISCOVER_EVERY = max(int(os.environ.get('WATCH_HOLD_DISCOVER_EVERY', '4')), 1)   # passes between queue reads
+WATCH_FIND_NEW_S = float(os.environ.get('WATCH_HOLD_FIND_NEW_S', '600'))   # how long to wait for Plex to list the new file
+WATCH_ALIGN_BIN = os.environ.get('WATCH_ALIGN_BIN', '/usr/local/bin/watch-align')  # ffmpeg under a name tierfs treats as background
+WATCH_PROBE_BIN = os.environ.get('WATCH_PROBE_BIN', 'ffprobe')
+_watch_lock = threading.RLock()
+_watch_prep_lock = threading.Lock()   # one audio mapping at a time (scheduler and grab passes)
+_watch_tls = threading.local()
+_watch_checked = set()
+_watch_last = {}
+
+
+def _watch_load():
+    try:
+        with open(WATCH_STATE) as f:
+            d = _json.load(f)
+        d = d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        d = {}
+    for k in ('held', 'tracked', 'seen'):
+        if not isinstance(d.get(k), dict):
+            d[k] = {}
+    return d
+
+
+_watch_doc = _watch_load()
+
+
+def _watch_held_hashes():
+    return set(_watch_doc.get('held') or {})
+
+
+def _watch_label_guard(h, label):
+    """True when `h` is held while someone streams it and another pass wants another label on it: the change
+    is not applied, it is recorded as the label to restore on release."""
+    if getattr(_watch_tls, 'bypass', False) or label == WATCH_HOLD_LABEL or h not in (_watch_doc.get('held') or {}):
+        return False
+    try:
+        with _watch_lock:
+            entry = (_watch_doc.get('held') or {}).get(h)
+            if not entry:
+                return False
+            entry['label'] = label
+            _write_json_atomic(WATCH_STATE, _watch_doc)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class WatchIO(GlacierIO):
+    """The I/O watch_hold needs: Plex (sessions, each user's view, progress and stream writes), the *arrs,
+    Deluge, and ffmpeg/ffprobe for the audio mapping."""
+    glacier_label = GLACIER_HOLD_LABEL
+    USERS_TTL_S = 3600
+
+    def __init__(self, doc):
+        super().__init__(doc)
+        self._users = (0.0, [])
+        self._series = {}
+
+    @staticmethod
+    def to_local(p):
+        return p
+
+    def save(self, doc):
+        _write_json_atomic(WATCH_STATE, doc)
+
+    def torrents(self):
+        deluge_login()
+        return get_all_torrents()          # the shared snapshot; set_label invalidates it
+
+    def set_label(self, h, label):
+        _watch_tls.bypass = True
+        try:
+            super().set_label(h, label)
+        finally:
+            _watch_tls.bypass = False
+
+    # -- Plex --------------------------------------------------------------------------------------------
+    def sessions(self):
+        return watch_hold.parse_sessions(_plex_get('/status/sessions'), self.to_local)
+
+    def users(self):
+        at, users = self._users
+        if not users or time.time() - at > self.USERS_TTL_S:
+            users = move_list.list_users(_plex_for_move_list, _plextv_for_move_list, PLEX_TOKEN)
+            self._users = (time.time(), users)
+        return users
+
+    def user_meta(self, token, key):
+        md = ((_plex_for_move_list(f'/library/metadata/{key}', None, token) or {}).get('MediaContainer') or {}).get('Metadata') or []
+        return md[0] if md else None
+
+    def _sections(self, kind):
+        secs = ((_plex_get('/library/sections') or {}).get('MediaContainer') or {}).get('Directory') or []
+        return [s.get('key') for s in secs if s.get('type') == kind and s.get('key')]
+
+    def plex_key(self, who, info, target=None):
+        """ratingKey of the Plex item whose file is `target` (the item's old file by default): the *arr's title
+        searched in the matching libraries, confirmed by the file name."""
+        target, title = target or info.get('old'), info.get('title')
+        if not title or not target:
+            return None
+        kind = 'movie' if who == 'Radarr' else 'show'
+        for sec in self._sections(kind):
+            found = ((_plex_get(f'/library/sections/{sec}/all', {'type': 1 if kind == 'movie' else 2, 'title': title})
+                      or {}).get('MediaContainer') or {}).get('Metadata') or []
+            for m in found:
+                if kind == 'movie':
+                    if watch_hold.find_part([m], target):
+                        return str(m.get('ratingKey'))
+                    continue
+                leaves = ((_plex_get(f"/library/metadata/{m.get('ratingKey')}/allLeaves") or {})
+                          .get('MediaContainer') or {}).get('Metadata') or []
+                hit = watch_hold.find_part(leaves, target)
+                if hit:
+                    return str(hit[0].get('ratingKey'))
+        return None
+
+    def find_new(self, item, new_path):
+        """ratingKey once Plex lists `new_path` (same item as the old file, or found again by title)."""
+        end = time.time() + WATCH_FIND_NEW_S
+        while True:
+            try:
+                key = item.get('plex')
+                meta = self.user_meta(PLEX_TOKEN, key) if key else None
+                if meta and watch_hold.find_part([meta], new_path):
+                    return str(key)
+                key = self.plex_key(item.get('who') or '', item.get('q') or {}, target=new_path)
+                if key:
+                    return key
+            except Exception:  # noqa: BLE001
+                pass
+            if time.time() >= end:
+                return None
+            time.sleep(20)
+
+    def _plex_user(self, method, path, params, token):
+        r = requests.request(method, f'{PLEX_URL}{path}', params=params,
+                             headers={'Accept': 'application/json', 'X-Plex-Token': token}, timeout=30)
+        r.raise_for_status()
+
+    def set_progress(self, token, key, ms):
+        self._plex_user('GET', '/:/progress', {'key': key, 'identifier': 'com.plexapp.plugins.library',
+                                               'time': int(ms), 'state': 'stopped'}, token)
+
+    def set_streams(self, token, part_id, audio=None, subs=None):
+        params = {'allParts': 1}
+        if audio is not None:
+            params['audioStreamID'] = audio
+        if subs is not None:
+            params['subtitleStreamID'] = subs
+        self._plex_user('PUT', f'/library/parts/{part_id}', params, token)
+
+    # -- the *arrs ---------------------------------------------------------------------------------------
+    def who_of(self, h, label):
+        if label.startswith('sonarr'):
+            return 'Sonarr'
+        if label.startswith('radarr'):
+            return 'Radarr'
+        if label == self.glacier_label:
+            return ((_glacier_load().get('held') or {}).get(h) or {}).get('who')
+        return None
+
+    def grab_ids(self, who, h):
+        """(item ids grabbed under download h, whether it was imported already) from the *arr's history."""
+        recs = self._get(who, '/api/v3/history', {'downloadId': h, 'pageSize': 200}) or {}
+        recs = recs.get('records') if isinstance(recs, dict) else recs
+        recs = [r for r in (recs or []) if str(r.get('downloadId') or '').lower() == h]
+        field = 'episodeId' if who == 'Sonarr' else 'movieId'
+        ids = sorted({r.get(field) for r in recs if str(r.get('eventType') or '').lower() == 'grabbed'
+                      and r.get(field) is not None})
+        imported = any(str(r.get('eventType') or '').lower() == 'downloadfolderimported' for r in recs)
+        return ids, imported
+
+    def items(self, who, ids):
+        """{item key: {'old': *arr path of its current file, 'title', ...}}; items without a file are left out."""
+        out = {}
+        for i in ids:
+            if who == 'Sonarr':
+                ep = self._get(who, f'/api/v3/episode/{i}') or {}
+                if not ep.get('hasFile'):
+                    continue
+                path = (ep.get('episodeFile') or {}).get('path')
+                if not path and ep.get('episodeFileId'):
+                    path = (self._get(who, f"/api/v3/episodefile/{ep['episodeFileId']}") or {}).get('path')
+                sid = ep.get('seriesId')
+                if sid not in self._series:
+                    self._series[sid] = (self._get(who, f'/api/v3/series/{sid}') or {}).get('title') if sid else None
+                if path:
+                    out[f'e{i}'] = {'old': path, 'title': self._series.get(sid), 'who': who}
+            else:
+                mv = self._get(who, f'/api/v3/movie/{i}') or {}
+                path = (mv.get('movieFile') or {}).get('path') if mv.get('hasFile') else None
+                if path:
+                    out[f'm{i}'] = {'old': path, 'title': mv.get('title'), 'who': who}
+        return out
+
+    # -- files ---------------------------------------------------------------------------------------------
+    def can_read_old(self, entry):
+        for it in (entry.get('items') or {}).values():
+            p = _relink_path(it.get('old'))
+            if not p or not os.path.isfile(p):
+                return False
+        return True
+
+    def new_file(self, h):
+        """The download's biggest video file as a '/data/...' path, once it is complete on disk."""
+        st = _deluge_rpc('core.get_torrent_status', [h, ['files', 'save_path', 'file_progress']]) or {}
+        files, prog = st.get('files') or [], st.get('file_progress') or []
+        best = None
+        for n, f in enumerate(files):
+            if os.path.splitext(f.get('path') or '')[1].lower() not in watch_hold.VIDEO_EXTS:
+                continue
+            if n < len(prog) and prog[n] < 1:
+                continue
+            if best is None or (f.get('size') or 0) > (best.get('size') or 0):
+                best = f
+        if not best:
+            return None
+        path = posixpath.join(st.get('save_path') or '', best['path'])
+        local = _relink_path(path)
+        return path if local and os.path.isfile(local) else None
+
+    def probe(self, path):
+        import subprocess
+        r = subprocess.run([WATCH_PROBE_BIN, '-v', 'error', '-print_format', 'json', '-show_streams', '-show_format',
+                            _relink_path(path)], capture_output=True, timeout=60)
+        if r.returncode:
+            raise RuntimeError('ffprobe failed')
+        return _json.loads(r.stdout or b'{}')
+
+    def read_pcm(self, path, index, start_s, dur_s):
+        """Mono 8 kHz s16le of [start_s, start_s + dur_s) of one audio stream, decoded by ffmpeg run as
+        watch-align (tierfs serves that name like the Plex scanner: no promote, no player priority)."""
+        import subprocess
+        sel = f'0:{index}' if index is not None else '0:a:0'
+        r = subprocess.run([WATCH_ALIGN_BIN, '-nostdin', '-v', 'error', '-ss', f'{max(start_s, 0):.3f}',
+                            '-t', f'{dur_s:.3f}', '-i', _relink_path(path), '-map', sel, '-vn', '-sn', '-dn',
+                            '-ac', '1', '-ar', str(watch_hold.RATE), '-f', 's16le', '-'],
+                           capture_output=True, timeout=180)
+        if r.returncode:
+            raise RuntimeError('ffmpeg failed')
+        return r.stdout
+
+
+_watch_io_obj = None
+
+
+def _watch_io():
+    global _watch_io_obj
+    if _watch_io_obj is None:
+        _watch_io_obj = WatchIO(_watch_doc)
+    return _watch_io_obj
+
+
+def _watch_log(what, counts, h=None):
+    """Log non-empty counts, and the same counts only once per minute."""
+    counts = {k: v for k, v in dict(counts).items() if v}
+    if not counts:
+        return
+    key = (what, h, tuple(sorted(counts.items())))
+    now = time.time()
+    if _watch_last.get(key, 0) > now - 60:
+        return
+    _watch_last[key] = now
+    if len(_watch_last) > 512:
+        for k in [k for k, t in _watch_last.items() if t < now - 60]:
+            _watch_last.pop(k, None)
+    log.info(f"[watch] {WATCH_CFG.mode} {what}{' ' + h if h else ''} {counts}")
+
+
+def watch_tick(io=None, now=None, discover_now=True):
+    """One pass. The audio mapping (ffmpeg reads, up to a minute) runs on a copy outside _watch_lock, so the
+    import gate, which the glacier release asks while holding _glacier_lock, is never held up by it. One
+    mapping at a time: a pass that cannot take _watch_prep_lock maps nothing."""
+    if WATCH_CFG.mode == 'off' and not _watch_doc.get('held'):
+        return {}
+    now = time.time() if now is None else now
+    io = io or _watch_io()
+    mine = _watch_prep_lock.acquire(blocking=False)
+    try:
+        due = []
+
+        def later(h, _entry):
+            if mine:
+                due.append(h)
+            return True                     # this pass's one mapping is taken (or another pass is mapping)
+
+        with _watch_lock:
+            deluge_login()
+            c = watch_hold.tick(io, _watch_doc, WATCH_CFG, now, _watch_checked,
+                                discover_now=discover_now, base_labels=('sonarr', 'radarr'),
+                                lane_labels=UPGRADE_LANE_LABELS, prep=later)
+            job = (due[0], _json.loads(_json.dumps(_watch_doc['tracked'][due[0]]))) if due else None
+        if job:
+            try:
+                watch_hold.prep_entry(io, job[0], job[1], now, WATCH_CFG, c)
+            except Exception as e:  # noqa: BLE001
+                log.error(f'[watch] mapping {job[0]} failed: {type(e).__name__}')
+                c.bump('prep_failed')
+            with _watch_lock:
+                c.bump('maps_kept', watch_hold.merge_maps(_watch_doc, *job))
+                io.save(_watch_doc)
+    finally:
+        if mine:
+            _watch_prep_lock.release()
+    _watch_log('tick', c)
+    return dict(c)
+
+
+def watch_gate(h, now=None):
+    """None when download `h` may be imported now; else why it waits. In dry mode it never waits (the reason
+    is logged as what would have happened)."""
+    if WATCH_CFG.mode == 'off':
+        return None
+    h = (h or '').lower()
+    with _watch_lock:
+        entry = (_watch_doc.get('tracked') or {}).get(h)
+        if not entry:
+            return None
+        try:
+            sessions = _watch_io().sessions()
+        except Exception:  # noqa: BLE001
+            sessions = []
+        ok, why = watch_hold.ready(entry, _watch_doc.get('seen') or {}, sessions,
+                                   time.time() if now is None else now, WATCH_CFG)
+    if ok:
+        return None
+    if not WATCH_CFG.acts:
+        _watch_log('gate', {'would_wait_' + why: 1}, h)
+        return None
+    _watch_log('gate', {'wait_' + why: 1}, h)
+    return why
+
+
+def watch_on_grab(data, source, sleep=time.sleep):
+    """OnGrab: look for the new download right away instead of on the next pass."""
+    if WATCH_CFG.mode == 'off':
+        return
+    sleep(5)
+    try:
+        watch_tick()
+    except Exception as e:  # noqa: BLE001
+        log.error(f'[watch] grab tick failed: {type(e).__name__}')
+
+
+def watch_on_import(data, source, io=None):
+    """OnDownload (upgrade): carry resume points and audio/subtitle choices over to the new file."""
+    if WATCH_CFG.mode == 'off':
+        return {}
+    h = (data.get('downloadId') or '').lower()
+    ikeys = watch_hold.item_keys_of(source, data)
+    new_path = ((data.get('episodeFile') if source == 'Sonarr' else data.get('movieFile')) or {}).get('path')
+    if not h or not ikeys or not new_path:
+        return {}
+    with _watch_lock:
+        entry = (_watch_doc.get('tracked') or {}).get(h)
+        entry = _json.loads(_json.dumps(entry)) if entry else None
+    if not entry:
+        _watch_log('import', {'untracked': 1}, h)
+        return {}
+    try:
+        c = watch_hold.after_import(io or _watch_io(), entry, ikeys, new_path, WATCH_CFG)
+    except Exception as e:  # noqa: BLE001
+        log.error(f'[watch] import {h} failed: {type(e).__name__}')
+        c = {}
+    with _watch_lock:
+        watch_hold.drop_items(_watch_doc, h, ikeys)
+        _write_json_atomic(WATCH_STATE, _watch_doc)
+    _watch_log('import', c, h)
+    return dict(c)
+
+
+def watch_startup(io=None):
+    """Once at start: load state, drop holds no longer in Deluge, log the Plex settings the invisible upgrade
+    leans on (intro/credit markers, preview thumbnails, loudness: values only)."""
+    with _watch_lock:
+        _watch_doc.clear()
+        _watch_doc.update(_watch_load())
+        out = {}
+        if _watch_doc['held']:
+            deluge_login()
+            out = dict(watch_hold.reconcile(io or _watch_io(), _watch_doc))
+    prefs = {}
+    try:
+        for s in ((_plex_get('/:/prefs') or {}).get('MediaContainer') or {}).get('Setting') or []:
+            if s.get('id') in ('GenerateIntroMarkerBehavior', 'GenerateCreditsMarkerBehavior', 'GenerateBIFBehavior',
+                               'LoudnessAnalysisBehavior'):
+                prefs[s['id']] = s.get('value')
+    except Exception:  # noqa: BLE001
+        prefs = {'unreadable': True}
+    log.info(f'[watch] mode={WATCH_CFG.mode} held={len(_watch_doc["held"])} tracked={len(_watch_doc["tracked"])} '
+             f'startup={out} plex_prefs={prefs}')
+    return out
+
+
+def watch_scheduler():
+    try:
+        watch_startup()
+    except Exception as e:  # noqa: BLE001
+        log.error(f'[watch] startup failed: {type(e).__name__}')
+    n = 0
+    while True:
+        try:
+            watch_tick(discover_now=n % WATCH_DISCOVER_EVERY == 0)   # the *arr queues every minute, sessions every pass
+        except Exception as e:  # noqa: BLE001
+            log.error(f'[watch] tick failed: {type(e).__name__}')
+        n += 1
+        time.sleep(WATCH_POLL_S)
 
 
 def maintenance_scheduler():
@@ -12319,4 +12750,6 @@ if __name__ == '__main__':
     t15.start()
     t16 = threading.Thread(target=glacier_scheduler, daemon=True)
     t16.start()
+    t17 = threading.Thread(target=watch_scheduler, daemon=True)
+    t17.start()
     app.run(host='0.0.0.0', port=port, threaded=True)

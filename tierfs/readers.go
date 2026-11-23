@@ -20,7 +20,9 @@ const (
 )
 
 // DefaultBackgroundComms names the readers that keep the remote stream.
-var DefaultBackgroundComms = []string{"Plex Media Scan"}
+// "watch-align" is the webhook's ffmpeg matching the sound of an old and a new copy before an upgrade:
+// a few short windows, which must not promote the file.
+var DefaultBackgroundComms = []string{"Plex Media Scan", "watch-align"}
 
 type classEntry struct {
 	background bool

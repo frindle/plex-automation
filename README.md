@@ -151,6 +151,39 @@ Upgrade-lane torrents are not on the ladder. Each one gets a per-torrent connect
 
 `STUCK_AUTOMATION` is `off`, `dry` (the default, also for any other value) or `on`. `off` does nothing on the timer. `dry` logs and writes `stuck-downloads` activity lines only: no call is made that changes Deluge or the arr apps (the connection cap included), and no state is saved. `on` carries the actions out. Preview: `GET /stuck-downloads` (read-only; each torrent, its step and what the next pass would do).
 
+## Watch hold (invisible upgrades)
+
+`watch_hold.py` (pure) is wired in `arr-webhook.py`. When an upgrade replaces a file someone is watching, or has a resume point in, the switch should go unnoticed: the import never happens under a stream, and afterwards each Plex user resumes at the same moment of the new copy, with the same audio and subtitle choices.
+
+How it works, per upgrade download (a Sonarr/Radarr download that replaces an existing file):
+
+1. **Track.** Every minute the webhook reads the arr queues (rows downloading or import pending) and the upgrade lane (labels `radarr-upgrade`/`sonarr-upgrade` and their priority variants, and glacier-held downloads), and records the file being replaced and its Plex item.
+2. **Snapshot.** While nobody is streaming it, it reads each Plex user's view of the old item: resume point, last viewed, selected audio and subtitle tracks (non-default picks only). The snapshot is taken again after each stream, and when it is older than 30 minutes.
+3. **Hold.** A download with a normal `sonarr`/`radarr` label is moved to the `watch-hold` label when the item is streamed (now or in the last `WATCH_HOLD_QUIET_MIN` minutes), or when it is `WATCH_HOLD_AT_PCT`% done and a resume point needs mapping. Like the glacier hold, the arr stops seeing the download but keeps its Grabbed history, so the release restores the label, the arr re-tracks it and imports it as the upgrade of its grab. Upgrade-lane downloads are not relabelled: auto-rescue skips them while they are held (`watch_hold` in its skip counts), and a glacier hold is kept past its own release until watch hold lets go.
+4. **Map.** Once the download is complete and nobody is watching, each resume point (at least 30 s in, before 95% of the runtime, viewed in the last `WATCH_HOLD_STALE_DAYS` days) is mapped to the new file by its sound: 40 s of audio around the point, decoded at 8 kHz mono, is matched by loudness envelope (normalised cross-correlation) within ±120 s, then ±300 s, of the new copy, at the same speed and at the PAL speed-up either way. A second window 150 s earlier (or 90 s later) must land within 0.5 s of the same shift. A point that does not match well is not mapped. Only one download is mapped per pass.
+5. **Release.** The hold ends when nobody is playing it, nobody has for `WATCH_HOLD_QUIET_MIN` minutes, the snapshot is fresh and every point is mapped, or after `WATCH_HOLD_MAX_HOURS` from completion (a download never seen complete gets 7 days more). Nothing is released under a playing stream.
+6. **After the import.** It waits up to 10 minutes for Plex to list the new file, then for each user: writes the mapped resume point (only when the shift is at least 1 s, and only if the user's point has not moved more than 5 s since the snapshot), puts back the old point when Plex made a new item and no point was mapped, and selects the matching audio track (same language and commentary, then codec and channels) and subtitle track (or off; forced subtitles are never turned off).
+
+The sound is read with ffmpeg under the name `watch-align`, which tierfs treats as a background reader (remote reads, no promote).
+
+`WATCH_HOLD` is `off`, `dry` (the default, also for any other value) or `on`. `dry` does the reads, the snapshots and the mapping and logs what it would do (`[watch] dry ... would_hold`, `would_wait_<reason>`, `would_write_offset`, `would_write_picks`), but never relabels a download, never delays an import and never writes to Plex. `off` releases any hold left from `on`. Logs carry counts and infohashes only; Plex tokens are never logged or stored.
+
+Not covered yet:
+- Downloads on a remote seedbox: held and choices carried over, but no resume point is mapped (the new file is not local until it is moved).
+- Season packs: held and choices carried over, but no resume point is mapped.
+- While a download is held the arr does not see it in its queue, so it could grab another release of the same upgrade; the dedupe passes do not look at the `watch-hold` label.
+- A held download is off the stuck-download ladder until it is released.
+- Offloaded old files: the webhook does not mount tierfs yet, so an old file that is only on the remote tier cannot be read; its download is released at `WATCH_HOLD_MAX_HOURS` without a mapped point.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `WATCH_HOLD` | `dry` | `off`, `dry` or `on` |
+| `WATCH_HOLD_QUIET_MIN` | `10` | minutes since the last stream before an import may happen |
+| `WATCH_HOLD_STALE_DAYS` | `30` | resume points viewed longer ago are not mapped |
+| `WATCH_HOLD_MAX_HOURS` | `48` | longest hold after the download completes |
+| `WATCH_HOLD_AT_PCT` | `50` | progress at which a download with a resume point to map is held |
+| `WATCH_HOLD_STATE` | `/data/watch_hold_state.json` | holds, tracked downloads and recent streams |
+
 ## Abandoned files audit
 
 `abandoned_audit.py` (pure) is wired in `arr-webhook.py`. Once a week (`ABANDONED_AUDIT_INTERVAL` seconds, default 604800, `0` = off; checked on the 6h maintenance tick, measured from the saved report so a restart does not rerun it) it compares what is on disk (Downloads and the library roots) with Deluge, Plex and Radarr/Sonarr and lists what nobody owns. **Report only**: it never deletes, moves, relabels or removes a torrent. Logs carry counts and GB, never paths; the paths appear on `/digest` and `/abandoned-audit`.
@@ -186,6 +219,8 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `main`: syn
 ## Changelog
 
 ### Unreleased
+
+- Watch hold (`watch_hold.py`, see **Watch hold**): an upgrade is not imported while its item is streamed or was in the last 10 minutes; each Plex user's resume point is mapped to the new file by matching the sound around it, and written back with their audio and subtitle choices after the import. `WATCH_HOLD=off|dry|on`, default `dry` (reads and maps, logs what it would do, changes nothing). The image gets `ffmpeg` (run as `watch-align`, which tierfs now treats as a background reader by default) and `numpy`. Glacier release gains a `keep` hook so a glacier hold waits for watch hold. New `test_watch_hold.py`.
 
 - Stuck downloads (`stuck_plan.py`, see **Stuck downloads**): stalled sonarr/radarr torrents go up a ladder (reannounce + queue top, pause + resume, then, only for a release that could never complete (no seeds and a piece no peer has, for the whole window), blocklist in the arr, remove the torrent and its files, and search again, at any progress). Upgrade-lane torrents get a per-torrent connection cap. `STUCK_AUTOMATION=off|dry|on`, default `dry`. Preview at `/stuck-downloads`.
 

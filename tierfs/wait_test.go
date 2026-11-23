@@ -401,7 +401,7 @@ func TestConfigWaitEnv(t *testing.T) {
 	env := map[string]string{"TIERFS_MOUNT": "/m", "TIERFS_MANIFESTS": "/f", "TIERFS_STUB_ROOTS": "/s", "TIERFS_REMOTE_BASE": "http://x"}
 	get := func(k string) string { return env[k] }
 	c, err := ConfigFromEnv(get)
-	if err != nil || len(c.BackgroundComms) != 1 || c.BackgroundComms[0] != "Plex Media Scan" || c.WaitTimeout != 0 {
+	if err != nil || fmt.Sprint(c.BackgroundComms) != "[Plex Media Scan watch-align]" || c.WaitTimeout != 0 {
 		t.Fatalf("defaults: %+v %v", c.BackgroundComms, err)
 	}
 	env["TIERFS_BACKGROUND_COMMS"] = "a, b ,,c"

@@ -422,12 +422,12 @@ def _drop_link(io, entry):
     return True
 
 
-def release_pass(io, state, hold_label=HOLD_LABEL, verify_tries=6, verify_poll_s=5.0, sleep=None):
+def release_pass(io, state, hold_label=HOLD_LABEL, verify_tries=6, verify_poll_s=5.0, sleep=None, keep=None):
     """Release every held download: remove its stopgap link (and empty hold folders), rescan the hold folder,
     THEN put its original label back, then nudge the *arr. A link that cannot be removed keeps the hold
     (retried next pass). A download gone from Deluge or relabelled by someone else is dropped from state, its
-    link removed. Returns Counts: released, gone, relabelled_elsewhere, failed, unlink_failed, rematched,
-    unmatched."""
+    link removed. `keep(h, entry)` true keeps a live hold as it is, link and all, until a later pass. Returns
+    Counts: kept, released, gone, relabelled_elsewhere, failed, unlink_failed, rematched, unmatched."""
     c = Counts()
     if not state:
         return c
@@ -437,6 +437,9 @@ def release_pass(io, state, hold_label=HOLD_LABEL, verify_tries=6, verify_poll_s
         entry = state[h]
         t = torrents.get(h)
         mine = t is not None and (t.get('label') or '') == hold_label
+        if mine and keep is not None and keep(h, entry):
+            c.bump('kept')           # someone else still wants it held (watch_hold: a viewer); next pass
+            continue
         had_link, scan_root = bool(entry.get('link')), entry.get('scan_root')
         if not _drop_link(io, entry):
             c.bump('unlink_failed')

@@ -35,7 +35,7 @@ type Config struct {
 	StubRoots    []string // stub_path must be exactly <root>/<id><ext>
 	Remote       RemoteConfig
 
-	BackgroundComms []string      // reader names that keep the remote stream (default "Plex Media Scan")
+	BackgroundComms []string      // reader names that keep the remote stream (default "Plex Media Scan", "watch-align")
 	WaitTimeout     time.Duration // player read with no new fill line for this long gets EIO (default 15m)
 	FillPoll        time.Duration // how often a waiting read looks at the fill file (default 100ms, max 200ms)
 	ProcRoot        string        // default /proc

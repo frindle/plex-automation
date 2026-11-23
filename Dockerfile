@@ -1,7 +1,9 @@
 FROM python:3.15-slim
 WORKDIR /app
 # unar: unpacks library RAR sets (rar_extract.py); Plex can't play .rar
-RUN apt-get update && apt-get install -y --no-install-recommends unar && rm -rf /var/lib/apt/lists/*
+# ffmpeg: the watch hold's audio matching (watch_hold.py), run as "watch-align" so tierfs serves it as a background reader
+RUN apt-get update && apt-get install -y --no-install-recommends unar ffmpeg && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/ffmpeg /usr/local/bin/watch-align
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY arr-webhook.py .
@@ -23,4 +25,5 @@ COPY tiering_gate.py .
 COPY speed_cap.py .
 COPY stuck_plan.py .
 COPY glacier_hold.py .
+COPY watch_hold.py .
 CMD ["python", "-u", "arr-webhook.py"]
