@@ -144,8 +144,10 @@ class FakePlex(fk._Server):
     def row(it):
         r = {k: v for k, v in it.items() if k not in ("files", "section", "videoResolution")}
         r["librarySectionTitle"] = it["section"]
+        ms = it.get("duration")  # Plex gives the play time on the item and on each part
         r["Media"] = [{"videoResolution": it.get("videoResolution", "1080"),
-                       "Part": [{"file": f} for f in it["files"]]}]
+                       "Part": [{"file": f, **({"duration": ms} if ms else {})}
+                                for f in it["files"]]}]
         return r
 
     def play(self, rk, at=None):
@@ -322,10 +324,11 @@ class Stack:
 
     def add(self, key, rel, *, section="Movies", kind="movie", size=48 * MIB, disk=0,
             show=None, season=None, episode=None, alt=True, added=None, resolution="1080",
-            in_arr=True, in_remote=True, src=None):
+            in_arr=True, in_remote=True, src=None, minutes=120):
         """One library file with every stand-in told about it. `rel` is the path under
         Media/. `alt` adds a second, different upload (the restore path). `src` copies a
-        real media file instead of writing `size` random bytes."""
+        real media file instead of writing `size` random bytes. `minutes` is the play time
+        Plex reports (it sizes the head); None: Plex reports none."""
         disk_path = os.path.join(self.disks[disk], "Media", rel)
         os.makedirs(os.path.dirname(disk_path), exist_ok=True)
         if src:
@@ -367,6 +370,8 @@ class Stack:
         item = {"ratingKey": f["rk"], "type": kind, "title": release, "section": section,
                 "files": [f["share"]], "addedAt": int(added or old),
                 "videoResolution": resolution}
+        if minutes:
+            item["duration"] = int(minutes * 60 * 1000)
         if kind == "episode":
             item.update(grandparentRatingKey=str(show), parentIndex=season, index=episode)
         self.plex.items.append(item)
