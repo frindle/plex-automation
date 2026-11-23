@@ -15,8 +15,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt ruff
-      - run: python -m py_compile arr-webhook.py abandoned_audit.py arr_health.py deluge_trim.py monthly_upgrade.py media_share.py
-      - run: ruff check arr-webhook.py abandoned_audit.py arr_health.py deluge_trim.py monthly_upgrade.py media_share.py
+      - run: python -m py_compile arr-webhook.py abandoned_audit.py arr_health.py deluge_trim.py monthly_upgrade.py media_share.py watch_hold.py
+      - run: ruff check arr-webhook.py abandoned_audit.py arr_health.py deluge_trim.py monthly_upgrade.py media_share.py watch_hold.py
       - run: python test_dockerfile_copies.py   # every imported local module is COPYed into the image
 
   shell-tests:

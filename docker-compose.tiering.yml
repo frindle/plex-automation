@@ -72,7 +72,7 @@ services:
       # tierfs only: seconds a player read waits for the promote before it gets
       # an error, and readers that stream from the remote and never trigger one.
       TIERFS_WAIT_S: "${TIERFS_WAIT_S:-900}"
-      TIERFS_BACKGROUND_COMMS: "${TIERFS_BACKGROUND_COMMS:-Plex Media Scan}"
+      TIERFS_BACKGROUND_COMMS: "${TIERFS_BACKGROUND_COMMS:-Plex Media Scan,watch-align}"
       PLEX_URL: "${TIERING_PLEX_URL:?set TIERING_PLEX_URL in .env}"
       PLEX_TOKEN: "${PLEX_TOKEN}"
       SONARR_URL: "${TIERING_SONARR_URL:?set TIERING_SONARR_URL in .env}"

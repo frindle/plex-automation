@@ -76,7 +76,7 @@ line that cannot be read counts as a player.
 | `TIERFS_SLOT_WAIT` | `20s` | How long a read waits for a free stream slot. After that it gets EIO and a `{"ev":"slot_timeout","id":...}` event. |
 | `TIERFS_ALLOW_OTHER` | `1` | Let other users (such as Plex) read the mount. Set `0` to turn off. |
 | `TIERFS_POLL` | `5s` | How often manifests are rescanned. `SIGHUP` rescans at once. |
-| `TIERFS_BACKGROUND_COMMS` | `Plex Media Scan` | Comma list of process names (`comm`, 15 characters) whose reads, and their children's, keep the remote stream. Every other reader is a player and waits for the promote. |
+| `TIERFS_BACKGROUND_COMMS` | `Plex Media Scan,watch-align` | Comma list of process names (`comm`, 15 characters) whose reads, and their children's, keep the remote stream. `watch-align` is the webhook's ffmpeg matching an old and a new copy's sound before an upgrade (see the main README, Watch hold). Every other reader is a player and waits for the promote. |
 | `TIERFS_WAIT_S` | `900` | Seconds a player read waits with no new line in the fill file before it gets EIO. |
 
 Manifests that are invalid are skipped with a log line. If a manifest is

@@ -420,6 +420,25 @@ def test_release_removes_the_link_first_then_relabels_then_refreshes():
     assert w.torrents[H1]['label'] == 'sonarr-upgrade'
 
 
+def test_keep_leaves_a_live_hold_as_it_is_until_it_says_go():
+    w, c, st, io = held_with_link()
+    link = st[H1]['link']
+    w.events.clear()
+    seen = []
+    r = gh.release_pass(io, st, keep=lambda h, e: seen.append(h) or True)   # a viewer: watch hold says wait
+    assert r['kept'] == 1 and not r.get('released') and seen == [H1]
+    assert w.events == [] and link in w.fs and w.torrents[H1]['label'] == gh.HOLD_LABEL and st[H1]['link'] == link
+    r = gh.release_pass(io, st, keep=lambda h, e: False)
+    assert r['released'] == 1 and w.torrents[H1]['label'] == 'sonarr-upgrade' and link not in w.fs
+
+
+def test_keep_is_not_asked_about_a_hold_that_is_gone():
+    w, c, st, io = held_with_link()
+    del w.torrents[H1]
+    r = gh.release_pass(io, st, keep=lambda h, e: True)
+    assert r['gone'] == 1 and not r.get('kept') and st == {}
+
+
 def test_after_release_the_arr_imports_it_as_an_upgrade_tied_to_its_grab():
     w, c, st, io = held_with_link()
     w.refresh_tracking('Sonarr')
