@@ -193,7 +193,9 @@ class _AmHandler(fk._AmHandler):
             before = len(o.uploads)
             super().do_POST()
             if len(o.uploads) > before:
-                o.job_dir[list(o.jobs)[-1]] = o.uploads[-1][0][:-len(".nzb")]
+                name, nzb = o.uploads[-1]
+                o.job_dir[list(o.jobs)[-1]] = (o.storage_by_nzb.get(nzb)
+                                               or name[:-len(".nzb")])
 
     def _history(self, o, q, query):
         if q.get("apikey", [""])[0] != o.key:
@@ -208,7 +210,8 @@ class _AmHandler(fk._AmHandler):
 
 
 class FakeAltMount(fk.FakeAltMount):
-    """Import API stand-in: each job lands in the remote directory named after its NZB."""
+    """Import API stand-in: each job lands in the remote directory named after its NZB,
+    or the one `storage_by_nzb` gives for those NZB bytes."""
 
     def __init__(self):
         self.job_dir = {}
@@ -324,11 +327,13 @@ class Stack:
 
     def add(self, key, rel, *, section="Movies", kind="movie", size=48 * MIB, disk=0,
             show=None, season=None, episode=None, alt=True, added=None, resolution="1080",
-            in_arr=True, in_remote=True, src=None, minutes=120):
+            in_arr=True, in_remote=True, src=None, minutes=120, twin=False):
         """One library file with every stand-in told about it. `rel` is the path under
         Media/. `alt` adds a second, different upload (the restore path). `src` copies a
         real media file instead of writing `size` random bytes. `minutes` is the play time
-        Plex reports (it sizes the head); None: Plex reports none."""
+        Plex reports (it sizes the head); None: Plex reports none. `twin` lists a second
+        upload of the same bytes under the same name, which AltMount serves from
+        `<release>-twin/`."""
         disk_path = os.path.join(self.disks[disk], "Media", rel)
         os.makedirs(os.path.dirname(disk_path), exist_ok=True)
         if src:
@@ -359,6 +364,16 @@ class Stack:
                                                  "nzb": fk.make_nzb(f["ids"], release)}
         for n in (self.nntp1, self.nntp2):
             n.ids |= set(f["ids"])
+        if twin:
+            tw_ids = [f"{release}.tw{i}@standin" for i in range(6)]
+            nzb = fk.make_nzb(tw_ids, release)
+            self.indexer.releases[f"{key}-twin"] = {"title": release, "nzb": nzb}
+            for n in (self.nntp1, self.nntp2):
+                n.ids |= set(tw_ids)
+            self.alt.storage_by_nzb[nzb] = f"{release}-twin"
+            os.makedirs(os.path.join(self.remote, f"{release}-twin"), exist_ok=True)
+            shutil.copyfile(disk_path, os.path.join(self.remote, f"{release}-twin",
+                                                    os.path.basename(rel)))
         if alt:
             title = release.rsplit("-", 1)[0] + "-OTHER"
             self.indexer.releases[f"{key}-alt"] = {"title": title,
@@ -507,10 +522,11 @@ class Stack:
             out = [json.loads(x) for x in fh if x.strip()]
         return [e for e in out if ev is None or e["ev"] == ev]
 
-    def zero(self, f, start, end):
-        """The remote answers [start, end) of this file with zeros (dead articles)."""
+    def zero(self, f, start, end, rel=None):
+        """The remote answers [start, end) of this file (or of `rel`, a path under the
+        remote root) with zeros (dead articles)."""
         with open(self.zero_file, "w") as fh:
-            json.dump({f["remote"]: [[start, end]]}, fh)
+            json.dump({rel or f["remote"]: [[start, end]]}, fh)
 
     # ---- what a reader sees
 

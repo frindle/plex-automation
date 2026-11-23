@@ -68,7 +68,9 @@ def test_perfect_fixture_passes(world):
     assert f["sha256"] == sha(world.content)
     assert set(f) <= set(COLUMNS)  # only files columns
     assert all(s["ok"] for s in r.steps.values())
-    assert set(r.steps) == {"nzb", "import", "hash", "stat_secondary", "stat_primary", "restore"}
+    assert set(r.steps) == {"nzb", "import", "hash", "stat_secondary", "stat_primary", "twin",
+                            "restore"}
+    assert r.steps["twin"]["found"] is False and f["twin_remote_path"] is None
     assert world.sec.stats == 45 and world.prim.stats == 45  # 40 plus the alternative's 5
 
 

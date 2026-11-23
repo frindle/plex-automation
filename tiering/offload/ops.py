@@ -74,6 +74,8 @@ DEFAULT_RETRY_S = 600.0
 DEFAULT_STREAM_FETCHES = 6  # chunks fetched at once while someone is watching the file
 MAX_STREAM_FETCHES = 32
 RETRY_MAX_DELAY = 30.0
+DEFAULT_SWITCH_S = 20.0  # a copy that fails a chunk this long gives way to the twin
+DEFAULT_HEDGE_S = 10.0  # while watched, a chunk still out after this long is asked of the twin too
 FAILED_HOLD_S = 1.5  # a failed line from a spent retry budget stays this long (tierfs polls every 0.2 s at most)
 _sleep = time.sleep  # tests patch these two
 _mono = time.monotonic
@@ -1063,6 +1065,13 @@ def _stream_fetches() -> int:
     return min(max(n, 1), MAX_STREAM_FETCHES)
 
 
+def _env_s(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
 def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=None, want=None,
              urgent=None, pause=None) -> Result:
     row = st.get(db, id)
@@ -1356,9 +1365,59 @@ class _Aborted(Exception):
     """A parallel fetch whose promote has already stopped (never seen by callers)."""
 
 
-def _fetch_chunk(reader, remote_path, off, n, digest, retry_s, abort=None):
-    """One chunk, checked against the chunk list. A fetch error is retried with
-    backoff for up to retry_s; a second hash mismatch raises ChunkMismatch."""
+class _Sources:
+    """The remote copies of one file (the upload, then its twin), first choice first. A
+    copy that fails a chunk goes to the back for the rest of the promote, so the chunks
+    after it start on the copy that works."""
+
+    def __init__(self, paths):
+        self._paths = list(dict.fromkeys(p for p in paths if p))
+        self._lock = threading.Lock()
+
+    def __len__(self):
+        return len(self._paths)
+
+    def order(self, other_first=False) -> list:
+        with self._lock:
+            o = list(self._paths)
+        return o[1:] + o[:1] if other_first else o
+
+    def demote(self, path) -> bool:
+        with self._lock:
+            if len(self._paths) < 2 or path not in self._paths or self._paths[-1] == path:
+                return False
+            self._paths.remove(path)
+            self._paths.append(path)
+            return True
+
+
+def _fetch_chunk(reader, remote, off, n, digest, retry_s, abort=None, other_first=False):
+    """One chunk, checked against the chunk list, from the first copy in ``remote`` (a
+    _Sources, or one path) that has it; ``other_first`` starts on the second copy (a
+    hedge). A copy with another behind it is given TIERING_PROMOTE_SWITCH_S of retries,
+    the last copy all of retry_s. The last copy's error is the one raised: a fetch error,
+    ShortRead, or ChunkMismatch (its second hash mismatch)."""
+    src = remote if isinstance(remote, _Sources) else _Sources([remote])
+    order = src.order(other_first)
+    switch = min(retry_s, _env_s("TIERING_PROMOTE_SWITCH_S", DEFAULT_SWITCH_S))
+    for i, path in enumerate(order):
+        last = i == len(order) - 1
+        try:
+            return _fetch_from(reader, path, off, n, digest, retry_s if last else switch, abort)
+        except _Aborted:
+            raise
+        except Exception as e:
+            if last:
+                raise
+            moved = src.demote(path)
+            log.warning("chunk at %d: %s from one copy; reading it from the twin%s", off,
+                        type(e).__name__, " (first choice from now on)" if moved else "")
+    raise _Aborted()  # no copy at all (not reached: a promote always has remote_path)
+
+
+def _fetch_from(reader, remote_path, off, n, digest, retry_s, abort=None):
+    """One chunk from one copy, checked against the chunk list. A fetch error is retried
+    with backoff for up to retry_s; a second hash mismatch raises ChunkMismatch."""
     deadline, delay, bad = None, 1.0, 0
     while True:
         if abort is not None and abort.is_set():
@@ -1405,8 +1464,13 @@ def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry
             ls = None
         if ls is not None and _same_inode(fs, ls):
             raise OpsError("stub is the same inode as L; refusing to write into the library file")
+        src = _Sources([row["remote_path"], row.get("twin_remote_path")])
+        hedge_s = _env_s("TIERING_PROMOTE_HEDGE_S", DEFAULT_HEDGE_S) if len(src) > 1 else 0.0
         wide = _stream_fetches()
-        pool = ThreadPoolExecutor(max_workers=wide, thread_name_prefix="promote-fetch")
+        pool = ThreadPoolExecutor(max_workers=wide * 2 if hedge_s else wide,
+                                  thread_name_prefix="promote-fetch")
+        started: dict = {}  # future -> when it was sent
+        hedged: set = set()  # chunks also asked of the twin
         cursor, last_want, first = 0, None, True
         while len(done) < n_chunks:
             w = want() if want else None
@@ -1422,25 +1486,48 @@ def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry
                 hot = bool(urgent and urgent())
             width = wide if hot else 1
             taken = set(busy.values())
-            while len(busy) < width and len(done) + len(busy) < n_chunks:
+            while len(taken) < width and len(done) + len(taken) < n_chunks:
                 idx = cursor
                 while idx in done or idx in taken:  # first chunk at or after the cursor still to fetch
                     idx = (idx + 1) % n_chunks
                 off = start + idx * chunk_size
-                fut = pool.submit(_fetch_chunk, reader, row["remote_path"], off,
+                fut = pool.submit(_fetch_chunk, reader, src, off,
                                   min(chunk_size, end - off), digests[idx], retry_s, abort)
                 busy[fut] = idx
+                started[fut] = _mono()
                 taken.add(idx)
                 cursor = (idx + 1) % n_chunks
-            finished, _ = _wait_futures(list(busy), timeout=1.0, return_when=FIRST_COMPLETED)
+            if hot and hedge_s:
+                # someone is watching: a chunk that is slow on one copy is asked of the
+                # other too, and whichever brings it first (checked) is kept
+                now = _mono()
+                for fut, idx in list(busy.items()):
+                    if idx not in hedged and now - started[fut] >= hedge_s:
+                        hedged.add(idx)
+                        off = start + idx * chunk_size
+                        log.info("chunk at %d is slow; asking the twin for it too", off)
+                        h = pool.submit(_fetch_chunk, reader, src, off, min(chunk_size, end - off),
+                                        digests[idx], retry_s, abort, True)
+                        busy[h] = idx
+                        started[h] = now
+            tick = min(1.0, hedge_s) if hot and hedge_s else 1.0
+            finished, _ = _wait_futures(list(busy), timeout=tick, return_when=FIRST_COMPLETED)
             for fut in sorted(finished, key=lambda f: busy[f]):
                 idx = busy.pop(fut)
+                started.pop(fut, None)
+                if idx in done:
+                    continue  # the other copy brought it first
                 off = start + idx * chunk_size
                 n = min(chunk_size, end - off)
                 try:
                     data = fut.result()
-                except ChunkMismatch:
-                    os.write(ffd, f"failed {off}\n".encode())
+                except Exception as e:
+                    if idx in busy.values():  # its hedge is still out: that one decides
+                        log.warning("chunk at %d: %s from one copy; waiting for the other",
+                                    off, type(e).__name__)
+                        continue
+                    if isinstance(e, ChunkMismatch):
+                        os.write(ffd, f"failed {off}\n".encode())
                     raise
                 view = memoryview(data)
                 w_ = 0

@@ -169,7 +169,8 @@ class _AmHandler(_Quiet):
                 if o.fail:
                     slots = [{"nzo_id": jid, "status": "Failed", "storage": ""}]
                 else:
-                    slots = [{"nzo_id": jid, "status": "Completed", "storage": o.storage}]
+                    slots = [{"nzo_id": jid, "status": "Completed",
+                              "storage": job.get("storage") or o.storage}]
         self._json({"history": {"slots": slots, "noofslots": len(slots)}})
 
     def do_POST(self):
@@ -198,7 +199,7 @@ class _AmHandler(_Quiet):
         if form.get("mode") != "addfile" or upload is None:
             return self._json({"status": False, "error": "bad request"})
         o.uploads.append((upload[0], upload[1]))
-        o.jobs[form["nzbname"]] = {"polls": 0}
+        o.jobs[form["nzbname"]] = {"polls": 0, "storage": o.storage_by_nzb.get(upload[1])}
         self._json({"status": True, "nzo_ids": [form["nzbname"]]})
 
     def do_GET(self):  # the key is never accepted in a URL
@@ -207,8 +208,9 @@ class _AmHandler(_Quiet):
 
 
 class FakeAltMount(_Server):
-    def __init__(self, storage, key=APIKEY, pending_polls=1, fail=False):
+    def __init__(self, storage, key=APIKEY, pending_polls=1, fail=False, storage_by_nzb=None):
         self.key, self.storage = key, storage
+        self.storage_by_nzb = dict(storage_by_nzb or {})  # NZB bytes -> where that import lands
         self.pending_polls, self.fail = pending_polls, fail
         self.uploads, self.jobs, self.urls = [], {}, []
         super().__init__(_AmHandler)
@@ -383,7 +385,8 @@ def self_signed_cert(tmp_path):
 
 COLUMNS = (
     "id", "lib_path", "stub_path", "remote_path", "size", "mtime_ns", "sha256", "head_len",
-    "tail_len", "head_b3", "tail_b3", "nzb_path", "nzb_path2", "title", "year", "imdb_id",
+    "tail_len", "head_b3", "tail_b3", "nzb_path", "nzb_path2", "twin_nzb_path",
+    "twin_remote_path", "title", "year", "imdb_id",
     "tvdb_id", "season", "episode", "release_name", "rating_key", "kind", "is4k", "state",
     "step", "restore_score", "restore_note", "last_check_ts", "last_stat_ok_ts", "last_ok_ts",
     "created_ts", "updated_ts")

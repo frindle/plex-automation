@@ -74,7 +74,7 @@ log = logging.getLogger(__name__)
 _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 _LIMIT = 256 * 1024 * 1024
 STALE = ("sha256", "head_b3", "tail_b3", "head_len", "tail_len", "nzb_path", "nzb_path2",
-         "restore_score", "restore_note", "remote_path")
+         "twin_nzb_path", "twin_remote_path", "restore_score", "restore_note", "remote_path")
 IDENTITY = ("title", "year", "imdb_id", "tvdb_id", "season", "episode", "release_name")
 
 

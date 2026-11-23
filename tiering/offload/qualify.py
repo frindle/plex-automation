@@ -12,6 +12,10 @@
    floor, that is a different upload (it shares no message-id with our NZB) and
    whose every segment is on both providers, like ``nzb_path``'s.
 
+Then, best effort and never a failure, it looks for a twin (``find_twin``): a second
+upload of the same bytes for a promote to read when the first copy fails. It runs last,
+so it only spends the grabs the five steps left.
+
 The first search is reused: one search per qualify, however many steps need it.
 
 Row fields it reads:
@@ -22,8 +26,9 @@ cannot be told, the floor is 1080p.
 
 It does not write to the database. ``QualifyResult.fields`` holds only ``files``
 columns for the caller to store: nzb_path, nzb_path2 (the archived NZB of the verified
-restore candidate; always present, None when there is none, so a stale one is cleared), remote_path, sha256, restore_score,
-restore_note, last_check_ts and last_stat_ok_ts. The result of each step is in
+restore candidate; always present, None when there is none, so a stale one is cleared),
+twin_nzb_path and twin_remote_path (the same: always present, None without a twin),
+remote_path, sha256, restore_score, restore_note, last_check_ts and last_stat_ok_ts. The result of each step is in
 ``QualifyResult.steps``, which is not a column.
 """
 from __future__ import annotations
@@ -47,6 +52,8 @@ _ERRORS = (AltMountError, NewznabError, NntpUnavailable, OSError, ParseError,
 MAX_FAILED_GRABS = 3  # failed NZB grabs for one row before it is called unsure
 GRAB_FAILED_NIGHTS = 3  # nights in a row a row's own grabs fail before it is called a miss
 _READ = 1 << 20
+TWIN_GRABS = 3  # NZB grabs one qualify may spend looking for a twin
+TWIN_SAMPLES = 5  # places (1 MiB each) a twin's bytes are compared with the local file
 
 
 @dataclass
@@ -161,6 +168,13 @@ def stat_nzb_bytes(raw: bytes, providers, tmp_dir: str, dead: dict | None = None
             os.unlink(tmp)
         except OSError:
             pass
+
+
+def _stat_ok(raw: bytes, providers, tmp_dir: str, dead: dict):
+    """True when every article is on every provider, False when one is missing, None
+    when a provider could not be asked."""
+    r = stat_nzb_bytes(raw, providers, tmp_dir, dead)
+    return True if r == "ok" else (False if r == "missing" else None)
 
 
 def score_restore(row: dict, indexers, own_ids: frozenset | None,
@@ -282,6 +296,63 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
             "partial": partial, "unsure": unsure, "note": note, "candidate": candidate}
 
 
+def find_twin(found, name: str, own_ids: frozenset, lib_path: str, *, indexers, importer,
+              reader, verify, grabs: int = TWIN_GRABS, own_link: str | None = None):
+    """A second upload of the very same file, for a promote to read from when the first
+    one fails. It has the same release name, no message-id in common with ``own_ids``,
+    ``verify(raw)`` says every article is there, and once imported it has the local
+    file's size and the local file's bytes at TWIN_SAMPLES places. A promote still checks
+    every chunk it reads from it against the chunk list.
+
+    Best effort: returns {title, nzb, remote_path} or None, and raises nothing of its
+    own. At most ``grabs`` NZBs are grabbed (cached per client); the listing ``own_link``
+    names (the one our upload came from) is never grabbed again."""
+    try:
+        size = os.path.getsize(lib_path)
+    except OSError:
+        return None
+    seen: list[frozenset] = []
+    for rel in _find_exact(found, name):
+        if own_link and rel.link == own_link:
+            continue
+        if grabs <= 0:
+            break
+        grabs -= 1
+        try:
+            ids, raw = indexers.fetch_nzb_ids(rel)
+        except GrabBudgetSpent:
+            break
+        except _ERRORS:
+            continue
+        if not ids or ids & own_ids or any(ids & s for s in seen):
+            continue  # our own upload, or one already tried
+        seen.append(ids)
+        try:
+            v = verify(raw)
+            if v is None:
+                break  # a provider could not be asked: more tries would not help
+            if not v:
+                continue
+            path = importer.import_nzb(raw, name)
+            if reader.size(path) != size or not _same_samples(reader, path, lib_path, size):
+                continue  # the same name, other bytes (a repack, say)
+        except _ERRORS:
+            continue
+        return {"title": rel.title, "nzb": raw, "remote_path": path}
+    return None
+
+
+def _same_samples(reader, remote_path: str, lib_path: str, size: int) -> bool:
+    n = min(_READ, size)
+    k = TWIN_SAMPLES if size > n else 1
+    offs = sorted({(size - n) * i // max(1, k - 1) for i in range(k)})
+    with open(lib_path, "rb") as f:
+        for off in offs:
+            if reader.read_range(remote_path, off, n) != os.pread(f.fileno(), n, off):
+                return False
+    return True
+
+
 def _find_exact(found, name: str):
     want = _clean(name)
     for rel in found:
@@ -343,6 +414,7 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
     # 1. exact NZB
     nzb_path = row.get("nzb_path")
     nzb_bytes = None
+    own_link = None  # the listing our NZB was grabbed from this time
     try:
         if nzb_path and os.path.exists(nzb_path):
             nzb_bytes = read_archived(nzb_path)
@@ -361,6 +433,7 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
             for rel in _find_exact(found, name):
                 try:
                     nzb_bytes = indexers.fetch_nzb(rel)
+                    own_link = rel.link
                     break
                 except GrabBudgetSpent:
                     unsure = others = True
@@ -451,14 +524,15 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
     fields["last_check_ts"] = now
     fields["last_stat_ok_ts"] = now
 
+    fields["twin_nzb_path"] = fields["twin_remote_path"] = None  # set again in step 6
+
     # 5. restore path: a different upload, checked on every provider like nzb_path
     fields["nzb_path2"] = None  # a stored one belongs to the release that was; set again below
     providers = (("secondary", stat_secondary), ("primary", stat_primary))
     dead_providers: dict = {}
 
     def verify(raw: bytes):
-        r = stat_nzb_bytes(raw, providers, archive_dir, dead_providers)
-        return True if r == "ok" else (False if r == "missing" else None)
+        return _stat_ok(raw, providers, archive_dir, dead_providers)
 
     try:
         sc = score_restore(row, indexers, nzb_segment_ids(nzb_bytes), stop_at=1,
@@ -490,6 +564,25 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
             return fail("restore", "no_restore_path", count=0)
         fields["nzb_path2"] = path2
     steps["restore"] = {"ok": True, "count": sc["count"], "best": sc["best"]}
+
+    # 6. a twin: the same bytes on a second upload, for a promote to switch to when the
+    # first fails mid-stream. Best effort, and last, so it only spends the grabs the
+    # required steps left: a file without one still qualifies.
+    try:
+        twin = find_twin(searched(), name, nzb_segment_ids(nzb_bytes), str(lib_path),
+                         indexers=indexers, importer=importer, reader=reader,
+                         verify=lambda raw: _stat_ok(raw, providers, archive_dir, {}),
+                         own_link=own_link)
+    except (IndexersUnavailable, *_ERRORS):
+        twin = None
+    if twin:
+        try:
+            tpath = archive_nzb(twin["nzb"], archive_dir, twin["title"])
+        except OSError:
+            tpath = None
+        if tpath and tpath != nzb_path:
+            fields["twin_nzb_path"], fields["twin_remote_path"] = tpath, twin["remote_path"]
+    steps["twin"] = {"ok": True, "found": bool(fields["twin_remote_path"])}
     return QualifyResult(True, [], fields, steps)
 
 
