@@ -469,18 +469,18 @@ def dirty(entry, seen, now):
 
 
 def ready(entry, seen, sessions, now, cfg):
-    """(ok, why): may this download be imported now? Never while it plays. Until WATCH_HOLD_MAX_HOURS after
-    it finished, also not while streamed or streamed in the quiet period, not before a fresh snapshot, and
-    not before every resume point is mapped."""
+    """(ok, why): may this download be imported now? Never while it plays, is paused, or was streamed in the
+    quiet period: a viewer who presses play again must find the file they were on. Until WATCH_HOLD_MAX_HOURS
+    after it finished, also not before a fresh snapshot and not before every resume point is mapped."""
     if playing(entry, sessions):
         return False, 'playing'
+    if streamed(entry, sessions) or now - last_seen(entry, seen) < cfg.quiet_s:
+        return False, 'recent'
     t0 = entry.get('done_at')
     if t0 is None:                                      # never seen finished: a long cap from the grab
         t0 = (entry.get('since') or now) + 7 * 86400
     if now - t0 >= cfg.max_s:
         return True, 'max_hours'
-    if streamed(entry, sessions) or now - last_seen(entry, seen) < cfg.quiet_s:
-        return False, 'recent'
     if dirty(entry, seen, now):
         return False, 'snapshot'
     if needs_prep(entry, now, cfg.stale_s):
