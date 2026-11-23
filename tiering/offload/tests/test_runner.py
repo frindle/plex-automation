@@ -831,7 +831,8 @@ def test_register_unhealthy_results_block_demotes_and_alert(tmp_path, monkeypatc
              (r(missing_local=3, ambiguous=3), True), (r(missing_local=5), False),
              (r(), False), ({"new": 2}, True), ({}, True), (r(listed=0), True),
              ({"missing_local": 1}, True), (None, True), (r(errors=[1]), True),
-             (r(ambiguous="0"), True), (r(missing_local=True), True)]
+             (r(ambiguous="0"), True), (r(missing_local=True), True),
+             (r(on_pool=40), False), (r(on_pool=40, missing_local=6), True)]  # on_pool is not missing
     for i, (res, bad) in enumerate(cases):
         sub = tmp_path / str(i)
         sub.mkdir()
