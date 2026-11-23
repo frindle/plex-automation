@@ -62,6 +62,7 @@ WATCHED_TTL = 600.0  # a file counts as watched this long after its last want or
 YIELD_POLL = 0.5  # a paused promote or demote looks this often for the watched promotes to end
 HEAD_FRAC = 0.20  # the head kept on disk is at least this share of the file ...
 HEAD_MIN_S = 1200.0  # ... and at least this much play time (TIERING_HEAD_MIN_S)
+MIN_PLAY_S = 1800.0  # a file with less play time than this stays whole (TIERING_MIN_PLAY_S)
 MIN_OFFLOAD_FRAC = 0.20  # a file whose middle would be under this share of it stays whole
 ATIME_EVERY = 600.0  # whole files are checked for a read this often (a stat of each)
 ATIME_SLACK = 1.0  # an access time this much newer than the one we noted is a read
@@ -168,6 +169,7 @@ class Config:
     pass_seconds: float = PASS_INTERVAL
     hot: hotset.Cfg = field(default_factory=hotset.Cfg)
     head_min_s: float = HEAD_MIN_S
+    min_play_s: float = MIN_PLAY_S
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
@@ -227,6 +229,7 @@ class Config:
             pass_seconds=float(e.get("TIERING_PASS_SECONDS") or PASS_INTERVAL),
             hot=hot,
             head_min_s=max(0.0, float(e.get("TIERING_HEAD_MIN_S") or HEAD_MIN_S)),
+            min_play_s=max(0.0, float(e.get("TIERING_MIN_PLAY_S") or MIN_PLAY_S)),
         )
 
 
@@ -1211,7 +1214,7 @@ class Runner:
         for r in todo:
             if r["state"] == "offloading":
                 continue  # its head was set when it started
-            frac, why = self._head_frac(r["id"])
+            frac, why = self._head_frac(r)
             if frac is None:
                 log.debug("demote %s skipped: %s", r["id"], why)
                 skipped[why] += 1
@@ -1246,13 +1249,18 @@ class Runner:
             self.join()
         return self.counts
 
-    def _head_frac(self, id):
+    def _head_frac(self, row):
         """The head share for a new offload: max(20 %, TIERING_HEAD_MIN_S of play time), so a
-        player always starts with that much on local disk. (None, why) when the play time is
-        unknown or the head would leave too little to offload."""
-        ms = self.durations.get(id)
+        player always starts with that much on local disk. The play time is Plex's, else the
+        one Radarr or Sonarr measured from the file (``play_ms``; never a show's listed slot
+        length, which runs longer than the file and would shrink the head). (None, why) when
+        neither has one, the file plays under TIERING_MIN_PLAY_S (a half-hour show), or the
+        head would leave too little to offload."""
+        ms = self.durations.get(row["id"]) or row.get("play_ms")
         if not ms or ms <= 0:
-            return None, "no play time from Plex (the head is sized by it)"
+            return None, "no play time from Plex or the arr (the head is sized by it)"
+        if ms < self.cfg.min_play_s * 1000.0:
+            return None, f"under {self.cfg.min_play_s / 60:.0f} minutes of play"
         frac = max(HEAD_FRAC, self.cfg.head_min_s * 1000.0 / ms)
         if frac > 1.0 - MIN_OFFLOAD_FRAC:
             return None, f"too short for a {self.cfg.head_min_s / 60:.0f}-minute head"
@@ -1448,7 +1456,7 @@ class Runner:
             return
         head_frac = None
         if not resume:
-            head_frac, why = self._head_frac(id)
+            head_frac, why = self._head_frac(row)
             if head_frac is None:
                 log.info("demote %s skipped: %s", id, why)
                 return

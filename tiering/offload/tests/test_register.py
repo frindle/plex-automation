@@ -128,6 +128,48 @@ def test_changed_size_or_mtime_clears_sha_and_refreshes_identity(tmp_path, arrs)
     assert row["sha256"] is None and row["size"] == 150
 
 
+@pytest.mark.parametrize("rt,ms", [
+    ("1:42:13", 6133000), ("42:13", 2533000), ("0:22:01.5", 1321500), ("00:00:00", None),
+    ("", None), (None, None), (5400, None), ("abc", None), ("1:2:3:4", None), ("-1:00", None),
+    ("1:nan:00", None)])
+def test_play_ms_reads_the_arrs_measured_run_time(rt, ms):
+    assert rg.play_ms({"mediaInfo": {"runTime": rt}}) == ms
+    assert rg.play_ms({}) is None and rg.play_ms({"mediaInfo": None}) is None
+
+
+def test_play_ms_comes_from_the_movie_and_episode_file(tmp_path, arrs):
+    mk(tmp_path, "m.mkv")
+    mk(tmp_path, "e.mkv")
+    m = movie("/data/m.mkv")
+    m["movieFile"]["mediaInfo"] = {"runTime": "1:50:00"}
+    s = arrs(series=[{"id": 7, "title": "Show", "tvdbId": 55}], episodes={7: [
+        {"seasonNumber": 1, "episodeNumber": 1,
+         "episodeFile": {"path": "/data/e.mkv", "size": 100, "mediaInfo": {"runTime": "21:30"}}}]})
+    st = FakeState()
+    run(st, [arrs(movies=[m])], [s], tmp_path=tmp_path)
+    by = {os.path.basename(r["lib_path"]): r for r in st.rows.values()}
+    assert by["m.mkv"]["play_ms"] == 110 * 60 * 1000 and by["e.mkv"]["play_ms"] == 1290 * 1000
+
+
+def test_play_ms_is_refreshed_and_goes_with_a_changed_file(tmp_path, arrs):
+    p = mk(tmp_path, "m.mkv", mtime=10**18)
+    r = arrs(movies=[movie("/data/m.mkv")])
+    st = FakeState()
+    run(st, [r], tmp_path=tmp_path)
+    (row,) = st.rows.values()
+    assert row["play_ms"] is None
+    row["sha256"] = "a" * 64
+    r.movies[0]["movieFile"]["mediaInfo"] = {"runTime": "1:00:00"}  # the arr scanned it later
+    assert run(st, [r], tmp_path=tmp_path)["updated"] == 1
+    assert row["play_ms"] == 3600 * 1000 and row["sha256"] == "a" * 64
+    assert run(st, [r], tmp_path=tmp_path)["unchanged"] == 1
+    r.movies[0]["movieFile"].pop("mediaInfo")  # no answer is not a new value
+    assert run(st, [r], tmp_path=tmp_path)["unchanged"] == 1 and row["play_ms"] == 3600 * 1000
+    os.utime(p, ns=(10**18 + 5, 10**18 + 5))  # another file, not scanned yet: its time is unknown
+    run(st, [r], tmp_path=tmp_path)
+    assert row["play_ms"] is None and row["sha256"] is None
+
+
 def test_identity_only_change_keeps_sha(tmp_path, arrs):
     mk(tmp_path, "m.mkv")
     r = arrs(movies=[movie("/data/m.mkv")])

@@ -327,11 +327,13 @@ class Stack:
 
     def add(self, key, rel, *, section="Movies", kind="movie", size=48 * MIB, disk=0,
             show=None, season=None, episode=None, alt=True, added=None, resolution="1080",
-            in_arr=True, in_remote=True, src=None, minutes=120, twin=False):
+            in_arr=True, in_remote=True, src=None, minutes=120, twin=False,
+            arr_minutes=None):
         """One library file with every stand-in told about it. `rel` is the path under
         Media/. `alt` adds a second, different upload (the restore path). `src` copies a
         real media file instead of writing `size` random bytes. `minutes` is the play time
-        Plex reports (it sizes the head); None: Plex reports none. `twin` lists a second
+        Plex reports (it sizes the head); None: Plex reports none. `arr_minutes` is the play
+        time the arr measured from the file (``mediaInfo.runTime``). `twin` lists a second
         upload of the same bytes under the same name, which AltMount serves from
         `<release>-twin/`."""
         disk_path = os.path.join(self.disks[disk], "Media", rel)
@@ -391,16 +393,20 @@ class Stack:
             item.update(grandparentRatingKey=str(show), parentIndex=season, index=episode)
         self.plex.items.append(item)
         f["item"] = item
+        afile = {"path": f["arr"], "size": size, "sceneName": release}
+        if arr_minutes:
+            s = int(arr_minutes * 60)
+            afile["mediaInfo"] = {"runTime": f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}"}
         if in_arr and kind == "movie":
             name, _, year = os.path.basename(os.path.dirname(rel)).rpartition(" (")
-            self.radarr.movies.append({"title": name, "year": int(year.rstrip(")")), "movieFile": {
-                "path": f["arr"], "size": size, "sceneName": release}})
+            self.radarr.movies.append({"title": name, "year": int(year.rstrip(")")),
+                                       "movieFile": afile})
         elif in_arr:
             if not self.sonarr.series:
                 self.sonarr.series.append({"id": 1, "title": "Show Name", "tvdbId": 1})
             self.sonarr.episodes.setdefault(1, []).append({
                 "seasonNumber": season, "episodeNumber": episode,
-                "episodeFile": {"path": f["arr"], "size": size, "sceneName": release}})
+                "episodeFile": afile})
         return f
 
     def add_season(self, season, n=4, prefix="Show.Name", **kw):

@@ -17,8 +17,8 @@ a disk path:
 
 - a new row gets a fresh random 16-hex ``id``, ``state=whole``, ``size``,
   ``mtime_ns`` and the media identity (``title``, ``year``, ``imdb_id``,
-  ``tvdb_id``, ``season``, ``episode``, ``release_name``). ``sha256`` stays empty
-  until qualify fills it;
+  ``tvdb_id``, ``season``, ``episode``, ``release_name``) and ``play_ms``, the play
+  time the arr measured from the file. ``sha256`` stays empty until qualify fills it;
 - an existing row is only touched while ``state=whole``. Its identity fields are
   refreshed; when the size or mtime differs it takes the new ones and clears
   ``sha256``, ``head_b3``, ``tail_b3``, ``head_len``, ``tail_len``, ``nzb_path``
@@ -76,6 +76,7 @@ _LIMIT = 256 * 1024 * 1024
 STALE = ("sha256", "head_b3", "tail_b3", "head_len", "tail_len", "nzb_path", "nzb_path2",
          "twin_nzb_path", "twin_remote_path", "restore_score", "restore_note", "remote_path")
 IDENTITY = ("title", "year", "imdb_id", "tvdb_id", "season", "episode", "release_name")
+REFRESHED = IDENTITY + ("play_ms",)  # refreshed on a whole row when the arr has a value
 
 
 class ArrError(Exception):
@@ -128,12 +129,35 @@ class ArrClient:
             raise ArrError("arr sent bad json") from None
 
 
+def play_ms(f: dict):
+    """The play time the arr measured from the file (``mediaInfo.runTime``, "h:mm:ss" or
+    "mm:ss", seconds may have a fraction) in ms, or None when it has none."""
+    mi = f.get("mediaInfo") if isinstance(f, dict) else None
+    rt = mi.get("runTime") if isinstance(mi, dict) else None
+    if not isinstance(rt, str):
+        return None
+    parts = rt.strip().split(":")
+    if not 2 <= len(parts) <= 3:
+        return None
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if any(n < 0 or n != n for n in nums):
+        return None
+    s = 0.0
+    for n in nums:
+        s = s * 60 + n
+    return int(s * 1000) or None
+
+
 def _movie_files(client: ArrClient):
     for m in client.get("/api/v3/movie"):
         f = m.get("movieFile") if isinstance(m, dict) else None
         if not f or not f.get("path"):
             continue
         yield {"path": f["path"], "size": f.get("size"), "scene": f.get("sceneName"),
+               "play_ms": play_ms(f),
                "title": m.get("title"), "year": m.get("year") or None,
                "imdb_id": m.get("imdbId") or None, "tvdb_id": None,
                "season": None, "episode": None}
@@ -155,6 +179,7 @@ def _episode_files(client: ArrClient):
                 seen[f["path"]] = (key, ep, f)
         for _, ep, f in seen.values():
             yield {"path": f["path"], "size": f.get("size"), "scene": f.get("sceneName"),
+                   "play_ms": play_ms(f),
                    "title": s.get("title"), "year": s.get("year") or None,
                    "imdb_id": s.get("imdbId") or None, "tvdb_id": s.get("tvdbId") or None,
                    "season": ep.get("seasonNumber"), "episode": ep.get("episodeNumber")}
@@ -207,7 +232,7 @@ def _entry_row(ent: dict, local: str, size: int, mtime_ns: int) -> dict:
     return {"title": ent.get("title"), "year": ent.get("year"), "imdb_id": ent.get("imdb_id"),
             "tvdb_id": ent.get("tvdb_id"), "season": ent.get("season"),
             "episode": ent.get("episode"), "release_name": release,
-            "size": size, "mtime_ns": mtime_ns}
+            "play_ms": ent.get("play_ms"), "size": size, "mtime_ns": mtime_ns}
 
 
 def _disk_map(env=None) -> list[tuple[str, str]]:
@@ -386,11 +411,12 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
                 out["skipped_state"] += 1
                 continue
             change = {k: v for k, v in want.items()
-                      if k in IDENTITY and v is not None
+                      if k in REFRESHED and v is not None
                       and (have.get(k) is None or str(have.get(k)) != str(v))}
             if have.get("size") != size or have.get("mtime_ns") != st.st_mtime_ns:
                 # a changed file is a different release: every fact about the old bytes goes
                 change.update(size=size, mtime_ns=st.st_mtime_ns, **{k: None for k in STALE})
+                change["play_ms"] = want["play_ms"]  # the new file's, or none
             if not change:
                 out["unchanged"] += 1
                 continue
