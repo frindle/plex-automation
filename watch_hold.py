@@ -144,6 +144,19 @@ def entry_keys(entry):
     return {k for it in (entry.get('items') or {}).values() for k in item_keys(it)}
 
 
+def busy(paths, sessions, seen, now, quiet_s):
+    """True while a viewer is on any of `paths` (by file name, like the holds): in a live session, or seen in one
+    within `quiet_s` (a pause or a quick stop may resume). `sessions` None means Plex was unreadable: busy."""
+    keys = {'f:' + base(p) for p in paths or () if p}
+    if not keys:
+        return False
+    if sessions is None:
+        return True
+    if any(keys & session_keys(s) for s in sessions):
+        return True
+    return any(now - (seen or {}).get(k, 0) < quiet_s for k in keys)
+
+
 def mark_seen(seen, sessions, now):
     for s in sessions or []:
         for k in session_keys(s):

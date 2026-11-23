@@ -211,6 +211,19 @@ def test_apply_deletes_and_searches_sonarr_and_radarr():
     assert st['broken'] == {}
 
 
+def test_a_file_someone_is_playing_waits_and_is_replaced_once_they_stop():
+    io, st = FakeIO(services=['Sonarr']), {}
+    io.logs['Sonarr'] = [err(EP_PATH)]
+    io.playing = {EP_PATH}
+    io.busy = lambda p: p in io.playing
+    _pass(io, st, T0, apply=True)
+    _pass(io, st, T0 + 2 * 3600, apply=True)
+    assert io.deletes == [] and st['broken'][EP_PATH]['outcome'] == 'waiting: someone is playing it'
+    io.playing = set()
+    _pass(io, st, T0 + 3 * 3600, apply=True)
+    assert io.deletes == [('Sonarr', '/api/v3/episodefile/50')]
+
+
 def test_source_torrent_in_deluge_is_rechecked_before_any_delete():
     io, st = FakeIO(services=['Sonarr']), {}
     io.logs['Sonarr'] = [err(EP_PATH)]

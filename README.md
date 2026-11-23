@@ -184,6 +184,20 @@ Not covered yet:
 | `WATCH_HOLD_AT_PCT` | `50` | progress at which a download with a resume point to map is held |
 | `WATCH_HOLD_STATE` | `/data/watch_hold_state.json` | holds, tracked downloads and recent streams |
 
+### Stream guard
+
+Every other path that deletes or unlinks a library file asks Plex first, with the same file-name match and `WATCH_HOLD_QUIET_MIN` window as watch hold. A file a viewer is on is left in place and tried again on a later pass:
+
+| Path | While someone plays the file | Plex unreadable |
+| --- | --- | --- |
+| Glacier release, dropping the ` - glacier-tmp` stopgap link | release waits (`[watch] guard glacier_link_playing`) | releases as before |
+| `/plex-dupe-fix?apply=1` (and the daily run) | loser kept: `skipped: playing now; next run` | nothing deleted |
+| arr health broken-file repair (`ARR_HEALTH_APPLY=1`) | `waiting: someone is playing it` | waits |
+| `/orphan-scan?delete=1` | counted in `skipped_playing` | nothing deleted |
+| `/delete-paths?apply=1` | listed under `skipped` | nothing deleted |
+
+Dry runs never ask Plex. `STREAM_GUARD=off` turns the guard off (default `on`). The offload tier has its own check (open file handles and Plex sessions), and downloads-only cleanups never touch a library file, so neither goes through this guard.
+
 ## Abandoned files audit
 
 `abandoned_audit.py` (pure) is wired in `arr-webhook.py`. Once a week (`ABANDONED_AUDIT_INTERVAL` seconds, default 604800, `0` = off; checked on the 6h maintenance tick, measured from the saved report so a restart does not rerun it) it compares what is on disk (Downloads and the library roots) with Deluge, Plex and Radarr/Sonarr and lists what nobody owns. **Report only**: it never deletes, moves, relabels or removes a torrent. Logs carry counts and GB, never paths; the paths appear on `/digest` and `/abandoned-audit`.

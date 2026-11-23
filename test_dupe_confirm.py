@@ -284,6 +284,7 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setattr(aw, 'supersede_torrent', lambda h: state['superseded'].append(h))
     # These tests are about the checks, not disk state: every listed copy is on disk.
     monkeypatch.setattr(aw, '_plex_file_on_disk', lambda p: bool(p))
+    monkeypatch.setattr(aw, 'stream_guard', lambda fail_closed=True: lambda p: False)   # nobody is watching
     monkeypatch.setattr(aw.llm_advisor, 'advise', advise)
     monkeypatch.delenv('LLM_DUPE_CONFIRM', raising=False)
     monkeypatch.delenv('LLM_DUPE_CONFIRM_MAX', raising=False)

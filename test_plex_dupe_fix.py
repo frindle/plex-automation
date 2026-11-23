@@ -47,6 +47,8 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setattr(aw, '_arr_items', lambda kind, cache: state['arr'][kind])
     monkeypatch.setattr(aw, '_arr_episode_files', lambda sid, cache: state['arr']['episodefile'].get(sid, []))
     state['root'] = tmp_path
+    state['playing'] = set()        # Plex paths a viewer is on (the stream guard)
+    monkeypatch.setattr(aw, 'stream_guard', lambda fail_closed=True: lambda p: p in state['playing'])
     return state
 
 
@@ -116,6 +118,19 @@ def test_same_name_copy_without_any_torrent_is_deleted(world):
     out = _run(apply=True)
     act = out['plan']['quality_upgrade'][0]['supersede'][0]
     assert act['result'].startswith('deleted ') and not fb.exists() and fa.exists()
+
+
+def test_copy_someone_is_playing_is_kept_until_a_later_run(world):
+    a = '/media/movies/Some Movie (2021)/Some.Movie.2021.1080p.mkv'
+    b = '/media/movies2/Some Movie (2021)/Some.Movie.2021.720p.mkv'
+    fa, fb = _file(world, a), _file(world, b)
+    world['entries'] = [{'plex_key': '1', 'title': 'Some Movie', 'media': [_m(a, size=6), _m(b, '720', 5, 2)]}]
+    world['playing'] = {b}
+    act = _run(apply=True)['plan']['quality_upgrade'][0]['supersede'][0]
+    assert act['result'] == 'skipped: playing now; next run' and fb.exists() and fa.exists()
+    world['playing'] = set()
+    act = _run(apply=True)['plan']['quality_upgrade'][0]['supersede'][0]
+    assert act['result'].startswith('deleted ') and not fb.exists()
 
 
 def test_different_name_loser_still_uses_basename_torrent_match(world):
