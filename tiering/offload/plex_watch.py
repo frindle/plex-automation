@@ -67,6 +67,20 @@ def _parts(row):
             for p in (m.get("Part") or []) if p.get("file")]
 
 
+def _durations(row):
+    """Play time in ms per file: the part's own, else its media's, else the item's."""
+    out = {}
+    for m in row.get("Media") or []:
+        for p in m.get("Part") or []:
+            ms = p.get("duration") or m.get("duration") or row.get("duration")
+            if p.get("file") and ms:
+                try:
+                    out[p["file"]] = int(ms)
+                except (TypeError, ValueError):
+                    pass
+    return out
+
+
 def _norm(row, section=None):
     res = next((m.get("videoResolution") for m in (row.get("Media") or [])
                 if m.get("videoResolution")), None)
@@ -82,6 +96,7 @@ def _norm(row, section=None):
         "bitrate": next((m.get("bitrate") for m in (row.get("Media") or [])
                          if m.get("bitrate")), None),
         "files": _parts(row),
+        "durations": _durations(row),
     }
 
 

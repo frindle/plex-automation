@@ -21,6 +21,25 @@ def test_a_fifth_of_the_file_stays_local_at_the_front(stack):
     stack.assert_intact()
 
 
+def test_head_holds_twenty_minutes_of_play(stack):
+    """The head holds at least 20 minutes of play, by Plex's play time: a 45-minute
+    file keeps 20/45 of itself; a 22-minute one, or one Plex has no play time for,
+    stays whole."""
+    mid = stack.add("mid", MOVIES[1], size=90 * S.MIB, minutes=45)
+    short = stack.add("short", MOVIES[2], size=60 * S.MIB, minutes=22)
+    unknown = stack.add("unknown", MOVIES[3], size=60 * S.MIB, minutes=None)
+    stack.start()
+    stack.wait_state(mid, "offloaded", timeout=120)
+    row = stack.row(mid)
+    want = -(-mid["size"] * 20 // 45)
+    assert want <= row["head_len"] < want + S.CHUNK, (row["head_len"], want)
+    S.wait_until(lambda: "demotes skipped by the head rule" in stack.log(), 60,
+                 what="the head rule to skip the short and the unknown file")
+    assert stack.state_of(short) == "whole" and stack.state_of(unknown) == "whole"
+    assert not os.path.islink(short["disk"]) and not os.path.islink(unknown["disk"])
+    stack.assert_intact()
+
+
 def test_sync_of_one_episode_brings_the_season_back(stack):
     """Scenario 3: a download of one offloaded episode has no Plex session. The
     reader gets the right bytes and the whole season comes back."""

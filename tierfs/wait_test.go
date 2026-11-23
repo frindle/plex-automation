@@ -14,7 +14,11 @@ import (
 	"time"
 )
 
-const playerPid = 5000
+// playerPid is a player that is not a Plex stream; streamPid is Plex's transcoder streaming to a client.
+const (
+	playerPid = 5000
+	streamPid = 5001
+)
 
 type wEnv struct {
 	*rvEnv
@@ -29,7 +33,8 @@ func wSetup(t *testing.T) *wEnv {
 	e := rvSetup(t, data, rs.URL, nil, nil)
 	e.s.class = newClassifier(fakeProc(t, map[uint32][2]string{
 		scanPid:   {"Plex Media Scan", "1"},
-		playerPid: {"Plex Transcoder", "1"},
+		playerPid: {"ffprobe", "1"},
+		streamPid: {"Plex Transcoder", "1"},
 		6000:      {"ffprobe", "4242"}, // child of the scanner
 	}), DefaultBackgroundComms)
 	e.s.cfg.FillPoll = 20 * time.Millisecond
@@ -287,6 +292,43 @@ func TestWaitPrewarmWantAtHeadLen(t *testing.T) {
 	}
 }
 
+// A Plex stream asks for the middle on its first read, wherever that read is.
+func TestWaitStreamWantsOnFirstRead(t *testing.T) {
+	w := wSetup(t)
+	h := w.open(t)
+	if _, errno := w.readAs(ctxPid(streamPid), h, 0, 4096); errno != 0 {
+		t.Fatal(errno)
+	}
+	if got := w.wants(t); len(got) != 1 || got[0] != w.m.HeadLen {
+		t.Fatalf("wants = %v, want [%d]", got, w.m.HeadLen)
+	}
+	if _, errno := w.readAs(ctxPid(streamPid), h, w.m.HeadLen*3/4, 8192); errno != 0 {
+		t.Fatal(errno)
+	}
+	if got := w.wants(t); len(got) != 1 {
+		t.Fatalf("wants = %v, want still one", got)
+	}
+	// A first read of the index at the end of the file counts too.
+	h2 := w.open(t)
+	if _, errno := w.readAs(ctxPid(streamPid), h2, w.m.Size-4096, 4096); errno != 0 {
+		t.Fatal(errno)
+	}
+	if got := w.wants(t); len(got) != 2 || got[1] != w.m.HeadLen {
+		t.Fatalf("wants = %v, want a second at %d", got, w.m.HeadLen)
+	}
+	// Another player reading the start (an arr's ffprobe) asks for nothing.
+	h3 := w.open(t)
+	if _, errno := w.readAs(ctxPid(playerPid), h3, 0, 1<<20); errno != 0 {
+		t.Fatal(errno)
+	}
+	if _, errno := w.readAs(ctxPid(playerPid), h3, w.m.Size-4096, 4096); errno != 0 {
+		t.Fatal(errno)
+	}
+	if got := w.wants(t); len(got) != 2 {
+		t.Fatalf("a probe wrote a want: %v", got)
+	}
+}
+
 func TestWaitWantReemittedOnFarSeek(t *testing.T) {
 	w := wSetup(t)
 	w.s.cfg.WaitTimeout = 100 * time.Millisecond
@@ -401,14 +443,17 @@ func TestConfigWaitEnv(t *testing.T) {
 	env := map[string]string{"TIERFS_MOUNT": "/m", "TIERFS_MANIFESTS": "/f", "TIERFS_STUB_ROOTS": "/s", "TIERFS_REMOTE_BASE": "http://x"}
 	get := func(k string) string { return env[k] }
 	c, err := ConfigFromEnv(get)
-	if err != nil || fmt.Sprint(c.BackgroundComms) != "[Plex Media Scan watch-align]" || c.WaitTimeout != 0 {
-		t.Fatalf("defaults: %+v %v", c.BackgroundComms, err)
+	if err != nil || fmt.Sprint(c.BackgroundComms) != "[Plex Media Scan watch-align]" || c.WaitTimeout != 0 ||
+		c.StreamComms != nil {
+		t.Fatalf("defaults: %+v %+v %v", c.BackgroundComms, c.StreamComms, err)
 	}
 	env["TIERFS_BACKGROUND_COMMS"] = "a, b ,,c"
+	env["TIERFS_STREAM_COMMS"] = " Plex Media Server ,, x"
 	env["TIERFS_WAIT_S"] = "30"
 	c, err = ConfigFromEnv(get)
-	if err != nil || fmt.Sprint(c.BackgroundComms) != "[a b c]" || c.WaitTimeout != 30*time.Second {
-		t.Fatalf("set: %+v %v %v", c.BackgroundComms, c.WaitTimeout, err)
+	if err != nil || fmt.Sprint(c.BackgroundComms) != "[a b c]" || c.WaitTimeout != 30*time.Second ||
+		fmt.Sprint(c.StreamComms) != "[Plex Media Server x]" {
+		t.Fatalf("set: %+v %+v %v %v", c.BackgroundComms, c.StreamComms, c.WaitTimeout, err)
 	}
 	env["TIERFS_WAIT_S"] = "0"
 	if _, err = ConfigFromEnv(get); err == nil {

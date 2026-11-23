@@ -15,6 +15,7 @@ reached through a `Deps` object (see `load_deps`), so tests can inject fakes.
 """
 from __future__ import annotations
 
+import collections
 import fcntl
 import importlib
 import inspect
@@ -57,6 +58,11 @@ WEEKLY_EVERY = 7 * DAY  # the weekly check runs when the last one is this old
 WEEKLY_RETRY = 3600.0  # after a failed weekly check, wait this long before trying again
 FOLLOW_POLL = 0.25  # the tierfs event file is read this often (a want starts a promote within 1 s)
 WANT_SPACING = 60.0  # wanted attempts on one id are at least this far apart
+WATCHED_TTL = 600.0  # a file counts as watched this long after its last want or live-session sighting
+YIELD_POLL = 0.5  # a paused promote or demote looks this often for the watched promotes to end
+HEAD_FRAC = 0.20  # the head kept on disk is at least this share of the file ...
+HEAD_MIN_S = 1200.0  # ... and at least this much play time (TIERING_HEAD_MIN_S)
+MIN_OFFLOAD_FRAC = 0.20  # a file whose middle would be under this share of it stays whole
 ATIME_EVERY = 600.0  # whole files are checked for a read this often (a stat of each)
 ATIME_SLACK = 1.0  # an access time this much newer than the one we noted is a read
 # Plex reads a new or replaced file for its own analysis (previews, intro and credits
@@ -161,6 +167,7 @@ class Config:
     http: str = "127.0.0.1:8471"
     pass_seconds: float = PASS_INTERVAL
     hot: hotset.Cfg = field(default_factory=hotset.Cfg)
+    head_min_s: float = HEAD_MIN_S
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
@@ -219,6 +226,7 @@ class Config:
             http=e.get("TIERING_HTTP") or "127.0.0.1:8471",
             pass_seconds=float(e.get("TIERING_PASS_SECONDS") or PASS_INTERVAL),
             hot=hot,
+            head_min_s=max(0.0, float(e.get("TIERING_HEAD_MIN_S") or HEAD_MIN_S)),
         )
 
 
@@ -292,10 +300,10 @@ def _http_gate(cfg: Config):
     return gate
 
 
-def _takes_want(fn) -> bool:
-    """True when `fn` accepts a `want=` argument (ops.promote gains it in a later change)."""
+def _takes(fn, name) -> bool:
+    """True when `fn` accepts the keyword argument `name`."""
     try:
-        return "want" in inspect.signature(fn).parameters
+        return name in inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
 
@@ -307,16 +315,18 @@ def load_deps(cfg: Config) -> Deps:
 
     reader = altmount.WebDavReader()
 
-    def promote(db, row, apply, want=None):
-        kw = {"want": want} if want is not None and _takes_want(ops.promote) else {}
+    def promote(db, row, apply, want=None, urgent=None, pause=None):
+        kw = {k: v for k, v in (("want", want), ("urgent", urgent), ("pause", pause))
+              if v is not None and _takes(ops.promote, k)}
         return ops.promote(db, row["id"], reader, apply=apply, manifest_dir=cfg.manifests,
                            path_map=cfg.path_map, **kw)
 
-    def demote(db, row, apply):
+    def demote(db, row, apply, head_frac=None):
         # lib_path stays the share path; ops resolves the disk path and picks the stub
         # root from TIERFS_STUB_ROOTS by st_dev.
+        kw = {"head_frac": head_frac} if head_frac is not None else {}
         return ops.demote(db, row, manifest_dir=cfg.manifests, tierfs_mount=cfg.tierfs_mount,
-                          apply=apply, path_map=cfg.path_map)
+                          apply=apply, path_map=cfg.path_map, **kw)
 
     factory = os.environ.get("TIERING_QUALIFY_FACTORY") or \
         f"{__package__}.wiring:qualify_from_env"
@@ -417,6 +427,8 @@ class Runner:
         self.flag_seq = 0  # last events row read for weekly flags
         self.want_last: dict = {}  # id -> start of the last wanted attempt (kept in kv)
         self.want_off: dict = {}  # id -> newest offset a player waits at
+        self.watched: dict = {}  # id -> last want or live-session sighting: its promote goes first, wide
+        self.durations: dict = {}  # id -> play time in ms, from Plex (sets the head)
         self.tail_events: list = []  # bad_chunk and slot_timeout events for the pass
         self.follow_mu = threading.Lock()
         self.weekly_last = 0.0
@@ -825,6 +837,7 @@ class Runner:
             return
         off = ev.get("offset")
         with self.mu:
+            self.watched[id] = max(self.watched.get(id, 0.0), now)
             if off is not None:
                 self.want_off[id] = off
             # a player waits: the retry backoff does not apply, only the 60 s spacing
@@ -835,6 +848,40 @@ class Runner:
             self.promote_running.add(id)
             self.promote_started[id] = now
         self._spawn(lambda: self._want_worker(id))
+
+    def _is_watched(self, id, now=None) -> bool:
+        """Someone is watching this file (call with self.mu held or not: a dict read)."""
+        t = self.watched.get(id)
+        return t is not None and (now if now is not None else self.clock()) - t < WATCHED_TTL
+
+    def _watched_running(self, but=None) -> bool:
+        now = self.clock()
+        with self.mu:
+            return any(o != but and self._is_watched(o, now) for o in self.promote_running)
+
+    def _yield_to_watched(self, id=None):
+        """Block while a promote someone is watching runs, unless `id` is watched too.
+        Promotes nobody watches call it before each chunk, the demote worker before each file."""
+        paused = False
+        while not self.stop.is_set():
+            if (id is not None and self._is_watched(id)) or not self._watched_running(but=id):
+                break
+            if not paused:
+                paused = True
+                log.info("%s paused: a watched file is being fetched",
+                         f"promote {id}" if id is not None else "demotes")
+            self.stop.wait(YIELD_POLL)
+        if paused:
+            log.info("%s resumed", f"promote {id}" if id is not None else "demotes")
+
+    def _session_wants(self, sessions, rows_by_rk, now):
+        """A live Plex session on a file that is not all on disk is a want: its promote
+        starts now, outside the concurrency limit, and the others pause."""
+        for s_ in sessions:
+            rk = s_.get("ratingKey")
+            for r in rows_by_rk.get(str(rk), []) if rk is not None else []:
+                if r["state"] in ("offloaded", "promoting"):
+                    self._want({"id": r["id"], "ts": now})
 
     def _want_worker(self, id):
         try:
@@ -1048,10 +1095,14 @@ class Runner:
 
         path_rk = {}
         by_rk_item = {}
+        path_ms = {}
         for it in items:
             by_rk_item[str(it["ratingKey"])] = it
             for f in it.get("files") or []:
                 path_rk[f] = str(it["ratingKey"])  # Plex's path is the share path
+            path_ms.update(it.get("durations") or {})
+        self.durations = {r["id"]: path_ms[r["lib_path"]] for r in rows
+                          if path_ms.get(r.get("lib_path"))}
         rows_by_rk: dict = {}
         id_to_rk = {}
         for r in rows:
@@ -1064,6 +1115,8 @@ class Runner:
             r["rating_key"] = rk
             rows_by_rk.setdefault(rk, []).append(r)
             id_to_rk[r["id"]] = rk
+
+        self._session_wants(data["sessions"] or [], rows_by_rk, now)
 
         synced = {}
         if cfg.events:
@@ -1154,6 +1207,20 @@ class Runner:
         todo = [] if block else [r for r in dcands if r["id"] not in tried]
         if block:
             log.info("demotes skipped: %s", block)
+        heads, skipped = {}, collections.Counter()
+        for r in todo:
+            if r["state"] == "offloading":
+                continue  # its head was set when it started
+            frac, why = self._head_frac(r["id"])
+            if frac is None:
+                log.debug("demote %s skipped: %s", r["id"], why)
+                skipped[why] += 1
+            else:
+                heads[r["id"]] = frac
+        if skipped:  # one line a pass, not one per file: most of a TV library is short
+            log.info("demotes skipped by the head rule: %s",
+                     ", ".join(f"{k} {v}" for k, v in sorted(skipped.items())))
+        todo = [r for r in todo if r["state"] == "offloading" or r["id"] in heads]
         if not cfg.apply:
             used = n["bytes"] if n else 0
             for r in todo:
@@ -1161,8 +1228,8 @@ class Runner:
                 if used + size > cfg.demote_bytes_per_night:
                     break
                 used += size
-                log.info("plan: demote %s id=%s (idle, %d bytes)", self.disk[r["id"]], r["id"],
-                         size)
+                log.info("plan: demote %s id=%s (idle, %d bytes, head %d%%)", self.disk[r["id"]],
+                         r["id"], size, round(100 * heads.get(r["id"], 0)))
         else:
             with self.mu:
                 self.demote_todo = deque(r["id"] for r in todo)
@@ -1178,6 +1245,18 @@ class Runner:
         if wait:
             self.join()
         return self.counts
+
+    def _head_frac(self, id):
+        """The head share for a new offload: max(20 %, TIERING_HEAD_MIN_S of play time), so a
+        player always starts with that much on local disk. (None, why) when the play time is
+        unknown or the head would leave too little to offload."""
+        ms = self.durations.get(id)
+        if not ms or ms <= 0:
+            return None, "no play time from Plex (the head is sized by it)"
+        frac = max(HEAD_FRAC, self.cfg.head_min_s * 1000.0 / ms)
+        if frac > 1.0 - MIN_OFFLOAD_FRAC:
+            return None, f"too short for a {self.cfg.head_min_s / 60:.0f}-minute head"
+        return frac, ""
 
     @staticmethod
     def _order_promotes(acts, by_rk, sessions):
@@ -1273,10 +1352,10 @@ class Runner:
                                                   else ("offloaded", "promoting")):
                 return
             log.info("promote start %s%s", id, " (wanted)" if wanted else "")
-            if _takes_want(self.deps.promote):
-                res = self.deps.promote(db, cur, True, want=lambda: self.want_off.get(id))
-            else:
-                res = self.deps.promote(db, cur, True)
+            kw = {"want": lambda: self.want_off.get(id), "urgent": lambda: self._is_watched(id),
+                  "pause": lambda: self._yield_to_watched(id)}
+            res = self.deps.promote(db, cur, True, **{k: v for k, v in kw.items()
+                                                      if _takes(self.deps.promote, k)})
             self._after(db, id, "promote", res)
         except Exception as e:
             log.error("promote %s raised %s: %s", id, type(e).__name__, e)
@@ -1288,6 +1367,7 @@ class Runner:
                 self.promote_running.discard(id)
                 self.promote_started.pop(id, None)
                 self.want_off.pop(id, None)
+                self.watched.pop(id, None)
 
     def _after(self, db, id, what, res):
         if res.ok:
@@ -1320,6 +1400,7 @@ class Runner:
                     if not self.demote_todo:
                         return
                     id = self.demote_todo.popleft()
+                self._yield_to_watched()
                 now = self.clock()
                 block = self._demote_block(now)
                 if block:
@@ -1365,7 +1446,12 @@ class Runner:
         if n["bytes"] + size > cfg.demote_bytes_per_night:
             log.info("demote %s skipped: would pass the night's cap", id)
             return
+        head_frac = None
         if not resume:
+            head_frac, why = self._head_frac(id)
+            if head_frac is None:
+                log.info("demote %s skipped: %s", id, why)
+                return
             try:
                 ls = os.lstat(disk)
             except OSError as e:
@@ -1419,7 +1505,10 @@ class Runner:
         with self.mu:
             self.demote_running.add(id)
         try:
-            res = self.deps.demote(db, row, True)
+            if head_frac is not None and _takes(self.deps.demote, "head_frac"):
+                res = self.deps.demote(db, row, True, head_frac=head_frac)
+            else:
+                res = self.deps.demote(db, row, True)
         except Exception as e:
             log.error("demote %s raised %s: %s", id, type(e).__name__, e)
             self._note_failure(self.clock())  # no more demotes tonight

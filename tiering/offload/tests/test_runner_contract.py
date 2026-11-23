@@ -222,6 +222,75 @@ def test_want_starts_a_promote_within_a_second_outside_the_concurrency(tmp_path,
         r.close()
 
 
+def test_live_session_promote_goes_first_and_wide_while_the_others_pause(tmp_path, monkeypatch):
+    r = Rig(tmp_path, monkeypatch, names=("Alpha", "Beta"), promote_concurrency=1)
+    try:
+        a, b = (x["id"] for x in sorted(st.list_files(r.db), key=lambda x: x["id"]))
+        st.upsert(r.db, {"id": b, "rating_key": "77"})
+        monkeypatch.setattr(plex_watch, "sessions", lambda: [{"ratingKey": "77", "file": None}])
+        b_in, release_b, a_in, a_resumed = (threading.Event() for _ in range(4))
+        seen = {}
+
+        def promote(db, row, apply, want=None, urgent=None, pause=None):
+            if row["id"] == b:
+                seen["b_wide"] = urgent()
+                b_in.set()
+                release_b.wait(10)
+            else:
+                seen["a_wide"] = urgent()
+                a_in.set()
+                pause()  # ops calls it before each chunk of a promote nobody watches
+                a_resumed.set()
+            st.set_state(db, row["id"], "whole")
+            return Res(True, "whole")
+        r.deps.promote = promote
+        st.log_event(r.db, a, "weekly_flag", {"reasons": ["x"]})  # a takes the only regular slot
+        r.runner.weekly_last = r.clock()
+        r.runner.run_pass()
+        assert b_in.wait(5), "the live session's file is promoted at once, outside the limit"
+        assert a_in.wait(5)
+        assert seen == {"b_wide": True, "a_wide": False}
+        assert not a_resumed.wait(0.5), "an unwatched promote waits while a watched one runs"
+        release_b.set()
+        assert a_resumed.wait(5), "and goes on once it is done"
+        r.runner.join()
+        assert r.row(a)["state"] == r.row(b)["state"] == "whole"
+        assert b not in r.runner.watched
+    finally:
+        r.runner.stop.set()
+        r.close()
+
+
+def test_watched_file_with_a_running_unwatched_promote_turns_it_wide(tmp_path, monkeypatch):
+    r = Rig(tmp_path, monkeypatch)
+    try:
+        rid = st.list_files(r.db)[0]["id"]
+        r.runner.weekly_last = r.clock()
+        in_promote, release, wide = threading.Event(), threading.Event(), []
+
+        def promote(db, row, apply, want=None, urgent=None, pause=None):
+            wide.append(urgent())
+            in_promote.set()
+            release.wait(10)
+            wide.append(urgent())
+            st.set_state(db, row["id"], "whole")
+            return Res(True, "whole")
+        r.deps.promote = promote
+        st.log_event(r.db, rid, "weekly_flag", {"reasons": ["x"]})
+        r.runner.run_pass()
+        assert in_promote.wait(5)
+        r.runner._want({"id": rid, "ts": r.clock(), "offset": None})  # play pressed mid-promote
+        release.set()
+        r.runner.join()
+        assert wide == [False, True]
+        r.clock.t += runner.WATCHED_TTL + 1
+        r.runner.watched[rid] = r.clock() - runner.WATCHED_TTL - 1
+        assert not r.runner._is_watched(rid), "a sighting this old is not a viewer"
+    finally:
+        r.runner.stop.set()
+        r.close()
+
+
 def test_want_for_a_running_promote_moves_its_cursor_and_stale_or_whole_is_ignored(
         tmp_path, monkeypatch):
     events = str(tmp_path / "events.jsonl")
@@ -352,6 +421,7 @@ def test_no_exact_nzb_is_still_recorded(tmp_path, monkeypatch):
             ok, reasons, fields = False, ["no_exact_nzb"], {}
         rig.deps.qualify = lambda r: Q
         rig.runner.disk[row["id"]] = row["lib_path"]
+        rig.runner.durations[row["id"]] = 2 * 3600 * 1000  # Plex's play time sets the head
         rig.runner._demote_one(rig.db, row["id"], rig.clock())
         assert "qualify_failed" in [e["kind"] for e in st.events(rig.db, row["id"])]
     finally:

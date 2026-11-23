@@ -22,7 +22,10 @@ import os
 import secrets
 import stat as stat_mod
 import tempfile
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as _wait_futures
 from dataclasses import dataclass
 from typing import Callable, NamedTuple, Protocol
 
@@ -68,6 +71,8 @@ class ShortRead(ConnectionError):
 SHORT_LIMIT = 3  # consecutive attempts that end short at the same offset
 WANT_SPAN = 64 * MIB  # a want inside the next 64 MiB does not move the fill cursor
 DEFAULT_RETRY_S = 600.0
+DEFAULT_STREAM_FETCHES = 6  # chunks fetched at once while someone is watching the file
+MAX_STREAM_FETCHES = 32
 RETRY_MAX_DELAY = 30.0
 FAILED_HOLD_S = 1.5  # a failed line from a spent retry budget stays this long (tierfs polls every 0.2 s at most)
 _sleep = time.sleep  # tests patch these two
@@ -983,20 +988,26 @@ def promote(
     after_step: Callable[[int], None] | None = None,
     path_map=None,
     want: Callable[[], int | None] | None = None,
+    urgent: Callable[[], bool] | None = None,
+    pause: Callable[[], None] | None = None,
 ) -> Result:
     """Fill the stub's middle from the remote (every chunk checked against the
     chunk list), verify sha256, swap it over L. On a mismatch nothing is
     swapped: state=failed and the symlink stays.
 
-    Chunks are fetched one at a time, starting at the newest offset `want()`
-    returns (None: from the start of the middle), then wrapping round. Each
-    chunk is written, fdatasync'd and only then listed in <id>.fill, which is
-    what tierfs's waiting players watch. `chunk` is kept for callers; one read
-    is always one list chunk."""
+    Chunks are fetched starting at the newest offset `want()` returns (None:
+    from the start of the middle), then wrapping round. Each chunk is written,
+    fdatasync'd and only then listed in <id>.fill, which is what tierfs's
+    waiting players watch. While `urgent()` is true (someone is watching the
+    file) TIERING_PROMOTE_STREAM_FETCHES chunks are fetched at once, so the fill
+    lines can land out of order; otherwise one at a time, and `pause()` is
+    called before each chunk (it blocks while a watched file is being fetched).
+    `chunk` is kept for callers; one read is always one list chunk."""
     with _id_lock(db, id) as held:
         if not held:
             return Result(False, None, 0, _BUSY)
-        return _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map, want)
+        return _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map, want,
+                        urgent, pause)
 
 
 def _short_remote(db, id, offset, step):
@@ -1044,7 +1055,16 @@ def _retry_budget() -> float:
         return DEFAULT_RETRY_S
 
 
-def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=None, want=None) -> Result:
+def _stream_fetches() -> int:
+    try:
+        n = int(os.environ.get("TIERING_PROMOTE_STREAM_FETCHES", DEFAULT_STREAM_FETCHES))
+    except ValueError:
+        return DEFAULT_STREAM_FETCHES
+    return min(max(n, 1), MAX_STREAM_FETCHES)
+
+
+def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=None, want=None,
+             urgent=None, pause=None) -> Result:
     row = st.get(db, id)
     if row is None:
         return Result(False, None, 0, "unknown id")
@@ -1144,7 +1164,8 @@ def _promote(db, id, reader, apply, chunk, manifest_dir, after_step, path_map=No
     # ---- step 1: fill the middle (only that range, chunk by chunk), fsync
     if step < 1:
         try:
-            _fill_middle(reader, row, stub, lib, chunk_size, chunk_digests, fpath, want, _retry_budget())
+            _fill_middle(reader, row, stub, lib, chunk_size, chunk_digests, fpath, want, _retry_budget(),
+                         urgent, pause)
         except ChunkMismatch as e:
             _fail(db, id, f"chunk mismatch from the remote at offset {e.offset}; nothing swapped",
                   offset=e.offset)
@@ -1331,11 +1352,17 @@ def _drop_failed_lines(path) -> None:
     _write_atomic(path, keep)
 
 
-def _fetch_chunk(reader, remote_path, off, n, digest, retry_s):
+class _Aborted(Exception):
+    """A parallel fetch whose promote has already stopped (never seen by callers)."""
+
+
+def _fetch_chunk(reader, remote_path, off, n, digest, retry_s, abort=None):
     """One chunk, checked against the chunk list. A fetch error is retried with
     backoff for up to retry_s; a second hash mismatch raises ChunkMismatch."""
     deadline, delay, bad = None, 1.0, 0
     while True:
+        if abort is not None and abort.is_set():
+            raise _Aborted()
         try:
             data = reader.read_range(remote_path, off, n)
             if len(data) != n:
@@ -1344,7 +1371,7 @@ def _fetch_chunk(reader, remote_path, off, n, digest, retry_s):
             now = _mono()
             if deadline is None:
                 deadline = now + retry_s
-            if now + delay > deadline:
+            if now + delay > deadline or (abort is not None and abort.is_set()):
                 raise
             log.warning("chunk at %d: %s: %s; retrying in %.0fs", off, type(e).__name__, e, delay)
             _sleep(delay)
@@ -1357,12 +1384,15 @@ def _fetch_chunk(reader, remote_path, off, n, digest, retry_s):
             raise ChunkMismatch(off)
 
 
-def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry_s):
+def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry_s,
+                 urgent=None, pause=None):
     start, end = row["head_len"], row["size"] - row["tail_len"]
     n_chunks = len(digests)
     done = _read_fill(fpath, start, chunk_size, n_chunks)
     _drop_failed_lines(fpath)
-    fd = ffd = None
+    fd = ffd = pool = None
+    abort = threading.Event()
+    busy: dict = {}  # future -> chunk index, fetched by the pool, written here
     try:
         fd = os.open(stub, os.O_WRONLY)
         ffd = os.open(fpath, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
@@ -1375,6 +1405,8 @@ def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry
             ls = None
         if ls is not None and _same_inode(fs, ls):
             raise OpsError("stub is the same inode as L; refusing to write into the library file")
+        wide = _stream_fetches()
+        pool = ThreadPoolExecutor(max_workers=wide, thread_name_prefix="promote-fetch")
         cursor, last_want, first = 0, None, True
         while len(done) < n_chunks:
             w = want() if want else None
@@ -1384,26 +1416,44 @@ def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry
                 if 0 <= widx < n_chunks and (first or not 0 <= w - (start + cursor * chunk_size) < WANT_SPAN):
                     cursor = widx
                 first = False
-            idx = cursor
-            while idx in done:  # first chunk at or after the cursor that is still to fetch
-                idx = (idx + 1) % n_chunks
-            off = start + idx * chunk_size
-            n = min(chunk_size, end - off)
-            try:
-                data = _fetch_chunk(reader, row["remote_path"], off, n, digests[idx], retry_s)
-            except ChunkMismatch:
-                os.write(ffd, f"failed {off}\n".encode())
-                raise
-            view = memoryview(data)
-            w_ = 0
-            while w_ < n:
-                w_ += os.pwrite(fd, view[w_:], off + w_)
-            os.fdatasync(fd)
-            os.write(ffd, f"{off}\n".encode())
-            done.add(idx)
-            cursor = (idx + 1) % n_chunks
+            hot = bool(urgent and urgent())
+            if not hot and not busy and pause is not None:
+                pause()  # a promote nobody watches waits while a watched one runs
+                hot = bool(urgent and urgent())
+            width = wide if hot else 1
+            taken = set(busy.values())
+            while len(busy) < width and len(done) + len(busy) < n_chunks:
+                idx = cursor
+                while idx in done or idx in taken:  # first chunk at or after the cursor still to fetch
+                    idx = (idx + 1) % n_chunks
+                off = start + idx * chunk_size
+                fut = pool.submit(_fetch_chunk, reader, row["remote_path"], off,
+                                  min(chunk_size, end - off), digests[idx], retry_s, abort)
+                busy[fut] = idx
+                taken.add(idx)
+                cursor = (idx + 1) % n_chunks
+            finished, _ = _wait_futures(list(busy), timeout=1.0, return_when=FIRST_COMPLETED)
+            for fut in sorted(finished, key=lambda f: busy[f]):
+                idx = busy.pop(fut)
+                off = start + idx * chunk_size
+                n = min(chunk_size, end - off)
+                try:
+                    data = fut.result()
+                except ChunkMismatch:
+                    os.write(ffd, f"failed {off}\n".encode())
+                    raise
+                view = memoryview(data)
+                w_ = 0
+                while w_ < n:
+                    w_ += os.pwrite(fd, view[w_:], off + w_)
+                os.fdatasync(fd)
+                os.write(ffd, f"{off}\n".encode())
+                done.add(idx)
         os.fsync(fd)
     finally:
+        abort.set()  # fetches still running stop at their next retry; their data is dropped
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
         for x in (fd, ffd):
             if x is not None:
                 os.close(x)

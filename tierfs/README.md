@@ -43,7 +43,9 @@ is also background when its `/proc/<pid>/cmdline` is one of Plex's analysis jobs
 loudness (`-f null -`), intro and credits markers (audio written under
 `Transcode/Detection/`) or voice activity (`track-NNNN.wav`). A command line that
 names any other muxer (dash, segment, mp4, ...) is a player. A pid or command
-line that cannot be read counts as a player.
+line that cannot be read counts as a player. A player whose comm is in
+`TIERFS_STREAM_COMMS` (Plex Media Server, a streaming Plex Transcoder, Plex DLNA
+Server) is a *Plex stream*: someone pressed play.
 
 - Background readers (the Plex scanner, its children and the analysis jobs) keep
   the remote stream described above, so they never promote the file and never
@@ -52,8 +54,10 @@ line that cannot be read counts as a player.
   chunks listed in `<id>.fill`, and waits until the chunk is listed. The fill
   file is checked at least every 200 ms.
 - The first wait for an offset writes a `want` event, and a far seek writes a new
-  one. A read 75% of the way through the head writes one for the start of the
-  middle. The promote fetches from the newest want.
+  one. A Plex stream's first read of the file, wherever it is, writes one for the
+  start of the middle, so the promote starts when play is pressed. Any other
+  player (an arr's ffprobe reading the media info) writes it only once a read
+  is 75% of the way through the head. The promote fetches from the newest want.
 - `failed <offset>` in the fill file gives EIO at once. `TIERFS_WAIT_S` is a
   no-progress timeout: the read gets EIO only when the fill file has not grown
   for that long. An interrupted request stops waiting.
@@ -77,6 +81,7 @@ line that cannot be read counts as a player.
 | `TIERFS_ALLOW_OTHER` | `1` | Let other users (such as Plex) read the mount. Set `0` to turn off. |
 | `TIERFS_POLL` | `5s` | How often manifests are rescanned. `SIGHUP` rescans at once. |
 | `TIERFS_BACKGROUND_COMMS` | `Plex Media Scan,watch-align` | Comma list of process names (`comm`, 15 characters) whose reads, and their children's, keep the remote stream. `watch-align` is the webhook's ffmpeg matching an old and a new copy's sound before an upgrade (see the main README, Watch hold). Every other reader is a player and waits for the promote. |
+| `TIERFS_STREAM_COMMS` | `Plex Media Server,Plex Transcoder,Plex DLNA Server` | Comma list of process names (`comm`, 15 characters) that are Plex streams: their first read of an offloaded file asks for the promote at once. A Plex Transcoder running an analysis job stays background. Unset or empty: the default. |
 | `TIERFS_WAIT_S` | `900` | Seconds a player read waits with no new line in the fill file before it gets EIO. |
 
 Manifests that are invalid are skipped with a log line. If a manifest is

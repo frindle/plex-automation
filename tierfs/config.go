@@ -84,6 +84,14 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			}
 		}
 	}
+	if v := strings.TrimSpace(getenv("TIERFS_STREAM_COMMS")); v != "" {
+		c.StreamComms = []string{}
+		for _, n := range strings.Split(v, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				c.StreamComms = append(c.StreamComms, n)
+			}
+		}
+	}
 	if v := getenv("TIERFS_WAIT_S"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {

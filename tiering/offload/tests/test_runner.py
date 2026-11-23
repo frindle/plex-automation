@@ -1,4 +1,5 @@
 import importlib.util
+import dataclasses
 import json
 import logging
 import os
@@ -130,7 +131,7 @@ class World:
                   window=runner.parse_window("02:00-06:00"))
         kw.update(cfgkw)
         self.cfg = Config(**kw)
-        for name, fn in (("library_items", lambda: self.items),
+        for name, fn in (("library_items", lambda: [self._timed(it) for it in self.items]),
                          ("play_history", lambda since: self.plays),
                          ("sessions", lambda: self.sessions),
                          ("on_deck", lambda: self.deck),
@@ -139,6 +140,13 @@ class World:
         deps = Deps(self.state, self._promote, self._demote, self._qualify,
                     lambda p: (self.calls.append(("gate", p)), self.gate_answer)[1])
         self.runner = Runner(self.cfg, deps, clock=self.clock, sleep=lambda s: None)
+
+    @staticmethod
+    def _timed(it):
+        """Plex gives every file its play time; a test item without one is a 2-hour file."""
+        if "durations" in it:
+            return it
+        return {**it, "durations": {f: 2 * 3600 * 1000 for f in it.get("files") or []}}
 
     def _wrap(self, name, fn):
         def f(*a):
@@ -411,7 +419,52 @@ def test_dry_run_logs_demote_plan(tmp_path, monkeypatch, caplog):
     w.row("d", 2, w.movie(2), "whole")
     with caplog.at_level(logging.INFO, logger="tiering.runner"):
         w.run()
-    assert "plan: demote" in caplog.text and w.calls == []
+    assert "plan: demote" in caplog.text and "head 20%" in caplog.text and w.calls == []
+
+
+def _timed_movie(w, rk, minutes):
+    path = w.movie(rk)
+    w.items[-1]["durations"] = {path: int(minutes * 60 * 1000)} if minutes else {}
+    return path
+
+
+def test_head_is_twenty_minutes_of_play_or_twenty_percent(tmp_path, monkeypatch, caplog):
+    w = World(tmp_path, monkeypatch, demote_bytes_per_night=100 * GB)
+    heads = {}
+
+    def demote(db, row, apply, head_frac=None):
+        heads[row["id"]] = head_frac
+        w.state.set_state(db, row["id"], "offloaded")
+        return Res(True, "offloaded")
+    w.runner.deps = dataclasses.replace(w.runner.deps, demote=demote)
+    w.row("long", 1, _timed_movie(w, 1, 150), "whole")  # 20 min is 13 %: the 20 % floor
+    w.row("mid", 2, _timed_movie(w, 2, 45), "whole")  # 20 min is 44 %
+    w.row("short", 3, _timed_movie(w, 3, 22), "whole")  # 20 min is 91 %: not worth it
+    w.row("unknown", 4, _timed_movie(w, 4, 0), "whole")  # Plex has no play time
+    with caplog.at_level(logging.INFO, logger="tiering.runner"):
+        w.run()
+    assert heads["long"] == pytest.approx(0.20)
+    assert heads["mid"] == pytest.approx(20 / 45)
+    assert "short" not in heads and "unknown" not in heads
+    assert ("demotes skipped by the head rule: no play time from Plex (the head is sized by it) 1, "
+            "too short for a 20-minute head 1") in caplog.text
+    assert "demote short skipped" not in caplog.text, "one line a pass, not one per file"
+    assert w.ops("qualify") == ["long", "mid"], "a file that cannot be offloaded is not qualified"
+
+
+def test_head_minutes_follow_the_setting(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, head_min_s=600.0)
+    heads = {}
+
+    def demote(db, row, apply, head_frac=None):
+        heads[row["id"]] = head_frac
+        return Res(True, "offloaded")
+    w.runner.deps = dataclasses.replace(w.runner.deps, demote=demote)
+    w.row("ep", 1, _timed_movie(w, 1, 22), "whole")
+    w.run()
+    assert heads["ep"] == pytest.approx(10 / 22)
+    assert Config.from_env({"TIERING_DB": "/x", "TIERING_HEAD_MIN_S": "900"}).head_min_s == 900.0
+    assert Config.from_env({"TIERING_DB": "/x"}).head_min_s == 1200.0
 
 
 # ---------------------------------------------------------------- failures
@@ -973,3 +1026,30 @@ def test_wiring_against_real_intake_modules(tmp_path, monkeypatch):
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert callable(wiring.qualify_from_env(env))
+
+
+def test_demotes_yield_to_a_watched_promote(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    seen = []
+    w.runner._yield_to_watched = lambda id=None: seen.append(id)
+    w.row("a", 1, w.movie(1), "whole")
+    w.run()
+    assert w.ops("demote") == ["a"] and seen == [None], "the demote worker yields before each file"
+
+
+def test_yield_blocks_only_while_someone_else_is_watched(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    r = w.runner
+    monkeypatch.setattr(runner, "YIELD_POLL", 0.01)
+    r.promote_running.update({"x", "y"})
+    r.watched["x"] = w.clock()
+    done = threading.Event()
+    th = threading.Thread(target=lambda: (r._yield_to_watched("y"), done.set()), daemon=True)
+    th.start()
+    assert not done.wait(0.2), "y waits while x, which someone watches, is fetched"
+    r._yield_to_watched("x")  # x is the watched one: it never waits on itself
+    r.watched["y"] = w.clock()
+    assert done.wait(2), "y is watched now too: both go"
+    r.watched.pop("y")
+    r.promote_running.discard("x")
+    r._yield_to_watched("y")  # nothing watched is running

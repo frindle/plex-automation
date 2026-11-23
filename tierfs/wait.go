@@ -71,7 +71,16 @@ func (h *handle) noteWant(off int64) {
 // maybeWant is the player pre-warm: once a read reaches the last quarter of
 // the head, ask for the start of the middle.
 func (h *handle) maybeWant(readEnd int64) {
-	if readEnd < h.m.HeadLen*3/4 || !h.warmed.CompareAndSwap(false, true) {
+	if readEnd < h.m.HeadLen*3/4 {
+		return
+	}
+	h.wantNow()
+}
+
+// wantNow asks for the start of the middle, once per handle. A Plex stream
+// calls it on its first read of any part of the file.
+func (h *handle) wantNow() {
+	if !h.warmed.CompareAndSwap(false, true) {
 		return
 	}
 	h.noteWant(h.m.HeadLen)

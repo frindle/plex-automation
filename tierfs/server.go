@@ -36,6 +36,7 @@ type Config struct {
 	Remote       RemoteConfig
 
 	BackgroundComms []string      // reader names that keep the remote stream (default "Plex Media Scan", "watch-align")
+	StreamComms     []string      // Plex streaming processes: ask for the file on the first read (nil: DefaultStreamComms)
 	WaitTimeout     time.Duration // player read with no new fill line for this long gets EIO (default 15m)
 	FillPoll        time.Duration // how often a waiting read looks at the fill file (default 100ms, max 200ms)
 	ProcRoot        string        // default /proc
@@ -110,7 +111,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("events: %w", err)
 	}
 	return &Server{
-		cfg: cfg, m: m, remote: r, ev: ev, class: newClassifier(cfg.ProcRoot, cfg.BackgroundComms),
+		cfg: cfg, m: m, remote: r, ev: ev, class: newClassifier(cfg.ProcRoot, cfg.BackgroundComms).withStreams(cfg.StreamComms),
 		entries: map[string]*entry{}, badSeen: map[string]string{}, cache: map[string]*cached{},
 		stop: make(chan struct{}),
 	}, nil
