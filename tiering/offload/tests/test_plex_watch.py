@@ -162,3 +162,13 @@ def test_get_only():
     assert not re.search(r"\bdata\s*=", src)
     for verb in ("POST", "PUT", "DELETE", "PATCH"):
         assert verb not in src
+
+
+def test_durations_part_then_media_then_item():
+    row = {"ratingKey": "9", "duration": 3000, "Media": [
+        {"duration": 2000, "Part": [{"file": "/a.mkv", "duration": 1000}, {"file": "/b.mkv"}]},
+        {"Part": [{"file": "/c.mkv"}, {"file": "/d.mkv", "duration": "x"}, {"duration": 5}]},
+    ]}
+    assert plex_watch._durations(row) == {"/a.mkv": 1000, "/b.mkv": 2000, "/c.mkv": 3000}
+    assert plex_watch._durations({"Media": [{"Part": [{"file": "/e.mkv"}]}]}) == {}
+    assert plex_watch._norm(row)["durations"]["/a.mkv"] == 1000

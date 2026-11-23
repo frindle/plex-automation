@@ -110,6 +110,40 @@ func TestClassifierTranscoderJobs(t *testing.T) {
 			t.Errorf("pid %d: background = %v, want %v", pid, got, want)
 		}
 	}
+	// The server, a client stream and a transcoder whose command line cannot be read are Plex streams.
+	for pid, want := range map[uint32]readerKind{100: readerStream, 101: readerBackground, 104: readerStream,
+		105: readerStream, 106: readerStream} {
+		if got := c.kind(ctxPid(pid)); got != want {
+			t.Errorf("pid %d: kind = %v, want %v", pid, got, want)
+		}
+	}
+}
+
+func TestClassifierStreamsAndOtherPlayers(t *testing.T) {
+	proc := fakeProc(t, map[uint32][2]string{
+		100: {"Plex Media Serv", "1"},
+		101: {"Plex DLNA Serve", "100"},
+		102: {"ffprobe", "1"},   // an arr reading the media info
+		103: {"ffprobe", "100"}, // a child of the server that is not the transcoder
+		104: {"Plex Media Scan", "100"},
+		105: {"Plex Transcoder", "104"}, // the scanner's transcoder
+	})
+	c := newClassifier(proc, DefaultBackgroundComms)
+	for pid, want := range map[uint32]readerKind{100: readerStream, 101: readerStream, 102: readerPlayer,
+		103: readerPlayer, 104: readerBackground, 105: readerBackground, 999: readerPlayer} {
+		if got := c.kind(ctxPid(pid)); got != want {
+			t.Errorf("pid %d: kind = %v, want %v", pid, got, want)
+		}
+	}
+	// TIERFS_STREAM_COMMS replaces the list; an empty list makes every reader a plain player.
+	c = newClassifier(proc, DefaultBackgroundComms).withStreams([]string{})
+	if got := c.kind(ctxPid(100)); got != readerPlayer {
+		t.Errorf("no stream names: kind = %v", got)
+	}
+	c = newClassifier(proc, nil).withStreams([]string{"ffprobe"})
+	if got := c.kind(ctxPid(102)); got != readerStream {
+		t.Errorf("custom stream name: kind = %v", got)
+	}
 }
 
 // Plex's analysis transcodes read an offloaded file through the remote

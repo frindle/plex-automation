@@ -9,7 +9,7 @@ come from environment variables or a config file that is not committed.
 ## Goal
 
 The library keeps every file at its path, size and mtime. A file that is
-offloaded keeps its first 20% and its last 32 MB on local disk. The middle is
+offloaded keeps its first 20 minutes of play (at least 20% of the file) and its last 32 MB on local disk. The middle is
 read from Usenet through AltMount's WebDAV. Plex is not told anything changed.
 
 ## Rules for what stays whole
@@ -54,7 +54,11 @@ These names apply to each library file system.
   - The stub root is per disk (`${stub_root}` on the same disk as `L`). `TIERFS_STUB_ROOTS` lists them (comma list). tierfs skips a manifest unless `stub_path` is exactly `<one of those roots>/<id><ext>`, and opens it with `O_NOFOLLOW`, then requires a regular file of the manifest's size.
   - Anything else that moves library files between disks (for example a glacier mover) must skip a symlink that points into `${TIERFS_MOUNT}`.
 - `<id>` is 16 lowercase hex characters. It is random, assigned once, and never reused.
-- `head_len` is `ceil(size * head_frac)`, where `head_frac` defaults to 0.20.
+- `head_len` is `ceil(size * head_frac)`. The runner sets `head_frac` per file so the head holds at least `TIERING_HEAD_MIN_S` (default 1200, 20 minutes) of play: `head_frac = max(0.20, TIERING_HEAD_MIN_S * 1000 / duration_ms)`, with the play time from Plex (the part's `duration`, else the media's, else the item's).
+  - A file Plex gives no play time for is not offloaded ("no play time from Plex").
+  - A file whose `head_frac` would pass 0.80 is not offloaded ("too short for a 20-minute head"): it would save too little.
+  - Examples: a 2-hour film keeps 20%, a 45-minute episode about 44%; a 22-minute episode stays whole.
+  - The layout is chosen only on a fresh demote. A resumed demote keeps the `head_len` in its manifest.
   - It is rounded up to a 1 MiB boundary.
   - `tail_len` is 32 MiB plus `size mod 1 MiB`, so the middle starts and ends on 1 MiB boundaries. Page-rounded tail reads then never reach into the middle.
   - When `head_len + tail_len >= size`, the file is never offloaded.
@@ -101,12 +105,13 @@ tierfs reads the remote at `${TIERFS_REMOTE_BASE}` + `remote_path`. The credenti
     - tierfs reads `/proc/<pid>/comm` and the parent's `comm`, cached per pid. `comm` is cut to 15 characters.
     - The reader is *background* when either name is in `TIERFS_BACKGROUND_COMMS` (comma list, default `Plex Media Scan,watch-align`). That covers the scan, match, analysis, deep analysis, chapter thumbnails, credits and voice-activity scanner jobs, and the webhook's audio matching before an upgrade (`watch-align`, ffmpeg under another name).
     - A `Plex Transcoder` started by the server is also *background* when its command line is one of Plex's analysis jobs: loudness (`-f null -`), intro and credits marker audio (written under `Transcode/Detection/`) or voice activity (`track-NNNN.wav`). One that names any other muxer is a client stream or a sync, so a *player*.
+    - A reader whose name is in `TIERFS_STREAM_COMMS` (comma list, default `Plex Media Server,Plex Transcoder,Plex DLNA Server`) and is not background is a *stream*: Plex serving a client.
     - Every other reader, including a pid or command line it cannot read, is a *player*.
     - tierfs runs with `pid: host`, so it can see the pids of Plex processes in other containers.
   - **Background reads** use the remote stream below, unchanged, and write `remote_read` as before.
   - **Player reads** of the middle come only from the stub, and only for chunks listed in the fill file `${TIERFS_MANIFESTS}/<id>.fill` (see **Promote order**). A read whose chunks are not listed yet waits:
     - On the first wait of a handle, tierfs writes a `want` event with `"offset"` set to the chunk start. It writes another whenever the wanted offset falls outside the 64 MiB after the last `want` of that handle.
-    - Pre-warm: once a player read reaches `0.75 * head_len`, tierfs writes a `want` at `head_len`, so the promote starts before the reader reaches the middle.
+    - Pre-warm: a *stream* writes a `want` at `head_len` on the first read of a handle, so the promote starts when play starts and has the whole head (20 minutes or more) to get ahead of the player. Any other player writes it once a read reaches `0.75 * head_len`.
     - The read is answered as soon as the fill file lists its chunks. tierfs watches the file, polling at least every 200 ms.
     - A `failed <offset>` line in the fill file returns EIO at once.
     - Otherwise, EIO only after `TIERFS_WAIT_S` (default 900) with no new line in the fill file. There is no limit while the fill file keeps growing.
@@ -267,17 +272,18 @@ The inputs are plain dicts shaped like Plex's JSON: `ratingKey`, `grandparentRat
 
 ### Promote order
 
-1. Read the middle through `RemoteReader` one chunk at a time.
+1. Read the middle through `RemoteReader`.
+   - **Width:** while someone watches the file (`urgent()` is true), up to `TIERING_PROMOTE_STREAM_FETCHES` (default 6, at most 32) chunks are fetched at once, in cursor order. Otherwise one at a time, and `pause()` is called before each chunk; it blocks while a promote someone watches is running. A promote turns wide as soon as its file is watched. Chunks are written and listed only by the promote's own thread, in the order they finish; the fill file is a set, so the order of its lines does not matter.
    - **Order:** start at the chunk that holds the newest `want` offset for this id and go to the end of the middle, then continue from the start of the middle. A newer `want` outside the next 64 MiB moves the cursor there. Chunks already written are skipped. With no `want`, start at the start of the middle.
    - **Each chunk:**
      - check it against the chunk list;
      - `pwrite` it into the stub's hole and `fdatasync`;
      - then append its start offset as one decimal line to `${TIERFS_MANIFESTS}/<id>.fill` and flush.
    - **Resume:** a resumed promote trusts the chunks the fill file already lists.
-   - **API:** `ops.promote(..., want: Callable[[], int | None] | None = None)`. The runner passes `want`; promote calls it before each chunk, and it returns the newest wanted offset for this id, or None.
+   - **API:** `ops.promote(..., want=None, urgent=None, pause=None)`. `want()` returns the newest wanted offset for this id, or None; `urgent()` says someone watches the file; `pause()` blocks while another, watched promote runs. The runner passes all three; promote calls them before each chunk.
    - **Errors:**
      - a fetch error is retried with backoff for up to `TIERING_PROMOTE_RETRY_S` (default 600) per chunk. When that time is spent the promote stops but stays resumable (`state=promoting`), and a `failed <offset>` line is appended to the fill file so a waiting player gets EIO now instead of after `TIERFS_WAIT_S`. The line stays 1.5 s (`FAILED_HOLD_S`, tierfs looks every 0.2 s at most) and is then taken off, because tierfs sends no `want` while a failed line stands and a later read would otherwise fail at once and never ask for the file;
-     - a BLAKE3 mismatch on two fetches stops the promote at once: append `failed <offset>` and set `state=failed`, as in step 2.
+     - a BLAKE3 mismatch on two fetches stops the promote at once: append `failed <offset>` and set `state=failed`, as in step 2. Fetches still in flight are told to stop and are not waited for.
 2. Hash the whole stub with SHA-256. If it does not match the manifest, stop: set `state=failed`, keep the symlink, and alert. Nothing is swapped.
 3. Restore the stub's mtime.
 4. Link the stub to `L.tierfs-tmp`, then `rename` it over `L`.
@@ -295,6 +301,11 @@ Swaps are automatic. One long-running process applies the hot set.
   - The first `want` for an id starts that file's promote within 1 s. It goes ahead of every other promote and outside `TIERING_PROMOTE_CONCURRENCY`, so a wanted promote never waits in the queue.
   - Later `want`s for the same id go to the running promote and move its cursor.
   - A `want` for a row that is neither `offloaded` nor `promoting` is ignored.
+  - A live Plex session on an `offloaded` or `promoting` row is a `want` too, seen on each pass.
+- **Watched files go first, at full speed:**
+  - A `want` or a live session marks the file watched for 10 minutes (`WATCHED_TTL`).
+  - Its promote fetches several chunks at once (see **Promote order**).
+  - Every promote nobody watches pauses before its next chunk while a watched one runs, and goes on when it ends. The demote worker pauses the same way before each file.
   - A `want` ignores the retry backoff, because a player is waiting. Wanted attempts on one id are at least 60 s apart (kept in `kv['want_last']`). A row in `state=failed` (for example after two BLAKE3 mismatches) is not retried by a `want`; the fill file's `failed` line already gives the player EIO.
 - **Other promotes run at once:**
   - wanted promotes first, then weekly-flagged rows, then a live session's season in episode order, then everything else;

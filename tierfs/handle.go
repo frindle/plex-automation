@@ -72,7 +72,11 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 	m := h.m
 	segs := Split(m.Size, m.HeadLen, m.TailLen, off, int64(len(dest)))
 	var total int64
-	background := h.srv.class.background(ctx)
+	kind := h.srv.class.kind(ctx)
+	background := kind == readerBackground
+	if kind == readerStream {
+		h.wantNow() // someone pressed play: ask for the middle now, not at the end of the head
+	}
 	for _, sg := range segs {
 		p := dest[sg.Off-off : sg.Off-off+sg.N]
 		if sg.Kind == Mid && !background {

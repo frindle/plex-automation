@@ -1,6 +1,8 @@
 """Promote for waiting players: fill order, the fill file, retry and failure."""
 
 import os
+import threading
+import time
 
 import pytest
 
@@ -353,3 +355,82 @@ def test_fdatasync_runs_between_the_write_and_the_fill_line(tmp_path, monkeypatc
     for i, k in enumerate(kinds):
         if k == "line":  # the nearest earlier events are the chunk's write and its sync
             assert kinds[i - 2:i] == ["pwrite", "fdatasync"], kinds
+
+
+# ---- someone is watching: wide and first; nobody is: one at a time, and it yields
+
+
+class Wide(FakeReader):
+    """Counts the reads in flight at once; each read takes a moment, like the remote."""
+
+    def __init__(self, data, **kw):
+        super().__init__(data, **kw)
+        self.mu = threading.Lock()
+        self.now = self.most = 0
+
+    def read_range(self, remote_path, offset, length):
+        with self.mu:
+            self.now += 1
+            self.most = max(self.most, self.now)
+        try:
+            time.sleep(0.01)
+            return super().read_range(remote_path, offset, length)
+        finally:
+            with self.mu:
+                self.now -= 1
+
+
+def test_watched_promote_fetches_several_chunks_at_once(big, monkeypatch):
+    env = big
+    monkeypatch.setenv("TIERING_PROMOTE_STREAM_FETCHES", "4")
+    reader, pauses = Wide(env.data), []
+    r = env.promote(reader, urgent=lambda: True, pause=lambda: pauses.append(1))
+    assert r.ok and r.state == "whole"
+    assert reader.most == 4, "a watched file is fetched 4 chunks at a time"
+    assert pauses == [], "a watched promote never yields"
+    assert sorted(o for o, _ in reader.calls) == [HEAD + i * CS for i in range(N)]
+    assert env.read_lib() == env.data
+
+
+def test_unwatched_promote_is_one_at_a_time_and_yields_before_each_chunk(big):
+    env = big
+    reader, pauses = Wide(env.data), []
+    r = env.promote(reader, urgent=lambda: False, pause=lambda: pauses.append(reader.now))
+    assert r.ok and r.state == "whole"
+    assert reader.most == 1
+    assert len(pauses) == N and set(pauses) == {0}, "it yields with nothing in flight"
+
+
+def test_promote_turns_wide_when_play_is_pressed(big, monkeypatch):
+    env = big
+    monkeypatch.setenv("TIERING_PROMOTE_STREAM_FETCHES", "6")
+    reader, pauses = Wide(env.data), []
+    watched = lambda: len(reader.calls) >= 5  # noqa: E731
+    r = env.promote(reader, urgent=watched, pause=lambda: pauses.append(1))
+    assert r.ok and r.state == "whole"
+    assert reader.most > 1 and len(pauses) == 5
+
+
+def test_watched_wide_fill_starts_at_the_want_and_lists_every_chunk(big):
+    env = big
+    reader = Wide(env.data)
+    r = env.promote(reader, urgent=lambda: True, want=lambda: HEAD + 30 * CS)
+    assert r.ok
+    first = sorted(o for o, _ in reader.calls[:6])
+    assert first == [HEAD + i * CS for i in range(30, 36)], "the first wave is at the want"
+
+
+def test_watched_wide_mismatch_fails_the_row_with_a_failed_line(big):
+    env = big
+    bad = HEAD + 9 * CS + 7
+    r = env.promote(Wide(env.data, corrupt_at=bad), urgent=lambda: True)
+    assert not r.ok and r.state == "failed"
+    assert fill_lines(env)[-1] == f"failed {HEAD + 9 * CS}"
+    assert os.path.islink(env.lib)
+
+
+def test_stream_fetches_setting_is_bounded(monkeypatch):
+    for v, want in (("0", 1), ("-3", 1), ("8", 8), ("999", ops.MAX_STREAM_FETCHES),
+                    ("x", ops.DEFAULT_STREAM_FETCHES)):
+        monkeypatch.setenv("TIERING_PROMOTE_STREAM_FETCHES", v)
+        assert ops._stream_fetches() == want
