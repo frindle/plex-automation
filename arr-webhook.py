@@ -11890,6 +11890,8 @@ def arr_health_tick(now=None, io=None):
             state['broken_last'] = now
             rows = arr_health.broken_files_pass(io, state, now, apply=ARR_HEALTH_APPLY)
             log.info(f'[arr-health] broken-file pass: {len(rows)} file(s), {"apply" if ARR_HEALTH_APPLY else "dry run"}')
+            stuck = arr_health.stuck_pending_pass(io, state, now, apply=ARR_HEALTH_APPLY)
+            log.info(f'[arr-health] stuck-import pass: {len(stuck)} item(s), {"apply" if ARR_HEALTH_APPLY else "dry run"}')
         _write_json_atomic(ARR_HEALTH_STATE, state)
     rows = getattr(io, 'advice', None)
     if rows and _llm_mode('arr_health') != 'off':
