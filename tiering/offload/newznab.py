@@ -187,7 +187,9 @@ def parse_resolution(title: str) -> int:
 
 
 def _clean(s: str) -> str:
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", s.lower()).split())
+    # Release names drop apostrophes ("Greys.Anatomy") and often spell out "&" ("Law.and.Order").
+    s = re.sub(r"['’`]", "", s.lower()).replace("&", " and ")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", s).split())
 
 
 # First word after a title that shows the title is over (year, episode, quality, source).
@@ -633,9 +635,13 @@ class NewznabClient:
                        limit: int = 100) -> list[Release]:
         tv = season is not None or tvdb_id is not None
         p: dict = {"t": "tvsearch" if tv else "movie", "limit": limit, "extended": 1}
-        if title:
+        # A TV search asks by tvdbid like Sonarr does, by title only without one, and never
+        # by imdbid: an indexer whose tv-search does not take imdbid (or q beside an id)
+        # can treat it as one more filter and return nothing (homelab-dr 0192: q+imdbid+tvdbid
+        # found 0/7 episodes, tvdbid+season+ep 7/7).
+        if title and not (tv and tvdb_id):
             p["q"] = title
-        if imdb_id:
+        if imdb_id and not tv:
             p["imdbid"] = str(imdb_id).lower().removeprefix("tt")
         if tvdb_id:
             p["tvdbid"] = str(tvdb_id)

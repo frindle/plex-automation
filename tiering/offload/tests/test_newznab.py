@@ -34,6 +34,29 @@ def test_tv_search_params():
     assert (q["t"], q["tvdbid"], q["season"], q["ep"]) == ("tvsearch", "99", "2", "5")
 
 
+def test_tv_search_sends_tvdbid_not_q_or_imdbid():
+    # 0192: the indexer returned no episodes when q and imdbid rode along with tvdbid.
+    s = FakeNewznab({})
+    try:
+        client(s).search(title="Show", imdb_id="tt0001", tvdb_id=99, season=2, episode=5)
+    finally:
+        s.close()
+    q = s.queries[0]
+    assert q["t"] == "tvsearch" and q["tvdbid"] == "99" and (q["season"], q["ep"]) == ("2", "5")
+    assert "q" not in q and "imdbid" not in q
+
+
+def test_tv_search_without_tvdbid_uses_title():
+    s = FakeNewznab({})
+    try:
+        client(s).search(title="Show", imdb_id="tt0001", season=2, episode=5)
+    finally:
+        s.close()
+    q = s.queries[0]
+    assert (q["t"], q["q"], q["season"], q["ep"]) == ("tvsearch", "Show", "2", "5")
+    assert "imdbid" not in q and "tvdbid" not in q
+
+
 def test_fetch_nzb_and_bad_body():
     nzb = make_nzb(["a@x"])
     s = FakeNewznab({"g1": {"title": "Movie.2020.1080p-A", "nzb": gzip.compress(nzb)},
@@ -125,6 +148,10 @@ def test_title_matches():
     assert m("Show.S02E05.1080p.WEB", "Show", None, 2, 5)
     assert not m("Show.S02E06.1080p.WEB", "Show", None, 2, 5)
     assert not m("Show.S02E055.1080p.WEB", "Show", None, 2, 5)
+    assert m("Greys.Anatomy.S03E04.1080p", "Grey's Anatomy", None, 3, 4)
+    assert m("Bobs.Burgers.S01E01.720p", "Bob’s Burgers", None, 1, 1)
+    assert m("Law.and.Order.S01E02.1080p", "Law & Order", None, 1, 2)
+    assert not m("Greys.S03E04.1080p", "Grey's Anatomy", None, 3, 4)
 
 
 def test_archive_nzb_gzip_sha_in_name_and_idempotent(tmp_path):
