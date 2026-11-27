@@ -56,6 +56,8 @@ services:
       # Promote: seconds a failing chunk fetch is retried, and promotes run at once.
       TIERING_PROMOTE_RETRY_S: "${TIERING_PROMOTE_RETRY_S:-600}"
       TIERING_PROMOTE_CONCURRENCY: "${TIERING_PROMOTE_CONCURRENCY:-2}"
+      # Days an orphaned stub (arr upgrade replaced L) is kept before cleanup; 0 = off.
+      TIERING_ORPHAN_GRACE_DAYS: "${TIERING_ORPHAN_GRACE_DAYS:-7}"
       # Every name must be visible from the container or nothing is demoted.
       TIERING_PROC_CANARY: "${TIERING_PROC_CANARY:-Plex Media Serv,shfs}"
       TIERING_PATH_MAP: "${TIERING_PATH_MAP:?set TIERING_PATH_MAP in .env}"

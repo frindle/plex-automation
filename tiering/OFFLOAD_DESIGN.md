@@ -339,7 +339,14 @@ Swaps are automatic. One long-running process applies the hot set.
   - no demotes on a night when any promote is queued or any hash check has failed;
   - optionally only the files in `TIERING_ONLY_PATHS` (see **Config from env**).
 - **A `bad_chunk` event:** promoting cannot help, because the remote copy is bad. Set `state=failed`, alert, and list it in the weekly report with its restore path. The file stays a working symlink for the parts that are good.
-- **Reconcile each pass:** if `L` is no longer the symlink a row expects (an arr upgrade or delete replaced it), stop managing that row. Set `state=failed` with `restore_note="L replaced"`. Leave the stub and the manifest for the weekly report; nothing is deleted.
+- **Reconcile each pass:** if `L` is no longer the symlink a row expects (an arr upgrade or delete replaced it), stop managing that row. Set `state=failed` with `restore_note="L replaced"`. The stub and the manifest stay for the weekly report during the grace period `TIERING_ORPHAN_GRACE_DAYS` (default 7; 0 turns the cleanup off).
+- **Orphan cleanup (later passes):** a row with `state=failed`, `restore_note="L replaced"` and a `updated_ts` (the time it was marked) older than the grace period loses its stub, its manifest, chunk list and fill file, and gets `restore_note="orphan cleaned"` so it is never handled again. Event `orphan_stub_removed` (id, size); one `orphan_stubs_removed` alert per pass with the count and bytes freed. It happens only when ALL hold, else everything stays and one line per id says why:
+  - the stub path is exactly `<one of TIERFS_STUB_ROOTS>/<id><ext>`, a regular file with link count 1;
+  - the manifest's `stub_path` is that path;
+  - no `L` on any disk is a symlink into tierfs for this id (checked again right before the delete);
+  - no process, tierfs included, holds the stub open (`ops.scan_open_holders` with nothing ignored; "not clear" or no check means keep).
+
+  Dry run only logs. `L` and the library are never touched. Anything that rewrites a failed row's `updated_ts` restarts its grace period.
 - **Config from env:**
   - `TIERING_MAX_STREAM_KBPS` gives `Cfg.max_stream_kbps`; `TIERING_KEEP_4K` gives `Cfg.keep_4k`;
   - `TIERING_NEVER_SECTIONS` is a comma list (default `Adult`).
@@ -357,6 +364,6 @@ Swaps are automatic. One long-running process applies the hot set.
 ## Safety
 
 - Dry run is the default everywhere. Nothing changes a file unless `TIERING_APPLY=1` is set.
-- No code path deletes media. The only unlinks are the stub's extra link, made in step 2 of an offload, and a temp symlink.
+- No code path deletes media. The only unlinks are the stub's extra link, made in step 2 of an offload, a temp symlink, and (after `TIERING_ORPHAN_GRACE_DAYS`) the stub and manifest of a row whose `L` an arr replaced, see "Orphan cleanup". That one deletes only `<stub root>/<id><ext>` and never `L`.
 - The tests run in GitHub Actions or the sandbox, never against the live library.
 - No unverified remote byte is ever served or written: tierfs and promote both check every chunk against the chunk list.
