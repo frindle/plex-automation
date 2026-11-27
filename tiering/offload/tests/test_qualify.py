@@ -157,7 +157,7 @@ def idx(*releases):
 
 
 @pytest.mark.parametrize("src,alt,expect", [
-    (2160, "Movie.2020.1080p.WEB-DL-A", 1),
+    (2160, "Movie.2020.1080p.WEB-DL-A", 0),  # a 4K file is never restored as 1080p
     (2160, "Movie.2020.2160p.WEB-DL-A", 1),
     (2160, "Movie.2020.720p.WEB-DL-A", 0),
     (1080, "Movie.2020.1080p.WEB-DL-A", 1),

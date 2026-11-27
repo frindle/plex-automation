@@ -21,8 +21,8 @@ The first search is reused: one search per qualify, however many steps need it.
 Row fields it reads:
   lib_path (required), nzb_path, release_name, title, year, imdb_id, tvdb_id,
   season, episode, is4k.
-The source resolution comes from ``is4k`` or the release or file name. When it
-cannot be told, the floor is 1080p.
+The source resolution comes from ``is4k`` or the release or file name. A 4K
+source needs a 4K alternative. When it cannot be told, the floor is 1080p.
 
 It does not write to the database. ``QualifyResult.fields`` holds only ``files``
 columns for the caller to store: nzb_path, nzb_path2 (the archived NZB of the verified
@@ -67,8 +67,11 @@ class QualifyResult:
 def resolution_floor(src_res: int) -> int:
     """Lowest resolution an alternative may have, given the source's.
 
-    A source below 1080p gets a 720p floor. An unknown source (0) gets 1080p.
+    A 4K source keeps a 4K floor (never restored as 1080p). A source below 1080p
+    gets a 720p floor. An unknown source (0) gets 1080p.
     """
+    if src_res >= 2160:
+        return 2160
     return 720 if 0 < src_res < 1080 else 1080
 
 
