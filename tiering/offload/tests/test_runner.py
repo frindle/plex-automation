@@ -491,7 +491,7 @@ def test_min_play_follows_the_setting(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- failures
 
 
-def test_bad_chunk_fails_row_alerts_and_does_not_promote(tmp_path, monkeypatch, caplog):
+def test_bad_chunk_flags_a_promote_and_alerts(tmp_path, monkeypatch, caplog):
     ev = tmp_path / "events.jsonl"
     w = World(tmp_path, monkeypatch, events=str(ev))
     w.row("bad", 1, w.movie(1), "offloaded")
@@ -500,9 +500,10 @@ def test_bad_chunk_fails_row_alerts_and_does_not_promote(tmp_path, monkeypatch, 
                   + "garbage\n")
     with caplog.at_level(logging.ERROR, logger="tiering.runner"):
         w.run()
-    assert w.state.rows["bad"]["state"] == "failed"
+    # not failed at once: a promote is flagged and decides (it fails only on every copy)
+    assert w.state.rows["bad"]["state"] != "failed"
     assert "4096" in w.state.rows["bad"]["restore_note"]
-    assert w.ops("promote") == []
+    assert "bad" in w.runner.flagged or w.ops("promote") == ["bad"]
     alert = json.loads(open(w.cfg.alerts).readline())
     assert alert["kind"] == "bad_chunk" and alert["id"] == "bad"
     assert any(r.levelno == logging.ERROR for r in caplog.records)

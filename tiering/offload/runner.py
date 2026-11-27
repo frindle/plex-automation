@@ -30,7 +30,7 @@ import time
 import traceback
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
@@ -48,13 +48,15 @@ REGISTER_LEAD = 3600.0  # register this long before the demote window opens
 PROTECTED_COLUMNS = ("id", "state", "created_ts", "updated_ts", "lib_path")
 REGISTER_BAD_FRAC = 0.05  # missing_local + ambiguous over this share of listed fails register (on_pool is not counted)
 ALERT_EVENTS = ("promote_short_remote", "takeover_orphan")  # ops events, alerted once per id
-ONCE_KINDS = ALERT_EVENTS + ("l_missing", "promote_stuck")  # alerted once per id, ever
+ONCE_KINDS = ALERT_EVENTS + ("l_missing", "promote_stuck", "lost_file")  # alerted once per id, ever
 BACKOFF_MAX = 6 * 3600.0  # promote retry delay: RETRY_DELAY doubling, capped here
 FAIL_ALERT_AFTER = 3  # failures in a row per id before an alert
 REGISTER_KEYS = ("listed", "missing_local", "ambiguous", "errors")  # required in the result
 HISTORY_DROP = 0.20  # a Plex history this much shorter than last time is not trusted
 HISTORY_EDGE = 120.0  # plays this close to the window edge are not counted as expected
-WEEKLY_EVERY = 7 * DAY  # the weekly check runs when the last one is this old
+CHECK_EVERY_H = 24.0  # the integrity check runs nightly: when the last start is this old (TIERING_CHECK_EVERY_H)
+CHECK_MAX_H = 4.0  # ... and stops starting rows after this long, to go on the next night (TIERING_CHECK_MAX_H)
+REDOWNLOAD_MAX = 3  # lost rows acted on per night (TIERING_REDOWNLOAD_MAX_PER_NIGHT)
 WEEKLY_RETRY = 3600.0  # after a failed weekly check, wait this long before trying again
 FOLLOW_POLL = 0.25  # the tierfs event file is read this often (a want starts a promote within 1 s)
 WANT_SPACING = 60.0  # wanted attempts on one id are at least this far apart
@@ -202,6 +204,10 @@ class Config:
     min_play_s: float = MIN_PLAY_S
     only_paths: frozenset = frozenset()  # empty: no allowlist; else only these may be demoted
     orphan_grace_days: float = 7.0  # 0 turns the orphan stub cleanup off
+    check_every_h: float = CHECK_EVERY_H
+    check_max_h: float = CHECK_MAX_H
+    auto_redownload: bool = True  # TIERING_AUTO_REDOWNLOAD (only acts with apply)
+    redownload_max: int = REDOWNLOAD_MAX
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
@@ -266,6 +272,11 @@ class Config:
             orphan_grace_days=max(0.0, float(
                 7.0 if e.get("TIERING_ORPHAN_GRACE_DAYS") in (None, "")
                 else e["TIERING_ORPHAN_GRACE_DAYS"])),
+            check_every_h=max(0.1, float(e.get("TIERING_CHECK_EVERY_H") or CHECK_EVERY_H)),
+            check_max_h=max(0.01, float(e.get("TIERING_CHECK_MAX_H") or CHECK_MAX_H)),
+            auto_redownload=e.get("TIERING_AUTO_REDOWNLOAD", "1").strip().lower()
+            not in ("0", "false", "no", "off"),
+            redownload_max=max(1, int(e.get("TIERING_REDOWNLOAD_MAX_PER_NIGHT") or REDOWNLOAD_MAX)),
         )
 
 
@@ -309,6 +320,10 @@ class Deps:
     gate: Callable
     register: Callable | None = None  # register(db, apply) -> dict, once a night
     weekly: Callable | None = None  # weekly(db) runs weekly.run_weekly; flags come as events
+    # arrs() -> redownload.Arrs (built on first use) and altmount_ok() -> bool; None: no
+    # automatic re-download
+    arrs: Callable | None = None
+    altmount_ok: Callable | None = None
     # open_holders(path) -> list of pids holding the file open (tierfs included); a -1 entry
     # means "not clear". None: the orphan cleanup cannot tell, so it keeps every stub.
     open_holders: Callable | None = None
@@ -348,6 +363,34 @@ def _takes(fn, name) -> bool:
         return name in inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
+
+
+def _accepts(fn, name) -> bool:
+    """Like _takes, and also true when `fn` has a ``**kwargs``."""
+    try:
+        ps = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in ps or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in ps.values())
+
+
+def _arrs_from_env(cfg: Config):
+    """``arrs()``: the Radarr/Sonarr clients for re-downloads, built on first use (a dry run
+    or a missing arr setting never stops the start). None when no arr URL is set."""
+    cache: list = []
+
+    def arrs():
+        if not cache:
+            from . import redownload, register
+            radarrs, sonarrs = register.clients_from_env()
+            if not radarrs and not sonarrs:
+                cache.append(None)
+            else:
+                cache.append(redownload.Arrs(
+                    radarrs, sonarrs, paths.parse_path_map(os.environ.get("TIERING_ARR_PATH_MAP")),
+                    paths.parse_path_map(os.environ.get("TIERING_PATH_MAP"))))
+        return cache[0]
+    return arrs
 
 
 def load_deps(cfg: Config) -> Deps:
@@ -390,7 +433,12 @@ def load_deps(cfg: Config) -> Deps:
         # ignore_comm=(): a tierfs reader holding the stub counts as a holder too
         return ops.scan_open_holders(path, ignore_comm=())
 
-    return Deps(st, promote, demote, qualify, _http_gate(cfg), register, weekly, open_holders)
+    arrs = altmount_ok = None
+    if not os.environ.get("TIERING_QUALIFY_FACTORY"):
+        arrs = _arrs_from_env(cfg)
+        altmount_ok = wiring.altmount_ok_from_env()
+    return Deps(st, promote, demote, qualify, _http_gate(cfg), register, weekly, open_holders,
+                arrs, altmount_ok)
 
 
 # --------------------------------------------------------------------------
@@ -482,6 +530,8 @@ class Runner:
         self.weekly_running = False
         self.weekly_tried = False
         self.weekly_retry_at = 0.0
+        self._redl = None  # redownload.Redownload, built on first use
+        self.lost_hold: set = set()  # ids waiting for a re-download: no promote starts for them
         self.history_ok = True
         self.atime_last = None  # when whole files were last checked for a read
         self.atime_mu = threading.Lock()
@@ -644,11 +694,14 @@ class Runner:
     def _weekly_due(self, now) -> bool:
         if self.deps.weekly is None or not self.cfg.apply:
             return False
-        return self.weekly_running or now - self.weekly_last >= WEEKLY_EVERY
+        every = self.cfg.check_every_h * 3600.0
+        # a little slack: a run that starts a few minutes later each night must not skip one
+        slack = min(3600.0, every * 0.1)
+        return self.weekly_running or now - self.weekly_last >= every - slack
 
     def _weekly(self, db, now):
-        """Start the weekly check when the last one is 7 days old: on start-up, and
-        at the start of the demote window. It runs on its own thread; demotes wait."""
+        """Start the nightly check when the last start is a day old: on start-up, and at
+        the start of the demote window. It runs on its own thread; demotes wait."""
         if not self._weekly_due(now) or self.weekly_running or now < self.weekly_retry_at:
             return
         if self.weekly_tried and night_start(now, self.cfg.window) is None:
@@ -660,17 +713,109 @@ class Runner:
     def _weekly_worker(self):
         try:
             db = self._open()
-            log.info("weekly check start")
-            self.deps.weekly(db)
-            now = self.clock()
-            self.weekly_last = now
-            self._kv_set(db, "weekly_last_ts", now)
-            log.info("weekly check done")
+            started = self.clock()
+            log.info("nightly check start")
+            fn = self.deps.weekly
+            summary: dict = {}
+            kw: dict = {}
+            month = datetime.fromtimestamp(started, timezone.utc).strftime("%Y-%m")
+            if _accepts(fn, "budget_s"):
+                kw["budget_s"] = self.cfg.check_max_h * 3600.0
+            if _accepts(fn, "summary"):
+                kw["summary"] = summary
+            if _accepts(fn, "lost_hook"):
+                kw["lost_hook"] = lambda lost, info: self._on_lost(db, lost, info)
+            if _accepts(fn, "monthly"):  # the full read sample: once in the first week of a month
+                first_week = datetime.fromtimestamp(started, timezone.utc).day <= 7
+                kw["monthly"] = first_week and self._kv_get(db, "full_read_month") != month
+            fn(db, **kw)
+            # the start time, not the end: a long run must not push every night later
+            self.weekly_last = started
+            self._kv_set(db, "weekly_last_ts", started)
+            if kw.get("monthly") and summary.get("finished", True):
+                self._kv_set(db, "full_read_month", month)
+            self._kv_set(db, "weekly_cursor", {"ts": started, "finished": summary.get("finished", True),
+                                               "unreached": len(summary.get("unreached") or [])})
+            if summary.get("finished") is False:
+                log.warning("nightly check stopped at its time budget; %d rows go first tomorrow",
+                            len(summary.get("unreached") or []))
+            log.info("nightly check done")
         except Exception as e:
             self._alert("weekly_failed", "-", reason=f"{type(e).__name__}: {e}")
             self.weekly_retry_at = self.clock() + WEEKLY_RETRY  # demotes stay blocked meanwhile
         finally:
             self.weekly_running = False
+
+    # ---- lost files and the automatic re-download
+
+    def _l_is_symlink_ours(self, row) -> bool:
+        """Strict, for a delete: exactly one disk path for lib_path, and it is a symlink whose
+        target is this row's tierfs link (by name, as reconcile and the orphan cleanup do) and
+        points into the tierfs mount. Anything else, including "cannot tell", is False."""
+        lib = row.get("lib_path")
+        if not lib:
+            return False
+        found = self._find_disk(row)
+        if len(found) != 1:
+            return False
+        ext = os.path.splitext(lib)[1]
+        try:
+            got = os.readlink(found[0])
+        except OSError:
+            return False
+        mount = self.cfg.tierfs_mount
+        if mount and os.path.dirname(os.path.normpath(got)) != os.path.normpath(mount):
+            return False
+        return os.path.basename(got) == f"{row['id']}{ext}"
+
+    def redownloader(self):
+        """The re-download orchestrator, or None when it cannot act (dry run, no arr
+        wiring). Built on first use so a missing arr setting never stops the runner."""
+        if self._redl is not None:
+            return self._redl
+        if not self.cfg.apply or self.deps.arrs is None:
+            return None
+        try:
+            arrs = self.deps.arrs()
+        except Exception as e:  # noqa: BLE001
+            log.error("re-download: arr clients not usable: %s", type(e).__name__)
+            return None
+        from . import redownload
+        ok = self.deps.altmount_ok or (lambda: True)
+        self._redl = redownload.Redownload(
+            state=self.state, arrs=arrs, l_ok=self._l_is_symlink_ours,
+            busy=lambda id: id in self.promote_running or id in self.demote_running,
+            healthy=ok, alert=self._alert, kv_get=self._kv_get, kv_set=self._kv_set,
+            enabled=self.cfg.auto_redownload, max_per_night=self.cfg.redownload_max,
+            clock=self.clock)
+        return self._redl
+
+    def _on_lost(self, db, lost, info):
+        """Called by the nightly check, once, with the rows it confirmed lost."""
+        rd = self.redownloader()
+        if rd is None:
+            for l in lost:
+                self._once("lost_file", str(l["id"]), reason="no automatic re-download")
+            return
+        try:
+            rd.process(db, lost, info, now=self.clock())
+        except Exception as e:  # noqa: BLE001
+            log.error("re-download pass failed: %s: %s", type(e).__name__, e)
+
+    def _lost_pass(self, db, now):
+        """Every pass: a row the nightly check confirmed lost while its promote was still
+        running is acted on once the promote stops (on a night that passed the guards), and
+        no new promote starts for it meanwhile."""
+        rd = self._redl if self._redl is not None else (
+            self.redownloader() if self.cfg.apply else None)
+        if rd is None:
+            self.lost_hold = set()
+            return
+        try:
+            rd.retry_pending(db, now)
+            self.lost_hold = set(rd.pending(db))
+        except Exception as e:  # noqa: BLE001
+            log.error("re-download retry failed: %s", type(e).__name__)
 
     # ---- reading the world
 
@@ -1138,16 +1283,22 @@ class Runner:
                 ev["held"] = True  # and its later updated_ts must not drop this event
                 continue
             del self.pending_bad[id]
-            note = f"bad_chunk at offset {ev['offset']}"
+            # The row is not failed here: a bad read may be one bad copy only. A promote
+            # (first in line, whether or not the hot set wants the file) verifies every
+            # chunk and uses failover and the twin. Only a promote that ends `failed`
+            # (mismatch on every copy) makes the file lost.
+            note = f"bad_chunk at offset {ev['offset']}; promote requested"
             self._note_failure(now)
             if not self.cfg.apply:
-                log.error("dry run: would fail %s: %s", id, note)
+                log.error("dry run: would flag %s for promote: %s", id, note)
                 continue
-            if not self.state.update_if(db, id, row["state"], state="failed", restore_note=note):
+            if not self.state.update_if(db, id, row["state"], restore_note=note):
                 ev["held"] = True  # the row moved on under us: look again next pass
                 self.pending_bad[id] = ev
                 continue
             self.state.log_event(db, id, "bad_chunk", {"offset": ev["offset"]})
+            self.flagged.add(id)
+            self._kv_set(db, "flagged", sorted(self.flagged))
             self._alert("bad_chunk", id, offset=ev["offset"], lib_path=row.get("lib_path"))
 
     # ---- nightly register
@@ -1280,6 +1431,7 @@ class Runner:
         self.skipped_paths = set()
         self._register(db, now)
         self._weekly(db, now)
+        self._lost_pass(db, now)
         data, complete = self._read_plex(now)
         items = data["items"]
         if items is None:
@@ -1529,7 +1681,7 @@ class Runner:
             while self.promote_todo:
                 id = self.promote_todo.popleft()
                 if id in self.promote_running or self.retry_after.get(id, 0) > now \
-                        or id in self.demote_running:
+                        or id in self.demote_running or id in self.lost_hold:
                     continue
                 self.promote_running.add(id)
                 self.promote_started[id] = now
@@ -1601,6 +1753,16 @@ class Runner:
         if res.state == "failed":
             self._note_failure(self.clock())
             self._alert(f"{what}_failed", id, reason=res.reason)
+            if what == "promote" and res.reason == "chunk mismatch":
+                # every copy (upload and twin) gave a bad chunk: the exact file is lost
+                rd = self.redownloader()
+                if rd is not None:
+                    rd.mark_lost(db, id, "a", "chunk mismatch on every copy")
+                else:
+                    self._once("lost_file", id, reason="chunk mismatch on every copy")
+                if id in self.flagged:
+                    self.flagged.discard(id)
+                    self._kv_set(db, "flagged", sorted(self.flagged))
 
     def _spawn_demote_worker(self):
         with self.mu:

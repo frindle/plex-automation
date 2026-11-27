@@ -97,7 +97,11 @@ def test_zeroed_chunk_is_never_written_into_the_file(stack):
     stub_before = (os.lstat(row["stub_path"]).st_ino, row["head_len"], row["tail_len"])
     with pytest.raises(OSError):
         stack.player_read(f, timeout=40)
-    S.wait_until(lambda: stack.state_of(f) == "failed", 30, what="state failed")
+    # the bad chunk flags a promote first; the row is failed only when that promote finds a
+    # mismatch on every copy (there is no twin here)
+    S.wait_until(lambda: any(a.get("kind") == "bad_chunk" for a in stack.alerts()), 30,
+                 what="the bad_chunk alert")
+    S.wait_until(lambda: stack.state_of(f) == "failed", 90, what="promote ends failed")
     assert os.path.islink(f["disk"]), "L was replaced although the remote copy is bad"
     assert os.lstat(row["stub_path"]).st_ino == stub_before[0]
     got, failed = stack.filled(row["id"])

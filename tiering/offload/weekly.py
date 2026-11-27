@@ -1,4 +1,4 @@
-"""Weekly safety check for offloaded files, and its report.
+"""Nightly safety check for offloaded files, and its report.
 
 There are no backups, so this is the safety net. For every offloaded row it:
 
@@ -20,7 +20,7 @@ account lock. An indexer that fails or answers only in part makes the restore
 check "unchecked", never "no restore path", and unchecked never promotes.
 ``last_check_ts`` is set on every checked row; ``last_stat_ok_ts`` only when both
 providers found every segment. An alert is raised for a row whose
-``last_stat_ok_ts`` is older than 14 days.
+``last_stat_ok_ts`` is older than 3 days (STALE_DAYS).
 
 Restore-path cost. Searches and NZB grabs are the indexers' quota (the client keeps
 rolling 24-hour budgets, so the caller resets nothing). A row keeps the NZB of its
@@ -39,13 +39,13 @@ promote reads when the first copy fails) is STATed the same way and dropped, wit
 a failed grab or a provider that cannot be asked makes the row "unchecked", never "no
 restore path".
 
-Monthly (the first 7 days, or ``monthly=True``) it reads a rotating 5% of the
+Monthly (the first 7 days of a month, or ``monthly=True``) it reads a rotating 5% of the
 offloaded bytes in full through WebDAV and compares the SHA-256. Rows are picked
 by the oldest *attempt*, not the oldest success, so a row that always fails
 cannot hold the rotation: the attempt is recorded before the read, in a small
 JSON file next to the report (no column). A hash mismatch is like ``bad_chunk``:
 the row goes to ``state=failed`` and an alert is raised (promoting cannot help,
-the remote copy is bad). Three read errors in a row, or three weekly STAT
+the remote copy is bad). Three read errors in a row, or three nightly STAT
 failures in a row, on one row raise an alert.
 
 ``run_weekly`` returns the rows flagged for promotion. It promotes nothing; the
@@ -64,7 +64,7 @@ from .newznab import NewznabError, archive_nzb, nzb_segment_ids, read_archived
 from .nntp_stat import NntpUnavailable
 from .qualify import _SOFT, score_restore, stat_nzb_bytes, stat_status
 
-STALE_DAYS = 14
+STALE_DAYS = 3  # an offloaded row without a complete STAT check this long raises an alert
 STREAK = 3
 
 
@@ -127,7 +127,14 @@ def _pick_for_full_read(rows: list[dict], frac: float, attempts: dict) -> list[d
 def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                state=None, reader=None, monthly: bool | None = None,
                sample_frac: float = 0.05, now: float | None = None,
-               alert=None, on_promote=None, attempts_path: str | None = None) -> list[dict]:
+               alert=None, on_promote=None, attempts_path: str | None = None,
+               budget_s: float | None = None, clock=time.time, summary: dict | None = None,
+               lost_hook=None) -> list[dict]:
+    """The nightly check. ``budget_s``: stop starting rows once this many seconds have
+    passed (rows are taken oldest check first, so the rows not reached go first the next
+    night). ``summary`` (a dict) is filled with ``finished``, ``unreached`` (ids),
+    ``provider_trouble`` and ``lost`` (rows whose exact file cannot be rebuilt).
+    ``lost_hook(lost, info)`` is called once, before the report is written."""
     if state is None:
         from . import state as _state
         state = _state
@@ -137,8 +144,14 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
     attempts_path = attempts_path or f"{report_path}.attempts.json"
     attempts = _load_attempts(attempts_path)
 
-    rows = state.list_files(db, "offloaded")
+    t0 = clock()
+    rows = state.list_files(db, "offloaded") + state.list_files(db, "promoting")
+    rows.sort(key=lambda r: (r.get("last_check_ts") or 0, str(r["id"])))
     res: dict[str, dict] = {}
+    trouble = False  # a provider could not be asked at some point
+    lost_rows: list[dict] = []
+    reached: list[dict] = []
+    stopped = False
     dead: dict[str, str] = {}  # provider label -> kind, once it cannot be asked
     providers = (("primary", stat_primary), ("secondary", stat_secondary))
     promote: list[dict] = []
@@ -156,7 +169,7 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
             alert(text)
 
     def write(r: dict, **fields) -> bool:
-        ok = state.update_if(db, r["row"]["id"], "offloaded", **fields)
+        ok = state.update_if(db, r["row"]["id"], r["row"]["state"], **fields)
         if not ok:
             r["moved"] = True
         return ok
@@ -182,11 +195,39 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
         """STAT the stored restore NZB on both providers: ok, missing or unchecked."""
         return stat_status(path, providers, dead)
 
+    def confirm_gone(ids) -> set:
+        """STAT the ids once more on every provider; those missing on all of them."""
+        nonlocal trouble
+        still = set(sorted(ids)[:100])
+        for label, fn in providers:
+            chk = getattr(fn, "check_ids", None)
+            if chk is None or label in dead:
+                return set()
+            try:
+                out = chk(sorted(still))
+            except NntpUnavailable as e:
+                trouble = True
+                if e.kind in _SOFT:
+                    dead[label] = e.kind
+                return set()
+            except Exception:  # noqa: BLE001
+                return set()
+            if out["total"] != len(still):
+                return set()
+            still &= set(out.get("missing_ids") or ())
+            if not still:
+                break
+        return still
+
     for row in rows:
+        if budget_s is not None and clock() - t0 >= budget_s:
+            stopped = True
+            break
+        reached.append(row)
         rid = row["id"]
         att = attempts.setdefault(rid, {})
         r = {"row": row, "flags": [], "unchecked": [], "failed": [], "lost": False,
-             "stat_done": 0, "moved": False, "entry": None, "hash_failed": False}
+             "stat_done": 0, "moved": False, "entry": None, "hash_failed": False, "miss": {}}
         res[rid] = r
         nzb = row.get("nzb_path")
         has_nzb = bool(nzb and os.path.exists(nzb))
@@ -200,6 +241,7 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                 try:
                     out = fn(nzb)
                 except NntpUnavailable as e:
+                    trouble = True
                     if e.kind in _SOFT:
                         dead[label] = e.kind
                         r["unchecked"].append(f"{label}_{e.kind}")
@@ -213,6 +255,8 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                     r["failed"].append(f"{label}_empty_nzb")
                     continue
                 r["stat_done"] += 1
+                if out["missing"]:
+                    r["miss"][label] = set(out.get("missing_ids") or ())
                 if out["missing"] and not flag(r, f"missing_segments_{label}"):
                     break  # the runner moved this row on
         if r["moved"]:
@@ -235,7 +279,12 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
         # the twin (the same bytes on a second upload, read by a promote when the first
         # copy fails): STATed like the restore NZB, dropped once an article is gone
         tw = row.get("twin_nzb_path")
-        if tw and (stat_restore(tw) if os.path.exists(tw) else "missing") == "missing":
+        twin_status = "none"
+        if tw:
+            twin_status = stat_restore(tw) if os.path.exists(tw) else "missing"
+            if twin_status == "unchecked":
+                trouble = True
+        if tw and twin_status == "missing":
             if not write(r, twin_nzb_path=None, twin_remote_path=None):
                 continue
             state.log_event(db, rid, "twin_lost", {})
@@ -243,6 +292,16 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
         last_ok = row.get("last_stat_ok_ts")
         if not all_found and (last_ok is None or now - float(last_ok) > STALE_DAYS * 86400):
             raise_alert(row, f"no complete STAT check in over {STALE_DAYS} days")
+
+        # lost: an article of nzb_path is gone on EVERY provider (a real "no such article")
+        # and there is no live twin. Confirmed by STATing those ids once more.
+        if (r["stat_done"] == len(providers) and len(r["miss"]) == len(providers)
+                and twin_status in ("none", "missing")):
+            cand = set.intersection(*r["miss"].values())
+            sure = confirm_gone(cand) if cand else set()
+            if sure:
+                lost_rows.append({"id": rid, "title": _title(row), "articles": len(sure)})
+                state.log_event(db, rid, "articles_gone", {"articles": len(sure)})
 
         # restore path
         if has_nzb:
@@ -347,14 +406,27 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
             if r["moved"]:
                 continue
 
+    # rows the budget did not reach keep their old last_stat_ok_ts; a stale one still alerts
+    unreached = [r for r in rows if r not in reached]
+    for row in unreached:
+        last_ok = row.get("last_stat_ok_ts")
+        if last_ok is not None and now - float(last_ok) > STALE_DAYS * 86400:
+            raise_alert(row, f"no complete STAT check in over {STALE_DAYS} days")
     live = {r["id"] for r in rows}
     _save_attempts(attempts_path, {k: v for k, v in attempts.items() if v and k in live})
+
+    trouble = trouble or bool(dead)
+    if summary is not None:
+        summary.update(finished=not stopped, unreached=[r["id"] for r in unreached],
+                       provider_trouble=trouble, lost=list(lost_rows))
+    if lost_hook is not None:
+        lost_hook(list(lost_rows), {"provider_trouble": trouble, "finished": not stopped})
 
     # classify for the report
     flagged, unchecked_rows, failed_rows = [], [], []
     ok = checked = moved = hash_failed = 0
     reasons: collections.Counter = collections.Counter()
-    for row in rows:
+    for row in reached:
         r = res[row["id"]]
         if r["moved"]:
             moved += 1
@@ -385,13 +457,14 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                   flagged=flagged, failed=failed_rows, unchecked=unchecked_rows,
                   reasons=reasons, dead=dead, promote=promote, lost=lost,
                   twins=twins, twins_lost=twins_lost, monthly=monthly, full=full,
-                  ran_full=ran_full, moved=moved, hash_failed=hash_failed, alerts=alerts, failed_state=failed_state)
+                  ran_full=ran_full, moved=moved, hash_failed=hash_failed, alerts=alerts, failed_state=failed_state,
+                  unreached=len(unreached))
     return promote
 
 
 def _write_report(path, *, now, rows, checked, ok, flagged, failed, unchecked, reasons,
                   dead, promote, lost, monthly, full, ran_full, moved, hash_failed,
-                  alerts, failed_state, twins=0, twins_lost=0):
+                  alerts, failed_state, twins=0, twins_lost=0, unreached=0):
     total_bytes = sum(int(r.get("size") or 0) for r in rows)
     day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
     L = [f"# Offload weekly check, {day}", ""]
@@ -408,6 +481,8 @@ def _write_report(path, *, now, rows, checked, ok, flagged, failed, unchecked, r
           f"Restore paths lost: {lost}.",
           f"Files with a twin (a second upload of the same bytes): {twins}; "
           f"twins lost this run: {twins_lost}.", ""]
+    if unreached:
+        L += [f"Time budget spent: {unreached} files not reached tonight; they go first tomorrow.", ""]
     if ran_full:
         L += [f"Full read check: {full['files']} files, {_human(full['bytes'])}, "
               f"{full['mismatch']} mismatches.", ""]
@@ -427,6 +502,13 @@ def _write_report(path, *, now, rows, checked, ok, flagged, failed, unchecked, r
         for fr in sorted(failed_state, key=lambda x: _title(x).lower()):
             L.append(f"- {_title(fr)}: {fr.get('restore_note') or 'no note'}; "
                      f"restore path: {fr.get('nzb_path2') or 'none archived'}")
+    else:
+        L.append("None.")
+    L += ["", "## Lost files (exact file cannot be rebuilt; re-download asked of the arr)"]
+    lostrows = [fr for fr in failed_state if str(fr.get("restore_note") or "").startswith("lost:")]
+    if lostrows:
+        for fr in sorted(lostrows, key=lambda x: str(x.get("id"))):
+            L.append(f"- {fr.get('id')} ({_title(fr)}): {fr.get('restore_note')}")
     else:
         L.append("None.")
     L += ["", "## Could not be checked"]

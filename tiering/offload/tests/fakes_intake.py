@@ -471,6 +471,12 @@ class _ArrHandler(_Quiet):
             return
         if u.path == "/api/v3/movie":
             data = o.movies
+        elif u.path.startswith("/api/v3/movie/") or u.path.startswith("/api/v3/episode/"):
+            data = o.item(u.path)
+            if data is None:
+                self.send_response(404)
+                self.end_headers()
+                return
         elif u.path == "/api/v3/series":
             data = o.series
         elif u.path == "/api/v3/episode":
@@ -486,6 +492,68 @@ class _ArrHandler(_Quiet):
         self.wfile.write(b)
 
 
+def _arr_write(self, verb):
+    """POST / PUT / DELETE for the fake arr: records what was asked and applies it."""
+    o = self.server.owner
+    u = urllib.parse.urlsplit(self.path)
+    n = int(self.headers.get("Content-Length") or 0)
+    raw = self.rfile.read(n) if n else b""
+    o.requests.append((verb, u.path, self.headers.get("X-Api-Key")))
+    if self.headers.get("X-Api-Key") != o.key:
+        self.send_response(401)
+        self.end_headers()
+        return
+    body = json.loads(raw) if raw else None
+    out = {}
+    if o.fail:
+        self.send_response(o.fail_code)
+        self.end_headers()
+        return
+    if verb == "POST" and u.path == "/api/v3/command":
+        o.commands.append(body)
+        out = {"id": len(o.commands)}
+    elif verb == "POST" and u.path == "/api/v3/release":
+        o.grabs.append(body)
+        out = {}
+    elif verb == "PUT" and (u.path.startswith("/api/v3/movie/")
+                            or u.path.startswith("/api/v3/episode/")):
+        cur = o.item(u.path)
+        if cur is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        cur.update(body)
+        o.puts.append((u.path, body))
+        out = cur
+    elif verb == "DELETE" and (u.path.startswith("/api/v3/moviefile/")
+                               or u.path.startswith("/api/v3/episodefile/")):
+        fid = int(u.path.rsplit("/", 1)[1])
+        o.deleted.append(u.path)
+        if "moviefile" in u.path:
+            for m in o.movies:
+                if (m.get("movieFile") or {}).get("id") == fid:
+                    m["movieFile"], m["hasFile"] = None, False
+        else:
+            for eps in o.episodes.values():
+                for e in eps:
+                    if (e.get("episodeFile") or {}).get("id") == fid:
+                        e["episodeFile"], e["hasFile"] = None, False
+    else:
+        self.send_response(404)
+        self.end_headers()
+        return
+    b = json.dumps(out).encode() if out else b""
+    self.send_response(200)
+    self.send_header("Content-Length", str(len(b)))
+    self.end_headers()
+    self.wfile.write(b)
+
+
+_ArrHandler.do_POST = lambda self: _arr_write(self, "POST")
+_ArrHandler.do_PUT = lambda self: _arr_write(self, "PUT")
+_ArrHandler.do_DELETE = lambda self: _arr_write(self, "DELETE")
+
+
 class FakeArr(_Server):
     """A Radarr (``movies``) or Sonarr (``series`` and ``episodes``) API on a real socket."""
 
@@ -494,5 +562,18 @@ class FakeArr(_Server):
         self.movies, self.series = movies or [], series or []
         self.episodes = episodes or {}  # series id -> list of episode dicts
         self.requests = []
+        self.commands, self.grabs, self.puts, self.deleted = [], [], [], []
         self.fail = False
+        self.fail_code, self.retry_after = 500, None
         super().__init__(_ArrHandler)
+
+    def item(self, path):
+        """The movie or episode that a /api/v3/movie/<id> or /episode/<id> path names."""
+        iid = int(path.rsplit("/", 1)[1])
+        if "/movie/" in path:
+            return next((m for m in self.movies if m["id"] == iid), None)
+        for eps in self.episodes.values():
+            for e in eps:
+                if e["id"] == iid:
+                    return e
+        return None

@@ -372,3 +372,27 @@ def test_a_new_file_still_on_a_pool_is_counted_on_pool_not_missing(tmp_path, arr
     mk(tmp_path, "new.mkv")  # the mover put it on the array: registered on the next pass
     out = run(st, [r], tmp_path=tmp_path, on_pool=lambda p: False)
     assert (out["new"], out["on_pool"], out["missing_local"]) == (1, 0, 1), out
+
+
+def test_real_file_at_a_lost_rows_path_is_a_new_whole_row(tmp_path, arrs):
+    p = mk(tmp_path, "m.mkv")
+    old = {"id": "00000000000000aa", "state": "failed", "lib_path": p,
+           "restore_note": "lost: re-download requested"}
+    st = FakeState([old])
+    out = run(st, [arrs(movies=[movie("/data/m.mkv")])], tmp_path=tmp_path)
+    assert out["lost_replaced"] == 1 and out["new"] == 1
+    assert st.rows["00000000000000aa"]["lib_path"] is None
+    assert st.rows["00000000000000aa"]["restore_note"] == "lost: re-downloaded"
+    fresh = [r for r in st.rows.values() if r["id"] != "00000000000000aa"]
+    assert len(fresh) == 1 and fresh[0]["state"] == "whole" and fresh[0]["lib_path"] == p
+
+
+def test_a_lost_row_whose_path_is_still_a_symlink_is_left_alone(tmp_path, arrs):
+    p = tmp_path / "lib" / "m.mkv"
+    p.parent.mkdir(parents=True)
+    os.symlink("/tfs/00000000000000aa.mkv", p)
+    old = {"id": "00000000000000aa", "state": "failed", "lib_path": str(p),
+           "restore_note": "lost: re-download requested"}
+    st = FakeState([old])
+    out = run(st, [arrs(movies=[movie("/data/m.mkv")])], tmp_path=tmp_path)
+    assert out["lost_replaced"] == 0 and st.rows["00000000000000aa"]["lib_path"] == str(p)
