@@ -22,7 +22,8 @@ Row fields it reads:
   lib_path (required), nzb_path, release_name, title, year, imdb_id, tvdb_id,
   season, episode, is4k.
 The source resolution comes from ``is4k`` or the release or file name. A 4K
-source needs a 4K alternative. When it cannot be told, the floor is 1080p.
+source tries 4K alternatives first; 1080p is the last resort, never lower. When it
+cannot be told, the floor is 1080p.
 
 It does not write to the database. ``QualifyResult.fields`` holds only ``files``
 columns for the caller to store: nzb_path, nzb_path2 (the archived NZB of the verified
@@ -67,11 +68,10 @@ class QualifyResult:
 def resolution_floor(src_res: int) -> int:
     """Lowest resolution an alternative may have, given the source's.
 
-    A 4K source keeps a 4K floor (never restored as 1080p). A source below 1080p
-    gets a 720p floor. An unknown source (0) gets 1080p.
+    Never below 1080p for a 1080p or 4K source: a 4K source may fall back to 1080p, but
+    only as the last resort (``score_restore`` tries every 4K alternative first). A source
+    below 1080p gets a 720p floor. An unknown source (0) gets 1080p.
     """
-    if src_res >= 2160:
-        return 2160
     return 720 if 0 < src_res < 1080 else 1080
 
 
@@ -201,7 +201,9 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
     spent grab budget, an indexer that cannot be asked or a failed transport also make it
     unsure. None of these is a "no".
 
-    Returns {count, floor, best, below_floor, dead, partial, unsure, note, candidate}.
+    Returns {count, floor, best, downgrade, below_floor, dead, partial, unsure, note,
+    candidate}. ``downgrade`` is True when the best verified alternative is below the
+    source's resolution (a 4K source with only 1080p left).
     ``candidate`` is {title, nzb} of the first verified alternative (its NZB bytes), or None.
     ``partial`` means some indexer did not answer; ``unsure`` means ``partial`` or
     some candidate's NZB could not be checked, or ``own_ids`` was not given.
@@ -224,9 +226,11 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
             below += 1
             continue
         cands.append(rel)
-    # a name that differs from ours is the better bet for a different upload, so it is
-    # tried first; the name never decides, only the message-ids do
-    cands.sort(key=lambda r: (_clean(r.title) == own_name, -r.resolution, _clean(r.title), r.link))
+    # highest resolution first: upgrade or keep, never downgrade while another option is
+    # left (a 4K source tries every 4K alternative before 1080p). Within a resolution a
+    # name that differs from ours is the better bet for a different upload; the name never
+    # decides, only the message-ids do
+    cands.sort(key=lambda r: (-r.resolution, _clean(r.title) == own_name, _clean(r.title), r.link))
     counted: list[frozenset] = []
     best = 0
     fails = 0
@@ -285,8 +289,12 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
         if candidate is None:
             candidate = {"title": rel.title, "nzb": raw}
     count = len(counted)
+    src_res = source_resolution(row)
+    downgrade = bool(count) and 0 < best < src_res
     if count:
         note = f"{count} alternative(s), best {best}p"
+        if downgrade:
+            note += f" (no {src_res}p alternative: {best}p is the last resort)"
     elif unsure:
         note = "restore path unchecked (an indexer or NZB did not answer)"
     elif dead:
@@ -295,7 +303,8 @@ def score_restore(row: dict, indexers, own_ids: frozenset | None,
         note = f"only below-floor alternatives ({below}), floor {floor}p"
     else:
         note = "no alternative release found"
-    return {"count": count, "floor": floor, "best": best, "below_floor": below, "dead": dead,
+    return {"count": count, "floor": floor, "best": best, "downgrade": downgrade,
+            "below_floor": below, "dead": dead,
             "partial": partial, "unsure": unsure, "note": note, "candidate": candidate}
 
 
@@ -566,7 +575,8 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
             fields["restore_score"] = 0
             return fail("restore", "no_restore_path", count=0)
         fields["nzb_path2"] = path2
-    steps["restore"] = {"ok": True, "count": sc["count"], "best": sc["best"]}
+    steps["restore"] = {"ok": True, "count": sc["count"], "best": sc["best"],
+                        "downgrade": sc["downgrade"]}
 
     # 6. a twin: the same bytes on a second upload, for a promote to switch to when the
     # first fails mid-stream. Best effort, and last, so it only spends the grabs the
