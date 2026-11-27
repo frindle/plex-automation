@@ -5,7 +5,7 @@ import pytest
 
 import sab_hold
 import watch_hold as wh
-from test_watch_hold import NEW, NOW, OLD, FakeIO, aw, meta, movie_world, speechy
+from test_watch_hold import NEW, NOW, OLD, FakeIO, aw, movie_world, speechy
 
 NZO = 'sabnzbd_nzo_ab12cd'
 DONE_DIR = '/sab/complete/watch-hold/Some.Movie.2001'
@@ -486,16 +486,23 @@ def test_import_command_for_radarr_and_sonarr(monkeypatch):
 
 
 def test_arr_imported_by_history_or_by_the_old_file_having_changed(monkeypatch):
-    state = {'hist': [], 'path': '/m/old.mkv'}
+    state = {'hist': [], 'path': '/m/old.mkv', 'left': '/data/dl/watch-hold/x/movie.mkv'}
 
     def get(who, path, params=None):
         return {'records': state['hist']}
     io, _ = arr_io(monkeypatch, get=get)
+    monkeypatch.setattr(aw, '_watch_sab', lambda: object())
     io.items = lambda who, ids: {f'm{i}': {'old': state['path']} for i in ids}
+    io.new_file = lambda h: state['left']
     e = {'olds': {'m7': '/m/old.mkv'}}
     assert not io.arr_imported('Radarr', 'sabnzbd_nzo_abc123', e)
     state['path'] = '/m/new.mkv'                        # the scan dropped the id from history but swapped the file
+    assert not io.arr_imported('Radarr', 'sabnzbd_nzo_abc123', e), 'the video is still in the download folder'
+    state['left'] = None                                # the import moved it out
     assert io.arr_imported('Radarr', 'sabnzbd_nzo_abc123', e)
+    monkeypatch.setattr(aw, '_watch_sab', lambda: None)
+    assert not io.arr_imported('Radarr', 'sabnzbd_nzo_abc123', e), 'SABnzbd unreadable proves nothing'
+    monkeypatch.setattr(aw, '_watch_sab', lambda: object())
     state['path'] = '/m/old.mkv'
     state['hist'] = [{'eventType': 'downloadFolderImported', 'downloadId': 'SABNZBD_NZO_ABC123'}]
     assert io.arr_imported('Radarr', 'sabnzbd_nzo_abc123', {})
@@ -543,3 +550,124 @@ def test_watchio_new_file_for_a_usenet_download(monkeypatch, tmp_path):
     monkeypatch.setattr(aw, '_sab_client', s)
     monkeypatch.setattr(aw, 'SABNZBD_PATH_PAIRS', sab_hold.parse_path_map(f'/sab={tmp_path}'))
     assert aw.WatchIO({}).new_file('sabnzbd_nzo_abc123') == str(d / 'm.mkv')
+
+
+# -- a job no arr lists, a held job without tracking, an import that will not take ------------------------
+
+def test_an_unlisted_job_is_looked_up_in_the_history_after_the_wait(film):
+    io, doc = usenet_world(film), {}
+    io.q['Radarr'] = []
+    assert wh.tick(io, doc, wh.Cfg('on'), NOW, set())['classify_wait'] == 1
+    assert wh.tick(io, doc, wh.Cfg('on'), NOW + wh.CLASSIFY_WAIT_S - 1, set())['classify_wait'] == 1
+    assert io.calls == [] and io.t[NZO]['paused']
+    io.grab_ids = lambda who, h: ([7], False) if who == 'Radarr' and h == NZO else ([], False)   # Radarr's history knows it
+    c = wh.tick(io, doc, wh.Cfg('on'), NOW + wh.CLASSIFY_WAIT_S, set())
+    assert c['held'] == 1 and io.calls == [('cat', NZO, wh.HOLD_LABEL), ('resume', NZO)]
+    assert doc['usenet_wait'] == {}
+
+
+def test_a_job_no_arr_knows_downloads_after_the_wait_and_is_held_if_an_arr_picks_it_up(film):
+    io, doc = usenet_world(film), {}
+    io.q['Radarr'] = []
+    wh.tick(io, doc, wh.Cfg('on'), NOW, set())
+    c = wh.tick(io, doc, wh.Cfg('on'), NOW + wh.CLASSIFY_WAIT_S, set())
+    assert c['resumed_unlisted'] == 1 and io.calls == [('resume', NZO)] and not doc['held']
+    assert NZO not in doc['usenet'], 'not decided: looked at again while it is queued'
+    io.q['Radarr'] = [{'downloadId': 'SABnzbd_nzo_ab12cd', 'movieId': 7, 'trackedDownloadState': 'downloading'}]
+    c = wh.tick(io, doc, wh.Cfg('on'), NOW + wh.CLASSIFY_WAIT_S + 60, set())
+    assert c['held'] == 1 and io.calls[-1] == ('cat', NZO, wh.HOLD_LABEL) and doc['held'][NZO]['resumed']
+
+
+def test_an_unreadable_queue_never_counts_toward_the_wait(film):
+    io, doc = usenet_world(film), {}
+    io.q['Radarr'] = []
+    wh.tick(io, doc, wh.Cfg('on'), NOW, set())
+    real = io.queue
+
+    def queue(who):
+        if who == 'Sonarr':
+            raise OSError('down')
+        return real(who)
+    io.queue = queue
+    c = wh.tick(io, doc, wh.Cfg('on'), NOW + wh.CLASSIFY_WAIT_S + 1, set())
+    assert c['classify_wait'] == 1 and io.calls == [] and io.t[NZO]['paused']
+
+
+def test_dry_mode_counts_an_unlisted_job_and_leaves_it_paused(film):
+    io, doc = usenet_world(film), {}
+    io.q['Radarr'] = []
+    wh.tick(io, doc, wh.Cfg('dry'), NOW, set())
+    c = wh.tick(io, doc, wh.Cfg('dry'), NOW + wh.CLASSIFY_WAIT_S, set())
+    assert c['would_resume_unlisted'] == 1 and io.calls == [] and io.t[NZO]['paused']
+
+
+def test_a_held_job_without_tracking_is_never_imported_blind(film):
+    io, doc, cfg = held_job(film)
+    finish(io)
+    doc['tracked'].clear()
+    for t in (NOW + 60, NOW + 60 + 3 * 3600):
+        c = wh.tick(io, doc, cfg, t, set())
+        assert c['kept_untracked'] == 1 and not io.acts('import'), 'no grab record: kept, never imported'
+
+
+def test_a_held_job_without_tracking_is_rebuilt_from_the_history_and_waits_for_the_stream(film):
+    io, doc, cfg = held_job(film)
+    finish(io)
+    doc['tracked'].clear()
+    io.grabs[NZO] = ([7], False)
+    io.sess = list(STREAM)
+    c = wh.tick(io, doc, cfg, NOW + 60, set())
+    assert c['retracked'] == 1 and c['kept_playing'] == 1 and not io.acts('import')
+    assert NZO in doc['tracked'] and doc['held'][NZO]['olds'] == {'m7': OLD}
+    io.sess, io.import_makes_history = [], True
+    t = NOW + 60
+    for _ in range(4):
+        t += 601
+        wh.tick(io, doc, cfg, t, set())
+    assert len(io.acts('import')) == 1, 'imported once the item is quiet and mapped'
+
+
+def test_a_held_job_whose_item_has_no_file_is_imported_without_a_stream_check(film):
+    io, doc, cfg = held_job(film)
+    finish(io)
+    doc['tracked'].clear()
+    io.grabs[NZO] = ([7], False)
+    io.arr.clear()                                      # the old file is gone: nobody can be watching it
+    c = wh.tick(io, doc, cfg, NOW + 60, set())
+    assert c['untracked_no_old_file'] == 1 and c['import_sent'] == 1
+
+
+def test_a_stuck_import_is_retried_every_few_hours_and_still_waits_for_the_stream(film):
+    io, doc, cfg = held_job(film)
+    finish(io)
+    t = NOW + 60
+    for _ in range(wh.IMPORT_MAX_TRIES):
+        wh.tick(io, doc, cfg, t, set())
+        last, t = t, t + wh.IMPORT_RETRY_S + 1
+    assert len(io.acts('import')) == wh.IMPORT_MAX_TRIES
+    c = wh.tick(io, doc, cfg, last + wh.IMPORT_STUCK_RETRY_S - 1, set())
+    assert c['import_stuck'] == 1 and len(io.acts('import')) == wh.IMPORT_MAX_TRIES
+    io.sess = list(STREAM)
+    c = wh.tick(io, doc, cfg, last + wh.IMPORT_STUCK_RETRY_S + 1, set())
+    assert c['kept_playing'] == 1 and len(io.acts('import')) == wh.IMPORT_MAX_TRIES
+    io.sess = []
+    wh.tick(io, doc, cfg, last + wh.IMPORT_STUCK_RETRY_S + 700, set())
+    assert len(io.acts('import')) == wh.IMPORT_MAX_TRIES + 1
+
+
+def test_the_tick_warns_hourly_when_a_usenet_hold_needs_a_look(monkeypatch):
+    warned = []
+    monkeypatch.setattr(aw, '_watch_look', {'at': 0.0})
+    monkeypatch.setattr(aw.log, 'warning', lambda msg, *a: warned.append(msg))
+    counts = {'import_stuck': 1}
+    monkeypatch.setattr(aw.watch_hold, 'tick', lambda *a, **k: wh.Counts(counts))
+    monkeypatch.setattr(aw, '_watch_log', lambda *a: None)
+    monkeypatch.setattr(aw, 'deluge_login', lambda: None)
+    monkeypatch.setattr(aw, 'WATCH_CFG', wh.Cfg('on'))
+    monkeypatch.setattr(aw, '_watch_doc', {'held': {}, 'tracked': {}, 'seen': {}})
+    for t in (NOW, NOW + 60, NOW + 3601):
+        aw.watch_tick(io=object(), now=t, discover_now=False)
+    assert len(warned) == 2 and 'import_stuck' in warned[0]
+    counts.clear()
+    aw.watch_tick(io=object(), now=NOW + 9000, discover_now=False)
+    assert len(warned) == 2, 'nothing to look at: no warning'

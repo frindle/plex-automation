@@ -12347,6 +12347,7 @@ _watch_prep_lock = threading.Lock()   # one audio mapping at a time (scheduler a
 _watch_tls = threading.local()
 _watch_checked = set()
 _watch_last = {}
+_watch_look = {'at': 0.0}             # the last 'usenet hold needs a look' warning (hourly at most)
 
 
 def _watch_load():
@@ -12483,7 +12484,13 @@ class WatchIO(GlacierIO):
         if not olds:
             return False
         cur = self.items(who, [int(k[1:]) for k in olds])
-        return any(k in cur and cur[k].get('old') != p for k, p in olds.items())
+        if not any(k in cur and cur[k].get('old') != p for k, p in olds.items()):
+            return False
+        # a changed file alone may be another upgrade or a rename: the import (mode Move) also took the video out
+        # of SABnzbd's folder, and only both together count, since the history entry and its files are deleted next
+        if sab_hold.is_usenet_id(h) and _watch_sab() is None:
+            return False                                # SABnzbd unreadable: not proven, asked again next pass
+        return self.new_file(h) is None
 
     def forget_usenet(self, h):
         sab = _watch_sab()
@@ -12737,6 +12744,10 @@ def watch_tick(io=None, now=None, discover_now=True):
         if mine:
             _watch_prep_lock.release()
     _watch_log('tick', c)
+    look = {k: c[k] for k in ('import_stuck', 'kept_untracked', 'resumed_unlisted') if c.get(k)}
+    if look and _watch_look['at'] <= now - 3600:     # at most hourly, at warning level for the alerts
+        _watch_look['at'] = now
+        log.warning(f'[watch] usenet hold needs a look: {look}')
     return dict(c)
 
 

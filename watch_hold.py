@@ -812,6 +812,8 @@ def release_pass(io, doc, sessions, now, cfg, c, force=False, verify_tries=3, ve
 
 IMPORT_RETRY_S = 120           # an import command not seen in the *arr's history by then is sent again
 IMPORT_MAX_TRIES = 3
+IMPORT_STUCK_RETRY_S = 6 * 3600   # after the quick tries: once every 6 h, still behind the stream check
+CLASSIFY_WAIT_S = 900          # a paused job no *arr queue lists by then: its grab is looked up in the history
 
 
 def classify_usenet(io, doc, torrents, now, cfg, checked, c, cats):
@@ -820,11 +822,14 @@ def classify_usenet(io, doc, torrents, now, cfg, checked, c, cats):
     SABnzbd's history is only counted (`usenet_late`). A job the *arr's queue does not list yet stays paused and
     is looked at again on the next pass. Dry mode looks up and counts, and changes nothing."""
     done = doc.setdefault('usenet', {})
+    waits = doc.setdefault('usenet_wait', {})          # job -> when it was first seen unlisted
     held, tracked = doc['held'], doc['tracked']
     rows = {h: t for h, t in torrents.items() if t.get('usenet')}
     if rows:
         for h in [h for h in done if h not in rows]:
             done.pop(h)
+        for h in [h for h in waits if h not in rows]:
+            waits.pop(h)
     pending = []
     for h, t in rows.items():
         lb = (t.get('label') or '').lower()
@@ -848,12 +853,14 @@ def classify_usenet(io, doc, torrents, now, cfg, checked, c, cats):
         pending.append(h)
     if not pending:
         return
-    queued = {}
-    for who in io.services():
+    queued, blind = {}, False
+    services = list(io.services())
+    for who in services:
         try:
             recs = io.queue(who)
         except Exception:  # noqa: BLE001
             c.bump('queue_unreadable')
+            blind = True
             continue
         for r in recs:
             h = str(r.get('downloadId') or '').lower()
@@ -863,8 +870,20 @@ def classify_usenet(io, doc, torrents, now, cfg, checked, c, cats):
     for h in pending:
         t = torrents[h]
         if h not in queued:
-            c.bump('classify_wait')                     # not in the *arr's queue yet: stays paused, asked again
-            continue
+            if h not in waits:
+                waits[h] = now
+                io.save(doc)
+            if blind or now - waits[h] < CLASSIFY_WAIT_S:
+                c.bump('classify_wait')                 # not in the *arr's queue yet: stays paused, asked again
+                continue
+            found = _grab_in_history(io, services, h)
+            if found is None:
+                _unlisted(io, h, t, cfg, c)
+                waits[h] = now                          # the histories are asked again in CLASSIFY_WAIT_S, not each pass
+                io.save(doc)
+                continue
+            queued[h] = found
+        waits.pop(h, None)
         who, ids = queued[h]
         status = 'tracked' if h in tracked else track(io, tracked, h, who, sorted(ids), now)
         if status == 'lookup_failed':
@@ -913,6 +932,58 @@ def classify_usenet(io, doc, torrents, now, cfg, checked, c, cats):
         else:
             held[h]['resumed'] = True
         io.save(doc)
+
+
+def _grab_in_history(io, services, h):
+    """(who, ids) of the *arr whose history shows the grab of job h, or None (also when a history is unreadable:
+    the job is then looked at again on the next pass)."""
+    for who in services:
+        try:
+            ids, _imported = io.grab_ids(who, h)
+        except Exception:  # noqa: BLE001
+            return None
+        if ids:
+            return who, set(ids)
+    return None
+
+
+def _unlisted(io, h, t, cfg, c):
+    """A job no *arr lists or grabbed after CLASSIFY_WAIT_S: no *arr can import it, so it may download rather
+    than wait paused for ever. It is not marked decided: while it is queued, every pass looks again, and an *arr
+    that picks it up gets it held like any other upgrade."""
+    if not cfg.acts:
+        c.bump('would_resume_unlisted')
+        return
+    if not t.get('paused'):
+        c.bump('unlisted')
+        return
+    try:
+        io.resume(h)
+        c.bump('resumed_unlisted')
+    except Exception:  # noqa: BLE001
+        c.bump('resume_failed')
+
+
+def _retrack(io, tracked, h, who, now, c):
+    """A held job without tracking (a lookup lost, or state from before the hold knew it): rebuild it from the
+    *arr's history so the import still waits for the stream check. Returns (go, entry): go is False to keep the
+    job for now; entry is None when none of its items has a file, so no viewer can be on one."""
+    try:
+        ids, _imported = io.grab_ids(who, h)
+    except Exception:  # noqa: BLE001
+        ids = []
+    if not ids:
+        c.bump('kept_untracked')                        # no grab record: never import it blind
+        return False, None
+    status = track(io, tracked, h, who, ids, now)
+    if status == 'tracked':
+        c.bump('retracked')
+        return True, tracked[h]
+    if status == 'not_upgrade':
+        c.bump('untracked_no_old_file')
+        return True, None
+    c.bump('kept_untracked')
+    return False, None
 
 
 def release_usenet(io, doc, h, e, t, entry, now, cfg, c):
@@ -964,11 +1035,12 @@ def release_usenet(io, doc, h, e, t, entry, now, cfg, c):
         except Exception:  # noqa: BLE001
             c.bump('verify_failed')
             return False
-        if now - e['import_at'] < IMPORT_RETRY_S:
-            c.bump('kept_verifying')
-            return False
-        if e.get('import_tries', 0) >= IMPORT_MAX_TRIES:
-            c.bump('import_stuck')
+        stuck = e.get('import_tries', 0) >= IMPORT_MAX_TRIES
+        if stuck:
+            c.bump('import_stuck')                      # every pass, so the log shows it until it clears
+        if now - e['import_at'] < (IMPORT_STUCK_RETRY_S if stuck else IMPORT_RETRY_S):
+            if not stuck:
+                c.bump('kept_verifying')
             return False
     # the stream check, on sessions read now: never an import under a viewer, at the cap or not
     try:
@@ -977,13 +1049,19 @@ def release_usenet(io, doc, h, e, t, entry, now, cfg, c):
         c.bump('kept_sessions_unreadable')
         return False
     mark_seen(seen, sessions, now)
+    if not entry:
+        go, entry = _retrack(io, tracked, h, who, now, c)
+        if not go:
+            io.save(doc)
+            return False
+        if entry and not e.get('olds'):
+            e['olds'] = {k: it.get('old') for k, it in (entry.get('items') or {}).items()}
+            io.save(doc)
     if entry:
         ok, why = ready(entry, seen, sessions, now, cfg)
         if not ok:
             c.bump('kept_' + why)
             return False
-    else:
-        c.bump('import_untracked')
     e['import_at'], e['import_tries'] = now, e.get('import_tries', 0) + 1
     io.save(doc)                                        # the attempt is on record before the command goes out
     try:
