@@ -71,7 +71,8 @@ def facts_file(tmp_path, data, name='f.jsonl'):
     return str(p)
 
 
-ENV = {'UNRAID_OLLAMA_URL': BASE}
+# A directory that never exists: default_facts must not find the host's own /data/backtest files.
+ENV = {'UNRAID_OLLAMA_URL': BASE, 'LLM_BACKTEST_DIR': '/nonexistent/backtest'}
 
 
 def run(tmp_path, http, argv=(), env=None, data=None, sleep=None):
