@@ -185,7 +185,10 @@ The `files` table has these columns:
 ### Qualify
 
 `qualify` decides whether one whole file may be offloaded tonight.
-- **Same bytes:** it hashes `L` itself with a fresh full read and hashes the remote copy, and both must equal. It never trusts a stored `sha256`. It writes the hash it saw into the row's `sha256`.
+- **Same bytes:** it hashes `L` itself with a fresh full read, then reads the remote copy by range reads (as tierfs plays it) and compares every 16 MiB chunk with `L`. It never trusts a stored `sha256`. It writes the hash it saw into the row's `sha256`.
+  - AltMount zero-fills a segment it could not fetch in time and still answers 206, so a chunk that differs is read again, up to `HASH_REREADS` (2) times, each with a fresh request. A reread that matches was a fluke and counts as `fixed`.
+  - The same wrong bytes on every read: `hash_mismatch` (the copy is not `L`). Different wrong bytes on every read: `hash_unsure` (a flaky read path proves nothing; not tonight, nothing recorded). A remote size that is not `L`'s is `hash_mismatch` too.
+  - The `qualify_failed` event carries the failed step's detail (chunks, rereads, first bad offset, zero-filled or not).
 - **Restore path:** another release at or above the quality floor that is a different upload. Any candidate whose NZB shares message-ids with the `nzb_path` NZB is the same upload, whatever its name. Size alone never decides.
   - Message-ids are compared without `<>` or white space, and case-sensitive.
   - The candidate's NZB is STATed, every segment on every configured provider, like `nzb_path`'s, before it counts. A candidate with missing articles is not a restore path.
@@ -240,7 +243,7 @@ The state file is shared by every client and process that names it: each write t
 
 A failure of one item is not the indexer's: a grab answered with newznab code 300 ("no such item"), a 404 or 410, or a body that is no NZB. It does not count toward the 3 errors; the release id (the guid, else a hash of the link) gets a strike. A body that is no NZB may be a maintenance page, so a release is called bad (not grabbed again) only after such answers on two different nights (at least 12 hours apart). A bad mark expires 7 days after its last strike, and a valid NZB clears it at once. When one indexer answers with non-NZB bodies for 4 different releases within an hour without giving one NZB, the indexer is the problem: those strikes are taken back, the indexer is dropped through the usual 24-hour backoff, and the grab raises `IndexerDropped` (so the row is `nzb_unsure`). Transport errors, 5xx and other error codes count as before. When a search finds every indexer dropped, out of budget or rate limited, the client raises `IndexersUnavailable` (a `NewznabError`). API keys never appear in a repr, log line or exception, and the release link (which holds the key) is never used as the guid.
 - Each row's result is written as soon as it is known, through `update_if(..., expect_state="offloaded")`. A row the runner changed during the run is left alone.
-- The monthly full reads pick by the oldest attempt, not the oldest success, so one bad row cannot use the whole budget. A hash mismatch on a full read is treated like `bad_chunk`: `state=failed` and an alert. Three failed attempts in a row on network errors alert.
+- The monthly full reads pick by the oldest attempt, not the oldest success, so one bad row cannot use the whole budget. A hash mismatch on a full read is read again: a match the second time was a fluke (`full_read_fluke`), a different hash the second time proves nothing (`full_read_unstable`, next rotation). The same wrong hash twice is treated like `bad_chunk`: `state=failed` and an alert. Three failed attempts in a row on network errors alert.
 - The report lists `offloaded` rows and every `failed` row with its `restore_note` and restore path.
 
 ### RemoteReader

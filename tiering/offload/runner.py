@@ -1693,7 +1693,10 @@ class Runner:
                 return
             if not q.ok:
                 log.info("demote %s skipped: qualify failed: %s", id, ",".join(q.reasons))
-                st.log_event(db, id, "qualify_failed", {"reasons": list(q.reasons)})
+                bad = {k: v for k, v in (getattr(q, "steps", None) or {}).items()
+                       if isinstance(v, dict) and not v.get("ok", True)}
+                st.log_event(db, id, "qualify_failed", {"reasons": list(q.reasons), **(
+                    {"steps": bad} if bad else {})})
                 return
             cols = set(getattr(st, "COLUMNS", None) or FALLBACK_COLUMNS) - set(PROTECTED_COLUMNS)
             fields = {k: v for k, v in (q.fields or {}).items() if k in cols}

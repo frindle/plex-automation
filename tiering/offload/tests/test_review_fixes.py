@@ -350,7 +350,9 @@ def test_hash_mismatch_marks_failed_and_is_not_picked_again(tmp_path):
         assert bad["state"] == "failed"
         assert ("full_read_mismatch" in [k for _, k, _ in e.state.events])
         e.run(reader=rd, now=DAY3 + 31 * 86400)
-        assert rd.calls.count(bad["remote_path"]) == 1  # a failed row leaves the rotation
+        # read twice (the second read confirms the mismatch), then never again:
+        # a failed row leaves the rotation
+        assert rd.calls.count(bad["remote_path"]) == 2
     finally:
         e.close()
 
