@@ -26,4 +26,5 @@ COPY speed_cap.py .
 COPY stuck_plan.py .
 COPY glacier_hold.py .
 COPY watch_hold.py .
+COPY sab_hold.py .
 CMD ["python", "-u", "arr-webhook.py"]
