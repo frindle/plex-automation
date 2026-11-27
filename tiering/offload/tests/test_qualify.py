@@ -157,7 +157,7 @@ def idx(*releases):
 
 
 @pytest.mark.parametrize("src,alt,expect", [
-    (2160, "Movie.2020.1080p.WEB-DL-A", 1),
+    (2160, "Movie.2020.1080p.WEB-DL-A", 1),  # 1080p: a 4K file's last resort
     (2160, "Movie.2020.2160p.WEB-DL-A", 1),
     (2160, "Movie.2020.720p.WEB-DL-A", 0),
     (1080, "Movie.2020.1080p.WEB-DL-A", 1),
@@ -174,6 +174,44 @@ def test_resolution_floor(src, alt, expect):
     try:
         row = {"release_name": f"Movie.2020.{src}p.X-GRP", "title": "Movie", "year": 2020}
         assert q.score_restore(row, ix, frozenset(IDS))["count"] == expect
+    finally:
+        s.close()
+
+
+def test_4k_source_tries_every_4k_alternative_before_1080p():
+    # the 1080p name differs from ours and the 4K one shares it: resolution still wins
+    s, ix = idx(("Movie.2020.1080p.WEB-DL-OTHER", make_nzb(["hd@t"])),
+                ("Movie.2020.2160p.X-GRP", make_nzb(["uhd@t"])))
+    try:
+        row = {"release_name": "Movie.2020.2160p.X-GRP", "title": "Movie", "year": 2020}
+        sc = q.score_restore(row, ix, frozenset(IDS), stop_at=1)
+        assert sc["candidate"]["title"] == "Movie.2020.2160p.X-GRP"
+        assert sc["best"] == 2160 and sc["downgrade"] is False
+        assert "last resort" not in sc["note"]
+    finally:
+        s.close()
+
+
+def test_4k_source_with_only_1080p_left_is_a_marked_downgrade():
+    s, ix = idx(("Movie.2020.1080p.WEB-DL-A", make_nzb(["hd@t"])),
+                ("Movie.2020.720p.WEB-DL-B", make_nzb(["sd@t"])))
+    try:
+        row = {"release_name": "Movie.2020.2160p.X-GRP", "title": "Movie", "year": 2020}
+        sc = q.score_restore(row, ix, frozenset(IDS))
+        assert sc["count"] == 1 and sc["best"] == 1080 and sc["below_floor"] == 1
+        assert sc["downgrade"] is True and "1080p is the last resort" in sc["note"]
+    finally:
+        s.close()
+
+
+def test_1080p_source_is_not_a_downgrade_and_prefers_4k():
+    s, ix = idx(("Movie.2020.1080p.WEB-DL-A", make_nzb(["hd@t"])),
+                ("Movie.2020.2160p.WEB-DL-B", make_nzb(["uhd@t"])))
+    try:
+        row = {"release_name": "Movie.2020.1080p.X-GRP", "title": "Movie", "year": 2020}
+        sc = q.score_restore(row, ix, frozenset(IDS), stop_at=1)
+        assert sc["candidate"]["title"] == "Movie.2020.2160p.WEB-DL-B"
+        assert sc["downgrade"] is False
     finally:
         s.close()
 
