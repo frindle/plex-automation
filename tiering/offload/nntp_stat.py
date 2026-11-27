@@ -165,6 +165,31 @@ class _Conn:
             raise NntpUnavailable("network", type(e).__name__) from None
         return [bool(x) for x in out]
 
+    def body(self, mid: str) -> list[bytes] | None:
+        """BODY of one article as raw lines (CRLF and dot-stuffing removed), or None when
+        the server does not have it."""
+        mid = mid.strip().strip("<>")
+        if not mid or any(c in mid for c in " \r\n\t\0"):
+            return None
+        try:
+            self._send(f"BODY <{mid}>")
+            code = self._line()[:3]
+            if code == "430":
+                return None
+            if code != "222":
+                raise _fail_for(code, "body")
+            lines = []
+            while True:
+                b = self.f.readline(1 << 16)
+                if not b:
+                    raise ConnectionError("closed")
+                b = b.rstrip(b"\r\n")
+                if b == b".":
+                    return lines
+                lines.append(b[1:] if b.startswith(b"..") else b)
+        except (OSError, ssl.SSLError, ConnectionError) as e:
+            raise NntpUnavailable("network", type(e).__name__) from None
+
     def close(self):
         try:
             if self.sock:

@@ -52,7 +52,8 @@ from xml.etree.ElementTree import ParseError
 from .altmount import AltMountError
 from .newznab import (BadRelease, GrabBudgetSpent, IndexersUnavailable, ItemFailed, NewznabError, NotNzb, archive_nzb, nzb_segment_ids, parse_resolution,
                       read_archived, title_matches)
-from .nntp_stat import NntpUnavailable
+from .nntp_stat import NntpUnavailable, ProviderCfg
+from .usenet_read import CannotTell, UsenetFile
 
 _ERRORS = (AltMountError, NewznabError, NntpUnavailable, OSError, ParseError,
            EOFError, zlib.error, ValueError)
@@ -65,6 +66,8 @@ HASH_CHUNK = 16 << 20  # bytes per range read when the remote copy is compared w
 HASH_REREADS = 2  # fresh reads of a chunk that differs, before the difference counts
 HASH_REREAD_PAUSE = 2.0  # seconds before a reread (times its number)
 HASH_WORKERS = 4  # range reads in flight during the compare
+HASH_FAULT_PAUSES = (30.0, 120.0)  # waits before the last reads of a chunk AltMount serves wrong
+HASH_FAULT_MAX = 3  # chunks one compare waits out like that; more is a read fault at once
 _ZEROS = b"\0" * (64 << 10)  # a run this long in the remote chunk, not in L: zero-filled
 
 
@@ -401,6 +404,13 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def local_size_of(path) -> int:
+    try:
+        return os.path.getsize(str(path))
+    except OSError:
+        return -1  # compare_remote reports it
+
+
 def _pread_all(fd: int, n: int, off: int) -> bytes:
     out = bytearray()
     while len(out) < n:
@@ -413,7 +423,7 @@ def _pread_all(fd: int, n: int, off: int) -> bytes:
 
 def compare_remote(reader, remote_path: str, lib_path: str, *, chunk: int | None = None,
                    rereads: int | None = None, workers: int | None = None,
-                   sleep=time.sleep) -> dict:
+                   sleep=time.sleep, usenet=None, fault_pauses=None) -> dict:
     """Compare the remote copy with ``lib_path`` byte for byte, by range reads.
 
     Range reads are how tierfs plays the file, so they are what has to be right. AltMount
@@ -421,27 +431,78 @@ def compare_remote(reader, remote_path: str, lib_path: str, *, chunk: int | None
     that differs proves nothing: the chunk is read again, each time with a fresh request,
     up to ``rereads`` times. A chunk that then matches counts as ``fixed``.
 
+    AltMount has also served the same wrong bytes for a chunk on every quick reread while
+    the articles held L's bytes. So a chunk that stays wrong is put to ``usenet(off, n)``
+    (``UsenetFile.read``: the bytes the upload really holds, CRC-checked) when it is given:
+      the upload is not L there   -> "mismatch", whatever the reads said;
+      the upload is L there       -> AltMount's fault, not the copy's. The chunk is read
+                                     again after each of ``fault_pauses``; right then, it
+                                     counts as fixed (and in ``read_faults``); still wrong,
+                                     the result is "read_fault";
+      it cannot tell (CannotTell) -> as without it.
+
     ``result`` is one of:
-      "ok"        every chunk matched (after rereads);
-      "size"      the remote size is not L's;
-      "mismatch"  a chunk came back the same wrong bytes on every read: the copy is not L;
-      "unstable"  a chunk came back different on each read and never right: a flaky read
-                  path, not proof that the copy is bad.
+      "ok"          every chunk matched (after rereads);
+      "size"        the remote size is not L's;
+      "mismatch"    a chunk came back the same wrong bytes on every read, or the upload
+                    itself differs from L: the copy is not L;
+      "unstable"    a chunk came back different on each read and never right: a flaky
+                    read path, not proof that the copy is bad;
+      "read_fault"  the upload is L, but AltMount kept serving other bytes for a chunk:
+                    not proof that the copy is bad either.
     The first chunk that cannot be made to match ends the compare (``first_bad`` is its
-    offset; ``zero_filled`` says whether the remote bytes hold a zero run that L lacks).
+    offset; ``zero_filled`` says whether the remote bytes hold a zero run that L lacks;
+    ``usenet`` is what the upload said for it: "same", "differ" or None).
     Read errors that outlast the rereads raise AltMountError.
     """
     chunk = chunk or HASH_CHUNK
     rereads = HASH_REREADS if rereads is None else rereads
     workers = workers or HASH_WORKERS
+    fault_pauses = HASH_FAULT_PAUSES if fault_pauses is None else fault_pauses
     local_size = os.path.getsize(lib_path)
     remote_size = reader.size(remote_path)
     out = {"result": "ok", "chunks": 0, "rereads": 0, "fixed": 0, "first_bad": None,
-           "zero_filled": False, "remote_size": remote_size, "local_size": local_size}
+           "zero_filled": False, "remote_size": remote_size, "local_size": local_size,
+           "read_faults": 0, "usenet": None}
     if remote_size != local_size:
         out["result"] = "size"
         return out
     stop = threading.Event()
+    faults = []  # chunks whose wrong bytes were AltMount's
+    fmu = threading.Lock()
+
+    def upload_says(off, n, want):
+        """"same" when the upload holds L's bytes here, "differ" when not, None when it
+        cannot be asked."""
+        if usenet is None:
+            return None
+        try:
+            theirs = usenet(off, n)
+        except CannotTell:
+            return None
+        except Exception:  # best effort: a fault in here is never a verdict on the copy
+            return None
+        return "same" if theirs == want else "differ"
+
+    def wait_out(off, n, want, done):
+        """Read a chunk the upload has right again after each pause. True when it comes
+        right."""
+        with fmu:
+            faults.append(off)
+            if len(faults) > HASH_FAULT_MAX:
+                return False
+        for pause in fault_pauses:
+            if stop.is_set():
+                return False
+            sleep(pause)
+            done[0] += 1
+            try:
+                got = reader.read_range(remote_path, off, n)
+            except AltMountError:
+                continue
+            if got == want:
+                return True
+        return False
 
     def one(fd, off):
         if stop.is_set():
@@ -465,6 +526,18 @@ def compare_remote(reader, remote_path: str, lib_path: str, *, chunk: int | None
             seen.append(got)
         z = _ZEROS[:max(1, min(len(_ZEROS), n))]
         zero = any(z in g and z not in want for g in seen)
+        says = upload_says(off, n, want)
+        if says == "differ":
+            return {"off": off, "rereads": rereads, "bad": "mismatch", "zero": zero,
+                    "usenet": says}
+        if says == "same":
+            done = [0]
+            if wait_out(off, n, want, done):
+                return {"off": off, "rereads": rereads + done[0], "bad": None, "fault": True}
+            if stop.is_set():
+                return None
+            return {"off": off, "rereads": rereads + done[0], "bad": "read_fault",
+                    "zero": zero, "usenet": says}
         # the same wrong bytes twice is a bad copy; one wrong read among errors is not
         same = len({hashlib.sha256(g).digest() for g in seen}) == 1 and \
             (len(seen) >= 2 or rereads == 0)
@@ -482,11 +555,13 @@ def compare_remote(reader, remote_path: str, lib_path: str, *, chunk: int | None
                         continue
                     out["rereads"] += r["rereads"]
                     if r["bad"]:
-                        out.update(result=r["bad"], first_bad=r["off"], zero_filled=r["zero"])
+                        out.update(result=r["bad"], first_bad=r["off"], zero_filled=r["zero"],
+                                   usenet=r.get("usenet"))
                         stop.set()
                         break
                     out["chunks"] += 1
                     out["fixed"] += 1 if r["rereads"] else 0
+                    out["read_faults"] += 1 if r.get("fault") else 0
             finally:
                 stop.set()  # an error or a bad chunk: the queued reads are skipped
     finally:
@@ -622,18 +697,33 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
     except OSError as e:
         return fail("hash", "local_unreadable", error=type(e).__name__)
     fields["sha256"] = local
+    # a chunk that stays wrong is checked against the articles themselves
+    cfg = next((getattr(c, "cfg", None) for c in (stat_primary, stat_secondary)
+                if isinstance(getattr(c, "cfg", None), ProviderCfg)), None)
+    usenet = UsenetFile(nzb_bytes, cfg, local_size_of(lib_path)) if cfg and nzb_bytes else None
     try:
-        cmp = compare_remote(reader, remote_path, str(lib_path))
+        cmp = compare_remote(reader, remote_path, str(lib_path),
+                             usenet=usenet.read if usenet else None)
     except _ERRORS as e:
         return fail("hash", "read_failed", error=type(e).__name__)
+    finally:
+        if usenet:
+            usenet.close()
     info = {k: cmp[k] for k in ("chunks", "rereads", "fixed", "first_bad", "zero_filled")}
+    if cmp.get("read_faults"):
+        info["read_faults"] = cmp["read_faults"]
     if cmp["result"] == "unstable":
         # different wrong bytes on every read: the read path is flaky tonight, which
         # proves nothing about the copy. Not tonight, and nothing is recorded.
         return fail("hash", "hash_unsure", **info)
+    if cmp["result"] == "read_fault":
+        # the articles are L's bytes, but AltMount kept serving others: its fault, not the
+        # copy's. Not tonight; the runner raises an alert.
+        return fail("hash", "hash_unsure", kind="read_fault", usenet=cmp["usenet"], **info)
     if cmp["result"] != "ok":
         return fail("hash", "hash_mismatch", kind=cmp["result"], remote_size=cmp["remote_size"],
-                    local_size=cmp["local_size"], **info)
+                    local_size=cmp["local_size"],
+                    **({"usenet": cmp["usenet"]} if cmp.get("usenet") else {}), **info)
     steps["hash"] = {"ok": True, **info}
 
     # 4. every segment on both providers

@@ -323,6 +323,18 @@ class _NntpHandler(socketserver.StreamRequestHandler):
                 else:
                     mid = cmd[5:].strip().strip("<>")
                     w.write(f"223 0 <{mid}>\r\n".encode() if mid in o.ids else b"430 no\r\n")
+            elif cmd.startswith("BODY"):
+                mid = cmd[5:].strip().strip("<>")
+                if not authed:
+                    w.write(b"480 auth\r\n")
+                elif mid in o.bodies:
+                    o.bodies_served += 1
+                    w.write(f"222 0 <{mid}>\r\n".encode())
+                    for ln in o.bodies[mid]:  # dot-stuffed, as on the wire
+                        w.write((b"." + ln if ln.startswith(b".") else ln) + b"\r\n")
+                    w.write(b".\r\n")
+                else:
+                    w.write(b"430 no\r\n")
             elif cmd == "QUIT":
                 w.write(b"205 bye\r\n")
                 return
@@ -331,7 +343,7 @@ class _NntpHandler(socketserver.StreamRequestHandler):
 
 
 class FakeNntp:
-    """STAT server. ``cert`` is a (certfile, keyfile) pair to serve TLS."""
+    """STAT and BODY server. ``cert`` is a (certfile, keyfile) pair to serve TLS."""
 
     def __init__(self, ids, user="nu", password="np", cert=None):
         self.ids, self.user, self.password = set(ids), user, password
@@ -339,6 +351,8 @@ class FakeNntp:
         self.quota = False
         self.greeting_code = "200"
         self.connections = self.stats = 0
+        self.bodies: dict = {}  # message-id -> article body lines (BODY)
+        self.bodies_served = 0
 
         class S(socketserver.ThreadingTCPServer):
             daemon_threads = True
