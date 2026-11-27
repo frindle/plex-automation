@@ -171,7 +171,10 @@ def parse_only_paths(spec) -> frozenset:
             raise ValueError("TIERING_ONLY_PATHS file holds no paths")
         return frozenset(out)
     parts = [x for line in spec.splitlines() for x in line.split(",")]
-    return frozenset(_norm_only(x) for x in parts if x.strip() and not x.strip().startswith("#"))
+    out = frozenset(_norm_only(x) for x in parts if x.strip() and not x.strip().startswith("#"))
+    if not out:  # set but only commas or comments: never widen to "every file"
+        raise ValueError("TIERING_ONLY_PATHS is set but holds no paths")
+    return out
 
 
 def _flag(v) -> bool:

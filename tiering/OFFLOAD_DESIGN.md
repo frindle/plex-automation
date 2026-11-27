@@ -347,7 +347,7 @@ Swaps are automatic. One long-running process applies the hot set.
     - comma- or newline-separated library paths, exactly as the runner stores them (the share path, after `TIERING_PATH_MAP` mapping); a value starting with `@` names a file with one path per line. `#` lines and blank lines are ignored. Each path is stripped and loses a trailing slash;
     - when set, only a row whose `lib_path` is listed may be demoted. Any other row is dropped from the demote plan before the disk path, `qualify` or any remote or indexer call, and `_demote_inner` checks again before `qualify`. A half-done offload of an unlisted row is not resumed;
     - promotes, reconcile, the weekly check, wants and the idle clocks are untouched: the allowlist never blocks a promote;
-    - matching is exact: no globs, no prefixes, so a typo cannot widen it. Unset or empty means no allowlist. An unreadable `@` file, or one with no paths, stops the start;
+    - matching is exact: no globs, no prefixes, so a typo cannot widen it. Unset or empty means no allowlist. An unreadable `@` file, or a value or file with no paths (only commas or `#` lines), stops the start;
     - at start the runner logs the number of paths (never the paths) and, when some match no row, one warning with that count. In a dry run each skipped demote is logged at debug level and the count at info level.
 - **Safety:**
   - dry run unless `TIERING_APPLY=1`, in which case it logs each planned action and changes nothing;

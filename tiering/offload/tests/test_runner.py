@@ -1159,6 +1159,9 @@ def test_only_paths_file_form_with_comments(tmp_path, monkeypatch):
 def test_only_paths_inline_comma_and_newline():
     got = runner.parse_only_paths("/m/a.mkv, /m/b.mkv/\n/m/c.mkv\n# /m/d.mkv\n,")
     assert got == frozenset(["/m/a.mkv", "/m/b.mkv", "/m/c.mkv"])
+    for bad in (",", " , \n", "# /m/a.mkv", "#a,#b"):
+        with pytest.raises(ValueError):
+            runner.parse_only_paths(bad)
 
 
 def test_only_paths_match_exactly_no_globs_no_prefixes(tmp_path, monkeypatch):
