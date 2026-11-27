@@ -437,8 +437,8 @@ def load_deps(cfg: Config) -> Deps:
     if not os.environ.get("TIERING_QUALIFY_FACTORY"):
         arrs = _arrs_from_env(cfg)
         altmount_ok = wiring.altmount_ok_from_env()
-    return Deps(st, promote, demote, qualify, _http_gate(cfg), register, weekly, open_holders,
-                arrs, altmount_ok)
+    return Deps(st, promote, demote, qualify, _http_gate(cfg), register, weekly,
+                open_holders=open_holders, arrs=arrs, altmount_ok=altmount_ok)
 
 
 # --------------------------------------------------------------------------
