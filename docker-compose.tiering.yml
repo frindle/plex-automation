@@ -127,6 +127,37 @@ services:
       - "${TIERING_SHARE_HOST:?set TIERING_SHARE_HOST in .env}:${TIERING_SHARE_PLEX:?set TIERING_SHARE_PLEX in .env}:ro,rslave"
       - "${TIERING_STATE_DIR:?set TIERING_STATE_DIR in .env}:/state"
 
+  # AltMount: the usenet-backed WebDAV store the offloaded bytes are read back from, plus
+  # the SABnzbd-compatible import API. It shares the tiering container's network
+  # namespace, so tiering reaches it at http://localhost:8480 (loopback: no https or
+  # TIERING_ALTMOUNT_ALLOW_HTTP needed) and the web UI is at http://${TIERING_IP}:8480.
+  # 8480 is free in that namespace (tierfs 9109, runner 8471; AltMount's peer listener
+  # 8470 and internal rclone RC 5573 stay at their defaults).
+  # No usenet provider yet: add them in the UI (Configuration > Providers).
+  # Needs JWT_SECRET (ALTMOUNT_JWT_SECRET in .env): without it AltMount exits at start and
+  # restarts in a loop, which does not affect the tiering service.
+  # Because it joins tiering's namespace, recreating tiering (a new image or changed env)
+  # leaves AltMount on a dead namespace: docker-compose up -d recreates it too, but if you
+  # recreate tiering by hand, run: docker-compose up -d --force-recreate altmount
+  # Deliberately left out vs upstream: docker.sock/auto-update, the /mnt mount, /dev/fuse
+  # and SYS_ADMIN (only for its own rclone mount, off by default; we use WebDAV + API).
+  altmount:
+    image: ghcr.io/kipsilabs/altmount:v0.4.0   # upstream moved from ghcr.io/javi11 at v0.4.0
+    container_name: altmount
+    restart: unless-stopped
+    network_mode: "service:tiering"
+    depends_on:
+      - tiering
+    environment:
+      PUID: "${ALTMOUNT_PUID:-99}"     # Unraid nobody:users
+      PGID: "${ALTMOUNT_PGID:-100}"
+      PORT: "8480"
+      JWT_SECRET: "${ALTMOUNT_JWT_SECRET:-}"
+      # Must match the address the web UI is opened at.
+      COOKIE_DOMAIN: "${TIERING_IP:?set TIERING_IP in .env}"
+    volumes:
+      - "${ALTMOUNT_CONFIG_DIR:-/mnt/user/appdata/altmount}:/config"
+
   # The webhook container reads library files too (audits, duplicate cleanup), so
   # it needs the mount at the same path to follow the symlinks.
   arr-webhook:

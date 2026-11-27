@@ -85,6 +85,17 @@ The run aborts if the array is stopped, a parity check/rebuild is running, or an
 4. Plex and each arr: add a path mapping `TIERFS_MOUNT` -> the same path in the container, access mode **Read Only - Slave**. Library symlinks point at that path, so it must be identical everywhere. A container started before tiering still gets the mount (slave propagation); one mapped without Slave sees an empty folder and every offloaded file looks broken.
 5. `./update.sh`, then check `docker logs tiering` (supervisor lines start with `supervise:`). The dry run logs `plan: demote ...` lines; read a night of them before setting `TIERING_APPLY=1`.
 
+### AltMount (usenet store)
+
+The same file also defines `altmount` (`ghcr.io/kipsilabs/altmount`, pinned to a release; no docker.sock, `/mnt` mount, FUSE or SYS_ADMIN). It joins the tiering container's network (`network_mode: service:tiering`), so the runner reaches it at `http://localhost:8480` (loopback, so no `TIERING_ALTMOUNT_ALLOW_HTTP`) and you open the UI at `http://TIERING_IP:8480`. Its config lives in `ALTMOUNT_CONFIG_DIR` (default `/mnt/user/appdata/altmount`).
+
+1. `.env`: set `ALTMOUNT_JWT_SECRET` (`openssl rand -hex 32`). AltMount refuses to start without it while login is required (its default); the tiering service is not affected, altmount just restarts until the secret is set. Set `TIERFS_REMOTE_BASE=http://localhost:8480/webdav`, `ALTMOUNT_URL=http://localhost:8480`, and leave `ALTMOUNT_MOUNT_PATH` empty.
+2. `./update.sh`, open `http://TIERING_IP:8480`, create the admin user.
+3. Once a usenet provider is bought: Configuration > Providers > Add Provider (host, port, credentials, max connections, SSL). Then Configuration > WebDAV: change the default `usenet`/`usenet` credentials, and Configuration > SABnzbd: enable it and add the category you use for `ALTMOUNT_CATEGORY`.
+4. Copy the WebDAV user/password and the API key from the UI into `TIERFS_REMOTE_USER`, `TIERFS_REMOTE_PASS` and `ALTMOUNT_API_KEY` in `.env`, then `./update.sh` again.
+
+Recreating `tiering` leaves altmount on a dead network namespace; `docker-compose up -d` (update.sh) recreates both, but after a manual recreate run `docker-compose up -d --force-recreate altmount`.
+
 To pause offloading without touching the mount, create the pause file: `touch "$TIERING_STATE_DIR/runner.paused"`. The runner stops within a second and is not started again; tierfs keeps serving offloaded files, and the health check counts a paused runner as healthy. Delete the file to resume. Do not stop the container to pause: offloaded files do not open while tierfs is down, and a container restart drops any stream reading an offloaded file at that moment. Promote every file back before removing the tier.
 
 Alerts (`alerts.jsonl` in the state folder) are only written to that file and the runner log. Nothing pushes them yet.
