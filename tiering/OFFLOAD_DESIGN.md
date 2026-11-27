@@ -142,7 +142,8 @@ tierfs reads the remote at `${TIERFS_REMOTE_BASE}` + `remote_path`. The credenti
 | `hotset.py` | rules | Pure functions, no I/O. |
 | `plex_watch.py` | rules | Read-only Plex client and the tierfs event reader. |
 | `altmount.py`, `nntp_stat.py`, `newznab.py` | intake | Clients. `altmount.WebDavReader` implements `RemoteReader`. |
-| `qualify.py`, `weekly.py` | intake | The checks before an offload, the weekly check and the report. |
+| `qualify.py`, `weekly.py` | intake | The checks before an offload, the nightly check and the report. |
+| `redownload.py` | runner | Lost files: find the arr item, delete its file record, search again, track it. |
 | `register.py` | intake | Creates `whole` rows from Radarr and Sonarr. See "Register". |
 | `runner.py` | runner | The long-running loop that applies the hot set. See "Runner". |
 
@@ -214,9 +215,9 @@ Offload step 3 hashes `L` again in the read that builds the chunk list. If that 
 - The runner fails closed on the result. It blocks that night's demotes when the result is not a dict, lacks `listed`, `missing_local`, `ambiguous` or `errors`, holds a non-int there, has `errors > 0` or `listed == 0`, or when `missing_local + ambiguous` is over 5% of `listed` (`on_pool` files are not missing and are left out). It alerts `register_failed`.
 - `lib_path` is the share path (see "Path namespaces"). `TIERING_ARR_PATH_MAP` maps arr paths to share paths when they differ. Size and mtime come from the resolved disk path.
 
-### Weekly
+### Nightly check
 
-- STAT every segment of each `offloaded` row's `nzb_path`. All found: set `last_check_ts` and `last_stat_ok_ts`. Any missing: flag a promote at once. Unknown (provider or network trouble): set `last_check_ts` only; alert when `last_stat_ok_ts` is older than 14 days.
+- STAT every segment of each `offloaded` row's `nzb_path`. All found: set `last_check_ts` and `last_stat_ok_ts`. Any missing: flag a promote at once. Unknown (provider or network trouble): set `last_check_ts` only; alert when `last_stat_ok_ts` is older than 3 days (an offloaded row should get a full STAT every night). Rows still `promoting` are checked too: a promote that keeps retrying gone chunks must end as lost, see "Lost files and automatic re-download".
 - An indexer that fails or answers partly makes the restore-path check "unchecked", never "no restore path". Unchecked never triggers a promote.
 - Twin: a stored `twin_nzb_path` is STATed on both providers like the restore NZB. Once an article is gone (or the archived file is), weekly clears `twin_nzb_path` and `twin_remote_path` and logs a `twin_lost` event; a lost twin alone flags nothing. The report counts the files with a twin and the twins lost.
 - Restore path: a stored `nzb_path2` is STATed on both providers, and nothing is asked of an indexer while it is live and disjoint from `nzb_path` (weekly checks that locally; `nzb_path2` equal to or overlapping `nzb_path` is never OK). A STAT that fails for a reason other than a provider being unreachable (a disk fault reading the file, say) is "unchecked": it never clears `nzb_path2`. Only an NZB that is not valid or has lost articles is dead. When it is missing, not disjoint, or has lost articles, weekly searches, verifies a candidate by message-id and STAT, and stores it as `nzb_path2`. A candidate that overlaps the dead `nzb_path2` or `nzb_path` never counts. If nothing new and live turns up, weekly flags the loss (alert, event and promote flag) and clears `nzb_path2`; it never reports "OK". When the stored one is known dead but the search for a replacement was incomplete, weekly keeps the path, raises an alert and logs a `restore_nzb_lost` event with `unsure`, and reports the row as unchecked, never OK.
@@ -240,7 +241,7 @@ The state file is shared by every client and process that names it: each write t
 
 A failure of one item is not the indexer's: a grab answered with newznab code 300 ("no such item"), a 404 or 410, or a body that is no NZB. It does not count toward the 3 errors; the release id (the guid, else a hash of the link) gets a strike. A body that is no NZB may be a maintenance page, so a release is called bad (not grabbed again) only after such answers on two different nights (at least 12 hours apart). A bad mark expires 7 days after its last strike, and a valid NZB clears it at once. When one indexer answers with non-NZB bodies for 4 different releases within an hour without giving one NZB, the indexer is the problem: those strikes are taken back, the indexer is dropped through the usual 24-hour backoff, and the grab raises `IndexerDropped` (so the row is `nzb_unsure`). Transport errors, 5xx and other error codes count as before. When a search finds every indexer dropped, out of budget or rate limited, the client raises `IndexersUnavailable` (a `NewznabError`). API keys never appear in a repr, log line or exception, and the release link (which holds the key) is never used as the guid.
 - Each row's result is written as soon as it is known, through `update_if(..., expect_state="offloaded")`. A row the runner changed during the run is left alone.
-- The monthly full reads pick by the oldest attempt, not the oldest success, so one bad row cannot use the whole budget. A hash mismatch on a full read is treated like `bad_chunk`: `state=failed` and an alert. Three failed attempts in a row on network errors alert.
+- The monthly full reads pick by the oldest attempt, not the oldest success, so one bad row cannot use the whole budget. A hash mismatch on a full read: `state=failed` and an alert. Three failed attempts in a row on network errors alert.
 - The report lists `offloaded` rows and every `failed` row with its `restore_note` and restore path.
 
 ### RemoteReader
@@ -296,6 +297,25 @@ The inputs are plain dicts shaped like Plex's JSON: `ratingKey`, `grandparentRat
 4. Link the stub to `L.tierfs-tmp`, then `rename` it over `L`.
 5. Unlink the stub path, remove the manifest, the chunk list and the fill file, and set `state=whole`.
 
+### Lost files and automatic re-download
+
+A row is **lost** when its exact file cannot be rebuilt from any copy:
+
+- (a) a promote ends `state=failed` because of BLAKE3 mismatches on every copy (a tierfs `bad_chunk` first only flags that promote, see Runner), or
+- (b) the nightly check finds an `nzb_path` article missing on EVERY provider with no live twin, confirmed by STATing the missing ids once more. A promote stuck retrying gone chunks therefore ends as lost too: the check covers `promoting` rows, and a confirmed row whose promote is still running waits in `kv['lost_pending']`, gets no new promote and is acted on once the promote stops.
+
+There is no new state. A lost row is `failed` with a `restore_note` starting `lost:` (`lost: re-download pending`, then `lost: re-download requested`, then `lost: re-downloaded`).
+
+`TIERING_AUTO_REDOWNLOAD` (default 1) turns it on, and only with `TIERING_APPLY`. Off: the alert `lost_file` only. Guards, all of which end in "do nothing and say why":
+
+- never on a night when any provider was unknown or unreachable, or AltMount did not answer;
+- at most `TIERING_REDOWNLOAD_MAX_PER_NIGHT` (default 3) rows per night; if more rows than that are lost, act on none and raise the alert `mass_loss` (event `mass_loss` per row, once a day);
+- right before the delete, `L` must still be the symlink into the tierfs mount for this row's id (the orphan-cleanup check); otherwise nothing happens and the event says why.
+
+Action: find the arr item for `lib_path` (Radarr movie file, or Sonarr episode file across all configured Sonarr instances, using `TIERING_ARR_PATH_MAP`), delete the arr file record (`DELETE /api/v3/moviefile/{id}` or `/api/v3/episodefile/{id}`), set the item monitored if it was not (only that item; event `redownload_monitored`), and start a search (`POST /api/v3/command`: `MoviesSearch` with `movieIds`, `EpisodeSearch` with `episodeIds`). Events and alerts: `redownload_requested`, `redownload_done`, `redownload_stalled`, `mass_loss`. A row with no new file after 3 days is searched again; after 3 searches the alert `redownload_stalled` is raised once. Register treats a real file at a lost row's path as a normal new `whole` row and releases the old row's path (event `lost_path_released`). The nightly report has a "Lost files" section listing these rows by id.
+
+Not handled: the stub and manifest of a lost row stay; an arr recycle bin may keep the dead symlink; a permanent "short remote" promote failure is not treated as lost.
+
 ## Runner (`runner.py`)
 
 Swaps are automatic. One long-running process applies the hot set.
@@ -322,7 +342,8 @@ Swaps are automatic. One long-running process applies the hot set.
   - It also refuses tonight's demotes (alert `history_shrunk`) when Plex's history is much shorter than it should be. "Should be" is the plays it saw last pass (`kv['history_times']`) that are still inside the idle window now, because the window slides and a play that ages out is not a lost play. The check trips when the history holds under 80% of those.
   - Reset after a deliberate purge: `DELETE FROM kv WHERE key IN ('history_count', 'history_times')`.
 - **Weekly check:**
-  - The runner calls `weekly.run_weekly` at the start of the demote window when `kv['weekly_last_ts']` is 7 or more days old, and on start-up when it is. It then sets the timestamp.
+  - The runner calls `weekly.run_weekly` at the start of the demote window when `kv['weekly_last_ts']` (the START time of the last run, kept under the old name) is `TIERING_CHECK_EVERY_H` (default 24) hours old, with a little slack so a run that starts minutes later each night is not skipped, and on start-up when it is.
+  - Time budget `TIERING_CHECK_MAX_H` (default 4): once it is spent the check starts no new row, writes its report and stops. Rows are taken oldest `last_check_ts` first, so the rows not reached go first the next night (cursor, informational: `kv['weekly_cursor']`). Unreached rows keep their old `last_stat_ok_ts` and still raise the 3-day alert. The monthly full-read sample runs in the first 7 days of a month, once per month (`kv['full_read_month']`, set only when that run finished). The default budget equals the 4 hour demote window, so while the check runs demotes can still wait for it.
   - That night's demotes wait until the check is done.
   - If the check fails, the runner alerts `weekly_failed` and retries after an hour. Demotes stay blocked until a check succeeds.
   - Flags come only from `weekly_flag` events (`detail.reasons`), read after the cursor `kv['weekly_flag_cursor']`. They never come from `restore_note`, which the next good week overwrites.
@@ -338,7 +359,7 @@ Swaps are automatic. One long-running process applies the hot set.
   - capped by `TIERING_DEMOTE_GB_PER_NIGHT` (default 200);
   - no demotes on a night when any promote is queued or any hash check has failed;
   - optionally only the files in `TIERING_ONLY_PATHS` (see **Config from env**).
-- **A `bad_chunk` event:** promoting cannot help, because the remote copy is bad. Set `state=failed`, alert, and list it in the weekly report with its restore path. The file stays a working symlink for the parts that are good.
+- **A `bad_chunk` event:** the row is NOT failed at once. The runner flags a promote for that row (first in line, whether or not the hot set wants the file), keeps the `bad_chunk` event and alert, and notes it in `restore_note`. The promote verifies every chunk against the BLAKE3 list and uses failover and the twin as always: the bad chunk may be a one-off, and a good copy may exist. Only when the promote ends `failed` (a mismatch on every copy) is the exact file lost, and it goes through the automatic re-download.
 - **Reconcile each pass:** if `L` is no longer the symlink a row expects (an arr upgrade or delete replaced it), stop managing that row. Set `state=failed` with `restore_note="L replaced"`. The stub and the manifest stay for the weekly report during the grace period `TIERING_ORPHAN_GRACE_DAYS` (default 7; 0 turns the cleanup off).
 - **Orphan cleanup (later passes):** a row with `state=failed`, `restore_note="L replaced"` and a `updated_ts` (the time it was marked) older than the grace period loses its stub, its manifest, chunk list and fill file, and gets `restore_note="orphan cleaned"` so it is never handled again. Event `orphan_stub_removed` (id, size); one `orphan_stubs_removed` alert per pass with the count and bytes freed. It happens only when ALL hold, else everything stays and one line per id says why:
   - the stub path is exactly `<one of TIERFS_STUB_ROOTS>/<id><ext>`, a regular file with link count 1;
@@ -364,6 +385,6 @@ Swaps are automatic. One long-running process applies the hot set.
 ## Safety
 
 - Dry run is the default everywhere. Nothing changes a file unless `TIERING_APPLY=1` is set.
-- No code path deletes media. The only unlinks are the stub's extra link, made in step 2 of an offload, a temp symlink, and (after `TIERING_ORPHAN_GRACE_DAYS`) the stub and manifest of a row whose `L` an arr replaced, see "Orphan cleanup". That one deletes only `<stub root>/<id><ext>` and never `L`.
+- No code path deletes media, with one exception: the automatic re-download (below) deletes the arr's file record for a lost file, and only after checking that `L` is still the symlink into the tierfs mount for that row's id. It never deletes a real media file and never touches a path that is not that symlink. The arr picks the release; nothing here grabs an NZB. The other unlinks are the stub's extra link, made in step 2 of an offload, a temp symlink, and (after `TIERING_ORPHAN_GRACE_DAYS`) the stub and manifest of a row whose `L` an arr replaced, see "Orphan cleanup". That one deletes only `<stub root>/<id><ext>` and never `L`.
 - The tests run in GitHub Actions or the sandbox, never against the live library.
 - No unverified remote byte is ever served or written: tierfs and promote both check every chunk against the chunk list.

@@ -112,9 +112,28 @@ class ArrClient:
         return "ArrClient()"
 
     def get(self, path: str, **params):
-        q = urllib.parse.urlencode(params)
+        return self._send("GET", path, params)
+
+    def post(self, path: str, body):
+        return self._send("POST", path, None, body)
+
+    def put(self, path: str, body):
+        return self._send("PUT", path, None, body)
+
+    def delete(self, path: str):
+        return self._send("DELETE", path)
+
+    def _send(self, method: str, path: str, params=None, body=None):
+        """One request. Same rules for every verb: no redirects, the key only in a header
+        (never logged), the answer size-limited. An empty answer (a delete) is None."""
+        q = urllib.parse.urlencode(params or {})
+        headers = {"X-Api-Key": self._key, "Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
         req = urllib.request.Request(f"{self._base}{path}" + (f"?{q}" if q else ""),
-                                     headers={"X-Api-Key": self._key, "Accept": "application/json"})
+                                     data=data, method=method, headers=headers)
         try:
             with self._opener.open(req, timeout=self._timeout) as r:
                 raw = r.read(_LIMIT + 1)
@@ -124,6 +143,8 @@ class ArrClient:
             raise ArrError(f"arr unreachable: {type(e).__name__}") from None
         if len(raw) > _LIMIT:
             raise ArrError("response too large")
+        if not raw.strip():
+            return None
         try:
             return json.loads(raw)
         except ValueError:
@@ -402,7 +423,7 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
     out = {"new": 0, "updated": 0, "unchanged": 0, "skipped_state": 0, "listed": 0,
            "missing_local": 0, "on_pool": 0, "ambiguous": 0, "disk_path": 0,
            "disk_path_mapped": 0, "unlisted": 0, "errors": 0, "renamed": 0,
-           "renamed_skipped": 0,
+           "renamed_skipped": 0, "lost_replaced": 0,
            "applied": bool(apply)}
 
     listed: set[str] = set()
@@ -450,6 +471,20 @@ def register(db, apply: bool, *, state=None, radarrs=None, sonarrs=None, arr_map
             size = int(st.st_size)  # the real file, not the arr's idea of it
             want = _entry_row(ent, local, size, st.st_mtime_ns)
             have = state.by_path(db, local)
+            if (have is not None and have.get("state") == "failed"
+                    and str(have.get("restore_note") or "").startswith("lost:")
+                    and not os.path.islink(cands[0])):
+                # a lost row (its file was re-requested from the arr) and a real file is at
+                # its path now: release the path; the file is a normal new row
+                out["lost_replaced"] += 1
+                if apply:
+                    if not state.update_if(db, have["id"], "failed", lib_path=None,
+                                           restore_note="lost: re-downloaded"):
+                        out["lost_replaced"] -= 1
+                        out["skipped_state"] += 1
+                        continue
+                    state.log_event(db, have["id"], "lost_path_released", {})
+                have = None
             if have is None:
                 out["new"] += 1
                 if apply:

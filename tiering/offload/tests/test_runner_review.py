@@ -398,7 +398,8 @@ def test_p7_bad_chunk_during_demote_is_not_lost(tmp_path, monkeypatch):
     w.run()
     assert mid == ["offloading"], "the runner must not write under a running demote"
     w.run()
-    assert w.state.rows["x"]["state"] == "failed", "bad remote copy, row 'offloaded'"
+    assert w.state.rows["x"]["state"] != "failed", "a promote decides, not the event"
+    assert "x" in w.runner.flagged or "x" in w.ops("promote")
     assert "bad_chunk" in kinds(w)
 
 

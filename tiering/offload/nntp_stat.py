@@ -314,5 +314,9 @@ class Checker:
     def __call__(self, nzb_path: str) -> dict:
         return check_nzb(nzb_path, self.cfg, self.pool)
 
+    def check_ids(self, ids) -> dict:
+        """STAT these message-ids (a fresh look, used to confirm a loss)."""
+        return check_ids(iter(ids), self.pool)
+
     def close(self):
         self.pool.close()

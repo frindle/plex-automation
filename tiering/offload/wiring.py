@@ -107,8 +107,22 @@ def weekly_from_env(env=None):
     weekly = _mod("weekly")
     e = dict(os.environ if env is None else env)
 
-    def run(db):
+    def run(db, **kw):
         c = clients(e)
         return weekly.run_weekly(db, stat_primary=c.stat_primary, stat_secondary=c.stat_secondary,
-                                 indexers=c.indexers, report_path=c.report, reader=c.reader)
+                                 indexers=c.indexers, report_path=c.report, reader=c.reader,
+                                 **kw)
     return run
+
+
+def altmount_ok_from_env(env=None):
+    """``ok() -> bool``: AltMount's WebDAV answers a listing of its root."""
+    e = dict(os.environ if env is None else env)
+
+    def ok() -> bool:
+        try:
+            clients(e).reader.listdir("/")
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+    return ok
