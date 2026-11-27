@@ -1,8 +1,14 @@
-"""Sonarr/Radarr health automation. Three jobs, all from the arrs' own APIs:
+"""Sonarr/Radarr health automation. Four jobs, all from the arrs' own APIs:
 
 1. Outages. An indexer, the download client or a root folder failing in Sonarr/Radarr health, an arr not
    answering, or Deluge not answering us, for OUTAGE_ALERT_MIN minutes sends one push. Recovery after a
    push sends one more. Short blips (Deluge restarts, the nightly appdata backup) never push.
+   "No indexers available with RSS sync / Automatic Search / Interactive Search enabled" is a setting the
+   owner chose, not an outage, so it is ignored.
+   Self-heal: a condition seen for HEAL_AFTER_MIN minutes gets a fix attempt, at most one per HEAL_GAP
+   seconds, before any push. Indexer problems: test all indexers (clears the backoff of those that pass),
+   then ask for an RSS sync. Download client problems: test all download clients. Root folders, an arr not
+   answering and Deluge get no action. The push and the recovery push say how many attempts were made.
 2. Removed from TheTVDB/TMDb. A series or movie newly named by RemovedSeriesCheck/RemovedMovieCheck gets
    one push. Whatever is already flagged the first time an arr is read is recorded silently.
 3. Broken library files: paths in the arrs' "Unable to parse media info from file" errors. A file whose
@@ -12,9 +18,15 @@
    recheck didn't fix it, the file is deleted through the arr and the episode/movie searched. At most
    MAX_REPLACE_PER_PASS per pass, only for monitored items, and nothing at all when more than MASS_LIMIT
    files look broken at once (that is a mount or ffprobe problem, not that many bad files).
+4. Stuck imports: a queue item that is importPending with "Not an upgrade" / "Not a Custom Format upgrade"
+   for more than STUCK_PENDING_HOURS hours means the library already has a better file, so it will never
+   import. With apply on it is removed from the arr's queue and blocklisted (so it is not grabbed again),
+   and the torrent stays in the download client. Shadow mode only reports. At most MAX_REPLACE_PER_PASS
+   per pass. importBlocked items are handled elsewhere.
 
 The caller supplies an `io` object (see ArrHealthIO in arr-webhook.py) and a state dict it persists.
 """
+import calendar
 import re
 
 OUTAGE_ALERT_MIN = 30
@@ -24,12 +36,18 @@ COPY_GRACE = 3600                # a file modified this recently may still be co
 MASS_LIMIT = 5
 MAX_REPLACE_PER_PASS = 3
 LOG_PAGE_SIZE = 500
+HEAL_AFTER_MIN = 10              # a condition must last this long before a fix is tried (less than OUTAGE_ALERT_MIN)
+HEAL_GAP = 900                   # at most one fix attempt per condition in this many seconds
+STUCK_PENDING_HOURS = 24
 
 OUTAGE_SOURCES = {
     'IndexerStatusCheck', 'IndexerLongTermStatusCheck', 'IndexerRssCheck', 'IndexerSearchCheck',
     'DownloadClientCheck', 'DownloadClientStatusCheck', 'RootFolderCheck',
 }
 REMOVED_SOURCES = {'RemovedSeriesCheck': 'TheTVDB', 'RemovedMovieCheck': 'TMDb'}
+INDEXER_SOURCES = {'IndexerStatusCheck', 'IndexerLongTermStatusCheck', 'IndexerRssCheck', 'IndexerSearchCheck'}
+CLIENT_SOURCES = {'DownloadClientCheck', 'DownloadClientStatusCheck'}
+_NOT_UPGRADE = ('not a custom format upgrade', 'not an upgrade')
 _REMOVED_RE = re.compile(r'([^,()]+?)\s*\((tvdbid|tmdbid)\s*(\d+)\)', re.I)
 _MEDIAINFO_RE = re.compile(
     r'Unable to parse media info from file:\s*(/.+?\.(?:mkv|mp4|m4v|avi|ts|m2ts|wmv|mov|webm|mpe?g))(?=:|\s*$)', re.I)
@@ -77,9 +95,27 @@ def health_conditions(who, items):
         if not isinstance(it, dict):
             continue
         src = it.get('source') or ''
+        if (it.get('message') or '').lower().startswith('no indexers available with'):
+            continue   # RSS/search switched off on purpose: configuration, not an outage
         if src in OUTAGE_SOURCES and it.get('type') in ('error', 'warning'):
             out[f'{who}:{src}'] = it.get('message') or src
     return out
+
+
+def _heal(io, who, what):
+    """Try the safe fix for one condition. Each call is on its own: a failure never stops the next or the tick."""
+    if what in INDEXER_SOURCES:
+        calls = [('/api/v3/indexer/testall', None), ('/api/v3/command', {'name': 'RssSync'})]
+    elif what in CLIENT_SOURCES:
+        calls = [('/api/v3/downloadclient/testall', None)]
+    else:
+        return False
+    for path, body in calls:
+        try:
+            io.post(who, path, body)   # testall answers with a list; nothing in it is needed
+        except Exception as e:  # noqa: BLE001
+            io.log(f'[arr-health] {who} self-heal call failed ({type(e).__name__})')
+    return True
 
 
 def outage_tick(io, state, now):
@@ -107,10 +143,17 @@ def outage_tick(io, state, now):
         if o is None or now - o.get('last_seen', 0) > OUTAGE_STALE_SEC:
             o = outages[key] = {'since': now, 'alerted': False}
         o['last_seen'], o['message'] = now, msg
+        who, _, what = key.partition(':')
+        if (what in INDEXER_SOURCES | CLIENT_SOURCES and now - o['since'] >= HEAL_AFTER_MIN * 60
+                and now - o.get('heal_at', now - HEAL_GAP) >= HEAL_GAP):
+            _heal(io, who, what)
+            o['heal_at'], o['heals'] = now, o.get('heals', 0) + 1
+            io.record('arr-health', f'{_label(key)}: self-heal attempt {o["heals"]}')
         if not o['alerted'] and now - o['since'] >= OUTAGE_ALERT_MIN * 60:
-            who, _, what = key.partition(':')
             _advise(io, advise_facts('outage', who, what, _mins(now - o['since']), len(current)))
-            io.push(_label(key), f'{msg}\nDown for {_mins(now - o["since"])} min.')
+            heals = o.get('heals', 0)
+            tried = f'\nSelf-heal attempts so far: {heals}.' if heals else ''
+            io.push(_label(key), f'{msg}\nDown for {_mins(now - o["since"])} min.{tried}')
             io.record('arr-health', f'{_label(key)} for {_mins(now - o["since"])} min: {msg}')
             o['alerted'] = True
     for key in [k for k in outages if k not in current]:
@@ -119,8 +162,10 @@ def outage_tick(io, state, now):
             took = _mins(now - o['since'])
             who, _, what = key.partition(':')
             _advise(io, advise_facts('recovered', who, what, took, len(current)))
-            io.push(f'{_label(key)}: recovered', f'Back after about {took} min.')
-            io.record('arr-health', f'{_label(key)}: recovered after about {took} min')
+            heals = o.get('heals', 0)
+            extra = f', recovered after {heals} self-heal attempt(s)' if heals else ''
+            io.push(f'{_label(key)}: recovered', f'Back after about {took} min{extra}.')
+            io.record('arr-health', f'{_label(key)}: recovered after about {took} min{extra}')
     return health
 
 
@@ -381,6 +426,72 @@ def broken_files_pass(io, state, now, apply=False):
     return [dict(b, path=p) for p, b in broken.items()]
 
 
+# ── 4. stuck imports ──────────────────────────────────────────────────────────
+
+def _added_ts(v):
+    """Epoch seconds from an arr ISO time like 2026-11-15T10:00:00.1234567Z (UTC), or None."""
+    m = re.match(r'(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)', v or '')
+    if not m:
+        return None
+    return calendar.timegm(tuple(int(x) for x in m.groups()) + (0, 0, 0))
+
+
+def _is_stuck_pending(r, now):
+    if not isinstance(r, dict) or r.get('trackedDownloadState') != 'importPending':
+        return False
+    texts = []
+    for sm in r.get('statusMessages') or []:
+        if isinstance(sm, dict):
+            texts.append(str(sm.get('title') or ''))
+            texts.extend(str(m) for m in sm.get('messages') or [])
+    blob = ' '.join(texts).lower()
+    if not any(n in blob for n in _NOT_UPGRADE):
+        return False
+    added = _added_ts(r.get('added'))
+    return added is not None and now - added > STUCK_PENDING_HOURS * 3600
+
+
+def stuck_pending_pass(io, state, now, apply=False):
+    """Queue items waiting to import as 'not an upgrade' for over STUCK_PENDING_HOURS. With apply they are
+    removed from the arr queue and blocklisted; the torrent stays in the download client. Returns report rows."""
+    rows, removed = [], 0
+    for who in io.services:
+        unknown = 'includeUnknownSeriesItems' if who == 'Sonarr' else 'includeUnknownMovieItems'
+        try:
+            q = io.get(who, '/api/v3/queue', {'pageSize': 200, unknown: 'false'})
+        except Exception as e:  # noqa: BLE001
+            io.log(f'[arr-health] {who} queue read failed ({type(e).__name__})')
+            continue
+        recs = q.get('records') if isinstance(q, dict) else q
+        done = 0
+        for r in recs or []:
+            if not _is_stuck_pending(r, now):
+                continue
+            row = {'who': who, 'id': r.get('id'), 'title': r.get('title') or '?',
+                   'age_h': int((now - _added_ts(r.get('added'))) // 3600),
+                   'would': 'remove from the queue and blocklist, keep the torrent'}
+            rows.append(row)
+            if not apply:
+                row['outcome'] = 'dry run'
+                continue
+            if removed >= MAX_REPLACE_PER_PASS:
+                row['outcome'] = f'waiting: {MAX_REPLACE_PER_PASS} per pass'
+                continue
+            try:
+                io.delete(who, f'/api/v3/queue/{r.get("id")}?removeFromClient=false&blocklist=true')
+                removed += 1
+                done += 1
+                row['outcome'] = 'removed, torrent kept'
+            except Exception as e:  # noqa: BLE001
+                row['outcome'] = f'error: {type(e).__name__}'
+        if done:
+            io.record('arr-health', f'{who}: {done} stuck import{"s" if done != 1 else ""} '
+                      f'(not an upgrade, {STUCK_PENDING_HOURS}h+) removed from the queue, torrent kept')
+    state['stuck'] = rows
+    state['stuck_pass'] = {'ts': now, 'apply': bool(apply)}
+    return rows
+
+
 # ── /digest ───────────────────────────────────────────────────────────────────
 
 def digest_html(state, fmt_ts=str):
@@ -402,5 +513,15 @@ def digest_html(state, fmt_ts=str):
             f"<td>{esc(b.get('would') or '')}</td></tr>" for p, b in sorted(broken.items()))
         parts.append(f"<h2>Broken library files: {len(broken)}</h2><div class='sub'>{head}</div>"
                      f"<table><tr><td><b>arr</b></td><td><b>item</b></td><td><b>state</b></td><td><b>result</b></td>"
+                     f"<td><b>apply would</b></td></tr>{rows or '<tr><td>none</td></tr>'}</table>")
+    sp = state.get('stuck_pass')
+    stuck = state.get('stuck') or []
+    if sp:
+        head = ('apply' if sp.get('apply') else 'dry run, nothing changed') + f" - last pass {esc(fmt_ts(sp.get('ts')))}"
+        rows = ''.join(
+            f"<tr><td>{esc(r.get('who'))}</td><td>{esc(r.get('title'))}</td><td>{esc(r.get('age_h'))}h</td>"
+            f"<td>{esc(r.get('outcome') or '')}</td><td>{esc(r.get('would') or '')}</td></tr>" for r in stuck)
+        parts.append(f"<h2>Stuck imports (not an upgrade): {len(stuck)}</h2><div class='sub'>{head}</div>"
+                     f"<table><tr><td><b>arr</b></td><td><b>item</b></td><td><b>age</b></td><td><b>result</b></td>"
                      f"<td><b>apply would</b></td></tr>{rows or '<tr><td>none</td></tr>'}</table>")
     return ''.join(parts)

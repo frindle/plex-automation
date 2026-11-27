@@ -49,6 +49,12 @@ class AdviceIO:
     def advise(self, f):
         self.advice.append(f)
 
+    def post(self, who, path, body):   # self-heal calls (arr_health._heal)
+        pass
+
+    def log(self, msg):
+        pass
+
 
 @pytest.fixture(autouse=True)
 def inline_shadow(monkeypatch):

@@ -32,6 +32,8 @@ class FakeIO:
         self.history = {('Sonarr', 5): [], ('Radarr', 9): []}
         self.torrents = set()
         self.mtimes = {}
+        self.queue = {}
+        self.post_fails = False
         self.pushes, self.records, self.posts, self.deletes, self.rechecks, self.gets = [], [], [], [], [], []
 
     def get(self, who, path, params=None):
@@ -52,6 +54,8 @@ class FakeIO:
             return self.moviefiles.get(params['movieId'], [])
         if path == '/api/v3/episode':
             return self.episodes.get(params['seriesId'], [])
+        if path == '/api/v3/queue':
+            return {'records': self.queue.get(who, [])}
         if path == '/api/v3/history/series':
             return self.history[('Sonarr', params['seriesId'])]
         if path == '/api/v3/history/movie':
@@ -60,6 +64,8 @@ class FakeIO:
 
     def post(self, who, path, body):
         self.posts.append((who, path, body))
+        if self.post_fails:
+            raise ConnectionError('refused')
 
     def delete(self, who, path):
         self.deletes.append((who, path))
@@ -140,6 +146,129 @@ def test_stale_outage_restarts_its_clock():
     # Container was off for hours; the old start time must not count.
     ah.outage_tick(io, st, T0 + 5 * 3600)
     assert io.pushes == [] and st['outages']['Deluge:direct']['since'] == T0 + 5 * 3600
+
+
+def test_config_off_messages_are_skipped_real_outages_kept():
+    items = [H('IndexerRssCheck', 'No indexers available with RSS sync enabled, Sonarr will not grab new releases'),
+             H('IndexerSearchCheck', 'No indexers available with Automatic Search enabled, Sonarr will not provide any results'),
+             H('IndexerSearchCheck', 'no indexers available with Interactive Search enabled', 'warning'),
+             H('IndexerRssCheck', 'All rss-capable indexers are temporarily unavailable due to recent indexer errors')]
+    assert ah.health_conditions('Sonarr', items) == {
+        'Sonarr:IndexerRssCheck': 'All rss-capable indexers are temporarily unavailable due to recent indexer errors'}
+    assert ah.health_conditions('Sonarr', items[:3]) == {}
+
+
+# ── self-heal ─────────────────────────────────────────────────────────────────
+
+def test_heal_waits_then_fires_once_per_gap():
+    io, st = FakeIO(), {}
+    io.health['Sonarr'] = [H('IndexerStatusCheck', 'Indexers unavailable due to failures: Torznab')]
+    ah.outage_tick(io, st, T0)
+    ah.outage_tick(io, st, T0 + (ah.HEAL_AFTER_MIN - 1) * MIN)
+    assert io.posts == []
+    ah.outage_tick(io, st, T0 + ah.HEAL_AFTER_MIN * MIN)
+    assert io.posts == [('Sonarr', '/api/v3/indexer/testall', None),
+                        ('Sonarr', '/api/v3/command', {'name': 'RssSync'})]
+    t = T0 + ah.HEAL_AFTER_MIN * MIN
+    ah.outage_tick(io, st, t + 5 * MIN)
+    assert len(io.posts) == 2
+    ah.outage_tick(io, st, t + ah.HEAL_GAP)
+    assert len(io.posts) == 4
+    o = st['outages']['Sonarr:IndexerStatusCheck']
+    assert o['heals'] == 2 and o['heal_at'] == t + ah.HEAL_GAP
+    assert [r for r in io.records if 'self-heal' in r[1]] == [
+        ('arr-health', 'Sonarr indexers failing: self-heal attempt 1'),
+        ('arr-health', 'Sonarr indexers failing: self-heal attempt 2')]
+
+
+def test_heal_endpoints_per_source():
+    io, st = FakeIO(), {}
+    io.health['Radarr'] = [H('DownloadClientStatusCheck', 'Download clients unavailable due to failures: Deluge')]
+    io.health['Sonarr'] = [H('RootFolderCheck', 'Missing root folder: /data/TV')]
+    io.deluge_up = False
+    io.down = set()
+    ah.outage_tick(io, st, T0)
+    ah.outage_tick(io, st, T0 + 11 * MIN)
+    assert io.posts == [('Radarr', '/api/v3/downloadclient/testall', None)]
+    io2, st2 = FakeIO(), {}
+    io2.down.add('Radarr')
+    ah.outage_tick(io2, st2, T0)
+    ah.outage_tick(io2, st2, T0 + 11 * MIN)
+    assert io2.posts == []
+
+
+def test_failing_heal_never_blocks_the_push():
+    io, st = FakeIO(), {}
+    io.post_fails = True
+    io.health['Sonarr'] = [H('IndexerLongTermStatusCheck', 'Indexers unavailable for more than 6 hours: Torznab')]
+    for m in (0, 10, 25, 30):
+        ah.outage_tick(io, st, T0 + m * MIN)
+    assert len(io.pushes) == 1
+    assert 'Self-heal attempts so far: 2' in io.pushes[0][1]
+    assert 'Torznab' in io.pushes[0][1]
+
+
+def test_recovery_text_mentions_heals_only_when_there_were_some():
+    io, st = FakeIO(), {}
+    io.health['Sonarr'] = [H('IndexerStatusCheck', 'down')]
+    for m in (0, 10, 30):
+        ah.outage_tick(io, st, T0 + m * MIN)
+    io.health['Sonarr'] = []
+    ah.outage_tick(io, st, T0 + 40 * MIN)
+    assert 'recovered after 2 self-heal attempt(s)' in io.pushes[-1][1]
+    assert 'recovered after 2 self-heal attempt(s)' in io.records[-1][1]
+    io, st = FakeIO(), {}
+    io.deluge_up = False
+    for m in (0, 30):
+        ah.outage_tick(io, st, T0 + m * MIN)
+    io.deluge_up = True
+    ah.outage_tick(io, st, T0 + 40 * MIN)
+    assert 'self-heal' not in io.pushes[-1][1] and 'self-heal' not in io.pushes[0][1]
+
+
+# ── stuck imports ─────────────────────────────────────────────────────────────
+
+# T0 is 2033-05-18 03:33:20 UTC; the `added` times below are relative to that.
+
+
+def _rec(i, state='importPending', msg='Not a Custom Format upgrade for existing movie file(s)', added=None):
+    return {'id': i, 'title': f'Item {i}', 'trackedDownloadState': state, 'added': added or '2033-05-16T03:00:00Z',
+            'statusMessages': [{'title': f'Item {i}', 'messages': [msg]}]}
+
+
+def test_stuck_pending_picks_only_matching_old_records():
+    io, st = FakeIO(), {}
+    io.queue['Radarr'] = [
+        _rec(1),
+        _rec(2, msg='Not an upgrade for existing episode file(s)'),
+        _rec(3, state='importBlocked'),
+        _rec(4, msg='Unknown movie'),
+        _rec(5, added='2033-05-18T02:00:00.1234567Z'),
+    ]
+    rows = ah.stuck_pending_pass(io, st, T0)
+    assert [r['id'] for r in rows] == [1, 2]
+    assert io.deletes == [] and all(r['outcome'] == 'dry run' for r in rows)
+    assert ('Radarr', '/api/v3/queue', {'pageSize': 200, 'includeUnknownMovieItems': 'false'}) in io.gets
+    assert ('Sonarr', '/api/v3/queue', {'pageSize': 200, 'includeUnknownSeriesItems': 'false'}) in io.gets
+    assert io.records == []
+
+
+def test_stuck_pending_apply_deletes_with_blocklist_and_caps():
+    io, st = FakeIO(), {}
+    io.queue['Radarr'] = [_rec(i) for i in range(10, 15)]
+    rows = ah.stuck_pending_pass(io, st, T0, apply=True)
+    assert io.deletes == [('Radarr', f'/api/v3/queue/{i}?removeFromClient=false&blocklist=true') for i in (10, 11, 12)]
+    assert len(rows) == 5 and rows[3]['outcome'].startswith('waiting')
+    assert io.records == [('arr-health', 'Radarr: 3 stuck imports (not an upgrade, 24h+) removed from the queue, torrent kept')]
+    assert all('Item' not in r[1] for r in io.records)
+
+
+def test_stuck_pending_digest_row():
+    io, st = FakeIO(), {}
+    io.queue['Sonarr'] = [_rec(7)]
+    ah.stuck_pending_pass(io, st, T0)
+    html = ah.digest_html(st)
+    assert 'Stuck imports' in html and 'Item 7' in html and 'dry run' in html
 
 
 # ── removed from TheTVDB ──────────────────────────────────────────────────────
