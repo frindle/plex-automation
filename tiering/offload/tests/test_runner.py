@@ -1075,3 +1075,117 @@ def test_yield_blocks_only_while_someone_else_is_watched(tmp_path, monkeypatch):
     r.watched.pop("y")
     r.promote_running.discard("x")
     r._yield_to_watched("y")  # nothing watched is running
+
+
+# ---------------------------------------------------------------- TIERING_ONLY_PATHS
+
+
+def _two_whole(w):
+    a, b = w.movie(1), w.movie(2)
+    w.row("a", 1, a, "whole")
+    w.row("b", 2, b, "whole")
+    return a, b
+
+
+def test_only_paths_unset_changes_nothing(w):
+    assert w.cfg.only_paths == frozenset()
+    assert Config.from_env({"TIERING_DB": "/x/t.db"}).only_paths == frozenset()
+    assert Config.from_env({"TIERING_DB": "/x/t.db", "TIERING_ONLY_PATHS": " \n "}).only_paths \
+        == frozenset()
+    _two_whole(w)
+    w.run()
+    assert sorted(w.ops("demote")) == ["a", "b"]
+
+
+def test_only_paths_demotes_only_the_listed_file(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    a, b = _two_whole(w)
+    w.cfg.only_paths = runner.parse_only_paths(a + "/")  # a trailing slash is stripped
+    w.run()
+    assert w.ops("demote") == ["a"]
+    assert w.state.rows["a"]["state"] == "offloaded" and w.state.rows["b"]["state"] == "whole"
+
+
+def test_only_paths_unlisted_file_is_never_qualified(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    a, b = _two_whole(w)
+    w.cfg.only_paths = frozenset([b])
+    w.run()
+    w.clock.t += 60
+    w.run()
+    assert w.ops("qualify") == ["b"] and w.ops("demote") == ["b"]
+    assert not [c for c in w.calls if c[0] == "gate" and c[1].endswith("m1.mkv")]
+
+
+def test_only_paths_unlisted_row_is_not_demoted_by_the_worker_either(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    a, b = _two_whole(w)
+    w.cfg.only_paths = frozenset([a])
+    w.run()
+    w.runner._demote_inner(w.runner.db(), "b", w.clock.t)
+    assert w.ops("qualify") == ["a"] and w.ops("demote") == ["a"]
+
+
+def test_only_paths_never_blocks_a_promote(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    a = w.movie(1)
+    w.row("a", 1, a, "whole")
+    w.row("p", 2, w.movie(2), "offloaded")
+    w.deck = [{"ratingKey": "2"}]
+    w.cfg.only_paths = frozenset([a])
+    w.run()
+    assert w.ops("promote") == ["p"] and w.state.rows["p"]["state"] == "whole"
+    assert w.ops("demote") == []  # the pending promote holds this pass's demotes, as before
+
+
+def test_only_paths_file_form_with_comments(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    a, b = _two_whole(w)
+    lst = tmp_path / "only.txt"
+    lst.write_text("# first test file\n\n  " + b + "/  \n  # " + a + "\n")
+    cfg = Config.from_env({"TIERING_DB": str(tmp_path / "t.db"),
+                           "TIERING_ONLY_PATHS": "@" + str(lst)})
+    assert cfg.only_paths == frozenset([b])
+    w.cfg.only_paths = cfg.only_paths
+    w.run()
+    assert w.ops("demote") == ["b"]
+    with pytest.raises(ValueError):
+        runner.parse_only_paths("@" + str(tmp_path / "missing.txt"))
+    lst.write_text("# nothing\n")
+    with pytest.raises(ValueError):
+        runner.parse_only_paths("@" + str(lst))
+
+
+def test_only_paths_inline_comma_and_newline():
+    got = runner.parse_only_paths("/m/a.mkv, /m/b.mkv/\n/m/c.mkv\n# /m/d.mkv\n,")
+    assert got == frozenset(["/m/a.mkv", "/m/b.mkv", "/m/c.mkv"])
+
+
+def test_only_paths_match_exactly_no_globs_no_prefixes(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    a, b = _two_whole(w)
+    w.cfg.only_paths = frozenset([str(tmp_path / "lib" / "*"), str(tmp_path / "lib"),
+                                  a[:-1], a.upper(), a + "x"])
+    w.run()
+    assert w.ops("demote") == [] and w.ops("qualify") == []
+
+
+def test_only_paths_startup_logs_count_not_paths(tmp_path, monkeypatch, caplog):
+    w = World(tmp_path, monkeypatch)
+    a, b = _two_whole(w)
+    w.cfg.only_paths = frozenset([a, "/synthetic/nowhere.mkv"])
+    with caplog.at_level(logging.INFO, logger="tiering.runner"):
+        w.runner.announce_only_paths()
+    assert "only 2 path(s)" in caplog.text and "1 path(s) match no row" in caplog.text
+    assert a not in caplog.text and "nowhere" not in caplog.text
+
+
+def test_only_paths_dry_run_logs_skips(tmp_path, monkeypatch, caplog):
+    w = World(tmp_path, monkeypatch, apply=False)
+    a, b = _two_whole(w)
+    w.cfg.only_paths = frozenset([a])
+    with caplog.at_level(logging.DEBUG, logger="tiering.runner"):
+        w.run()
+    assert "demotes skipped by TIERING_ONLY_PATHS: 1" in caplog.text
+    assert "plan: demote " + b + " id=b skipped" in caplog.text
+    assert "plan: demote " + a + " id=a (idle" in caplog.text and w.calls == []

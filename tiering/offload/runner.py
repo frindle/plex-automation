@@ -147,6 +147,33 @@ def next_night_start(now: float, window: tuple[int, int]) -> float:
     return t
 
 
+def _norm_only(p: str) -> str:
+    """One allowlist or row path, compared exactly: stripped, no trailing slash."""
+    p = p.strip()
+    return p.rstrip("/") if len(p) > 1 else p
+
+
+def parse_only_paths(spec) -> frozenset:
+    """TIERING_ONLY_PATHS: library paths (as stored, share paths) that may be offloaded.
+    Comma or newline separated; `@file` names a file with one path per line. `#` lines
+    and blanks are ignored. Empty means no allowlist. Errors never name a path."""
+    spec = (spec or "").strip()
+    if not spec:
+        return frozenset()
+    if spec.startswith("@"):
+        try:
+            with open(spec[1:].strip(), encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError as e:
+            raise ValueError(f"TIERING_ONLY_PATHS file cannot be read ({type(e).__name__})")
+        out = {_norm_only(x) for x in lines if x.strip() and not x.strip().startswith("#")}
+        if not out:  # an empty list must not silently widen the allowlist to everything
+            raise ValueError("TIERING_ONLY_PATHS file holds no paths")
+        return frozenset(out)
+    parts = [x for line in spec.splitlines() for x in line.split(",")]
+    return frozenset(_norm_only(x) for x in parts if x.strip() and not x.strip().startswith("#"))
+
+
 def _flag(v) -> bool:
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -170,6 +197,7 @@ class Config:
     hot: hotset.Cfg = field(default_factory=hotset.Cfg)
     head_min_s: float = HEAD_MIN_S
     min_play_s: float = MIN_PLAY_S
+    only_paths: frozenset = frozenset()  # empty: no allowlist; else only these may be demoted
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
@@ -230,6 +258,7 @@ class Config:
             hot=hot,
             head_min_s=max(0.0, float(e.get("TIERING_HEAD_MIN_S") or HEAD_MIN_S)),
             min_play_s=max(0.0, float(e.get("TIERING_MIN_PLAY_S") or MIN_PLAY_S)),
+            only_paths=parse_only_paths(e.get("TIERING_ONLY_PATHS")),
         )
 
 
@@ -461,6 +490,27 @@ class Runner:
         self.heartbeat_path = cfg.db + ".heartbeat"
 
     # ---- small helpers
+
+    def _may_demote(self, row) -> bool:
+        """The TIERING_ONLY_PATHS allowlist; only ever asked about demotes."""
+        only = self.cfg.only_paths
+        return not only or _norm_only(str(row.get("lib_path") or "")) in only
+
+    def announce_only_paths(self):
+        """Once at start: the allowlist's size, and how many of its paths match no row."""
+        only = self.cfg.only_paths
+        if not only:
+            return
+        log.info("TIERING_ONLY_PATHS: only %d path(s) may be offloaded", len(only))
+        try:
+            known = {_norm_only(str(r.get("lib_path") or ""))
+                     for r in self.state.list_files(self.db())}
+        except Exception as e:
+            log.warning("TIERING_ONLY_PATHS: rows not readable (%s)", type(e).__name__)
+            return
+        missing = len(only - known)
+        if missing:
+            log.warning("TIERING_ONLY_PATHS: %d path(s) match no row", missing)
 
     def _open(self):
         return self.state.open_db(self.cfg.db)
@@ -1196,6 +1246,16 @@ class Runner:
         for r in rows:  # an offload a crash left half done is resumed, not restarted
             if r["state"] == "offloading":
                 dcands.insert(0, r)
+        if cfg.only_paths:  # before disk, qualify or anything remote: others never offload
+            kept = [r for r in dcands if self._may_demote(r)]
+            if not cfg.apply:
+                for r in dcands:
+                    if not self._may_demote(r):
+                        log.debug("plan: demote %s id=%s skipped: not in TIERING_ONLY_PATHS",
+                                  r["lib_path"], r["id"])
+                if len(kept) != len(dcands):
+                    log.info("demotes skipped by TIERING_ONLY_PATHS: %d", len(dcands) - len(kept))
+            dcands = kept
         self.disk = {}
         usable = []
         for r in dcands:
@@ -1440,6 +1500,8 @@ class Runner:
         row = st.get(db, id)
         if row is None or row["state"] not in ("whole", "offloading"):
             return
+        if not self._may_demote(row):
+            return  # not on the TIERING_ONLY_PATHS allowlist; nothing remote runs
         with self.mu:
             n.setdefault("tried", []).append(id)
             self._save_night()
@@ -1634,6 +1696,7 @@ def main(argv=None, env=None, deps=None) -> int:
             log.error("settings: %s: %s", type(e).__name__, e)
             return 2
         runner = Runner(cfg, deps)
+        runner.announce_only_paths()
         if once:
             try:
                 runner.run_pass(wait=True)
