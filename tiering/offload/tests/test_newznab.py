@@ -48,6 +48,19 @@ def test_fetch_nzb_and_bad_body():
         s.close()
 
 
+def test_requests_send_own_user_agent_not_pythons():
+    # an indexer behind Cloudflare 403s urllib's default "Python-urllib/3.x" on every call
+    s = FakeNewznab({"g1": {"title": "Movie.2020.1080p-A", "nzb": make_nzb(["a@x"])}})
+    try:
+        c = client(s)
+        (rel,) = c.search(title="Movie")
+        c.fetch_nzb(rel)
+    finally:
+        s.close()
+    assert len(s.agents) == 2 and set(s.agents) == {nz.USER_AGENT}
+    assert "python" not in nz.USER_AGENT.lower()
+
+
 def test_bad_key_and_down_indexer_are_errors_without_leaking():
     s = FakeNewznab({"g1": {"title": "t", "nzb": b"x"}})
     try:

@@ -221,6 +221,7 @@ class FakeAltMount(_Server):
 class _NzHandler(_Quiet):
     def do_GET(self):
         o = self.server.owner
+        o.agents.append(self.headers.get("User-Agent"))
         u = urllib.parse.urlsplit(self.path)
         q = urllib.parse.parse_qs(u.query)
         if q.get("apikey", [""])[0] != o.key:
@@ -278,6 +279,7 @@ class FakeNewznab(_Server):
         self.key = key
         self.releases = dict(releases or {})  # guid -> {title, nzb, size?}
         self.queries, self.gets = [], []
+        self.agents = []  # User-Agent of every request, in order
         self.fail = False
         self.fail_code = 500
         self.retry_after = None

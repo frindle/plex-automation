@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 
 NZB_MAX = 100 * 1024 * 1024
 _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+USER_AGENT = "plex-automation-tiering/1.0"
 
 
 class NewznabError(Exception):
@@ -315,6 +316,9 @@ class NewznabClient:
             pass  # reads the file once at start, writing back any corrected times
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=tls_context()), _SafeRedirect())
+        # replaces urllib's default "Python-urllib/3.x", which some indexers' edge (Cloudflare)
+        # answers with 403 for every request, caps included
+        self._opener.addheaders = [("User-Agent", USER_AGENT)]
         self.grabs = 0
         self.searches = 0
 
