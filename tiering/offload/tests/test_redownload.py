@@ -265,3 +265,58 @@ def test_arr_client_verbs_send_the_key_and_return_json(radarr):
     assert c.delete("/api/v3/moviefile/10") is None
     assert all(req[-1] == radarr.key for req in radarr.requests if len(req) == 3)
     assert radarr.key not in repr(c)
+
+
+def _guarded_pending(radarr, ids=("a",)):
+    """A night that passed the guards with `a` pending (it was busy when the check found it)."""
+    w = W(arrs_for(radarr), ids=ids)
+    w.busy_ids = {"a"}
+    w.process(LOST_A)
+    assert "a" in w.rd.pending(None) and radarr.deleted == []
+    w.busy_ids = set()
+    return w
+
+
+def test_a_row_marked_during_a_pass_stays_and_an_acted_one_does_not_come_back(radarr):
+    w = _guarded_pending(radarr, ids=("a", "b"))
+    real = w.rd.arrs.search
+
+    def search_and_mark(item):
+        real(item)
+        w.rd.mark_lost(None, "b", "a", "marked while a was being acted on")
+
+    w.rd.arrs.search = search_and_mark
+    w.rd.retry_pending(None, NOW + 60)
+    assert set(w.rd.pending(None)) == {"b"}
+
+
+def test_two_threads_reaching_run_pending_act_on_a_row_once(radarr):
+    import threading
+    import time
+    w = _guarded_pending(radarr)
+    real = w.rd.arrs.delete_file
+    n = []
+
+    def slow_delete(item):
+        n.append(1)
+        time.sleep(0.2)
+        real(item)
+
+    w.rd.arrs.delete_file = slow_delete
+    ts = [threading.Thread(target=w.rd.retry_pending, args=(None, NOW + 60)) for _ in range(2)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(n) == 1 and radarr.deleted == ["/api/v3/moviefile/10"]
+
+
+def test_reset_clears_the_mass_loss_list_and_the_mark():
+    a = FakeArr(movies=[movie(i, 10 + i, f"/share/Movies/M{i}/M{i}.mkv") for i in range(1, 5)])
+    try:
+        ids = ("1", "2", "3", "4")
+        w = W(arrs_for(a), ids=ids, max_per_night=3)
+        w.process([{"id": i, "title": i, "articles": 1} for i in ids])
+        assert len(w.rd.pending(None)) == 4 and w.kv["redownload_night"].get("mass")
+        assert w.rd.reset(None) == 4
+        assert w.rd.pending(None) == {} and w.kv["redownload_night"] == {}
+    finally:
+        a.close()

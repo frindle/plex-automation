@@ -31,6 +31,7 @@ Guards (nothing is deleted, searched or marked if one fails):
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -154,6 +155,9 @@ class Redownload:
         self.l_ok, self.busy, self.healthy, self.alert = l_ok, busy, healthy, alert
         self.kv_get, self.kv_set = kv_get, kv_set
         self.enabled, self.max_per_night, self.clock = enabled, max(1, int(max_per_night)), clock
+        # the weekly thread (process) and the runner's main loop (retry_pending, mark_lost) both reach
+        # run_pending; one at a time, so a row is acted on once
+        self._lock = threading.RLock()
 
     # ---- kv helpers
 
@@ -183,6 +187,10 @@ class Redownload:
     # ---- entry points
 
     def mark_lost(self, db, id, kind, why):
+        with self._lock:
+            return self._mark_lost(db, id, kind, why)
+
+    def _mark_lost(self, db, id, kind, why):
         """Note that a row is lost; it is acted on at the next night that passes the guards.
         Returns True when the row was newly marked."""
         row = self.state.get(db, id)
@@ -200,6 +208,10 @@ class Redownload:
         return True
 
     def process(self, db, lost, info, now=None):
+        with self._lock:
+            return self._process(db, lost, info, now)
+
+    def _process(self, db, lost, info, now=None):
         """Called once by the nightly check: ``lost`` are the rows it just confirmed (b),
         ``info`` says whether a provider could not be asked. Does the tracking, then, when
         every guard passes, the acting."""
@@ -240,6 +252,10 @@ class Redownload:
         return ""
 
     def retry_pending(self, db, now=None):
+        with self._lock:
+            return self._retry_pending(db, now)
+
+    def _retry_pending(self, db, now=None):
         """Each runner pass: rows deferred earlier (a promote was running) are acted on once
         it stops, but only on a night that already passed the guards."""
         now = self.clock() if now is None else now
@@ -247,6 +263,15 @@ class Redownload:
             return
         if self.pending(db):
             self.run_pending(db, now)
+
+    def reset(self, db):
+        """Forget the pending list and tonight's mass-loss mark (the --reset-redownload flag). Rows are not
+        touched: a row still lost is marked again by the next nightly check. Returns how many were pending."""
+        with self._lock:
+            n = len(self.pending(db))
+            self._save_pending(db, {})
+            self.kv_set(db, "redownload_night", {})
+            return n
 
     # ---- acting
 
@@ -257,12 +282,23 @@ class Redownload:
             return True
         return row["state"] == "failed" and is_lost_note(row.get("restore_note"))
 
+    def _save_unacted(self, db, acted):
+        """Save the stored list minus the rows this pass already acted on or dropped. Built from what is stored
+        now, not from the list read at the start: a row marked meanwhile stays, an acted one never comes back."""
+        self._save_pending(db, {k: v for k, v in self.pending(db).items() if k not in acted})
+
     def run_pending(self, db, now):
+        with self._lock:
+            return self._run_pending(db, now)
+
+    def _run_pending(self, db, now):
         p = self.pending(db)
+        acted = set()
         for id in list(p):
             if not self._valid(self.state.get(db, id)):
                 p.pop(id)
-        self._save_pending(db, p)
+                acted.add(id)
+        self._save_unacted(db, acted)
         if not p:
             return
         day = self._day(now)
@@ -276,8 +312,10 @@ class Redownload:
                 self.alert("mass_loss", "-", lost=len(p), limit=self.max_per_night)
                 for id in sorted(p):
                     self.state.log_event(db, id, "mass_loss", {"lost": len(p)})
-            log.error("redownload: %d rows lost (limit %d a night); acting on none",
-                      len(p), self.max_per_night)
+            log.error("redownload: %d rows lost (limit %d a night); acting on none. To act on them, set "
+                      "TIERING_REDOWNLOAD_MAX_PER_NIGHT to at least %d and restart; to forget the list "
+                      "(the next nightly check marks again what is still lost) run the runner once with "
+                      "--reset-redownload", len(p), self.max_per_night, len(p))
             return
         for id in sorted(p):
             if night["n"] >= self.max_per_night:
@@ -287,8 +325,9 @@ class Redownload:
                 night["n"] += 1
             if res in ("requested", "dropped"):
                 p.pop(id, None)
+                acted.add(id)
             self.kv_set(db, "redownload_night", night)
-            self._save_pending(db, p)
+            self._save_unacted(db, acted)
 
     def _act(self, db, id, now) -> str:
         """requested, dropped (nothing to do for this row any more) or wait."""

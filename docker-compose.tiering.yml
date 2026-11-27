@@ -56,6 +56,11 @@ services:
       # Promote: seconds a failing chunk fetch is retried, and promotes run at once.
       TIERING_PROMOTE_RETRY_S: "${TIERING_PROMOTE_RETRY_S:-600}"
       TIERING_PROMOTE_CONCURRENCY: "${TIERING_PROMOTE_CONCURRENCY:-2}"
+      # the nightly integrity check and the automatic re-download of a lost file (off until set to 1)
+      TIERING_AUTO_REDOWNLOAD: "${TIERING_AUTO_REDOWNLOAD:-0}"
+      TIERING_CHECK_EVERY_H: "${TIERING_CHECK_EVERY_H:-24}"
+      TIERING_CHECK_MAX_H: "${TIERING_CHECK_MAX_H:-4}"
+      TIERING_REDOWNLOAD_MAX_PER_NIGHT: "${TIERING_REDOWNLOAD_MAX_PER_NIGHT:-3}"
       # Days an orphaned stub (arr upgrade replaced L) is kept before cleanup; 0 = off.
       TIERING_ORPHAN_GRACE_DAYS: "${TIERING_ORPHAN_GRACE_DAYS:-7}"
       # Every name must be visible from the container or nothing is demoted.

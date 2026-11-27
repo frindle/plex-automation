@@ -764,7 +764,10 @@ class Runner:
         except OSError:
             return False
         mount = self.cfg.tierfs_mount
-        if mount and os.path.dirname(os.path.normpath(got)) != os.path.normpath(mount):
+        if not mount:
+            log.warning("re-download: TIERFS_MOUNT is not set, so the check that the link points into the "
+                        "tierfs mount is skipped; only its name is compared")
+        elif os.path.dirname(os.path.normpath(got)) != os.path.normpath(mount):
             return False
         return os.path.basename(got) == f"{row['id']}{ext}"
 
@@ -1979,7 +1982,9 @@ def start_health_server(runner: Runner, spec: str):
 
 
 def main(argv=None, env=None, deps=None) -> int:
-    once = "--once" in (sys.argv[1:] if argv is None else argv)
+    args = sys.argv[1:] if argv is None else argv
+    once = "--once" in args
+    reset = "--reset-redownload" in args
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     handler.addFilter(Redact())
@@ -2007,6 +2012,15 @@ def main(argv=None, env=None, deps=None) -> int:
             log.error("settings: %s: %s", type(e).__name__, e)
             return 2
         runner = Runner(cfg, deps)
+        if reset:
+            rd = runner.redownloader()
+            if rd is None:
+                log.error("--reset-redownload needs TIERING_APPLY=1 and the arr settings")
+                return 2
+            n = rd.reset(runner.db())
+            log.info("re-download list cleared (%d rows forgotten); the next nightly check marks again "
+                     "what is still lost", n)
+            return 0
         runner.announce_only_paths()
         if once:
             try:
