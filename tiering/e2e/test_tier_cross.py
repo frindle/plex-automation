@@ -98,9 +98,11 @@ def test_zeroed_chunk_is_never_written_into_the_file(stack):
     with pytest.raises(OSError):
         stack.player_read(f, timeout=40)
     # the bad chunk flags a promote first; the row is failed only when that promote finds a
-    # mismatch on every copy (there is no twin here)
-    S.wait_until(lambda: any(a.get("kind") == "bad_chunk" for a in stack.alerts()), 30,
-                 what="the bad_chunk alert")
+    # mismatch on every copy (there is no twin here). A read that waits on the promote
+    # (want, then promote) never reaches tierfs's own chunk check, so the alert is
+    # promote_failed there; a mid-file read that hits the chunk itself says bad_chunk.
+    S.wait_until(lambda: any(a.get("kind") in ("promote_failed", "bad_chunk")
+                             for a in stack.alerts()), 60, what="an alert for the bad chunk")
     S.wait_until(lambda: stack.state_of(f) == "failed", 90, what="promote ends failed")
     assert os.path.islink(f["disk"]), "L was replaced although the remote copy is bad"
     assert os.lstat(row["stub_path"]).st_ino == stub_before[0]

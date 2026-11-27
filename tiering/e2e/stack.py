@@ -399,14 +399,19 @@ class Stack:
             afile["mediaInfo"] = {"runTime": f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}"}
         if in_arr and kind == "movie":
             name, _, year = os.path.basename(os.path.dirname(rel)).rpartition(" (")
-            self.radarr.movies.append({"title": name, "year": int(year.rstrip(")")),
-                                       "movieFile": afile})
+            # Radarr and Sonarr always give ids; the re-download looks items up by them
+            n = len(self.radarr.movies) + 1
+            afile["id"] = n
+            self.radarr.movies.append({"id": n, "title": name, "year": int(year.rstrip(")")),
+                                       "monitored": True, "movieFile": afile})
         elif in_arr:
             if not self.sonarr.series:
                 self.sonarr.series.append({"id": 1, "title": "Show Name", "tvdbId": 1})
-            self.sonarr.episodes.setdefault(1, []).append({
-                "seasonNumber": season, "episodeNumber": episode,
-                "episodeFile": afile})
+            eps = self.sonarr.episodes.setdefault(1, [])
+            n = sum(len(v) for v in self.sonarr.episodes.values()) + 1
+            afile["id"] = n
+            eps.append({"id": n, "seasonNumber": season, "episodeNumber": episode,
+                        "monitored": True, "episodeFile": afile})
         return f
 
     def add_season(self, season, n=4, prefix="Show.Name", **kw):

@@ -51,8 +51,10 @@ with a bindfs stand-in.
    in the middle, answered with HTTP 206.
 2. Full Plex download. Assert it fails and no read of that range ever returns
    zero bytes (compare every byte the client did receive).
-3. Assert a `bad_chunk` event with the chunk offset and an alert. The row is
-   NOT failed at once: the runner flags a promote for it (first in line).
+3. Assert an alert: `promote_failed` when the read waited on the promote (the
+   usual path: want, then promote), `bad_chunk` with the chunk offset when a
+   mid-file read hit the chunk itself. The row is NOT failed at once: the
+   runner flags a promote for it (first in line).
 4. Assert that promote verifies every chunk, finds the mismatch on every copy
    (no twin here) and ends the row `state=failed` (the exact file is lost, so
    an automatic re-download follows when it is wired). No promote swap
