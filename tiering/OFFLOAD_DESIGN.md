@@ -336,12 +336,19 @@ Swaps are automatic. One long-running process applies the hot set.
   - only files that pass `qualify` that night, with the glacier gate "free" and nlink 1;
   - the gate and nlink are looked at again right after `qualify` and before the offload starts, because `qualify` reads the whole file and takes minutes: a torrent that began to seed it meanwhile keeps it whole;
   - capped by `TIERING_DEMOTE_GB_PER_NIGHT` (default 200);
-  - no demotes on a night when any promote is queued or any hash check has failed.
+  - no demotes on a night when any promote is queued or any hash check has failed;
+  - optionally only the files in `TIERING_ONLY_PATHS` (see **Config from env**).
 - **A `bad_chunk` event:** promoting cannot help, because the remote copy is bad. Set `state=failed`, alert, and list it in the weekly report with its restore path. The file stays a working symlink for the parts that are good.
 - **Reconcile each pass:** if `L` is no longer the symlink a row expects (an arr upgrade or delete replaced it), stop managing that row. Set `state=failed` with `restore_note="L replaced"`. Leave the stub and the manifest for the weekly report; nothing is deleted.
 - **Config from env:**
   - `TIERING_MAX_STREAM_KBPS` gives `Cfg.max_stream_kbps`; `TIERING_KEEP_4K` gives `Cfg.keep_4k`;
   - `TIERING_NEVER_SECTIONS` is a comma list (default `Adult`).
+  - `TIERING_ONLY_PATHS` (optional) is an opt-in demote allowlist, for a first live test on one file:
+    - comma- or newline-separated library paths, exactly as the runner stores them (the share path, after `TIERING_PATH_MAP` mapping); a value starting with `@` names a file with one path per line. `#` lines and blank lines are ignored. Each path is stripped and loses a trailing slash;
+    - when set, only a row whose `lib_path` is listed may be demoted. Any other row is dropped from the demote plan before the disk path, `qualify` or any remote or indexer call, and `_demote_inner` checks again before `qualify`. A half-done offload of an unlisted row is not resumed;
+    - promotes, reconcile, the weekly check, wants and the idle clocks are untouched: the allowlist never blocks a promote;
+    - matching is exact: no globs, no prefixes, so a typo cannot widen it. Unset or empty means no allowlist. An unreadable `@` file, or a value or file with no paths (only commas or `#` lines), stops the start;
+    - at start the runner logs the number of paths (never the paths) and, when some match no row, one warning with that count. In a dry run each skipped demote is logged at debug level and the count at info level.
 - **Safety:**
   - dry run unless `TIERING_APPLY=1`, in which case it logs each planned action and changes nothing;
   - one instance at a time (a lock file next to `TIERING_DB`);
