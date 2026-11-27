@@ -106,6 +106,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+    # A fixed MAC, like the main service: on br0 Docker otherwise makes a new one on every restart,
+    # and the router sees a new device each time.
+    mac_address: "${TIERING_MAC:-02:8e:b2:5d:a1:38}"
     networks:
       br0:
         ipv4_address: "${TIERING_IP:?set TIERING_IP in .env}"
