@@ -44,9 +44,11 @@ Monthly (the first 7 days, or ``monthly=True``) it reads a rotating 5% of the
 offloaded bytes in full through WebDAV and compares the SHA-256. Rows are picked
 by the oldest *attempt*, not the oldest success, so a row that always fails
 cannot hold the rotation: the attempt is recorded before the read, in a small
-JSON file next to the report (no column). A hash mismatch is like ``bad_chunk``:
-the row goes to ``state=failed`` and an alert is raised (promoting cannot help,
-the remote copy is bad). Three read errors in a row, or three weekly STAT
+JSON file next to the report (no column). A mismatch is read a second time:
+a second read that matches was a fluke (``full_read_fluke``, the row is fine), and
+a second read with a different hash proves nothing (``full_read_unstable``, left for
+the next rotation). The same wrong hash twice is like ``bad_chunk``: the row goes to
+``state=failed`` and an alert is raised (promoting cannot help, the remote copy is bad). Three read errors in a row, or three weekly STAT
 failures in a row, on one row raise an alert.
 
 ``run_weekly`` returns the rows flagged for promotion. It promotes nothing; the
@@ -67,6 +69,14 @@ from .qualify import _SOFT, present, score_restore, stat_nzb_bytes, stat_status
 
 STALE_DAYS = 14
 STREAK = 3
+
+
+def _read_again(reader, remote_path):
+    """A second full read after a mismatch: its hash, or None when it fails."""
+    try:
+        return reader.sha256_full(remote_path)
+    except Exception:
+        return None
 
 
 def _title(row: dict) -> str:
@@ -337,6 +347,16 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
                     r["unchecked"].append("no_sha256")
                 elif got == row["sha256"]:
                     write(r, last_ok_ts=now)
+                elif (again := _read_again(reader, row["remote_path"])) == row["sha256"]:
+                    # AltMount zero-fills a segment it could not fetch in time and still
+                    # answers: one wrong read is a fluke until a second read agrees with it
+                    state.log_event(db, rid, "full_read_fluke", {})
+                    write(r, last_ok_ts=now)
+                elif again != got:
+                    # a different wrong hash (or an error) the second time: the read path
+                    # is flaky, which proves nothing about the copy. Next rotation again.
+                    r["unchecked"].append("full_read_unstable")
+                    state.log_event(db, rid, "full_read_unstable", {})
                 else:
                     full["mismatch"] += 1
                     r["hash_failed"] = True

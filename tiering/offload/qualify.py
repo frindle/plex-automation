@@ -4,9 +4,12 @@
 
 1. find or reuse an NZB for the exact release, and archive it;
 2. import it into AltMount;
-3. hash ``lib_path`` itself with a fresh full read, read the remote copy back
-   through WebDAV, and require the two SHA-256 to be equal. A stored ``sha256``
-   is never trusted;
+3. hash ``lib_path`` itself with a fresh full read, then read the remote copy back
+   through WebDAV by range reads (as tierfs plays it) and compare every chunk with
+   ``lib_path``. A stored ``sha256`` is never trusted. A chunk that differs is read
+   again (``compare_remote``): a read that comes right is a fluke, not a bad copy; the
+   same wrong bytes every time is ``hash_mismatch``; different wrong bytes every time
+   is ``hash_unsure`` (not tonight);
 4. STAT every segment on the secondary and the primary provider: none missing
    (the primary alone when TIERING_SINGLE_PROVIDER left the secondary out);
 5. restore path: another release of the same title, at least the resolution
@@ -39,8 +42,10 @@ import hashlib
 import os
 import re
 import tempfile
+import threading
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from xml.etree.ElementTree import ParseError
 
@@ -56,6 +61,11 @@ GRAB_FAILED_NIGHTS = 3  # nights in a row a row's own grabs fail before it is ca
 _READ = 1 << 20
 TWIN_GRABS = 3  # NZB grabs one qualify may spend looking for a twin
 TWIN_SAMPLES = 5  # places (1 MiB each) a twin's bytes are compared with the local file
+HASH_CHUNK = 16 << 20  # bytes per range read when the remote copy is compared with L
+HASH_REREADS = 2  # fresh reads of a chunk that differs, before the difference counts
+HASH_REREAD_PAUSE = 2.0  # seconds before a reread (times its number)
+HASH_WORKERS = 4  # range reads in flight during the compare
+_ZEROS = b"\0" * (64 << 10)  # a run this long in the remote chunk, not in L: zero-filled
 
 
 @dataclass
@@ -391,6 +401,99 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _pread_all(fd: int, n: int, off: int) -> bytes:
+    out = bytearray()
+    while len(out) < n:
+        b = os.pread(fd, n - len(out), off + len(out))
+        if not b:
+            break
+        out += b
+    return bytes(out)
+
+
+def compare_remote(reader, remote_path: str, lib_path: str, *, chunk: int | None = None,
+                   rereads: int | None = None, workers: int | None = None,
+                   sleep=time.sleep) -> dict:
+    """Compare the remote copy with ``lib_path`` byte for byte, by range reads.
+
+    Range reads are how tierfs plays the file, so they are what has to be right. AltMount
+    zero-fills a segment it could not fetch in time and still answers 206, so one read
+    that differs proves nothing: the chunk is read again, each time with a fresh request,
+    up to ``rereads`` times. A chunk that then matches counts as ``fixed``.
+
+    ``result`` is one of:
+      "ok"        every chunk matched (after rereads);
+      "size"      the remote size is not L's;
+      "mismatch"  a chunk came back the same wrong bytes on every read: the copy is not L;
+      "unstable"  a chunk came back different on each read and never right: a flaky read
+                  path, not proof that the copy is bad.
+    The first chunk that cannot be made to match ends the compare (``first_bad`` is its
+    offset; ``zero_filled`` says whether the remote bytes hold a zero run that L lacks).
+    Read errors that outlast the rereads raise AltMountError.
+    """
+    chunk = chunk or HASH_CHUNK
+    rereads = HASH_REREADS if rereads is None else rereads
+    workers = workers or HASH_WORKERS
+    local_size = os.path.getsize(lib_path)
+    remote_size = reader.size(remote_path)
+    out = {"result": "ok", "chunks": 0, "rereads": 0, "fixed": 0, "first_bad": None,
+           "zero_filled": False, "remote_size": remote_size, "local_size": local_size}
+    if remote_size != local_size:
+        out["result"] = "size"
+        return out
+    stop = threading.Event()
+
+    def one(fd, off):
+        if stop.is_set():
+            return None
+        n = min(chunk, local_size - off)
+        want = _pread_all(fd, n, off)
+        seen = []
+        for attempt in range(rereads + 1):
+            if attempt:
+                sleep(HASH_REREAD_PAUSE * attempt)
+            try:
+                got = reader.read_range(remote_path, off, n)
+            except AltMountError:
+                if attempt == rereads:
+                    if not seen:
+                        raise
+                    break
+                continue
+            if got == want:
+                return {"off": off, "rereads": attempt, "bad": None}
+            seen.append(got)
+        z = _ZEROS[:max(1, min(len(_ZEROS), n))]
+        zero = any(z in g and z not in want for g in seen)
+        # the same wrong bytes twice is a bad copy; one wrong read among errors is not
+        same = len({hashlib.sha256(g).digest() for g in seen}) == 1 and \
+            (len(seen) >= 2 or rereads == 0)
+        return {"off": off, "rereads": rereads, "bad": "mismatch" if same else "unstable",
+                "zero": zero}
+
+    fd = os.open(lib_path, os.O_RDONLY)
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            futs = [ex.submit(one, fd, off) for off in range(0, local_size, chunk)]
+            try:
+                for f in futs:  # in offset order, so first_bad is the lowest bad chunk
+                    r = f.result()
+                    if r is None:
+                        continue
+                    out["rereads"] += r["rereads"]
+                    if r["bad"]:
+                        out.update(result=r["bad"], first_bad=r["off"], zero_filled=r["zero"])
+                        stop.set()
+                        break
+                    out["chunks"] += 1
+                    out["fixed"] += 1 if r["rereads"] else 0
+            finally:
+                stop.set()  # an error or a bad chunk: the queued reads are skipped
+    finally:
+        os.close(fd)
+    return out
+
+
 def qualify(row: dict, *, reader, importer, indexers, stat_primary, stat_secondary,
             archive_dir: str, clock=time.time) -> QualifyResult:
     """Run the five steps. Every call records an attempt for the row (so ``oldest_first``
@@ -520,12 +623,18 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
         return fail("hash", "local_unreadable", error=type(e).__name__)
     fields["sha256"] = local
     try:
-        remote = reader.sha256_full(remote_path)
+        cmp = compare_remote(reader, remote_path, str(lib_path))
     except _ERRORS as e:
         return fail("hash", "read_failed", error=type(e).__name__)
-    if remote != local:
-        return fail("hash", "hash_mismatch")
-    steps["hash"] = {"ok": True}
+    info = {k: cmp[k] for k in ("chunks", "rereads", "fixed", "first_bad", "zero_filled")}
+    if cmp["result"] == "unstable":
+        # different wrong bytes on every read: the read path is flaky tonight, which
+        # proves nothing about the copy. Not tonight, and nothing is recorded.
+        return fail("hash", "hash_unsure", **info)
+    if cmp["result"] != "ok":
+        return fail("hash", "hash_mismatch", kind=cmp["result"], remote_size=cmp["remote_size"],
+                    local_size=cmp["local_size"], **info)
+    steps["hash"] = {"ok": True, **info}
 
     # 4. every segment on both providers
     for label, fn in present((("secondary", stat_secondary), ("primary", stat_primary))):

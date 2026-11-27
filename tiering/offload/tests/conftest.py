@@ -1,6 +1,6 @@
 import pytest
 
-from tiering.offload import nntp_stat, ops
+from tiering.offload import nntp_stat, ops, qualify
 
 
 @pytest.fixture(autouse=True)
@@ -28,3 +28,8 @@ def _no_grab_delay(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_nntp_backoff(monkeypatch):
     monkeypatch.setattr(nntp_stat, "BACKOFF_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_reread_pause(monkeypatch):
+    monkeypatch.setattr(qualify, "HASH_REREAD_PAUSE", 0.0)
