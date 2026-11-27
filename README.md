@@ -169,12 +169,22 @@ How it works, per upgrade download (a Sonarr/Radarr download that replaces an ex
 
 The sound is read with ffmpeg under the name `watch-align`, which tierfs treats as a background reader (remote reads, no promote).
 
+**Usenet (SABnzbd).** A paused job never finishes, so a Usenet upgrade is not held by pausing it. With `WATCH_HOLD=on`, `scripts/setup-usenet-arrs.py` sets the SABnzbd client's recent and older priority to Paused in both arrs (Radarr `recentMoviePriority`/`olderMoviePriority`, Sonarr `recentTvPriority`/`olderTvPriority`; the Paused value is read from the app's own field options), so every grab arrives paused. Each pass (and the Grab webhook) then looks every undecided paused job up in the arr's queue by its download id, once:
+- Not an upgrade (the item has no file): the job is resumed, nothing else changes.
+- An upgrade: the job is moved to the `watch-hold` SABnzbd category (own folder under the complete folder, defined by `usenet/render_sabnzbd_ini.py`) with `change_cat`, which works only on a queued job, and then resumed. The arr's category is kept as the way back. In that category the arr cannot see the job, and it downloads to completion like any other.
+- While it is held and complete, the new file is found and every resume point is mapped as for a torrent.
+- Release is an import, never an import under a stream. The sessions are read again right before the command, also at `WATCH_HOLD_MAX_HOURS` (the cap skips the mapping, never the stream check). The import is the arr's own scan command (`DownloadedMoviesScan` / `DownloadedEpisodesScan`) with `path` the completed folder as the arrs see it (`SABNZBD_COMPLETE_DIR` mapped to `SABNZBD_ARR_VISIBLE_DIR`), `downloadClientId` the job id as SABnzbd spells it and `importMode` Move. It is verified in the arr's history (or by the old file having been replaced) and retried up to 3 times, 2 minutes apart; only then is the SABnzbd history entry deleted with its files. The after-import writes of the previous section then run as for a torrent.
+- A held job that fails in SABnzbd is marked failed through the arr's `history/failed/{id}` for its grab, so the release is blocklisted and searched again.
+- A job already in SABnzbd's history when first seen cannot be held and is imported by the arr as usual; it is only counted (`usenet_late`).
+- With `WATCH_HOLD` not `on`, the setup script puts a Paused priority back to Default, so no job waits for a hold that is not running. Switching the hold off later puts queued held jobs back to their category; run the setup script again, and resume any job still paused in the SABnzbd queue.
+- In `dry` mode nothing is changed in SABnzbd or the arrs; the passes only count (`would_hold`, `would_resume`, `would_release`).
+
 `WATCH_HOLD` is `off`, `dry` (the default, also for any other value) or `on`. `dry` does the reads, the snapshots and the mapping and logs what it would do (`[watch] dry ... would_hold`, `would_wait_<reason>`, `would_write_offset`, `would_write_picks`), but never relabels a download, never delays an import and never writes to Plex. `off` releases any hold left from `on`. Logs carry counts and infohashes only; Plex tokens are never logged or stored.
 
 Not covered yet:
 - Downloads on a remote seedbox: held and choices carried over, but no resume point is mapped (the new file is not local until it is moved).
 - Season packs: held and choices carried over, but no resume point is mapped.
-- While a download is held the arr does not see it in its queue, so it could grab another release of the same upgrade; the dedupe passes do not look at the `watch-hold` label.
+- While a download is held (torrent or Usenet) the arr does not see it in its queue, so it could grab another release of the same upgrade; the dedupe passes do not look at the `watch-hold` label. Deluge has no guard against this and none was added for Usenet.
 - A held download is off the stuck-download ladder until it is released.
 - Offloaded old files: the webhook does not mount tierfs yet, so an old file that is only on the remote tier cannot be read; its download is released at `WATCH_HOLD_MAX_HOURS` without a mapped point.
 

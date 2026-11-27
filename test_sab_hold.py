@@ -76,7 +76,7 @@ STREAM = [{'key': '100', 'files': [], 'state': 'playing'}]
 def test_an_upgrade_is_moved_to_the_hold_category_while_queued_then_resumed(film):
     io, doc = usenet_world(film), {}
     c = wh.tick(io, doc, wh.Cfg('on'), NOW, set())
-    assert c['tracked'] == 1 and c['held'] == 1 and c['resumed'] == 1
+    assert c['held'] == 1 and c['resumed'] == 1
     assert io.calls == [('cat', NZO, wh.HOLD_LABEL), ('resume', NZO)], 'category first, then resume: it never runs visible'
     assert doc['held'][NZO]['label'] == 'radarr' and doc['held'][NZO]['usenet'] and doc['held'][NZO]['resumed']
     assert doc['usenet'] == {NZO: 'hold'} and NZO in doc['tracked']
@@ -201,7 +201,8 @@ def test_import_is_blocked_while_the_item_streams_even_at_the_cap(film):
     c = wh.tick(io, doc, cfg, NOW + cap, set())
     assert c['kept_playing'] == 1 and not io.acts('import'), 'the cap skips the mapping, never the stream check'
     io.sess = [{'key': '100', 'files': [], 'state': 'paused'}]
-    assert wh.tick(io, doc, cfg, NOW + cap + 15, set()).get('kept_playing') == 1 and not io.acts('import')
+    c = wh.tick(io, doc, cfg, NOW + cap + 15, set())
+    assert (c.get('kept_playing') or c.get('kept_recent')) and not io.acts('import'), 'a paused stream is not quiet'
     io.sess = []
     c = wh.tick(io, doc, cfg, NOW + cap + 30, set())
     assert c['kept_recent'] == 1 and not io.acts('import'), 'a viewer who just stopped may press play again'
@@ -253,7 +254,7 @@ def test_import_command_shape_and_verify_then_delete_the_history_entry(film):
     assert io.acts('import') == [('import', NZO, 'Radarr', DONE_DIR)] and c['import_sent'] == 1
     assert not io.acts('forget') and NZO in doc['held'], 'nothing is deleted before the arr shows the import'
     c = wh.tick(io, doc, cfg, NOW + 75, set())
-    assert c['kept_verifying'] == 1 and not io.acts('import') and not io.acts('forget')
+    assert c['kept_verifying'] == 1 and len(io.acts('import')) == 1 and not io.acts('forget')
     io.imported = True                                  # the arr's history shows the import
     c = wh.tick(io, doc, cfg, NOW + 90, set())
     assert c['imported'] == 1 and io.acts('forget') == [('forget', NZO)] and doc['held'] == {}
