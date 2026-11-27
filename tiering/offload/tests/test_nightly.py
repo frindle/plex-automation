@@ -88,7 +88,7 @@ def test_article_gone_on_every_provider_is_lost(env):
     hooked = []
     summary = {}
     env.run(lost_hook=lambda lost, info: hooked.append((lost, info)), summary=summary)
-    assert [l["id"] for l in hooked[0][0]] == [f"{1:016x}"]
+    assert [lo["id"] for lo in hooked[0][0]] == [f"{1:016x}"]
     assert hooked[0][1]["provider_trouble"] is False
     assert summary["lost"][0]["id"] == f"{1:016x}"
     assert any(e[1] == "articles_gone" for e in env.state.events)

@@ -797,8 +797,8 @@ class Runner:
         """Called by the nightly check, once, with the rows it confirmed lost."""
         rd = self.redownloader()
         if rd is None:
-            for l in lost:
-                self._once("lost_file", str(l["id"]), reason="no automatic re-download")
+            for lr in lost:
+                self._once("lost_file", str(lr["id"]), reason="no automatic re-download")
             return
         try:
             rd.process(db, lost, info, now=self.clock())

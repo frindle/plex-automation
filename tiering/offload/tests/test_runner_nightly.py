@@ -8,10 +8,9 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 
 from fakes_intake import FakeArr  # noqa: E402
-from offload import redownload  # noqa: E402
 from offload.runner import Config  # noqa: E402
 from test_runner_contract import Rig, Res  # noqa: E402
-from test_weekly import DAY15, ids_for  # noqa: E402
+from test_weekly import ids_for  # noqa: E402
 from tiering.offload import state as st  # noqa: E402
 from tiering.offload import weekly  # noqa: E402
 from tiering.offload.register import ArrClient  # noqa: E402

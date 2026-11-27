@@ -217,10 +217,10 @@ class Redownload:
         every guard passes, the acting."""
         now = self.clock() if now is None else now
         p = self.pending(db)
-        for l in lost:
-            row = self.state.get(db, l["id"])
-            if row is not None and l["id"] not in p:
-                p[l["id"]] = {"kind": "b", "since": now}
+        for lr in lost:
+            row = self.state.get(db, lr["id"])
+            if row is not None and lr["id"] not in p:
+                p[lr["id"]] = {"kind": "b", "since": now}
         if p != self.pending(db):
             self._save_pending(db, p)
         if not self.enabled:
