@@ -250,3 +250,19 @@ def test_does_not_touch_non_offloaded_rows(env):
     env.run()
     assert "Files offloaded: 3." in env.text()
     assert "last_check_ts" not in env.state.rows[f"{0:016x}"]
+
+
+def test_single_provider_checks_the_primary_alone(env):
+    """TIERING_SINGLE_PROVIDER: stat_secondary is None; a segment the primary lost still flags."""
+    env.sec.ids.clear()  # would flag every row if the secondary were asked
+    env.prim.ids.discard(ids_for("Bravo")[4])
+    p = ns.Checker(env.prim.cfg())
+    try:
+        promote = weekly.run_weekly(None, stat_primary=p, stat_secondary=None, indexers=env.indexers,
+                                    report_path=env.report, state=env.state, now=DAY15)
+    finally:
+        p.close()
+    by = {r["title"]: r["promote_reasons"] for r in promote}
+    assert by == {"Bravo": ["missing_segments_primary"], "Charlie": ["no_restore_path"]}
+    assert env.sec.stats == 0
+    assert env.state.rows[f"{0:016x}"]["last_stat_ok_ts"] == DAY15
