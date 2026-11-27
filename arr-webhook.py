@@ -6824,6 +6824,60 @@ def sonarr_webhook():
             threading.Thread(target=handle_import_relabel, args=(data, 'Sonarr'), daemon=True).start()
     return jsonify({'status': 'ok'}), 200
 
+# ── Seerr request -> home import lists ───────────────────────────────────────
+# While another Sonarr/Radarr pair takes the requests (a move to a seedbox), the home arrs learn about new
+# items only through Sonarr/Radarr-type import lists, which each arr fetches at most every 15 minutes. A
+# download that finishes before that fetch has no movie/series at home and needs manual import. Seerr's
+# webhook on approval syncs those lists at once, twice (the other arr may still be adding the item on the
+# first pass). Other list kinds are untouched; with no such list (normal running) this does nothing.
+SEERR_SYNC_AT = (20, 120)                      # seconds after the webhook
+_SEERR_SYNC_TYPES = {'MEDIA_APPROVED', 'MEDIA_AUTO_APPROVED'}
+_ARR_LIST_KINDS = {'Sonarr': 'SonarrImport', 'Radarr': 'RadarrImport'}
+
+
+def sync_arr_import_lists(who):
+    """Start every enabled, auto-adding Sonarr/Radarr-type import list on the home arr. Returns how many."""
+    url, key = (SONARR_URL, SONARR_API_KEY) if who == 'Sonarr' else (RADARR_URL, RADARR_API_KEY)
+    if not key:
+        return 0
+    resp = requests.get(f'{url}/api/v3/importlist', headers={'X-Api-Key': key}, timeout=20)
+    resp.raise_for_status()
+    n = 0
+    for lst in resp.json() or []:
+        auto = lst.get('enableAutomaticAdd', lst.get('enableAuto', False))   # Sonarr / Radarr field names
+        if lst.get('implementation') != _ARR_LIST_KINDS[who] or not lst.get('enabled', True) or not auto:
+            continue
+        requests.post(f'{url}/api/v3/command', headers={'X-Api-Key': key},
+                      json={'name': 'ImportListSync', 'definitionId': lst['id']}, timeout=20).raise_for_status()
+        n += 1
+    return n
+
+
+def _seerr_sync_job(whos, sleep=time.sleep):
+    waited = 0
+    for at in SEERR_SYNC_AT:
+        sleep(max(0, at - waited))
+        waited = at
+        for who in whos:
+            try:
+                n = sync_arr_import_lists(who)
+                if n:
+                    log.info(f'[seerr-sync] {who}: {n} import list(s) synced')
+            except Exception as e:  # noqa: BLE001
+                log.warning(f'[seerr-sync] {who}: list sync failed ({type(e).__name__})')
+
+
+@app.route('/webhook/seerr', methods=['POST'])
+def seerr_webhook():
+    data = request.get_json(force=True, silent=True) or {}
+    kind = str(data.get('notification_type') or '')
+    log.info(f'Seerr event: {kind or "?"}')
+    if kind in _SEERR_SYNC_TYPES:
+        mt = str((data.get('media') or {}).get('media_type') or '').lower()
+        whos = ['Radarr'] if mt == 'movie' else ['Sonarr'] if mt == 'tv' else ['Sonarr', 'Radarr']
+        threading.Thread(target=_seerr_sync_job, args=(whos,), daemon=True).start()
+    return jsonify({'status': 'ok'}), 200
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'}), 200
