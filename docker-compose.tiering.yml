@@ -154,7 +154,7 @@ services:
       PORT: "8480"
       JWT_SECRET: "${ALTMOUNT_JWT_SECRET:-}"
       # Must match the address the web UI is opened at.
-      COOKIE_DOMAIN: "${ALTMOUNT_COOKIE_DOMAIN:-${TIERING_IP}}"
+      COOKIE_DOMAIN: "${TIERING_IP:?set TIERING_IP in .env}"
     volumes:
       - "${ALTMOUNT_CONFIG_DIR:-/mnt/user/appdata/altmount}:/config"
 
