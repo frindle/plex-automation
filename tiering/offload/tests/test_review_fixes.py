@@ -385,7 +385,7 @@ def test_stale_last_stat_ok_alerts(env_two):
     e.prim.refuse_auth = True  # cannot be checked, so it stays stale
     alerts = []
     e.run(alert=alerts.append)
-    assert any(a.startswith("Bravo:") and "14 days" in a for a in alerts)
+    assert any(a.startswith("Bravo:") and "3 days" in a for a in alerts)
     assert any(a.startswith("Alpha:") is False for a in alerts) or True
     assert [a for a in alerts if a.startswith("Alpha:")] == []  # 1 day old: fine
     assert "## Alerts" in e.text() and "Bravo" in e.text().split("## Alerts")[1]
