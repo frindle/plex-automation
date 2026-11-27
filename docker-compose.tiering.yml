@@ -50,6 +50,9 @@ services:
       TIERING_NEVER_SECTIONS: "${TIERING_NEVER_SECTIONS:-Adult}"
       TIERING_KEEP_4K: "${TIERING_KEEP_4K:-0}"
       TIERING_MAX_STREAM_KBPS: "${TIERING_MAX_STREAM_KBPS:-0}"
+      # Optional demote allowlist for a first live test (tiering/README.md). Empty = no
+      # restriction. A list file must be a container path, e.g. @/state/only-paths.txt.
+      TIERING_ONLY_PATHS: "${TIERING_ONLY_PATHS:-}"
       # Promote: seconds a failing chunk fetch is retried, and promotes run at once.
       TIERING_PROMOTE_RETRY_S: "${TIERING_PROMOTE_RETRY_S:-600}"
       TIERING_PROMOTE_CONCURRENCY: "${TIERING_PROMOTE_CONCURRENCY:-2}"
