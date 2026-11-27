@@ -7,7 +7,8 @@
 3. hash ``lib_path`` itself with a fresh full read, read the remote copy back
    through WebDAV, and require the two SHA-256 to be equal. A stored ``sha256``
    is never trusted;
-4. STAT every segment on the secondary and the primary provider: none missing;
+4. STAT every segment on the secondary and the primary provider: none missing
+   (the primary alone when TIERING_SINGLE_PROVIDER left the secondary out);
 5. restore path: another release of the same title, at least the resolution
    floor, that is a different upload (it shares no message-id with our NZB) and
    whose every segment is on both providers, like ``nzb_path``'s.
@@ -171,6 +172,12 @@ def stat_nzb_bytes(raw: bytes, providers, tmp_dir: str, dead: dict | None = None
             os.unlink(tmp)
         except OSError:
             pass
+
+
+def present(providers) -> tuple:
+    """The providers that are set up. With TIERING_SINGLE_PROVIDER the secondary is None
+    and every check runs on the primary alone."""
+    return tuple((label, fn) for label, fn in providers if fn is not None)
 
 
 def _stat_ok(raw: bytes, providers, tmp_dir: str, dead: dict):
@@ -521,7 +528,7 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
     steps["hash"] = {"ok": True}
 
     # 4. every segment on both providers
-    for label, fn in (("secondary", stat_secondary), ("primary", stat_primary)):
+    for label, fn in present((("secondary", stat_secondary), ("primary", stat_primary))):
         try:
             res = fn(nzb_path)
         except NntpUnavailable as e:
@@ -540,7 +547,7 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
 
     # 5. restore path: a different upload, checked on every provider like nzb_path
     fields["nzb_path2"] = None  # a stored one belongs to the release that was; set again below
-    providers = (("secondary", stat_secondary), ("primary", stat_primary))
+    providers = present((("secondary", stat_secondary), ("primary", stat_primary)))
     dead_providers: dict = {}
 
     def verify(raw: bytes):

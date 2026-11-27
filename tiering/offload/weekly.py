@@ -2,7 +2,8 @@
 
 There are no backups, so this is the safety net. For every offloaded row it:
 
-- runs a 100% STAT of the row's NZB on both providers;
+- runs a 100% STAT of the row's NZB on both providers (the primary alone with
+  TIERING_SINGLE_PROVIDER);
 - re-checks the restore path;
 - flags the row for promotion at once if a segment is missing or there is no
   restore path.
@@ -62,7 +63,7 @@ from datetime import datetime, timezone
 
 from .newznab import NewznabError, archive_nzb, nzb_segment_ids, read_archived
 from .nntp_stat import NntpUnavailable
-from .qualify import _SOFT, score_restore, stat_nzb_bytes, stat_status
+from .qualify import _SOFT, present, score_restore, stat_nzb_bytes, stat_status
 
 STALE_DAYS = 14
 STREAK = 3
@@ -140,7 +141,7 @@ def run_weekly(db, *, stat_primary, stat_secondary, indexers, report_path: str,
     rows = state.list_files(db, "offloaded")
     res: dict[str, dict] = {}
     dead: dict[str, str] = {}  # provider label -> kind, once it cannot be asked
-    providers = (("primary", stat_primary), ("secondary", stat_secondary))
+    providers = present((("primary", stat_primary), ("secondary", stat_secondary)))
     promote: list[dict] = []
     alerts: list[str] = []
     full = {"files": 0, "bytes": 0, "mismatch": 0}

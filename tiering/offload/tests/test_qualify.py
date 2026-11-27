@@ -263,3 +263,36 @@ def test_identity_parses_release_name():
     assert (i["title"], i["year"]) == ("The Big Movie", 2019)
     i = q.identity({"release_name": "Some.Show.S03E11.720p.HDTV-X"})
     assert (i["title"], i["season"], i["episode"]) == ("Some Show", 3, 11)
+
+
+def test_single_provider_qualifies_on_the_primary_alone(world):
+    """TIERING_SINGLE_PROVIDER: stat_secondary is None, every STAT runs on the primary."""
+    reader = am.WebDavReader(world.dav.url, "u", "p")
+    importer = am.ImportClient(world.am.url, APIKEY, reader=reader, mount_path="/mnt/am",
+                               poll_interval=0, sleep=lambda s: None)
+    indexers = nz.NewznabClient([nz.Indexer("one", world.nz.url, "nzkey")])
+    p = ns.Checker(world.prim.cfg())
+    try:
+        r = q.qualify(world.row, reader=reader, importer=importer, indexers=indexers,
+                      stat_primary=p, stat_secondary=None, archive_dir=world.archive)
+    finally:
+        p.close()
+    assert r.ok and r.reasons == []
+    assert "stat_secondary" not in r.steps and r.steps["stat_primary"]["ok"]
+    assert r.fields["restore_score"] == 1
+    assert world.prim.stats == 45 and world.sec.stats == 0
+
+
+def test_single_provider_still_fails_on_a_missing_primary_segment(world):
+    world.prim.ids.discard(IDS[7])
+    reader = am.WebDavReader(world.dav.url, "u", "p")
+    importer = am.ImportClient(world.am.url, APIKEY, reader=reader, mount_path="/mnt/am",
+                               poll_interval=0, sleep=lambda s: None)
+    indexers = nz.NewznabClient([nz.Indexer("one", world.nz.url, "nzkey")])
+    p = ns.Checker(world.prim.cfg())
+    try:
+        r = q.qualify(world.row, reader=reader, importer=importer, indexers=indexers,
+                      stat_primary=p, stat_secondary=None, archive_dir=world.archive)
+    finally:
+        p.close()
+    assert not r.ok and r.reasons == ["missing_segments_primary"]

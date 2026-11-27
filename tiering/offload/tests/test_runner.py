@@ -941,7 +941,8 @@ def _fake_intake(monkeypatch, calls):
     class Cfg:
         @staticmethod
         def from_env(name, env=None):
-            return None if name == "secondary" and "NO_SECONDARY" in (env or {}) else name
+            e = env or {}
+            return None if ("NO_SECONDARY" in e and name == "secondary") or ("NO_PRIMARY" in e and name == "primary") else name
 
     mk("nntp_stat", ProviderCfg=Cfg, Checker=lambda cfg: ("checker", cfg))
     mk("newznab", load_indexers=lambda raw: [("idx", raw)],
@@ -982,6 +983,13 @@ def test_wiring_builds_clients_from_env(tmp_path, monkeypatch):
     with pytest.raises(wiring.WiringError):
         wiring.check(bad)
     assert len(calls) == 2
+    # TIERING_SINGLE_PROVIDER accepts the primary alone: no secondary checker
+    one = {**bad, "TIERING_SINGLE_PROVIDER": "1"}
+    wiring.check(one)
+    wiring.qualify_from_env(one)({"id": "d"})
+    assert calls[2][1]["stat_primary"] == ("checker", "primary") and calls[2][1]["stat_secondary"] is None
+    with pytest.raises(wiring.WiringError):  # never the primary
+        wiring.check({**one, "NO_PRIMARY": "1"})
 
 
 def test_dry_run_loads_without_usenet_settings_apply_does_not(tmp_path, monkeypatch):

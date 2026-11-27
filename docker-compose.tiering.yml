@@ -101,6 +101,8 @@ services:
       NNTP_SECONDARY_PORT: "${NNTP_SECONDARY_PORT:-563}"
       NNTP_SECONDARY_USER: "${NNTP_SECONDARY_USER:-}"
       NNTP_SECONDARY_PASS: "${NNTP_SECONDARY_PASS:-}"
+      # 1 = run with the primary provider alone (no secondary set up): every STAT runs on it only.
+      TIERING_SINGLE_PROVIDER: "${TIERING_SINGLE_PROVIDER:-0}"
     # Both /healthz endpoints (tierfs and the runner); a paused runner counts as healthy.
     healthcheck:
       test: ["CMD", "python", "-m", "offload.supervise", "--health"]

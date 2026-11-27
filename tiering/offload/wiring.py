@@ -5,7 +5,9 @@ The intake modules are imported inside the function, so the runner and its
 tests import without them.
 
 Environment (all read by the client constructors, none logged):
-  NNTP_PRIMARY_* and NNTP_SECONDARY_*   both providers are required
+  NNTP_PRIMARY_* and NNTP_SECONDARY_*   both providers are required, unless
+  TIERING_SINGLE_PROVIDER=1             accepts the primary alone: every STAT then runs on it
+                                        only (a first test, or until a second provider is set up)
   NEWZNAB_INDEXERS                      JSON list of indexers
   ALTMOUNT_URL, ALTMOUNT_API_KEY, ALTMOUNT_MOUNT_PATH, ALTMOUNT_CATEGORY
   TIERFS_REMOTE_BASE, TIERFS_REMOTE_USER, TIERFS_REMOTE_PASS   WebDAV reader
@@ -17,8 +19,11 @@ Environment (all read by the client constructors, none logged):
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 import threading
+
+log = logging.getLogger(__name__)
 
 
 class WiringError(Exception):
@@ -44,11 +49,13 @@ class Clients:
 
     def __init__(self, e):
         nntp, newznab, altmount = (_mod(n) for n in ("nntp_stat", "newznab", "altmount"))
+        single = (e.get("TIERING_SINGLE_PROVIDER") or "").strip().lower() in ("1", "true", "yes")
         cfgs = {}
         for name in ("primary", "secondary"):
             cfg = nntp.ProviderCfg.from_env(name, e)
-            if cfg is None:
-                raise WiringError(f"NNTP_{name.upper()}_HOST is not set")
+            if cfg is None and not (name == "secondary" and single):
+                hint = " (TIERING_SINGLE_PROVIDER=1 accepts the primary alone)" if name == "secondary" else ""
+                raise WiringError(f"NNTP_{name.upper()}_HOST is not set{hint}")
             cfgs[name] = cfg
         self.archive = e.get("TIERING_NZB_DIR") or _beside_db(e, "nzb")
         self.report = e.get("TIERING_WEEKLY_REPORT") or _beside_db(e, "weekly_report.md")
@@ -58,7 +65,9 @@ class Clients:
         self.reader = altmount.WebDavReader()
         self.importer = altmount.ImportClient(reader=self.reader)
         self.stat_primary = nntp.Checker(cfgs["primary"])
-        self.stat_secondary = nntp.Checker(cfgs["secondary"])
+        self.stat_secondary = None if cfgs["secondary"] is None else nntp.Checker(cfgs["secondary"])
+        if self.stat_secondary is None:
+            log.warning("TIERING_SINGLE_PROVIDER: no secondary NNTP provider; every STAT runs on the primary alone")
 
 
 def clients(env=None) -> Clients:
