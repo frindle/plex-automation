@@ -66,8 +66,11 @@ HASH_CHUNK = 16 << 20  # bytes per range read when the remote copy is compared w
 HASH_REREADS = 2  # fresh reads of a chunk that differs, before the difference counts
 HASH_REREAD_PAUSE = 2.0  # seconds before a reread (times its number)
 HASH_WORKERS = 4  # range reads in flight during the compare
-HASH_FAULT_PAUSES = (30.0, 120.0)  # waits before the last reads of a chunk AltMount serves wrong
-HASH_FAULT_MAX = 3  # chunks one compare waits out like that; more is a read fault at once
+# Waits before each late read of a chunk AltMount serves wrong while the upload is L (17.5
+# min in all). Seen live: a segment AltMount had restarted mid-read was served with its own
+# head repeated for over 10 minutes, to every reader, then right again.
+HASH_FAULT_PAUSES = (30.0, 120.0, 300.0, 600.0)
+HASH_FAULT_MAX = 2  # chunks one compare waits out like that; more is a read fault at once
 _ZEROS = b"\0" * (64 << 10)  # a run this long in the remote chunk, not in L: zero-filled
 
 
@@ -431,8 +434,9 @@ def compare_remote(reader, remote_path: str, lib_path: str, *, chunk: int | None
     that differs proves nothing: the chunk is read again, each time with a fresh request,
     up to ``rereads`` times. A chunk that then matches counts as ``fixed``.
 
-    AltMount has also served the same wrong bytes for a chunk on every quick reread while
-    the articles held L's bytes. So a chunk that stays wrong is put to ``usenet(off, n)``
+    AltMount has also served the same wrong bytes for a chunk on every read for minutes
+    while the articles held L's bytes (a segment restarted mid-read, its head served
+    again where its tail belongs). So a chunk that stays wrong is put to ``usenet(off, n)``
     (``UsenetFile.read``: the bytes the upload really holds, CRC-checked) when it is given:
       the upload is not L there   -> "mismatch", whatever the reads said;
       the upload is L there       -> AltMount's fault, not the copy's. The chunk is read

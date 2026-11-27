@@ -137,7 +137,7 @@ def test_a_missing_article_cannot_tell(srv):
     try:
         assert u.read(0, 100) == data[:100]
         with pytest.raises(ur.CannotTell):
-            u.read(len(data) - 100, 100)
+            u.read(5000, 100)  # in the third part
     finally:
         u.close()
 
@@ -179,7 +179,7 @@ def lib(tmp_path):
 
 def cmp(reader, path, usenet, **kw):
     kw.setdefault("workers", 1)
-    kw.setdefault("fault_pauses", (30.0, 120.0))
+    kw.setdefault("fault_pauses", (30.0, 120.0))  # the default is longer
     naps = []
     r = q.compare_remote(reader, "/r.mkv", path, chunk=CH, sleep=naps.append, usenet=usenet, **kw)
     return r, naps
@@ -247,7 +247,7 @@ def test_good_reads_never_ask_the_upload(lib):
 def world(tmp_path, monkeypatch):
     monkeypatch.setattr(q, "HASH_CHUNK", 8192)
     monkeypatch.setattr(q, "HASH_REREAD_PAUSE", 0.0)
-    monkeypatch.setattr(q, "HASH_FAULT_PAUSES", (0.0, 0.0))
+    monkeypatch.setattr(q, "HASH_FAULT_PAUSES", (0.0, 0.0, 0.0))
     w = World(tmp_path)
     yield w
     w.close()
@@ -277,7 +277,7 @@ def test_qualify_read_fault_is_not_tonight_and_not_a_mismatch(world, monkeypatch
 
 def test_qualify_passes_when_the_fault_clears(world, monkeypatch):
     post(world.prim, world.content, IDS)
-    _zeros_at(monkeypatch, 16384, 4)  # three quick reads and the first long wait
+    _zeros_at(monkeypatch, 16384, 5)  # three quick reads and two late ones
     r = world.run()
     assert r.ok, r.steps
     assert r.steps["hash"]["read_faults"] == 1
