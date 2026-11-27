@@ -18,10 +18,16 @@
 #   SABNZBD_CONNECTIONS  connections for SABnzbd. With ALTMOUNT_CONNECTIONS it must stay at or under
 #                        USENET_ACCOUNT_CONNECTIONS; SABnzbd is clamped to the difference.
 # The cap applies to downloads only; AltMount's stream and promote reads are not limited by it.
+#
+# Imports: Radarr and Sonarr MOVE a finished SABnzbd download into the library (they hardlink or copy
+# only torrents, which have to keep seeding). A Usenet download has nothing to seed, so the complete
+# folder is emptied by the import; that is intended.
+# SABNZBD_URL must use the container's IP, not a hostname: SABnzbd answers only to names in its
+# host_whitelist, and an IP is accepted without listing it.
 
 services:
   sabnzbd:
-    image: "${SABNZBD_IMAGE:-lscr.io/linuxserver/sabnzbd:4.5.3}"
+    image: "${SABNZBD_IMAGE:-lscr.io/linuxserver/sabnzbd:4.5.3-ls234}"
     container_name: sabnzbd
     restart: unless-stopped
     environment:
@@ -32,6 +38,7 @@ services:
       NNTP_PRIMARY_PORT: "${NNTP_PRIMARY_PORT:-563}"
       NNTP_PRIMARY_USER: "${NNTP_PRIMARY_USER:-}"
       NNTP_PRIMARY_PASS: "${NNTP_PRIMARY_PASS:-}"
+      NNTP_PRIMARY_CONNS: "${NNTP_PRIMARY_CONNS:-8}"   # the tiering STAT checks use this many of the account's connections
       SABNZBD_MAX_MBIT: "${SABNZBD_MAX_MBIT:-750}"
       SABNZBD_CONNECTIONS: "${SABNZBD_CONNECTIONS:?set SABNZBD_CONNECTIONS in .env}"
       ALTMOUNT_CONNECTIONS: "${ALTMOUNT_CONNECTIONS:?set ALTMOUNT_CONNECTIONS in .env (what AltMount's provider uses)}"
@@ -41,14 +48,15 @@ services:
       SABNZBD_INCOMPLETE_DIR: "${SABNZBD_INCOMPLETE_DIR:-/incomplete-downloads}"
       SABNZBD_CATEGORY_RADARR: "${SABNZBD_CATEGORY_RADARR:-radarr}"
       SABNZBD_CATEGORY_SONARR: "${SABNZBD_CATEGORY_SONARR:-sonarr}"
-    mac_address: "${SABNZBD_MAC:-02:8e:b2:5d:a1:39}"
+    mac_address: "${SABNZBD_MAC:?set SABNZBD_MAC in .env}"
     networks:
       br0:
         ipv4_address: "${SABNZBD_IP:?set SABNZBD_IP in .env}"
     volumes:
       - "${SABNZBD_CONFIG_DIR:-/mnt/user/appdata/sabnzbd}:/config"
       # Completed downloads, at the SAME container path the arrs see (SABNZBD_COMPLETE_DIR), so no
-      # remote path mapping is needed. The setup script reads the arrs' Deluge layout and checks it.
+      # remote path mapping is needed. setup-usenet-arrs.py prints the arrs' Deluge layout and root
+      # folders for you to compare; it does not check them.
       - "${SABNZBD_COMPLETE_HOST:?set SABNZBD_COMPLETE_HOST in .env}:${SABNZBD_COMPLETE_DIR:?set SABNZBD_COMPLETE_DIR in .env}"
       - "${SABNZBD_INCOMPLETE_HOST:-/mnt/cache/appdata/sabnzbd/incomplete}:${SABNZBD_INCOMPLETE_DIR:-/incomplete-downloads}"
       - "./usenet/render_sabnzbd_ini.py:/render/render_sabnzbd_ini.py:ro"

@@ -2,15 +2,16 @@
 
 The watch hold keeps an upgrade from being imported while someone streams the item it replaces. For a
 torrent it moves the download to a hold label the *arr does not read, and puts the label back on release.
-A SABnzbd download has the same lever: its category. Radarr and Sonarr only look at downloads in their own
-category, so a download moved to the hold category is out of the *arr's queue until it is moved back.
+A SABnzbd download is held by pausing it: mode=queue&name=pause, resumed on release. Its category is
+never touched (the *arr keeps its own category, and SABnzbd's change_cat only works on queued jobs, so a
+category swap would also leave the release unable to put it back). A paused job stops downloading, so it
+cannot finish and be imported; the *arr sees it as paused. rows() reports a paused job under the hold
+label, so watch_hold treats it like a Deluge download wearing the hold label.
 
-The one difference: SABnzbd can change the category of a queued download (downloading, paused, being
-repaired or unpacked), not of one already in its history. The hold therefore takes a Usenet download while
-it is still in the queue; one that completed before the hold was wanted is imported as usual (the
-`usenet_late` count in the log). With the cap at 750 Mbit/s an episode can finish within a pass, so the
-hold is taken as soon as the download is tracked and someone streams the item or a resume point has to be
-mapped, not at the half-way mark that torrents use.
+Only a queued download can be paused. One that completed before the hold was wanted (in SABnzbd's history)
+is imported as usual (the `usenet_late` count in the log). With the cap at 750 Mbit/s an episode can finish
+within a pass, so the hold is taken as soon as the download is tracked and someone streams the item or a
+resume point has to be mapped, not at the half-way mark that torrents use.
 
 This module only talks to SABnzbd and maps its rows onto the shape watch_hold already reads from Deluge
 ({label, is_finished, progress}). Logs carry nzo ids and counts only; the API key is never logged and is
@@ -23,6 +24,7 @@ import posixpath
 
 VIDEO_EXTS = ('.mkv', '.mp4', '.avi', '.m4v', '.mov', '.ts', '.wmv')
 ID_PREFIX = 'sabnzbd_nzo_'
+HOLD_LABEL = 'watch-hold'   # what a paused job is reported as; same as watch_hold.HOLD_LABEL
 _TIMEOUT = 20
 
 
@@ -35,10 +37,9 @@ def is_usenet_id(h) -> bool:
 
 
 class Sab:
-    def __init__(self, url, key, http=None, hold_category='watch-hold'):
+    def __init__(self, url, key, http=None):
         self.url = (url or '').rstrip('/')
         self._key = key or ''
-        self.hold_category = hold_category
         self._ids = {}   # lowercase nzo id -> the id as SABnzbd spelled it (the *arr's downloadId is lowercased here)
         if http is None:
             import requests
@@ -74,8 +75,11 @@ class Sab:
         h = str(h)
         return self._ids.get(h.lower()) or ('SABnzbd_nzo_' + h[len(ID_PREFIX):])
 
-    def change_category(self, h, category):
-        self._call('change_cat', value=self.original_id(h), value2=category)
+    def pause(self, h):
+        self._call('queue', name='pause', value=self.original_id(h))
+
+    def resume(self, h):
+        self._call('queue', name='resume', value=self.original_id(h))
 
 
 def rows(sab: Sab):
@@ -91,7 +95,8 @@ def rows(sab: Sab):
             pct = float(s.get('percentage') or 0)
         except (TypeError, ValueError):
             pct = 0.0
-        out[h] = {'label': str(s.get('cat') or ''), 'is_finished': False, 'progress': pct, 'usenet': True,
+        paused = str(s.get('status') or '').lower() == 'paused'
+        out[h] = {'label': HOLD_LABEL if paused else str(s.get('cat') or ''), 'is_finished': False, 'progress': pct, 'usenet': True,
                   'status': str(s.get('status') or '')}
     for s in sab.history():
         h = str(s.get('nzo_id') or '').lower()

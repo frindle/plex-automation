@@ -192,3 +192,24 @@ def test_missing_settings_skip_instead_of_failing(apis, capsys):
     assert run(env, apis) == 0
     out = capsys.readouterr().out
     assert 'download client skipped' in out and 'indexers skipped' in out
+
+
+def test_client_is_matched_by_host_not_the_first_sabnzbd_type(apis):
+    other = {**schema_sab('movieCategory'), 'id': 7, 'name': 'AltMount', 'enable': True}
+    su.set_fields(other, {'host': 'altmount.invalid', 'port': 8080, 'useSsl': False, 'urlBase': '', 'movieCategory': 'radarr',
+                          'apiKey': '********'})
+    apis['Radarr'].d['/downloadclient'] = [other]
+    run(ENV, apis, apply=True)
+    w = [(m, p) for m, p, _ in apis['Radarr'].writes if p.startswith('/downloadclient')]
+    assert w == [('POST', '/downloadclient')], 'the other SABnzbd-type client is left alone and a new one added'
+    assert apis['Radarr'].d['/downloadclient'][0]['id'] == 7
+
+
+def test_generic_newznab_schema_is_chosen_by_name(apis):
+    preset = {'implementation': 'Newznab', 'name': 'SomePreset', 'fields': [{'name': 'baseUrl', 'value': 'https://preset.invalid'},
+                                                                           {'name': 'apiPath', 'value': '/x'}, {'name': 'apiKey', 'value': None}]}
+    generic = {**SCHEMA_NEWZNAB, 'name': 'Newznab'}
+    apis['Radarr'].schemas['/indexer/schema'] = [preset, generic]
+    run(ENV, apis, apply=True)
+    ix = next(b for m, p, b in apis['Radarr'].writes if p == '/indexer')
+    assert ix['name'] != 'SomePreset' and su.fields_map(ix)['baseUrl'] == 'https://ix.invalid'

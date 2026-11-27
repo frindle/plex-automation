@@ -42,7 +42,7 @@ def test_connections_stay_under_the_account_limit():
 
 def test_server_entry_is_written_with_clamped_connections():
     out, rep = r.render('', {**ENV, 'SABNZBD_CONNECTIONS': '99'})
-    assert rep['server'] and 'connections = 22' in out
+    assert rep['server'] and 'connections = 14' in out      # 30 - AltMount 8 - STAT pool 8 (default)
     assert 'host = news.invalid' in out and 'username = someuser' in out
     assert 'ssl = 1' in out and '[[usenet]]' in out and '[servers]' in out
 
@@ -75,10 +75,11 @@ def test_idempotent_and_keeps_other_lines():
     assert once.count('bandwidth_max') == 1 and once.count('[[usenet]]') == 1 and once.count('[servers]') == 1
 
 
-def test_categories_exist_including_the_hold_category():
+def test_categories_exist():
     out, _ = r.render('', ENV)
-    for c in ('radarr', 'sonarr', 'watch-hold'):
+    for c in ('radarr', 'sonarr'):
         assert f'[[{c}]]' in out
+    assert 'watch-hold' not in out, 'the hold is a pause, no category is needed'
     out, _ = r.render('', {**ENV, 'SABNZBD_CATEGORY_RADARR': 'movies-usenet'})
     assert '[[movies-usenet]]' in out
 
@@ -109,3 +110,30 @@ def test_new_child_section_lands_under_its_own_parent():
     lines = out.splitlines()
     assert r._find(lines, ('servers', 'usenet')) is not None and r._find(lines, ('categories', 'radarr')) is not None
     assert lines.index('[[usenet]]') < lines.index('[categories]')
+
+
+def test_stat_pool_is_subtracted_and_no_room_switches_the_old_entry_off():
+    assert r.connections(12, 8, 30, 8) == (12, '') and r.connections(20, 8, 30, 8)[0] == 14
+    assert r.connections(5, 8, 30, 22)[0] is None
+    once, _ = r.render('', ENV)
+    assert 'enable = 1' in once
+    out, rep = r.render(once, {**ENV, 'NNTP_PRIMARY_CONNS': '22'})
+    assert not rep['server'] and 'enable = 0' in out and 'enable = 1' not in out and rep['notes']
+    again, rep2 = r.render(out, {**ENV, 'NNTP_PRIMARY_CONNS': '22'})
+    assert again == out and rep2['changed'] == 0
+    # credentials removed: same switch-off
+    out2, _ = r.render(once, {k: v for k, v in ENV.items() if k != 'NNTP_PRIMARY_PASS'})
+    assert 'enable = 0' in out2
+
+
+def test_file_is_chowned_to_puid_pgid_before_the_replace(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(os, 'fchown', lambda fd, u, g: calls.append((u, g)))
+    p = tmp_path / 'sabnzbd.ini'
+    assert r.write_private(str(p), 'x\n', 99, 100) and calls == [(99, 100)]
+    calls.clear()
+    p2, p3 = tmp_path / 'b.ini', tmp_path / 'c.ini'
+    assert r.main([str(p2)], {**ENV, 'PUID': '1000', 'PGID': '1001'}) == 0 and calls == [(1000, 1001)]
+    calls.clear()
+    assert r.main([str(p3)], ENV) == 0 and calls == [(99, 100)]      # default 99/100
+    assert stat.S_IMODE(os.stat(p3).st_mode) == 0o600

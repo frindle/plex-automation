@@ -14,12 +14,14 @@ Reads (all from the container environment):
   USENET_ACCOUNT_CONNECTIONS         the account's connection limit
   SABNZBD_API_KEY                    set as SABNZBD's own API key when given
   SABNZBD_COMPLETE_DIR / SABNZBD_INCOMPLETE_DIR   container paths
-  SABNZBD_CATEGORY_RADARR / _SONARR / _HOLD       categories (radarr, sonarr, watch-hold)
+  SABNZBD_CATEGORY_RADARR / _SONARR               categories (radarr, sonarr)
+  PUID / PGID                        owner of sabnzbd.ini (default 99/100), so SABnzbd can read it
 
-SABnzbd and AltMount use the same account, so the two must stay at or under the account limit.
-SABNZBD_CONNECTIONS is clamped to USENET_ACCOUNT_CONNECTIONS - ALTMOUNT_CONNECTIONS; with no room
-left, or any of the three unset, no server entry is written (a download app with no server is
-harmless; one that takes streams' connections is not).
+SABnzbd, AltMount and the tiering STAT checks (NNTP_PRIMARY_CONNS, default 8) use the same account, so
+the three must stay at or under the account limit. SABNZBD_CONNECTIONS is clamped to
+USENET_ACCOUNT_CONNECTIONS - ALTMOUNT_CONNECTIONS - NNTP_PRIMARY_CONNS; with no room left, or any of the
+numbers unset, no server entry is written and an existing [[usenet]] entry is switched off (enable = 0):
+a download app with no server is harmless; one that takes streams' connections is not.
 """
 from __future__ import annotations
 
@@ -43,19 +45,19 @@ def bandwidth_max(mbit) -> str:
     return str(int(round(m * MBIT_TO_BYTES)))
 
 
-def connections(wanted, altmount, limit):
-    """(connections for SABnzbd, note). None means no server entry. Never exceeds limit - altmount."""
+def connections(wanted, altmount, limit, stat=0):
+    """(connections for SABnzbd, note). None means no server entry. Never exceeds limit - altmount - stat."""
     try:
-        w, a, lim = int(wanted), int(altmount), int(limit)
+        w, a, lim, st = int(wanted), int(altmount), int(limit), int(stat)
     except (TypeError, ValueError):
         return None, "SABNZBD_CONNECTIONS, ALTMOUNT_CONNECTIONS and USENET_ACCOUNT_CONNECTIONS must all be numbers"
-    if w < 1 or a < 0 or lim < 1:
+    if w < 1 or a < 0 or lim < 1 or st < 0:
         return None, "connection settings out of range"
-    room = lim - a
+    room = lim - a - st
     if room < 1:
         return None, "no connections left for SABnzbd under the account limit"
     if w > room:
-        return room, f"SABNZBD_CONNECTIONS clamped from {w} to {room} (account limit {lim}, AltMount {a})"
+        return room, f"SABNZBD_CONNECTIONS clamped from {w} to {room} (account limit {lim}, AltMount {a}, STAT checks {st})"
     return w, ""
 
 
@@ -145,6 +147,13 @@ def set_keys(lines, names, kv):
     return changed
 
 
+def _switch_off(lines, rep):
+    """No room (or no credentials): an earlier [[usenet]] entry must not keep taking connections."""
+    if _find(lines, ("servers", SERVER_SECTION)) is not None:
+        rep["changed"] += set_keys(lines, ("servers", SERVER_SECTION), {"enable": "0"})
+        rep["notes"].append("existing server entry switched off (enable = 0)")
+
+
 def render(text: str, env) -> tuple[str, dict]:
     """The new ini text for `env`, and a report with key names and counts only."""
     lines = text.splitlines()
@@ -168,14 +177,13 @@ def render(text: str, env) -> tuple[str, dict]:
     misc["host"] = "0.0.0.0"
     put(("misc",), misc)
 
-    for cat in (env.get("SABNZBD_CATEGORY_RADARR") or "radarr", env.get("SABNZBD_CATEGORY_SONARR") or "sonarr",
-                env.get("SABNZBD_CATEGORY_HOLD") or "watch-hold"):
+    for cat in (env.get("SABNZBD_CATEGORY_RADARR") or "radarr", env.get("SABNZBD_CATEGORY_SONARR") or "sonarr"):
         put(("categories", cat), {"name": _quote(cat), "dir": _quote(cat), "priority": "-100"})
 
     host, user = env.get("NNTP_PRIMARY_HOST", ""), env.get("NNTP_PRIMARY_USER", "")
     if host and user and env.get("NNTP_PRIMARY_PASS"):
         n, note = connections(env.get("SABNZBD_CONNECTIONS"), env.get("ALTMOUNT_CONNECTIONS"),
-                              env.get("USENET_ACCOUNT_CONNECTIONS"))
+                              env.get("USENET_ACCOUNT_CONNECTIONS"), env.get("NNTP_PRIMARY_CONNS") or 8)
         if note:
             rep["notes"].append(note)
         if n is not None:
@@ -188,16 +196,22 @@ def render(text: str, env) -> tuple[str, dict]:
                 "enable": "1", "optional": "0", "required": "0", "priority": "0", "timeout": "60",
             })
             rep["server"] = True
+        else:
+            _switch_off(lines, rep)
     else:
         rep["notes"].append("no primary server in the environment: no server entry written")
+        _switch_off(lines, rep)
     return "\n".join(lines) + "\n", rep
 
 
-def write_private(path: str, text: str) -> bool:
-    """Write `text` to `path` with mode 600 through a temp file. False when nothing changed."""
+def write_private(path: str, text: str, uid=None, gid=None) -> bool:
+    """Write `text` to `path` with mode 600, owned by uid:gid when given (this runs as root and SABnzbd runs
+    as another user), through a temp file. False when nothing changed."""
     try:
         with open(path, encoding="utf-8") as f:
-            if f.read() == text and (os.stat(path).st_mode & 0o777) == 0o600:
+            st = os.stat(path)
+            if f.read() == text and (st.st_mode & 0o777) == 0o600 \
+                    and (os.geteuid() != 0 or ((uid is None or st.st_uid == uid) and (gid is None or st.st_gid == gid))):
                 return False
     except OSError:
         pass
@@ -205,6 +219,11 @@ def write_private(path: str, text: str) -> bool:
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".sabnzbd-", suffix=".tmp")
     try:
         os.fchmod(fd, 0o600)
+        if uid is not None and gid is not None:
+            try:
+                os.fchown(fd, uid, gid)
+            except PermissionError:
+                pass  # not root (a test run): the file stays with the caller
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp, path)
@@ -231,7 +250,11 @@ def main(argv=None, env=None) -> int:
     except ValueError as e:
         print(f"render_sabnzbd_ini: {e}")
         return 1
-    wrote = write_private(path, new)
+    try:
+        uid, gid = int(env.get("PUID") or 99), int(env.get("PGID") or 100)
+    except ValueError:
+        uid, gid = 99, 100
+    wrote = write_private(path, new, uid, gid)
     print(f"render_sabnzbd_ini: {'updated' if wrote else 'unchanged'}, {rep['changed']} keys set, "
           f"server entry {'written' if rep['server'] else 'not written'}")
     for n in rep["notes"]:

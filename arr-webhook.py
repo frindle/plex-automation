@@ -12396,7 +12396,7 @@ def _watch_sab():
     """The SABnzbd client for Usenet upgrades, or None when SABNZBD_URL and SABNZBD_API_KEY are not set."""
     global _sab_client
     if _sab_client is None and SABNZBD_URL and SABNZBD_API_KEY:
-        _sab_client = sab_hold.Sab(SABNZBD_URL, SABNZBD_API_KEY, hold_category=watch_hold.HOLD_LABEL)
+        _sab_client = sab_hold.Sab(SABNZBD_URL, SABNZBD_API_KEY)
     return _sab_client
 
 
@@ -12441,7 +12441,8 @@ class WatchIO(GlacierIO):
             sab = _watch_sab()
             if sab is None:
                 raise RuntimeError('sabnzbd not configured')
-            sab.change_category(h, label)
+            # the hold is a pause and the release a resume; the category is never changed
+            (sab.pause if label == watch_hold.HOLD_LABEL else sab.resume)(h)
             return
         _watch_tls.bypass = True
         try:

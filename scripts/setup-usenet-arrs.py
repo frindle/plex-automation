@@ -160,7 +160,11 @@ def ensure_sab_client(api, app, out, env, layout):
     cat = env.get(cfg["cat_env"]) or cfg["cat_default"]
     want = {"host": host, "port": port or (443 if scheme == "https" else 80), "useSsl": scheme == "https",
             "urlBase": urlbase, cfg["cat_field"]: cat}
-    existing = [c for c in layout["clients"] if str(c.get("implementation")).lower() == "sabnzbd"]
+    # match by host (and port): AltMount also offers a SABnzbd-type API, so "the first SABnzbd client"
+    # could be the wrong one
+    sab_type = [c for c in layout["clients"] if str(c.get("implementation")).lower() == "sabnzbd"]
+    existing = [c for c in sab_type if str(fields_map(c).get("host") or "").lower() == str(host).lower()
+                and str(fields_map(c).get("port") or "") == str(want["port"])]
     if existing:
         c = existing[0]
         have = fields_map(c)
@@ -185,7 +189,9 @@ def ensure_sab_client(api, app, out, env, layout):
     if miss:
         out.say(app, f"SABnzbd schema has no field(s) {miss}: skipped")
         return
-    body.update({"name": "SABnzbd", "enable": True, "priority": 1, "removeCompletedDownloads": True,
+    taken = {str(c.get("name")) for c in layout["clients"]}
+    name = "SABnzbd" if "SABnzbd" not in taken else "SABnzbd (usenet)"
+    body.update({"name": name, "enable": True, "priority": 1, "removeCompletedDownloads": True,
                  "removeFailedDownloads": True, "tags": []})
     body.pop("id", None)
     out.act(app, f"add the SABnzbd download client (category {cat!r})", lambda: api.post("/downloadclient", body))
@@ -227,7 +233,8 @@ def ensure_indexers(api, app, out, env, prowlarr_mode):
         if not schema:
             out.say(app, "no Newznab schema: indexers skipped")
             return
-        body = json.loads(json.dumps(schema[0]))
+        generic = [s for s in schema if str(s.get("name") or s.get("implementationName") or "").lower() == "newznab"]
+        body = json.loads(json.dumps((generic or schema)[0]))
         miss = set_fields(body, {"baseUrl": base, "apiPath": api_path, "apiKey": ix["apikey"]})
         if miss:
             out.say(app, f"Newznab schema has no field(s) {miss}: skipped")

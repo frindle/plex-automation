@@ -26,24 +26,54 @@ def usenet_world(film, progress=40.0, label='radarr'):
 
 # -- the hold and release over the fake world -------------------------------------------------------------
 
-def test_streamed_usenet_upgrade_is_held_then_released_after_the_stream(film):
+def test_streamed_usenet_upgrade_is_paused_then_resumed_after_the_stream(film):
     io, doc, cfg, checked = usenet_world(film), {}, wh.Cfg('on'), set()
     io.sess = [{'key': '100', 'files': [], 'state': 'playing'}]
     c = wh.tick(io, doc, cfg, NOW, checked)
     assert c['tracked'] == 1 and c['held'] == 1
     assert io.t[NZO]['label'] == wh.HOLD_LABEL and doc['held'][NZO]['label'] == 'radarr'
-    # it finishes in SABnzbd's history while the stream goes on: kept, never imported
-    io.t[NZO].update(progress=100.0, is_finished=True, in_history=True)
-    io.new[NZO] = NEW
+    # paused, it cannot finish: nothing is imported while the stream goes on
     c = wh.tick(io, doc, cfg, NOW + 600, checked)
     assert c['kept_playing'] == 1 and io.t[NZO]['label'] == wh.HOLD_LABEL and not c.get('released')
-    # the stream ends; after the quiet period it is mapped and released
     io.sess = []
     c = wh.tick(io, doc, cfg, NOW + 615, checked)
     assert c['kept_recent'] == 1 and io.t[NZO]['label'] == wh.HOLD_LABEL
     c = wh.tick(io, doc, cfg, NOW + 615 + 601, checked)
+    assert c['usenet_unmapped'] == 1
     assert c['released'] == 1 and io.t[NZO]['label'] == 'radarr' and io.refreshed == ['Radarr']
     assert doc['held'] == {}
+
+
+def test_release_of_a_paused_job_resumes_it_and_never_changes_the_category():
+    s = sab(queue={'queue': {'slots': [{'nzo_id': 'SABnzbd_nzo_AbC123', 'cat': 'radarr', 'percentage': '42', 'status': 'Paused'}]}})
+    r = sab_hold.rows(s)['sabnzbd_nzo_abc123']
+    assert r['label'] == wh.HOLD_LABEL and r['usenet'] and not r['is_finished']
+    doc = {'held': {'sabnzbd_nzo_abc123': {'label': 'radarr', 'who': 'Radarr'}}, 'tracked': {}, 'seen': {}}
+
+    class Io:
+        def __init__(self):
+            self.saved = 0
+
+        def torrents(self):
+            return sab_hold.rows(s)
+
+        def set_label(self, h, label):
+            (s.pause if label == wh.HOLD_LABEL else s.resume)(h)
+
+        def save(self, d):
+            self.saved += 1
+
+        def refresh(self, who):
+            pass
+
+        def queue(self, who):
+            return [{'downloadId': 'SABnzbd_nzo_AbC123'}]
+
+    c = wh.release_pass(Io(), doc, [], NOW, wh.Cfg('on'), wh.Counts(), force=True)
+    assert c['released'] == 1 and doc['held'] == {}
+    modes = [p for _, p in s._http.calls if p['mode'] == 'queue' and p.get('name')]
+    assert modes[-1] == {'mode': 'queue', 'output': 'json', 'apikey': 'KEY123', 'name': 'resume', 'value': 'SABnzbd_nzo_AbC123'}
+    assert not [1 for _, p in s._http.calls if p['mode'] == 'change_cat']
 
 
 def test_held_at_once_not_at_half_way(film):
@@ -52,7 +82,7 @@ def test_held_at_once_not_at_half_way(film):
     assert c['held'] == 1, 'a fast Usenet download may finish within a pass: no waiting for 50 percent'
 
 
-def test_a_download_already_in_the_history_cannot_be_held_and_is_left_alone(film):
+def test_a_download_already_in_the_history_cannot_be_paused_and_is_left_alone(film):
     io, doc = usenet_world(film, progress=100.0), {}
     io.t[NZO].update(is_finished=True, in_history=True)
     io.sess = [{'key': '100', 'files': [], 'state': 'playing'}]
@@ -79,7 +109,7 @@ def test_a_torrent_is_unchanged_by_the_usenet_rules(film):
     assert not wh.tick(io, doc, wh.Cfg('on'), NOW, set()).get('held'), 'a torrent still waits for half way'
 
 
-def test_dry_run_never_recategorises(film):
+def test_dry_run_never_pauses(film):
     io, doc = usenet_world(film), {}
     io.sess = [{'key': '100', 'files': [], 'state': 'playing'}]
     c = wh.tick(io, doc, wh.Cfg('dry'), NOW, set())
@@ -119,7 +149,7 @@ HISTORY = {'history': {'slots': [
 
 
 def sab(**docs):
-    return sab_hold.Sab('http://sab.invalid:8080/', 'KEY123', http=Http({'queue': QUEUE, 'history': HISTORY, 'change_cat': {'status': True}, **docs}))
+    return sab_hold.Sab('http://sab.invalid:8080/', 'KEY123', http=Http({'queue': QUEUE, 'history': HISTORY, **docs}))
 
 
 def test_rows_map_the_queue_and_history_onto_the_torrent_shape():
@@ -132,12 +162,14 @@ def test_rows_map_the_queue_and_history_onto_the_torrent_shape():
     assert not b['is_finished'] and b['in_history']
 
 
-def test_change_category_sends_the_id_as_sabnzbd_spelled_it():
+def test_pause_and_resume_send_the_id_as_sabnzbd_spelled_it():
     s = sab()
     sab_hold.rows(s)
-    s.change_category('sabnzbd_nzo_abc123', 'watch-hold')
-    url, params = s._http.calls[-1]
-    assert params['mode'] == 'change_cat' and params['value'] == 'SABnzbd_nzo_AbC123' and params['value2'] == 'watch-hold'
+    s.pause('sabnzbd_nzo_abc123')
+    s.resume('sabnzbd_nzo_abc123')
+    (_, p1), (_, p2) = s._http.calls[-2:]
+    assert p1['mode'] == 'queue' and p1['name'] == 'pause' and p1['value'] == 'SABnzbd_nzo_AbC123'
+    assert p2['name'] == 'resume' and p2['value'] == 'SABnzbd_nzo_AbC123'
 
 
 def test_errors_and_repr_never_carry_the_key_or_url():
@@ -146,9 +178,9 @@ def test_errors_and_repr_never_carry_the_key_or_url():
         s.queue()
     assert 'KEY123' not in str(e.value) and 'sab.invalid' not in str(e.value)
     assert 'KEY123' not in repr(s) and 'sab.invalid' not in repr(s)
-    s2 = sab(change_cat={'status': False})
+    s2 = sab(queue={'status': False})
     with pytest.raises(sab_hold.SabError):
-        s2.change_category('sabnzbd_nzo_x', 'c')
+        s2.pause('sabnzbd_nzo_x')
 
 
 def test_is_usenet_id_and_path_map():
@@ -183,7 +215,7 @@ class FakeDeluge:
         monkeypatch.setattr(aw, 'get_all_torrents', lambda *a, **k: dict(torrents))
 
 
-def test_watchio_merges_sabnzbd_rows_and_routes_set_label(monkeypatch):
+def test_watchio_merges_sabnzbd_rows_and_routes_set_label_to_pause_and_resume(monkeypatch):
     FakeDeluge(monkeypatch, {'a' * 40: {'label': 'radarr'}})
     s = sab()
     monkeypatch.setattr(aw, '_sab_client', s)
@@ -191,7 +223,9 @@ def test_watchio_merges_sabnzbd_rows_and_routes_set_label(monkeypatch):
     t = io.torrents()
     assert 'a' * 40 in t and 'sabnzbd_nzo_abc123' in t
     io.set_label('sabnzbd_nzo_abc123', 'watch-hold')
-    assert s._http.calls[-1][1]['mode'] == 'change_cat'
+    assert s._http.calls[-1][1]['name'] == 'pause'
+    io.set_label('sabnzbd_nzo_abc123', 'radarr')
+    assert s._http.calls[-1][1]['name'] == 'resume'
 
 
 def test_sabnzbd_down_without_usenet_holds_leaves_deluge_alone(monkeypatch):
