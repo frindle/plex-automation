@@ -31,6 +31,10 @@ stream that is playing right now holds it.
 dry: nothing is relabelled or held, no import waits, nothing is written to Plex. The reads (sessions,
 users' resume points and choices, the audio mapping) still run, and the log says what would have happened.
 
+SABnzbd (Usenet) downloads are held the same way through their category (sab_hold.py), as soon as they are
+tracked and still queued: SABnzbd cannot recategorise a download that is already in its history, so one that
+finished before the hold was wanted imports as usual.
+
 Not covered: a download made by a remote (seedbox) client is not in this Deluge and cannot be held; its
 choices are still carried over, its resume points are not mapped. A season pack is held while someone
 streams one of its episodes and its choices are carried over, but its resume points are not mapped.
@@ -492,7 +496,10 @@ def wants_hold(entry, info, seen, sessions, now, cfg):
     """Hold a download on the *arr's own label: someone streams the item (now or in the quiet period), or a
     resume point has to be mapped and the download is far enough along."""
     if streamed(entry, sessions) or now - last_seen(entry, seen) < cfg.quiet_s:
-        return True
+        return not (info.get('usenet') and (info.get('is_finished') or info.get('in_history')))  # not once in SABnzbd's history
+    if info.get('usenet'):
+        # SABnzbd can recategorise a queued download but not a finished one (see sab_hold.py): hold at once
+        return not (info.get('is_finished') or info.get('in_history')) and needs_prep(entry, now, cfg.stale_s)
     done = info.get('is_finished') or (info.get('progress') or 0) >= cfg.at_pct
     return bool(done) and needs_prep(entry, now, cfg.stale_s)
 
@@ -706,7 +713,9 @@ def tick(io, doc, cfg, now, checked, discover_now=True, base_labels=('sonarr', '
                 except Exception:  # noqa: BLE001
                     c.bump('snapshot_failed')
             c.bump('snapshots')
-        if info is not None and h not in held and (info.get('label') or '').lower() in base_labels \
+        lb = (info.get('label') or '').lower() if info is not None else ''
+        if info is not None and h not in held and lb != HOLD_LABEL \
+                and (lb in base_labels or info.get('usenet')) \
                 and wants_hold(entry, info, seen, sessions, now, cfg):
             if not cfg.acts:
                 c.bump('would_hold')

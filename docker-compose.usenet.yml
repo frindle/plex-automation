@@ -1,0 +1,64 @@
+# SABnzbd for the arrs' regular downloads (Usenet next to Deluge). NOT the offload tier:
+# AltMount (docker-compose.tiering.yml) stays stream-only; this container only downloads
+# what Radarr and Sonarr grab.
+#
+# Not loaded by default. Add to .env:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.usenet.yml
+# (with the tier: docker-compose.yml:docker-compose.tiering.yml:docker-compose.usenet.yml)
+# update.sh then starts it with the rest. After the first start, run once:
+#   python3 scripts/setup-usenet-arrs.py            # dry run: shows what it would change
+#   python3 scripts/setup-usenet-arrs.py --apply
+#
+# Every site value comes from .env (see .env.example); nothing here is a secret.
+#
+# Settings are copied from .env into sabnzbd.ini at every start by
+# usenet/render_sabnzbd_ini.py (mode 600, idempotent, no secret is printed):
+#   NNTP_PRIMARY_*       the server entry (the same account AltMount's provider uses)
+#   SABNZBD_MAX_MBIT     download cap, megabit/s (default 750; 0 = unlimited)
+#   SABNZBD_CONNECTIONS  connections for SABnzbd. With ALTMOUNT_CONNECTIONS it must stay at or under
+#                        USENET_ACCOUNT_CONNECTIONS; SABnzbd is clamped to the difference.
+# The cap applies to downloads only; AltMount's stream and promote reads are not limited by it.
+
+services:
+  sabnzbd:
+    image: "${SABNZBD_IMAGE:-lscr.io/linuxserver/sabnzbd:4.5.3}"
+    container_name: sabnzbd
+    restart: unless-stopped
+    environment:
+      PUID: "${SABNZBD_PUID:-99}"      # Unraid nobody:users
+      PGID: "${SABNZBD_PGID:-100}"
+      TZ: "${SABNZBD_TZ:-UTC}"
+      NNTP_PRIMARY_HOST: "${NNTP_PRIMARY_HOST:-}"
+      NNTP_PRIMARY_PORT: "${NNTP_PRIMARY_PORT:-563}"
+      NNTP_PRIMARY_USER: "${NNTP_PRIMARY_USER:-}"
+      NNTP_PRIMARY_PASS: "${NNTP_PRIMARY_PASS:-}"
+      SABNZBD_MAX_MBIT: "${SABNZBD_MAX_MBIT:-750}"
+      SABNZBD_CONNECTIONS: "${SABNZBD_CONNECTIONS:?set SABNZBD_CONNECTIONS in .env}"
+      ALTMOUNT_CONNECTIONS: "${ALTMOUNT_CONNECTIONS:?set ALTMOUNT_CONNECTIONS in .env (what AltMount's provider uses)}"
+      USENET_ACCOUNT_CONNECTIONS: "${USENET_ACCOUNT_CONNECTIONS:?set USENET_ACCOUNT_CONNECTIONS in .env (the account's limit)}"
+      SABNZBD_API_KEY: "${SABNZBD_API_KEY:?set SABNZBD_API_KEY in .env}"
+      SABNZBD_COMPLETE_DIR: "${SABNZBD_COMPLETE_DIR:?set SABNZBD_COMPLETE_DIR in .env}"
+      SABNZBD_INCOMPLETE_DIR: "${SABNZBD_INCOMPLETE_DIR:-/incomplete-downloads}"
+      SABNZBD_CATEGORY_RADARR: "${SABNZBD_CATEGORY_RADARR:-radarr}"
+      SABNZBD_CATEGORY_SONARR: "${SABNZBD_CATEGORY_SONARR:-sonarr}"
+    mac_address: "${SABNZBD_MAC:-02:8e:b2:5d:a1:39}"
+    networks:
+      br0:
+        ipv4_address: "${SABNZBD_IP:?set SABNZBD_IP in .env}"
+    volumes:
+      - "${SABNZBD_CONFIG_DIR:-/mnt/user/appdata/sabnzbd}:/config"
+      # Completed downloads, at the SAME container path the arrs see (SABNZBD_COMPLETE_DIR), so no
+      # remote path mapping is needed. The setup script reads the arrs' Deluge layout and checks it.
+      - "${SABNZBD_COMPLETE_HOST:?set SABNZBD_COMPLETE_HOST in .env}:${SABNZBD_COMPLETE_DIR:?set SABNZBD_COMPLETE_DIR in .env}"
+      - "${SABNZBD_INCOMPLETE_HOST:-/mnt/cache/appdata/sabnzbd/incomplete}:${SABNZBD_INCOMPLETE_DIR:-/incomplete-downloads}"
+      - "./usenet/render_sabnzbd_ini.py:/render/render_sabnzbd_ini.py:ro"
+      - "./usenet/10-render-sabnzbd-ini.sh:/custom-cont-init.d/10-render-sabnzbd-ini.sh:ro"
+
+  # The watch hold (watch_hold.py) also holds SABnzbd-sourced upgrades: it moves them to the hold
+  # category while someone streams the item, exactly as it relabels a Deluge download.
+  arr-webhook:
+    environment:
+      SABNZBD_URL: "${SABNZBD_URL:?set SABNZBD_URL in .env}"
+      SABNZBD_API_KEY: "${SABNZBD_API_KEY:?set SABNZBD_API_KEY in .env}"
+      # "sab path=path in this container", comma separated; empty when both see the same paths.
+      SABNZBD_PATH_MAP: "${SABNZBD_PATH_MAP:-}"

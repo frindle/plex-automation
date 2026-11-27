@@ -28,6 +28,7 @@ import arr_health
 import deluge_trim
 import stuck_plan
 import glacier_hold
+import sab_hold
 import watch_hold
 import speed_cap  # noqa: F401 -- the only sanctioned per-torrent speed-cap writer (see test_no_speed_limit_tampering)
 
@@ -12385,6 +12386,20 @@ def _watch_label_guard(h, label):
         return False
 
 
+SABNZBD_URL = os.environ.get('SABNZBD_URL', '')
+SABNZBD_API_KEY = os.environ.get('SABNZBD_API_KEY', '')
+SABNZBD_PATH_PAIRS = sab_hold.parse_path_map(os.environ.get('SABNZBD_PATH_MAP', ''))
+_sab_client = None
+
+
+def _watch_sab():
+    """The SABnzbd client for Usenet upgrades, or None when SABNZBD_URL and SABNZBD_API_KEY are not set."""
+    global _sab_client
+    if _sab_client is None and SABNZBD_URL and SABNZBD_API_KEY:
+        _sab_client = sab_hold.Sab(SABNZBD_URL, SABNZBD_API_KEY, hold_category=watch_hold.HOLD_LABEL)
+    return _sab_client
+
+
 class WatchIO(GlacierIO):
     """The I/O watch_hold needs: Plex (sessions, each user's view, progress and stream writes), the *arrs,
     Deluge, and ffmpeg/ffprobe for the audio mapping."""
@@ -12405,9 +12420,29 @@ class WatchIO(GlacierIO):
 
     def torrents(self):
         deluge_login()
-        return get_all_torrents()          # the shared snapshot; set_label invalidates it
+        out = dict(get_all_torrents())     # the shared snapshot; set_label invalidates it
+        sab = _watch_sab()
+        if sab is not None:
+            try:
+                out.update(sab_hold.rows(sab))
+            except sab_hold.SabError as e:
+                # a held Usenet download must not look gone just because SABnzbd did not answer: that
+                # would drop its restore category from the state. Without one, Deluge goes on alone.
+                with _watch_lock:
+                    mine = [h for h in list((_watch_doc.get('held') or {})) + list((_watch_doc.get('tracked') or {}))
+                            if sab_hold.is_usenet_id(h)]
+                log.error(f'[watch] sabnzbd unreadable: {e}')
+                if mine:
+                    raise
+        return out
 
     def set_label(self, h, label):
+        if sab_hold.is_usenet_id(h):
+            sab = _watch_sab()
+            if sab is None:
+                raise RuntimeError('sabnzbd not configured')
+            sab.change_category(h, label)
+            return
         _watch_tls.bypass = True
         try:
             super().set_label(h, label)
@@ -12544,6 +12579,9 @@ class WatchIO(GlacierIO):
 
     def new_file(self, h):
         """The download's biggest video file as a '/data/...' path, once it is complete on disk."""
+        if sab_hold.is_usenet_id(h):
+            sab = _watch_sab()
+            return sab_hold.biggest_video(sab, h, SABNZBD_PATH_PAIRS) if sab is not None else None
         st = _deluge_rpc('core.get_torrent_status', [h, ['files', 'save_path', 'file_progress']]) or {}
         files, prog = st.get('files') or [], st.get('file_progress') or []
         best = None
