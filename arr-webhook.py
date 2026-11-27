@@ -12356,7 +12356,7 @@ def _watch_load():
         d = d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         d = {}
-    for k in ('held', 'tracked', 'seen'):
+    for k in ('held', 'tracked', 'seen', 'usenet'):
         if not isinstance(d.get(k), dict):
             d[k] = {}
     return d
@@ -12389,6 +12389,10 @@ def _watch_label_guard(h, label):
 SABNZBD_URL = os.environ.get('SABNZBD_URL', '')
 SABNZBD_API_KEY = os.environ.get('SABNZBD_API_KEY', '')
 SABNZBD_PATH_PAIRS = sab_hold.parse_path_map(os.environ.get('SABNZBD_PATH_MAP', ''))
+SABNZBD_COMPLETE_DIR = os.environ.get('SABNZBD_COMPLETE_DIR', '')           # where SABnzbd writes completed jobs
+SABNZBD_ARR_VISIBLE_DIR = os.environ.get('SABNZBD_ARR_VISIBLE_DIR', '')     # the same folder as the *arrs see it
+SABNZBD_CATEGORIES = tuple(c for c in (os.environ.get('SABNZBD_CATEGORY_RADARR') or 'radarr',
+                                       os.environ.get('SABNZBD_CATEGORY_SONARR') or 'sonarr') if c)
 _sab_client = None
 
 
@@ -12441,14 +12445,64 @@ class WatchIO(GlacierIO):
             sab = _watch_sab()
             if sab is None:
                 raise RuntimeError('sabnzbd not configured')
-            # the hold is a pause and the release a resume; the category is never changed
-            (sab.pause if label == watch_hold.HOLD_LABEL else sab.resume)(h)
+            sab.change_cat(h, label)       # the hold is a category, never a pause (a paused job cannot finish)
             return
         _watch_tls.bypass = True
         try:
             super().set_label(h, label)
         finally:
             _watch_tls.bypass = False
+
+    # -- Usenet: resume, import, forget, fail ---------------------------------------------------------------
+    def resume(self, h):
+        sab = _watch_sab()
+        if sab is None:
+            raise RuntimeError('sabnzbd not configured')
+        sab.resume(h)
+
+    def import_usenet(self, h, who, row):
+        """Have the *arr import the completed folder with its own scan command, tied to the grab by the job's
+        id as SABnzbd spells it. Move: the leftovers are deleted afterwards through SABnzbd."""
+        sab = _watch_sab()
+        path = sab_hold.to_arr(row.get('storage') or '', SABNZBD_COMPLETE_DIR, SABNZBD_ARR_VISIBLE_DIR)
+        if sab is None or not path:
+            raise RuntimeError('no completed folder to import')
+        url, key = self._arrs[who]
+        cmd = 'DownloadedMoviesScan' if who == 'Radarr' else 'DownloadedEpisodesScan'
+        requests.post(f'{url}/api/v3/command', headers={'X-Api-Key': key},
+                      json={'name': cmd, 'path': path, 'downloadClientId': sab.original_id(h), 'importMode': 'Move'},
+                      timeout=20).raise_for_status()
+
+    def arr_imported(self, who, h, held_entry):
+        """The *arr's history shows an import for this download id, or (the id is not always kept on a scanned
+        import) the file of an item it replaces is no longer the one recorded when the job was held."""
+        _ids, imported = self.grab_ids(who, h)
+        if imported:
+            return True
+        olds = (held_entry or {}).get('olds') or {}
+        if not olds:
+            return False
+        cur = self.items(who, [int(k[1:]) for k in olds])
+        return any(k in cur and cur[k].get('old') != p for k, p in olds.items())
+
+    def forget_usenet(self, h):
+        sab = _watch_sab()
+        if sab is None:
+            raise RuntimeError('sabnzbd not configured')
+        sab.delete_history(h)
+
+    def mark_failed(self, who, h):
+        """Mark the grab of download `h` failed in the *arr's history, so it blocklists the release and searches
+        again. Nothing to do (and no error) when the *arr has no grab record for it."""
+        url, key = self._arrs[who]
+        recs = self._get(who, '/api/v3/history', {'downloadId': h, 'pageSize': 50}) or {}
+        recs = recs.get('records') if isinstance(recs, dict) else recs
+        grab = next((r for r in (recs or []) if str(r.get('eventType') or '').lower() == 'grabbed'
+                     and str(r.get('downloadId') or '').lower() == h and r.get('id') is not None), None)
+        if grab is None:
+            return False
+        requests.post(f"{url}/api/v3/history/failed/{grab['id']}", headers={'X-Api-Key': key}, timeout=20).raise_for_status()
+        return True
 
     # -- Plex --------------------------------------------------------------------------------------------
     def sessions(self):
@@ -12667,7 +12721,7 @@ def watch_tick(io=None, now=None, discover_now=True):
         with _watch_lock:
             deluge_login()
             c = watch_hold.tick(io, _watch_doc, WATCH_CFG, now, _watch_checked,
-                                discover_now=discover_now, base_labels=('sonarr', 'radarr'),
+                                discover_now=discover_now, base_labels=('sonarr', 'radarr') + SABNZBD_CATEGORIES,
                                 lane_labels=UPGRADE_LANE_LABELS, prep=later)
             job = (due[0], _json.loads(_json.dumps(_watch_doc['tracked'][due[0]]))) if due else None
         if job:

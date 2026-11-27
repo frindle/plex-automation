@@ -7,7 +7,11 @@
 What it does, in each app, idempotently (a second run changes nothing):
   1. reads the existing download clients, remote path mappings and root folders and prints the layout
      (read-only);
-  2. adds the SABnzbd download client with the app's own category;
+  2. adds the SABnzbd download client with the app's own category and, with WATCH_HOLD=on, recent and older
+     priority Paused (Radarr recentMoviePriority/olderMoviePriority, Sonarr recentTvPriority/olderTvPriority;
+     the Paused value is read from the app's own field options): every grab arrives paused and arr-webhook's
+     watch hold classifies it before anything downloads. With WATCH_HOLD not on, nothing is set Paused, and a
+     Paused priority left by an earlier run is put back to Default;
   3. adds the Newznab indexer(s) from NEWZNAB_INDEXERS, or, when Prowlarr is in use (PROWLARR_URL and
      PROWLARR_API_KEY set, or the app's indexers look Prowlarr-synced), adds them to Prowlarr instead and
      leaves the apps' indexer lists to Prowlarr's sync;
@@ -18,7 +22,7 @@ What it does, in each app, idempotently (a second run changes nothing):
 
 Settings come from the environment, then from .env (--env-file): RADARR_URL / SONARR_URL (or
 TIERING_RADARR_URL / TIERING_SONARR_URL), RADARR_API_KEY, SONARR_API_KEY, SABNZBD_URL, SABNZBD_API_KEY,
-SABNZBD_CATEGORY_RADARR / _SONARR, NEWZNAB_INDEXERS, PROWLARR_URL, PROWLARR_API_KEY.
+SABNZBD_CATEGORY_RADARR / _SONARR, WATCH_HOLD, NEWZNAB_INDEXERS, PROWLARR_URL, PROWLARR_API_KEY.
 Keys and passwords are never printed: output names what changes, not the values.
 """
 from __future__ import annotations
@@ -33,9 +37,11 @@ import urllib.request
 
 APPS = {
     "Radarr": {"url": ("RADARR_URL", "TIERING_RADARR_URL"), "key": "RADARR_API_KEY", "cat_env": "SABNZBD_CATEGORY_RADARR",
-               "cat_default": "radarr", "cat_field": "movieCategory"},
+               "cat_default": "radarr", "cat_field": "movieCategory",
+               "prio_fields": ("recentMoviePriority", "olderMoviePriority")},
     "Sonarr": {"url": ("SONARR_URL", "TIERING_SONARR_URL"), "key": "SONARR_API_KEY", "cat_env": "SABNZBD_CATEGORY_SONARR",
-               "cat_default": "sonarr", "cat_field": "tvCategory"},
+               "cat_default": "sonarr", "cat_field": "tvCategory",
+               "prio_fields": ("recentTvPriority", "olderTvPriority")},
 }
 MASK = "********"
 
@@ -150,6 +156,33 @@ def report_layout(api, app, out):
 
 
 # -- 2. SABnzbd client --------------------------------------------------------------------------------------
+def option_value(field, name, fallback):
+    """The value of the select option called `name` in a schema field (read from the app, not guessed)."""
+    for o in field.get("selectOptions") or []:
+        if str(o.get("name") or "").lower() == name.lower():
+            return o.get("value")
+    return fallback
+
+
+def priority_wants(app, fields, hold_on):
+    """{field: value} for the client's recent/older priority. With the watch hold on, every grab is added to
+    SABnzbd Paused, so nothing downloads before arr-webhook has classified it (watch_hold.classify_usenet); the
+    value comes from the field's own options (-2 only when the app lists none). With it off, a priority that
+    is Paused is put back to Default, so no job is left waiting for a hold that is not running. Fields the app
+    does not have are left out."""
+    out = {}
+    for name in APPS[app]["prio_fields"]:
+        f = next((x for x in fields or [] if x.get("name") == name), None)
+        if f is None:
+            continue
+        paused, default = option_value(f, "Paused", -2), option_value(f, "Default", -100)
+        if hold_on:
+            out[name] = paused
+        elif f.get("value") == paused:
+            out[name] = default
+    return out
+
+
 def ensure_sab_client(api, app, out, env, layout):
     cfg = APPS[app]
     sab_url = env.get("SABNZBD_URL") or ""
@@ -165,8 +198,12 @@ def ensure_sab_client(api, app, out, env, layout):
     sab_type = [c for c in layout["clients"] if str(c.get("implementation")).lower() == "sabnzbd"]
     existing = [c for c in sab_type if str(fields_map(c).get("host") or "").lower() == str(host).lower()
                 and str(fields_map(c).get("port") or "") == str(want["port"])]
+    hold_on = str(env.get("WATCH_HOLD") or "").strip().lower() == "on"
+    if not hold_on:
+        out.say(app, "WATCH_HOLD is not on: grabs are not added Paused (set WATCH_HOLD=on in .env and run again)")
     if existing:
         c = existing[0]
+        want.update(priority_wants(app, c.get("fields"), hold_on))
         have = fields_map(c)
         if all(have.get(k) == v or (k == "urlBase" and not have.get(k) and not v) for k, v in want.items()) \
                 and c.get("enable"):
@@ -185,6 +222,7 @@ def ensure_sab_client(api, app, out, env, layout):
         out.say(app, "no SABnzbd schema in this app: skipped")
         return
     body = json.loads(json.dumps(schemas[0]))
+    want.update(priority_wants(app, body.get("fields"), hold_on))
     miss = set_fields(body, {**want, "apiKey": env["SABNZBD_API_KEY"]})
     if miss:
         out.say(app, f"SABnzbd schema has no field(s) {miss}: skipped")

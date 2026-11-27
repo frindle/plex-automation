@@ -62,11 +62,16 @@ services:
       - "./usenet/render_sabnzbd_ini.py:/render/render_sabnzbd_ini.py:ro"
       - "./usenet/10-render-sabnzbd-ini.sh:/custom-cont-init.d/10-render-sabnzbd-ini.sh:ro"
 
-  # The watch hold (watch_hold.py) also holds SABnzbd-sourced upgrades: it moves them to the hold
-  # category while someone streams the item, exactly as it relabels a Deluge download.
+  # The watch hold (watch_hold.py) also holds SABnzbd-sourced upgrades: every grab arrives paused, an upgrade
+  # is moved to the watch-hold category and let download, and the release is an import through the arr.
   arr-webhook:
     environment:
       SABNZBD_URL: "${SABNZBD_URL:?set SABNZBD_URL in .env}"
       SABNZBD_API_KEY: "${SABNZBD_API_KEY:?set SABNZBD_API_KEY in .env}"
       # "sab path=path in this container", comma separated; empty when both see the same paths.
       SABNZBD_PATH_MAP: "${SABNZBD_PATH_MAP:-}"
+      # the completed folder as SABnzbd writes it and as the arrs see it (the import command takes the arrs' view)
+      SABNZBD_COMPLETE_DIR: "${SABNZBD_COMPLETE_DIR:?set SABNZBD_COMPLETE_DIR in .env}"
+      SABNZBD_ARR_VISIBLE_DIR: "${SABNZBD_ARR_VISIBLE_DIR:-}"
+      SABNZBD_CATEGORY_RADARR: "${SABNZBD_CATEGORY_RADARR:-radarr}"
+      SABNZBD_CATEGORY_SONARR: "${SABNZBD_CATEGORY_SONARR:-sonarr}"

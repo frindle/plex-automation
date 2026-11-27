@@ -14,7 +14,7 @@ Reads (all from the container environment):
   USENET_ACCOUNT_CONNECTIONS         the account's connection limit
   SABNZBD_API_KEY                    set as SABNZBD's own API key when given
   SABNZBD_COMPLETE_DIR / SABNZBD_INCOMPLETE_DIR   container paths
-  SABNZBD_CATEGORY_RADARR / _SONARR               categories (radarr, sonarr)
+  SABNZBD_CATEGORY_RADARR / _SONARR               categories (radarr, sonarr); the watch-hold category is always written
   PUID / PGID                        owner of sabnzbd.ini (default 99/100), so SABnzbd can read it
 
 SABnzbd, AltMount and the tiering STAT checks (NNTP_PRIMARY_CONNS, default 8) use the same account, so
@@ -32,6 +32,7 @@ import tempfile
 
 MBIT_TO_BYTES = 1_000_000 / 8  # megabit/s (decimal, as line speeds are quoted) to bytes/s
 SERVER_SECTION = "usenet"
+HOLD_CATEGORY = "watch-hold"   # same as watch_hold.HOLD_LABEL
 
 
 def bandwidth_max(mbit) -> str:
@@ -179,6 +180,11 @@ def render(text: str, env) -> tuple[str, dict]:
 
     for cat in (env.get("SABNZBD_CATEGORY_RADARR") or "radarr", env.get("SABNZBD_CATEGORY_SONARR") or "sonarr"):
         put(("categories", cat), {"name": _quote(cat), "dir": _quote(cat), "priority": "-100"})
+
+    # the watch hold's category (watch_hold.py): its own folder under complete, no script, default priority.
+    # A queued upgrade is moved here with change_cat so the arr cannot see it until the import is sent.
+    put(("categories", HOLD_CATEGORY), {"name": _quote(HOLD_CATEGORY), "dir": _quote(HOLD_CATEGORY),
+                                        "script": "None", "priority": "-100"})
 
     host, user = env.get("NNTP_PRIMARY_HOST", ""), env.get("NNTP_PRIMARY_USER", "")
     if host and user and env.get("NNTP_PRIMARY_PASS"):

@@ -18,9 +18,16 @@ ENV = {'RADARR_URL': 'http://radarr.invalid:7878', 'RADARR_API_KEY': ARR_KEY,
        'NEWZNAB_INDEXERS': json.dumps([{'name': 'ix-one', 'url': 'https://ix.invalid/api', 'apikey': IX_KEY}])}
 
 
+PRIO_OPTIONS = [{'value': -100, 'name': 'Default'}, {'value': -2, 'name': 'Paused'}, {'value': 0, 'name': 'Normal'},
+                {'value': 2, 'name': 'Force'}]
+
+
 def schema_sab(cat_field):
+    prio = ('recentMoviePriority', 'olderMoviePriority') if cat_field == 'movieCategory' \
+        else ('recentTvPriority', 'olderTvPriority')
     return {'implementation': 'Sabnzbd', 'protocol': 'usenet', 'fields': [
-        {'name': n, 'value': None} for n in ('host', 'port', 'useSsl', 'urlBase', 'apiKey', cat_field)]}
+        {'name': n, 'value': None} for n in ('host', 'port', 'useSsl', 'urlBase', 'apiKey', cat_field)] + [
+        {'name': n, 'value': -100, 'selectOptions': PRIO_OPTIONS} for n in prio]}
 
 
 SCHEMA_NEWZNAB = {'implementation': 'Newznab', 'protocol': 'usenet',
@@ -213,3 +220,66 @@ def test_generic_newznab_schema_is_chosen_by_name(apis):
     run(ENV, apis, apply=True)
     ix = next(b for m, p, b in apis['Radarr'].writes if p == '/indexer')
     assert ix['name'] != 'SomePreset' and su.fields_map(ix)['baseUrl'] == 'https://ix.invalid'
+
+
+# -- the watch hold's priority: every grab arrives Paused ----------------------------------------------------
+
+HOLD_ENV = {**ENV, 'WATCH_HOLD': 'on'}
+PRIOS = {'Radarr': ('recentMoviePriority', 'olderMoviePriority'), 'Sonarr': ('recentTvPriority', 'olderTvPriority')}
+
+
+def test_hold_on_sets_recent_and_older_priority_to_paused_from_the_schema_options(apis):
+    assert run(HOLD_ENV, apis, apply=True) == 0
+    for app, a in apis.items():
+        f = su.fields_map(next(b for m, p, b in a.writes if p == '/downloadclient'))
+        assert [f[n] for n in PRIOS[app]] == [-2, -2]
+
+
+def test_hold_on_uses_the_paused_value_the_app_lists(apis):
+    for a in apis.values():
+        for f in a.schemas['/downloadclient/schema'][0]['fields']:
+            for o in f.get('selectOptions') or []:
+                if o['name'] == 'Paused':
+                    o['value'] = -7
+    run(HOLD_ENV, apis, apply=True)
+    f = su.fields_map(next(b for m, p, b in apis['Radarr'].writes if p == '/downloadclient'))
+    assert f['recentMoviePriority'] == -7
+
+
+def test_hold_on_second_apply_changes_nothing_and_an_existing_client_is_updated(apis):
+    run(ENV, apis, apply=True)                              # a client without the hold exists already
+    for a in apis.values():
+        a.writes.clear()
+    run(HOLD_ENV, apis, apply=True)
+    assert [(m, p) for m, p, _ in apis['Radarr'].writes] == [('PUT', '/downloadclient/10')]
+    for a in apis.values():
+        a.writes.clear()
+    run(HOLD_ENV, apis, apply=True)
+    assert all(not a.writes for a in apis.values())
+
+
+def test_hold_not_on_leaves_the_priority_alone_and_puts_a_stale_pause_back(apis, capsys):
+    run(ENV, apis, apply=True)
+    f = su.fields_map(next(b for m, p, b in apis['Radarr'].writes if p == '/downloadclient'))
+    assert f['recentMoviePriority'] == -100
+    run(HOLD_ENV, apis, apply=True)
+    for a in apis.values():
+        a.writes.clear()
+    capsys.readouterr()
+    run(ENV, apis, apply=True)
+    client = apis['Radarr'].d['/downloadclient'][0]
+    assert su.fields_map(client)['recentMoviePriority'] == -100 and su.fields_map(client)['olderMoviePriority'] == -100
+    assert 'WATCH_HOLD is not on' in capsys.readouterr().out
+
+
+def test_dry_run_with_the_hold_writes_nothing(apis):
+    run(HOLD_ENV, apis, apply=False)
+    assert all(not a.writes for a in apis.values())
+
+
+def test_an_app_without_priority_fields_is_skipped_quietly(apis):
+    for a in apis.values():
+        sch = a.schemas['/downloadclient/schema'][0]
+        sch['fields'] = [f for f in sch['fields'] if 'Priority' not in f['name']]
+    assert run(HOLD_ENV, apis, apply=True) == 0
+    assert any(p == '/downloadclient' for m, p, _ in apis['Radarr'].writes)

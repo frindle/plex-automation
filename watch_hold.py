@@ -31,9 +31,19 @@ stream that is playing right now holds it.
 dry: nothing is relabelled or held, no import waits, nothing is written to Plex. The reads (sessions,
 users' resume points and choices, the audio mapping) still run, and the log says what would have happened.
 
-SABnzbd (Usenet) downloads are held by pausing them (sab_hold.py), as soon as they are
-tracked and still queued: SABnzbd cannot pause a download that is already in its history, so one that
-finished before the hold was wanted imports as usual.
+SABnzbd (Usenet) upgrades are held differently (sab_hold.py), because a Usenet download finishes in seconds
+and a paused job never finishes. Every Usenet grab arrives in SABnzbd paused (the *arr's download client
+priority, set by scripts/setup-usenet-arrs.py), so nothing downloads before classify_usenet has looked at it:
+  - not an upgrade (the item has no file): resumed unchanged, the *arr imports it as usual;
+  - an upgrade: moved to the hold category while still queued, then resumed. It downloads to completion where
+    the *arr cannot see it, so there is a new file to map resume points and choices onto, exactly as for a held
+    torrent. The *arr's own category is kept as the restore label.
+Release is an import, never a resume: when nobody streams the item at that moment (sessions are read again
+right before, also past the cap) the *arr is told to import the completed folder with its own scan command
+(downloadClientId = the job, so its history links to the grab). Only a verified import deletes the SABnzbd
+history entry and its leftover files. A held job that fails in SABnzbd is marked failed in the *arr's history,
+so it blocklists the release and searches again as it would have on its own. A job already in SABnzbd's history
+when first seen is left to the *arr and only counted (`usenet_late`, should stay near 0).
 
 Not covered: a download made by a remote (seedbox) client is not in this Deluge and cannot be held; its
 choices are still carried over, its resume points are not mapped. A season pack is held while someone
@@ -496,10 +506,7 @@ def wants_hold(entry, info, seen, sessions, now, cfg):
     """Hold a download on the *arr's own label: someone streams the item (now or in the quiet period), or a
     resume point has to be mapped and the download is far enough along."""
     if streamed(entry, sessions) or now - last_seen(entry, seen) < cfg.quiet_s:
-        return not (info.get('usenet') and (info.get('is_finished') or info.get('in_history')))  # not once in SABnzbd's history
-    if info.get('usenet'):
-        # SABnzbd can pause a queued download but not a finished one (see sab_hold.py): hold at once
-        return not (info.get('is_finished') or info.get('in_history')) and needs_prep(entry, now, cfg.stale_s)
+        return True
     done = info.get('is_finished') or (info.get('progress') or 0) >= cfg.at_pct
     return bool(done) and needs_prep(entry, now, cfg.stale_s)
 
@@ -689,6 +696,7 @@ def tick(io, doc, cfg, now, checked, discover_now=True, base_labels=('sonarr', '
     torrents = io.torrents()
     base_labels = {b.lower() for b in base_labels}
     lane_labels = {b.lower() for b in lane_labels}
+    classify_usenet(io, doc, torrents, now, cfg, checked, c, base_labels)
     if discover_now:
         discover(io, doc, now, torrents, checked, c, base_labels, lane_labels)
     prepped = False
@@ -714,8 +722,7 @@ def tick(io, doc, cfg, now, checked, discover_now=True, base_labels=('sonarr', '
                     c.bump('snapshot_failed')
             c.bump('snapshots')
         lb = (info.get('label') or '').lower() if info is not None else ''
-        if info is not None and h not in held and lb != HOLD_LABEL \
-                and (lb in base_labels or info.get('usenet')) \
+        if info is not None and h not in held and not info.get('usenet') and lb in base_labels \
                 and wants_hold(entry, info, seen, sessions, now, cfg):
             if not cfg.acts:
                 c.bump('would_hold')
@@ -759,13 +766,12 @@ def release_pass(io, doc, sessions, now, cfg, c, force=False, verify_tries=3, ve
             c.bump('gone' if t is None else 'relabelled_elsewhere')
             continue
         entry = tracked.get(h)
+        if t.get('usenet'):
+            if release_usenet(io, doc, h, e, t, entry, now, cfg, c):
+                released.append((h, e.get('who')))
+            continue
         if entry and not force:
             ok, why = ready(entry, seen, sessions, now, cfg)
-            if not ok and why == 'prep' and t.get('usenet') and not t.get('is_finished'):
-                # a paused Usenet job has no new file to map a resume point onto and cannot get one until it is
-                # resumed: waiting would stall it for the whole cap. It resumes; its resume point is not mapped.
-                ok = True
-                c.bump('usenet_unmapped')
             if not ok:
                 c.bump('kept_' + why)
                 continue
@@ -800,6 +806,210 @@ def release_pass(io, doc, sessions, now, cfg, c, force=False, verify_tries=3, ve
                 sleep(verify_poll_s)
         c['unmatched'] = c.get('unmatched', 0) + len(pending)
     return c
+
+
+# ── Usenet: classify on arrival, import on release ────────────────────────────
+
+IMPORT_RETRY_S = 120           # an import command not seen in the *arr's history by then is sent again
+IMPORT_MAX_TRIES = 3
+
+
+def classify_usenet(io, doc, torrents, now, cfg, checked, c, cats):
+    """Decide each Usenet job in an *arr category once. A job arrives paused: not an upgrade is resumed as it is,
+    an upgrade is moved to the hold category while still queued and then resumed. A job found already in
+    SABnzbd's history is only counted (`usenet_late`). A job the *arr's queue does not list yet stays paused and
+    is looked at again on the next pass. Dry mode looks up and counts, and changes nothing."""
+    done = doc.setdefault('usenet', {})
+    held, tracked = doc['held'], doc['tracked']
+    rows = {h: t for h, t in torrents.items() if t.get('usenet')}
+    if rows:
+        for h in [h for h in done if h not in rows]:
+            done.pop(h)
+    pending = []
+    for h, t in rows.items():
+        lb = (t.get('label') or '').lower()
+        if h in held:
+            if cfg.acts and not held[h].get('resumed') and t.get('paused') and not t.get('in_history') and lb == HOLD_LABEL:
+                try:
+                    io.resume(h)
+                    held[h]['resumed'] = True
+                    io.save(doc)
+                    c.bump('resumed')
+                except Exception:  # noqa: BLE001
+                    c.bump('resume_failed')
+            continue
+        if h in done or lb == HOLD_LABEL or lb not in cats:
+            continue
+        if t.get('in_history'):
+            done[h] = 'late'
+            c.bump('usenet_late')
+            io.save(doc)
+            continue
+        pending.append(h)
+    if not pending:
+        return
+    queued = {}
+    for who in io.services():
+        try:
+            recs = io.queue(who)
+        except Exception:  # noqa: BLE001
+            c.bump('queue_unreadable')
+            continue
+        for r in recs:
+            h = str(r.get('downloadId') or '').lower()
+            i = r.get('episodeId') if who == 'Sonarr' else r.get('movieId')
+            if h and i is not None:
+                queued.setdefault(h, (who, set()))[1].add(i)
+    for h in pending:
+        t = torrents[h]
+        if h not in queued:
+            c.bump('classify_wait')                     # not in the *arr's queue yet: stays paused, asked again
+            continue
+        who, ids = queued[h]
+        status = 'tracked' if h in tracked else track(io, tracked, h, who, sorted(ids), now)
+        if status == 'lookup_failed':
+            c.bump('lookup_failed')
+            continue
+        paused = bool(t.get('paused'))
+        if status == 'not_upgrade':
+            checked.add(h)
+            if not cfg.acts:
+                c.bump('would_resume' if paused else 'would_leave')
+                continue
+            if paused:
+                try:
+                    io.resume(h)
+                    c.bump('resumed')
+                except Exception:  # noqa: BLE001
+                    c.bump('resume_failed')
+                    continue
+            done[h] = 'resume'
+            io.save(doc)
+            continue
+        if not cfg.acts:
+            c.bump('would_hold')
+            continue
+        held[h] = {'label': t.get('label') or who.lower(), 'who': who, 'since': now, 'usenet': True, 'resumed': False,
+                   'olds': {k: it.get('old') for k, it in ((tracked.get(h) or {}).get('items') or {}).items()}}
+        done[h] = 'hold'
+        io.save(doc)                                    # the way back first
+        try:
+            io.set_label(h, HOLD_LABEL)                 # change_cat: only a queued job can change category
+        except Exception:  # noqa: BLE001
+            held.pop(h, None)
+            done.pop(h, None)
+            tracked.pop(h, None)
+            c.bump('hold_failed')
+            io.save(doc)
+            continue
+        c.bump('held')
+        if paused:
+            try:
+                io.resume(h)
+                held[h]['resumed'] = True
+                c.bump('resumed')
+            except Exception:  # noqa: BLE001
+                c.bump('resume_failed')                 # retried by the next pass
+        else:
+            held[h]['resumed'] = True
+        io.save(doc)
+
+
+def release_usenet(io, doc, h, e, t, entry, now, cfg, c):
+    """One held Usenet job. Returns True when its category was put back (the caller nudges the *arr).
+    A queued job keeps downloading in the hold category; the *arr must not see it before the import, which
+    waits for the stream check. A completed job is imported through the *arr when nobody streams the item
+    right now; a failed one is marked failed in the *arr."""
+    held, tracked, seen = doc['held'], doc['tracked'], doc['seen']
+    if cfg.mode == 'dry':
+        c.bump('would_release')
+        return False
+    who = e.get('who')
+    if t.get('failed'):
+        try:
+            io.mark_failed(who, h)
+        except Exception:  # noqa: BLE001
+            c.bump('mark_failed_error')                 # asked again next pass
+            return False
+        try:
+            io.forget_usenet(h)
+        except Exception:  # noqa: BLE001
+            c.bump('forget_failed')
+        held.pop(h, None)
+        tracked.pop(h, None)
+        io.save(doc)
+        c.bump('failed_marked')
+        return False
+    if not t.get('in_history'):
+        if cfg.mode == 'off':                           # the feature is off: back to the *arr, as for a torrent
+            try:
+                io.set_label(h, e.get('label') or '')
+            except Exception:  # noqa: BLE001
+                c.bump('release_failed')
+                return False
+            held.pop(h)
+            io.save(doc)
+            c.bump('released')
+            return True
+        c.bump('kept_downloading')
+        return False
+    if not t.get('is_finished'):
+        c.bump('kept_processing')                       # extracting, repairing, moving
+        return False
+    if e.get('import_at'):
+        try:
+            if io.arr_imported(who, h, e):
+                _finish_import(io, doc, h, c)
+                return False
+        except Exception:  # noqa: BLE001
+            c.bump('verify_failed')
+            return False
+        if now - e['import_at'] < IMPORT_RETRY_S:
+            c.bump('kept_verifying')
+            return False
+        if e.get('import_tries', 0) >= IMPORT_MAX_TRIES:
+            c.bump('import_stuck')
+            return False
+    # the stream check, on sessions read now: never an import under a viewer, at the cap or not
+    try:
+        sessions = io.sessions()
+    except Exception:  # noqa: BLE001
+        c.bump('kept_sessions_unreadable')
+        return False
+    mark_seen(seen, sessions, now)
+    if entry:
+        ok, why = ready(entry, seen, sessions, now, cfg)
+        if not ok:
+            c.bump('kept_' + why)
+            return False
+    else:
+        c.bump('import_untracked')
+    e['import_at'], e['import_tries'] = now, e.get('import_tries', 0) + 1
+    io.save(doc)                                        # the attempt is on record before the command goes out
+    try:
+        io.import_usenet(h, who, t)
+    except Exception:  # noqa: BLE001
+        c.bump('import_failed')
+        return False
+    c.bump('import_sent')
+    try:
+        if io.arr_imported(who, h, e):
+            _finish_import(io, doc, h, c)
+    except Exception:  # noqa: BLE001
+        c.bump('verify_failed')
+    return False
+
+
+def _finish_import(io, doc, h, c):
+    """The *arr's history shows the import: now the SABnzbd history entry and its leftovers can go."""
+    try:
+        io.forget_usenet(h)
+    except Exception:  # noqa: BLE001
+        c.bump('forget_failed')
+        return
+    doc['held'].pop(h, None)
+    io.save(doc)
+    c.bump('imported')
 
 
 def reconcile(io, doc):

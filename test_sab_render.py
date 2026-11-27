@@ -79,9 +79,18 @@ def test_categories_exist():
     out, _ = r.render('', ENV)
     for c in ('radarr', 'sonarr'):
         assert f'[[{c}]]' in out
-    assert 'watch-hold' not in out, 'the hold is a pause, no category is needed'
     out, _ = r.render('', {**ENV, 'SABNZBD_CATEGORY_RADARR': 'movies-usenet'})
     assert '[[movies-usenet]]' in out
+
+
+def test_hold_category_has_its_own_folder_no_script_and_default_priority():
+    out, _ = r.render('', ENV)
+    body = out.split('[[watch-hold]]')[1].split('[')[0]
+    assert 'dir = watch-hold' in body and 'script = None' in body and 'priority = -100' in body
+    again, rep = r.render(out, ENV)
+    assert again == out and rep['changed'] == 0 and out.count('[[watch-hold]]') == 1
+    kept, _ = r.render('[categories]\n[[watch-hold]]\nname = watch-hold\ndir = elsewhere\n', ENV)
+    assert 'dir = watch-hold' in kept and 'dir = elsewhere' not in kept
 
 
 def test_file_is_mode_600_and_main_prints_no_secret(tmp_path, capsys):

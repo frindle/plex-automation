@@ -1,17 +1,13 @@
-"""SABnzbd side of the watch hold (watch_hold.py): a Usenet upgrade is held like a Deluge download.
+"""SABnzbd side of the watch hold (watch_hold.py): a Usenet upgrade is held like a Deluge download, in its own category.
 
-The watch hold keeps an upgrade from being imported while someone streams the item it replaces. For a
-torrent it moves the download to a hold label the *arr does not read, and puts the label back on release.
-A SABnzbd download is held by pausing it: mode=queue&name=pause, resumed on release. Its category is
-never touched (the *arr keeps its own category, and SABnzbd's change_cat only works on queued jobs, so a
-category swap would also leave the release unable to put it back). A paused job stops downloading, so it
-cannot finish and be imported; the *arr sees it as paused. rows() reports a paused job under the hold
-label, so watch_hold treats it like a Deluge download wearing the hold label.
-
-Only a queued download can be paused. One that completed before the hold was wanted (in SABnzbd's history)
-is imported as usual (the `usenet_late` count in the log). With the cap at 750 Mbit/s an episode can finish
-within a pass, so the hold is taken as soon as the download is tracked and someone streams the item or a
-resume point has to be mapped, not at the half-way mark that torrents use.
+The watch hold keeps an upgrade from being imported while someone streams the item it replaces. A Usenet
+download is not paused to do that (a paused job never finishes, so there would be no new file to map a resume
+point onto): the *arr's SABnzbd client adds every job Paused, watch_hold.classify_usenet looks each one up in
+the *arr's queue, and an upgrade is moved to the hold category with `change_cat` (which only works on a queued
+job) before it is resumed. It downloads to completion in the hold category, where the *arr cannot see it. The
+release is an import through the *arr's own scan command (arr-webhook.py), after which the SABnzbd history entry
+and its leftover files are deleted. A job already in SABnzbd's history when first seen is only counted
+(`usenet_late`).
 
 This module only talks to SABnzbd and maps its rows onto the shape watch_hold already reads from Deluge
 ({label, is_finished, progress}). Logs carry nzo ids and counts only; the API key is never logged and is
@@ -24,7 +20,7 @@ import posixpath
 
 VIDEO_EXTS = ('.mkv', '.mp4', '.avi', '.m4v', '.mov', '.ts', '.wmv')
 ID_PREFIX = 'sabnzbd_nzo_'
-HOLD_LABEL = 'watch-hold'   # what a paused job is reported as; same as watch_hold.HOLD_LABEL
+HOLD_LABEL = 'watch-hold'   # the hold category; same as watch_hold.HOLD_LABEL
 _TIMEOUT = 20
 
 
@@ -75,11 +71,16 @@ class Sab:
         h = str(h)
         return self._ids.get(h.lower()) or ('SABnzbd_nzo_' + h[len(ID_PREFIX):])
 
-    def pause(self, h):
-        self._call('queue', name='pause', value=self.original_id(h))
-
     def resume(self, h):
         self._call('queue', name='resume', value=self.original_id(h))
+
+    def change_cat(self, h, cat):
+        """Move a queued job to another category (SABnzbd refuses once it is in the history)."""
+        self._call('change_cat', value=self.original_id(h), value2=cat)
+
+    def delete_history(self, h):
+        """Remove a job from the history together with its leftover files."""
+        self._call('history', name='delete', value=self.original_id(h), del_files=1)
 
 
 def rows(sab: Sab):
@@ -95,9 +96,9 @@ def rows(sab: Sab):
             pct = float(s.get('percentage') or 0)
         except (TypeError, ValueError):
             pct = 0.0
-        paused = str(s.get('status') or '').lower() == 'paused'
-        out[h] = {'label': HOLD_LABEL if paused else str(s.get('cat') or ''), 'is_finished': False, 'progress': pct, 'usenet': True,
-                  'status': str(s.get('status') or '')}
+        status = str(s.get('status') or '')
+        out[h] = {'label': str(s.get('cat') or ''), 'is_finished': False, 'progress': pct, 'usenet': True,
+                  'status': status, 'paused': status.lower() == 'paused'}
     for s in sab.history():
         h = str(s.get('nzo_id') or '').lower()
         if not h:
@@ -106,7 +107,7 @@ def rows(sab: Sab):
         status = str(s.get('status') or '').lower()
         out[h] = {'label': str(s.get('category') or ''), 'is_finished': status == 'completed',
                   'progress': 100.0 if status == 'completed' else 0.0, 'usenet': True, 'in_history': True, 'status': status,
-                  'storage': s.get('storage') or ''}
+                  'failed': status == 'failed', 'storage': s.get('storage') or ''}
     return out
 
 
@@ -125,6 +126,15 @@ def to_local(path, pairs):
     for a, b in pairs:
         if path == a or path.startswith(a + '/'):
             return b + path[len(a):]
+    return path
+
+
+def to_arr(path, complete, visible):
+    """`path` (as SABnzbd wrote it) as the *arrs see it: the complete folder's prefix swapped for the *arrs' view of it.
+    Unchanged when both are the same folder, unset, or the path is outside the complete folder."""
+    complete, visible = (complete or '').rstrip('/'), (visible or '').rstrip('/')
+    if complete and visible and complete != visible and (path == complete or path.startswith(complete + '/')):
+        return visible + path[len(complete):]
     return path
 
 
