@@ -6867,11 +6867,58 @@ def _seerr_sync_job(whos, sleep=time.sleep):
                 log.warning(f'[seerr-sync] {who}: list sync failed ({type(e).__name__})')
 
 
+# Seerr allows one webhook URL. SEERR_FORWARD_URL (optional) passes every POST on to the receiver that used
+# to own it: same raw body and Content-Type, Authorization only from SEERR_FORWARD_AUTH (the whole header
+# value). Runs on a background thread and never changes the reply to Seerr. The URL and auth are never logged.
+SEERR_FORWARD_LOOP_HEADER = 'X-Arr-Webhook-Forwarded'
+
+
+def _seerr_forward_url_checked(raw):
+    raw = (raw or '').strip()
+    if not raw:
+        return ''
+    if not re.match(r'^https?://[^/\s]', raw, re.I):
+        log.warning('SEERR_FORWARD_URL is not an http(s) URL; Seerr forwarding is off')
+        return ''
+    return raw
+
+
+SEERR_FORWARD_URL = _seerr_forward_url_checked(os.environ.get('SEERR_FORWARD_URL'))
+SEERR_FORWARD_AUTH = os.environ.get('SEERR_FORWARD_AUTH', '')
+
+
+def _seerr_forward_job(body, content_type, kind):
+    """POST the raw Seerr body onward; one retry on a connection error or 5xx. Logs status/error class only."""
+    headers = {SEERR_FORWARD_LOOP_HEADER: '1'}
+    if content_type:
+        headers['Content-Type'] = content_type
+    if SEERR_FORWARD_AUTH:
+        headers['Authorization'] = SEERR_FORWARD_AUTH
+    outcome = 'error'
+    for _attempt in (1, 2):
+        try:
+            r = requests.post(SEERR_FORWARD_URL, data=body, headers=headers, timeout=(5, 10))
+            outcome = str(r.status_code)
+            if r.status_code < 500:
+                break
+        except Exception as e:  # noqa: BLE001
+            outcome = type(e).__name__
+    log.info(f'Seerr forward: {outcome} ({kind or "?"})')
+
+
 @app.route('/webhook/seerr', methods=['POST'])
 def seerr_webhook():
-    data = request.get_json(force=True, silent=True) or {}
+    raw = request.get_data()
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        data = {}
     kind = str(data.get('notification_type') or '')
     log.info(f'Seerr event: {kind or "?"}')
+    if SEERR_FORWARD_URL and request.headers.get(SEERR_FORWARD_LOOP_HEADER) != '1':
+        try:
+            threading.Thread(target=_seerr_forward_job, args=(raw, request.content_type, kind), daemon=True).start()
+        except Exception as e:  # noqa: BLE001
+            log.warning(f'Seerr forward not started: {type(e).__name__}')
     if kind in _SEERR_SYNC_TYPES:
         mt = str((data.get('media') or {}).get('media_type') or '').lower()
         whos = ['Radarr'] if mt == 'movie' else ['Sonarr'] if mt == 'tv' else ['Sonarr', 'Radarr']

@@ -58,6 +58,10 @@ services:
       PLEX_TOKEN: ${PLEX_TOKEN}
       # Daily duplicate cleanup: off | dry (plan only, report in /data/plex_dupe_fix_last.json) | apply.
       PLEX_DUPE_FIX_DAILY: "${PLEX_DUPE_FIX_DAILY:-dry}"
+      # Seerr allows one webhook URL: set this to the receiver that used to own it and every POST to
+      # /webhook/seerr is forwarded there (raw body). AUTH is the whole Authorization header value. Empty = off.
+      SEERR_FORWARD_URL: "${SEERR_FORWARD_URL:-}"
+      SEERR_FORWARD_AUTH: "${SEERR_FORWARD_AUTH:-}"
       # Advisory LLM decisions (llm_decide/llm_advisor). off = rules only (default), shadow = log
       # what the chain would do next to what the rules did, enforce = the chain may override rules
       # at confidence >= 0.75 (hard rules still win). Layers, each skipped when its env is unset:

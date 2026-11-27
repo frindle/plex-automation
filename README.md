@@ -100,6 +100,9 @@ Grab-time identity check: every grab (new and upgrade, Sonarr and Radarr) is com
 
 Logging: each row in `LLM_DECISIONS_LOG` carries `layer`, `model`, `latency_ms`, `pending_min`, and for paid calls `paid_calls` (token usage and provider request id). Keys and headers are never logged. Each escalation to a paid layer adds an activity line (`llm-escalation`). `GET /llm-decisions` reads the log; `GET /llm-spend?month=YYYY-MM` sums calls and tokens per paid layer (tokens only, no prices).
 
+## Seerr webhook forwarding
+`/webhook/seerr` syncs the import lists on `MEDIA_APPROVED` / `MEDIA_AUTO_APPROVED`. Seerr allows one webhook URL, so to keep another receiver fed set `SEERR_FORWARD_URL` (http or https; anything else is rejected at startup and treated as unset) and optionally `SEERR_FORWARD_AUTH` (the whole `Authorization` header value; the incoming auth is never passed on). Every POST, of any type including tests, is forwarded on a background thread with the same raw body and Content-Type (connect 5 s, total 10 s, one retry on a connection error or 5xx). The reply to Seerr never changes. One log line per forward holds the status code or error class and the notification type, never the URL, auth or body. Forwarded requests carry `X-Arr-Webhook-Forwarded: 1`, and a request that already has it is not forwarded again. Empty or unset means no outbound call.
+
 ## Arr health
 
 `arr_health.py`, run from a background thread every `ARR_HEALTH_INTERVAL` seconds (300):
