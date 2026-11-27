@@ -201,6 +201,7 @@ class Config:
     head_min_s: float = HEAD_MIN_S
     min_play_s: float = MIN_PLAY_S
     only_paths: frozenset = frozenset()  # empty: no allowlist; else only these may be demoted
+    orphan_grace_days: float = 7.0  # 0 turns the orphan stub cleanup off
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
@@ -262,6 +263,9 @@ class Config:
             head_min_s=max(0.0, float(e.get("TIERING_HEAD_MIN_S") or HEAD_MIN_S)),
             min_play_s=max(0.0, float(e.get("TIERING_MIN_PLAY_S") or MIN_PLAY_S)),
             only_paths=parse_only_paths(e.get("TIERING_ONLY_PATHS")),
+            orphan_grace_days=max(0.0, float(
+                7.0 if e.get("TIERING_ORPHAN_GRACE_DAYS") in (None, "")
+                else e["TIERING_ORPHAN_GRACE_DAYS"])),
         )
 
 
@@ -305,6 +309,9 @@ class Deps:
     gate: Callable
     register: Callable | None = None  # register(db, apply) -> dict, once a night
     weekly: Callable | None = None  # weekly(db) runs weekly.run_weekly; flags come as events
+    # open_holders(path) -> list of pids holding the file open (tierfs included); a -1 entry
+    # means "not clear". None: the orphan cleanup cannot tell, so it keeps every stub.
+    open_holders: Callable | None = None
 
 
 def _http_gate(cfg: Config):
@@ -379,7 +386,11 @@ def load_deps(cfg: Config) -> Deps:
     def register(db, apply):
         return importlib.import_module(f"{__package__}.register").register(db, apply)
 
-    return Deps(st, promote, demote, qualify, _http_gate(cfg), register, weekly)
+    def open_holders(path):
+        # ignore_comm=(): a tierfs reader holding the stub counts as a holder too
+        return ops.scan_open_holders(path, ignore_comm=())
+
+    return Deps(st, promote, demote, qualify, _http_gate(cfg), register, weekly, open_holders)
 
 
 # --------------------------------------------------------------------------
@@ -452,6 +463,7 @@ class Runner:
         self.pending_bad: dict = {}
         self.slot_alerted: set = set()  # (night start, id)
         self.ops_alerted: set = set()  # (kind, id), once per id, ever
+        self.orphan_logged: set = set()  # (id, what): orphan cleanup notes, logged once per id
         self._seed_alerted()
         self.demote_running: set = set()
         self.fails: dict = {}  # id -> failures in a row
@@ -864,6 +876,139 @@ class Runner:
                 self.state.log_event(db, row["id"], "l_replaced", {"lib_path": row.get("lib_path")})
                 log.warning("%s: L replaced, no longer managed", row["id"])
 
+    # ---- orphan stub cleanup
+
+    def _orphan_note(self, id, what, msg, *a):
+        """Log one line per (id, what), not once per pass."""
+        if (id, what) not in self.orphan_logged:
+            self.orphan_logged.add((id, what))
+            log.warning("orphan %s: " + msg, id, *a)
+
+    def _orphan_l_is_ours(self, row, ext) -> bool:
+        """Something at L, on any disk, is a symlink into tierfs for this id (by name, as
+        reconcile does). With no lib_path we cannot tell, so it counts as ours: keep."""
+        if not row.get("lib_path"):
+            return True
+        for disk in self._find_disk(row):
+            try:
+                got = os.readlink(disk)
+            except OSError:
+                continue  # not a symlink (a regular file, or gone)
+            if os.path.basename(got) == f"{row['id']}{ext}":
+                return True
+        return False
+
+    def _orphan_stub(self, row, ext):
+        """(stub, lstat, None) when the row's stub is exactly <root>/<id><ext>, a regular
+        file with one link, directly in a stub root; else (None, None, why)."""
+        id = str(row["id"])
+        stub = row.get("stub_path") or ""
+        if not stub or "/" in id or id in ("", ".", ".."):
+            return None, None, "no usable stub_path or id"
+        roots = [os.path.normpath(r.strip()) for r in self.cfg.stub_roots.split(",") if r.strip()]
+        for root in roots:
+            if stub != os.path.join(root, f"{id}{ext}"):
+                continue
+            try:
+                ls = os.lstat(stub)
+            except OSError:
+                return None, None, "the stub cannot be read"
+            if not stat_mod.S_ISREG(ls.st_mode):
+                return None, None, "the stub is not a regular file"
+            if ls.st_nlink != 1:
+                return None, None, f"the stub has {ls.st_nlink} links"
+            return stub, ls, None
+        return None, None, "the stub is not <stub root>/<id><ext>"
+
+    def _orphans(self, db, rows, now):
+        """Remove the stub and manifest of rows an arr upgrade or delete left behind
+        (state=failed, restore_note "L replaced") once TIERING_ORPHAN_GRACE_DAYS have
+        passed since the row was marked (its updated_ts). Every check must hold, else
+        everything stays. Never touches L or the library. Dry run: logs only."""
+        grace = self.cfg.orphan_grace_days
+        if grace <= 0 or not self.cfg.manifests:
+            return
+        n = freed = 0
+        for row in rows:
+            if row["state"] != "failed" or row.get("restore_note") != "L replaced":
+                continue
+            marked = row.get("updated_ts")
+            if not marked or now - float(marked) < grace * DAY:
+                continue
+            try:
+                size = self._orphan_one(db, row)
+            except Exception as e:
+                log.error("orphan %s: cleanup failed: %s", row.get("id"), type(e).__name__)
+                continue
+            if size is not None:
+                n += 1
+                freed += size
+        if n and self.cfg.apply:
+            self._alert("orphan_stubs_removed", "orphans", count=n, bytes_freed=freed)
+
+    def _orphan_one(self, db, row):
+        """Clean one row; returns the stub's size in bytes if it was (or, in a dry run,
+        would be) removed, else None."""
+        id = str(row["id"])
+        ext = os.path.splitext(row.get("lib_path") or "")[1]
+        stub, ls, why = self._orphan_stub(row, ext)
+        if stub is None:
+            self._orphan_note(id, "keep", "kept: %s", why)
+            return None
+        mfiles = [os.path.join(self.cfg.manifests, f"{id}{x}") for x in (".json", ".chunks", ".fill")]
+        try:
+            with open(mfiles[0]) as fh:
+                man = json.load(fh)
+            if not isinstance(man, dict) or man.get("stub_path") != stub:
+                raise ValueError
+        except (OSError, ValueError):
+            self._orphan_note(id, "keep", "kept: the manifest is missing or its stub_path differs")
+            return None
+        if self._orphan_l_is_ours(row, ext):
+            self._orphan_note(id, "keep", "kept: L is (or may be) a tierfs symlink for this id")
+            return None
+        if self.deps.open_holders is None:
+            self._orphan_note(id, "keep", "kept: no open-file check available")
+            return None
+        if not self.cfg.apply:
+            self._orphan_note(id, "dry", "dry run: would remove stub %s (%d bytes) and manifest",
+                              stub, ls.st_size)
+            return ls.st_size
+        try:
+            holders = self.deps.open_holders(stub)
+        except Exception as e:
+            holders = [-1]
+            log.error("orphan %s: open check failed: %s", id, type(e).__name__)
+        if holders:
+            self._orphan_note(id, "keep", "kept: the open-file check is not clear")
+            return None
+        # right before deleting: the row and L again, and the stub is still the same file
+        cur = self.state.get(db, id)
+        if not cur or cur.get("state") != "failed" or cur.get("restore_note") != "L replaced" \
+                or cur.get("stub_path") != stub or self._orphan_l_is_ours(cur, ext):
+            self._orphan_note(id, "keep", "kept: the row or L changed during the check")
+            return None
+        try:
+            now_ls = os.lstat(stub)
+            if (now_ls.st_ino, now_ls.st_dev) != (ls.st_ino, ls.st_dev) or now_ls.st_nlink != 1:
+                raise OSError
+            os.unlink(stub)
+        except OSError:
+            self._orphan_note(id, "keep", "kept: the stub changed or cannot be removed")
+            return None
+        for m in mfiles:
+            try:
+                os.unlink(m)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log.error("orphan %s: cannot remove %s: %s", id, os.path.basename(m),
+                          type(e).__name__)
+        self.state.update_if(db, id, "failed", restore_note="orphan cleaned")
+        self.state.log_event(db, id, "orphan_stub_removed", {"id": id, "size": ls.st_size})
+        log.warning("orphan %s: stub and manifest removed (%d bytes)", id, ls.st_size)
+        return ls.st_size
+
     def _once(self, kind, id, **detail):
         """Alert once per (kind, id), ever (the alerts file seeds this after a restart)."""
         if (kind, str(id)) in self.ops_alerted:
@@ -1145,6 +1290,7 @@ class Runner:
 
         rows = st.list_files(db)
         self._reconcile(db, rows, now)
+        self._orphans(db, rows, now)
         self._bad_chunks(db, now)
         self._ops_events(db)
         rows = st.list_files(db)
