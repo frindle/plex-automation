@@ -139,6 +139,7 @@ tierfs reads the remote at `${TIERFS_REMOTE_BASE}` + `remote_path`. The credenti
 |---|---|---|
 | `state.py` | file ops | SQLite at `${TIERING_DB}`. API below. |
 | `ops.py` | file ops | `offload`, `promote`, `demote` on one file. Uses a `RemoteReader`. |
+| `restub.py` | file ops | Rebuilds lost stubs and `L` from the remote's head and tail. See "Restub". |
 | `hotset.py` | rules | Pure functions, no I/O. |
 | `plex_watch.py` | rules | Read-only Plex client and the tierfs event reader. |
 | `altmount.py`, `nntp_stat.py`, `newznab.py` | intake | Clients. `altmount.WebDavReader` implements `RemoteReader`. |
@@ -298,6 +299,18 @@ The inputs are plain dicts shaped like Plex's JSON: `ratingKey`, `grandparentRat
 3. Restore the stub's mtime.
 4. Link the stub to `L.tierfs-tmp`, then `rename` it over `L`.
 5. Unlink the stub path, remove the manifest, the chunk list and the fill file, and set `state=whole`.
+
+### Restub (rebuild a lost stub from the remote)
+
+After a data loss the stub, and with it `L` (same disk), can be gone while the database, manifest and chunk list survive. The stub holds only the head and the tail, and the manifest has `head_b3` and `tail_b3`, so it is rebuilt from two ranged reads of the remote through the same `RemoteReader` promote uses. The release is not downloaded again and not offloaded again. `restub.py`, run as `python -m offload.restub` or `python -m offload.runner restub`.
+
+- **Finds:** rows in `state=offloaded` whose stub is missing, has the wrong size, or whose head or tail hash differs from the manifest, and rows whose `L` is missing. The stub check reads the stub's head and tail from local disk.
+- **Rebuilds:** a sparse temp file of the full size next to the stub, the tail and then the head read in 8 MiB pieces and checked against `tail_b3` and `head_b3`, mtime set to the original, fsync, then rename onto `stub_path` and a directory fsync. The middle stays a hole. Only then `L` is restored the way demote leaves it: a symlink to `${TIERFS_MOUNT}/<id><ext>`, made with `symlink(2)`, which fails rather than replace anything that appeared since the check. The stub is always first, so `L` never points at nothing tierfs cannot serve. A twin copy is tried when the first fails to verify. Each range gets two fetches per copy.
+- **Needs:** the manifest and a chunk list that matches `chunks_b3`, and the manifest's size, lengths and hashes equal to the row's. A row without them is reported (`no_manifest`) and not rebuilt. Promote cannot check the middle without the chunk list either.
+- **Refuses** (the file is left as it is, reported under `refused`): `TIERING_APPLY` unset on `--apply`; the remote down (a one-byte read fails to connect, or refuses the login) before anything is written; a stub root that is missing (never created), not one of `TIERFS_STUB_ROOTS`, not a real file system, or on another disk than the library folder; a library path that is not on exactly one disk (when `L` is gone, the folder on the stub's disk decides); a regular file or a foreign symlink at `L` (a new import, or a whole copy); anything but a regular file at the stub path; a row another operation holds the per-id lock on.
+- **Unreadable head or tail** (hash mismatch after both fetches, a short answer or a status error through the retry budget `TIERING_RESTUB_RETRY_S`, default 60 per piece): the row goes to `state=failed` with a `restore_note`, a `restub_unreadable` alert is appended to `TIERING_ALERTS`, the temp file is removed, and nothing is left at the stub path or at `L`. A remote that goes away mid-run stops the run instead and leaves the row `offloaded`, so a rerun resumes.
+- **Dry run by default.** `--apply` (with `TIERING_APPLY=1`) writes. `--cap N` (default `TIERING_RESTUB_CAP`, 10) rebuilds at most N files per run; the rest are `deferred`. The state stays `offloaded` throughout, so a rerun is idempotent: a repaired file is `ok`, a stale temp from a killed run is removed first, and a crash between the stub and `L` is finished by the next run without touching the remote. A `failed` row is not retried; set it back to `offloaded` once the articles are back.
+- **Events:** `restubbed` on success. Exit code 0 when nothing failed or was refused.
 
 ## Runner (`runner.py`)
 

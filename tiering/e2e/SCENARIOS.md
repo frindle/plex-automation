@@ -113,6 +113,20 @@ with a bindfs stand-in.
    for the promote and get every byte; the other file stays offloaded and Plex
    keeps the same part.
 
+## 12. Restub
+
+1. Offload a movie, then delete its stub, and in a second run also `L`, to
+   stand in for a lost disk. Keep the DB and manifest.
+2. `python -m offload.runner restub` (dry run): assert it lists the file and the
+   tree is unchanged.
+3. Run with `--apply`. Assert the fake WebDAV saw ranged reads of only the head
+   and the tail, the stub is sparse with the original mtime, `L` is the tierfs
+   symlink again, the sha256 through `L` equals the original and the row is
+   still `offloaded`.
+4. Delete the manifest too: assert the file is reported and nothing is written.
+5. Make the tail unreadable on the fake remote: assert `state=failed`, a
+   `restub_unreadable` alert, no stub and no `L` left half-written.
+
 ## Shared assertions after every scenario
 
 - No `L` is missing or dangling.
