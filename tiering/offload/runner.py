@@ -47,6 +47,8 @@ STUCK_AFTER = 3 * 3600.0  # a promote running this long is reported as stuck
 REGISTER_LEAD = 3600.0  # register this long before the demote window opens
 PROTECTED_COLUMNS = ("id", "state", "created_ts", "updated_ts", "lib_path")
 REGISTER_BAD_FRAC = 0.05  # missing_local + ambiguous over this share of listed fails register (on_pool is not counted)
+RESTORED_NOTE = "restored from the restore path"  # ops.RESTORED_NOTE
+ORPHAN_NOTES = ("L replaced", RESTORED_NOTE)  # failed rows whose stub the orphan cleanup may remove
 ALERT_EVENTS = ("promote_short_remote", "takeover_orphan")  # ops events, alerted once per id
 ONCE_KINDS = ALERT_EVENTS + ("l_missing", "promote_stuck")  # alerted once per id, ever
 BACKOFF_MAX = 6 * 3600.0  # promote retry delay: RETRY_DELAY doubling, capped here
@@ -203,6 +205,7 @@ class Config:
     only_paths: frozenset = frozenset()  # empty: no allowlist; else only these may be demoted
     only_spec: str = ""  # "@file" form of TIERING_ONLY_PATHS: re-read at the start of each pass
     orphan_grace_days: float = 7.0  # 0 turns the orphan stub cleanup off
+    auto_restore: bool = False  # TIERING_AUTO_RESTORE: restore from the restore path when the exact copy is bad
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
@@ -269,6 +272,7 @@ class Config:
             orphan_grace_days=max(0.0, float(
                 7.0 if e.get("TIERING_ORPHAN_GRACE_DAYS") in (None, "")
                 else e["TIERING_ORPHAN_GRACE_DAYS"])),
+            auto_restore=_flag(e.get("TIERING_AUTO_RESTORE")),
         )
 
 
@@ -318,6 +322,9 @@ class Deps:
     # relink(db, row, mount_wait) -> "ok" | "relinked" | "skip: why": points an offloaded L at
     # TIERFS_MOUNT when its symlink names the entry in another directory (ops.relink_to_mount).
     relink: Callable | None = None
+    # restore(db, row, apply, keep_name) -> ops Result: brings the file back as the restore path's
+    # release (ops.restore_from_path). None: no restore (the auto trigger only logs).
+    restore: Callable | None = None
 
 
 def _http_gate(cfg: Config):
@@ -400,8 +407,17 @@ def load_deps(cfg: Config) -> Deps:
         return ops.relink_to_mount(db, row, cfg.tierfs_mount, path_map=cfg.path_map,
                                    mount_wait=mount_wait)
 
+    def restore(db, row, apply, keep_name=True):
+        # the clients are built on use: a dry run and a runner that never restores need
+        # neither AltMount's API key nor the arr and Plex settings
+        from . import notify as notify_mod
+        importer = altmount.ImportClient(reader=reader)
+        return ops.restore_from_path(db, row["id"], importer, reader, apply=apply,
+                                     path_map=cfg.path_map, keep_name=keep_name,
+                                     notify=notify_mod.notify_from_env())
+
     return Deps(st, promote, demote, qualify, _http_gate(cfg), register, weekly, open_holders,
-                relink)
+                relink, restore)
 
 
 # --------------------------------------------------------------------------
@@ -474,6 +490,7 @@ class Runner:
         self.pending_bad: dict = {}
         self.slot_alerted: set = set()  # (night start, id)
         self.ops_alerted: set = set()  # (kind, id), once per id, ever
+        self.restore_tried: set = set()  # ids the auto restore has tried (once per id and process)
         self.orphan_logged: set = set()  # (id, what): orphan cleanup notes, logged once per id
         self._seed_alerted()
         self.demote_running: set = set()
@@ -992,7 +1009,7 @@ class Runner:
             return
         n = freed = 0
         for row in rows:
-            if row["state"] != "failed" or row.get("restore_note") != "L replaced":
+            if row["state"] != "failed" or row.get("restore_note") not in ORPHAN_NOTES:
                 continue
             marked = row.get("updated_ts")
             if not marked or now - float(marked) < grace * DAY:
@@ -1046,7 +1063,7 @@ class Runner:
             return None
         # right before deleting: the row and L again, and the stub is still the same file
         cur = self.state.get(db, id)
-        if not cur or cur.get("state") != "failed" or cur.get("restore_note") != "L replaced" \
+        if not cur or cur.get("state") != "failed" or cur.get("restore_note") not in ORPHAN_NOTES \
                 or cur.get("stub_path") != stub or self._orphan_l_is_ours(cur, ext):
             self._orphan_note(id, "keep", "kept: the row or L changed during the check")
             return None
@@ -1066,10 +1083,48 @@ class Runner:
             except OSError as e:
                 log.error("orphan %s: cannot remove %s: %s", id, os.path.basename(m),
                           type(e).__name__)
-        self.state.update_if(db, id, "failed", restore_note="orphan cleaned")
+        after = {"restore_note": "orphan cleaned"}
+        if row.get("restore_note") == RESTORED_NOTE:
+            after["lib_path"] = None  # the path belongs to the restored file now: register may take it
+        self.state.update_if(db, id, "failed", **after)
         self.state.log_event(db, id, "orphan_stub_removed", {"id": id, "size": ls.st_size})
         log.warning("orphan %s: stub and manifest removed (%d bytes)", id, ls.st_size)
         return ls.st_size
+
+    # ---- restore path
+
+    def _auto_restore(self, id, why):
+        """The exact copy is bad (bad_chunk, or a remote that is permanently short): when
+        TIERING_AUTO_RESTORE is on, bring the file back as the restore path's release, in
+        its own thread. Once per id and process: a failed try is not repeated every pass."""
+        if not self.cfg.auto_restore or id in self.restore_tried:
+            return
+        self.restore_tried.add(id)
+        if not self.cfg.apply:
+            log.error("dry run: would restore %s from the restore path (%s)", id, why)
+            return
+        if self.deps.restore is None:
+            log.error("%s: TIERING_AUTO_RESTORE is on but this runner has no restore", id)
+            return
+        self._spawn(lambda: self._restore_one(id, why))
+
+    def _restore_one(self, id, why, keep_name=True):
+        try:
+            db = self._open()
+            row = self.state.get(db, id)
+            if row is None:
+                return None
+            log.warning("restore %s from the restore path (%s)", id, why)
+            res = self.deps.restore(db, row, True, keep_name)
+        except Exception as e:
+            log.error("restore %s raised %s: %s", id, type(e).__name__, e)
+            self._alert("restore_failed", id, why=why, reason=f"{type(e).__name__}: {e}")
+            return None
+        if res.ok:
+            self._alert("restore_done", id, why=why)
+        else:
+            self._alert("restore_failed", id, why=why, reason=res.reason)
+        return res
 
     def _once(self, kind, id, **detail):
         """Alert once per (kind, id), ever (the alerts file seeds this after a restart)."""
@@ -1211,6 +1266,7 @@ class Runner:
                 continue
             self.state.log_event(db, id, "bad_chunk", {"offset": ev["offset"]})
             self._alert("bad_chunk", id, offset=ev["offset"], lib_path=row.get("lib_path"))
+            self._auto_restore(id, "bad_chunk")
 
     # ---- nightly register
 
@@ -1294,6 +1350,8 @@ class Runner:
                 self.flagged.add(id)
             elif kind in ALERT_EVENTS and seq > self.ops_seq:
                 self._once(kind, id, **(e.get("detail") or {}))
+                if kind == "promote_short_remote":
+                    self._auto_restore(id, kind)
         top = max([int(e.get("seq") or 0) for e in evs] + [0])
         self.ops_seq = max(self.ops_seq, top)
         self.flag_seq = max(self.flag_seq, top)
@@ -1887,8 +1945,135 @@ def start_health_server(runner: Runner, spec: str):
     return srv
 
 
+def restore_main(args, env=None, deps=None) -> int:
+    """`--restore ID [--release-name]`: restore one row from its restore path (nzb_path2) and
+    exit. A dry run unless TIERING_APPLY=1. The runner's own lock is not taken: the restore holds
+    the per-id locks, so it can run beside a running runner."""
+    try:
+        cfg = Config.from_env(env)
+        deps = deps or load_deps(cfg)
+    except Exception as e:
+        log.error("settings: %s: %s", type(e).__name__, e)
+        return 2
+    i = args.index("--restore")
+    if i + 1 >= len(args) or args[i + 1].startswith("-"):
+        log.error("--restore needs a row id")
+        return 2
+    id = args[i + 1]
+    db = deps.state.open_db(cfg.db)
+    row = deps.state.get(db, id)
+    if row is None:
+        log.error("restore: no row with id %s", id)
+        return 1
+    if deps.restore is None:
+        log.error("restore: not available")
+        return 2
+    res = deps.restore(db, row, cfg.apply, "--release-name" not in args)
+    log.info("restore %s: ok=%s state=%s %s", id, res.ok, res.state, res.reason)
+    return 0 if res.ok else 1
+
+
+HAND_FAILED_NOTE = "marked failed by hand"
+
+
+def mark_failed_main(args, env=None, deps=None) -> int:
+    """`--mark-failed ID [--undo]`: mark one offloaded row failed, the state a bad chunk
+    leaves, so no promote runs for it (a want never promotes a failed row). tierfs keeps
+    serving its stub, so it still plays, and --restore or --switch-live can run while it does.
+    `--undo` puts a row marked this way back to offloaded. A dry run unless TIERING_APPLY=1.
+    The state change is a compare-and-set, so a row a promote or demote holds is left alone.
+    Only TIERING_DB and TIERING_APPLY are read: it touches the state DB and nothing else."""
+    e = os.environ if env is None else env
+    dbpath, apply = e.get("TIERING_DB", ""), e.get("TIERING_APPLY") == "1"
+    if not dbpath:
+        log.error("settings: TIERING_DB must be set")
+        return 2
+    if deps is None:
+        from . import state as st_mod
+        state = st_mod
+    else:
+        state = deps.state
+    i = args.index("--mark-failed")
+    if i + 1 >= len(args) or args[i + 1].startswith("-"):
+        log.error("--mark-failed needs a row id")
+        return 2
+    id, undo = args[i + 1], "--undo" in args
+    db = state.open_db(dbpath)
+    row = state.get(db, id)
+    if row is None:
+        log.error("mark-failed: no row with id %s", id)
+        return 1
+    if undo:
+        if row["state"] != "failed" or row.get("restore_note") != HAND_FAILED_NOTE:
+            log.error("mark-failed --undo: %s is %s (%s), not marked by hand", id, row["state"],
+                      row.get("restore_note") or "no note")
+            return 1
+        frm, to = "failed", {"state": "offloaded", "restore_note": None}
+    else:
+        if row["state"] != "offloaded":
+            log.error("mark-failed: %s is %s, only an offloaded row can be marked", id,
+                      row["state"])
+            return 1
+        frm, to = "offloaded", {"state": "failed", "restore_note": HAND_FAILED_NOTE}
+    if not apply:
+        log.info("dry run: would set %s %s -> %s", id, frm, to["state"])
+        return 0
+    if not state.update_if(db, id, frm, **to):
+        log.error("mark-failed: %s moved on from %s, nothing changed", id, frm)
+        return 1
+    state.log_event(db, id, "unmarked_failed" if undo else "marked_failed", {})
+    log.info("%s: %s -> %s", id, frm, to["state"])
+    return 0
+
+
+def switch_main(args, env=None, deps=None, plex=None, **kw) -> int:
+    """`--switch-live ID [--check]`: move the players watching row ID onto the restore-path
+    release (see switch_live.py). `--check` only lists the sessions and whether each player
+    accepts remote control. Otherwise a dry run unless TIERING_APPLY=1. Like --restore it does
+    not take the runner lock."""
+    from . import switch_live
+    try:
+        cfg = Config.from_env(env)
+        deps = deps or load_deps(cfg)
+    except Exception as e:
+        log.error("settings: %s: %s", type(e).__name__, e)
+        return 2
+    i = args.index("--switch-live")
+    if i + 1 >= len(args) or args[i + 1].startswith("-"):
+        log.error("--switch-live needs a row id")
+        return 2
+    id = args[i + 1]
+    db = deps.state.open_db(cfg.db)
+    row = deps.state.get(db, id)
+    if row is None:
+        log.error("switch: no row with id %s", id)
+        return 1
+    try:
+        plex = plex or switch_live.Plex()
+        if "--check" in args:
+            switch_live.check(row, plex, out=print)
+            return 0
+        if deps.restore is None:
+            log.error("switch: restore is not available")
+            return 2
+        e = os.environ if env is None else env
+        res = switch_live.switch_live(
+            db, row, plex, apply=cfg.apply, restore=deps.restore, path_map=cfg.path_map,
+            tierfs_mount=cfg.tierfs_mount, server_url=e.get("TIERING_PLEX_PLAYER_URL") or None,
+            **kw)
+    except switch_live.PlexRCError as e:
+        log.error("switch %s: %s", id, e)
+        return 1
+    log.info("switch %s: switched=%d left=%d %s", id, len(res["switched"]), len(res["left"]),
+             res["note"])
+    for m, why in res["left"].items():
+        log.warning("switch %s: player %s left on the old file: %s", id, m, why)
+    return 0 if res["switched"] or not res["left"] else 1
+
+
 def main(argv=None, env=None, deps=None) -> int:
-    once = "--once" in (sys.argv[1:] if argv is None else argv)
+    args = sys.argv[1:] if argv is None else argv
+    once = "--once" in args
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     handler.addFilter(Redact())
@@ -1896,6 +2081,12 @@ def main(argv=None, env=None, deps=None) -> int:
     if not root.handlers:
         root.addHandler(handler)
     root.setLevel(logging.INFO)
+    if "--restore" in args:
+        return restore_main(args, env, deps)
+    if "--switch-live" in args:
+        return switch_main(args, env, deps)
+    if "--mark-failed" in args:
+        return mark_failed_main(args, env, deps)
     try:
         cfg = Config.from_env(env)
     except ValueError as e:

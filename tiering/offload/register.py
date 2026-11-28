@@ -111,6 +111,24 @@ class ArrClient:
     def __repr__(self) -> str:
         return "ArrClient()"
 
+    def post(self, path: str, body: dict):
+        """POST a JSON body (the key goes in the header, as for a GET)."""
+        req = urllib.request.Request(
+            f"{self._base}{path}", data=json.dumps(body).encode(), method="POST",
+            headers={"X-Api-Key": self._key, "Accept": "application/json",
+                     "Content-Type": "application/json"})
+        try:
+            with self._opener.open(req, timeout=self._timeout) as r:
+                raw = r.read(_LIMIT + 1)
+        except urllib.error.HTTPError as e:
+            raise ArrError(f"arr status {e.code}") from None
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            raise ArrError(f"arr unreachable: {type(e).__name__}") from None
+        try:
+            return json.loads(raw) if raw else {}
+        except ValueError:
+            return {}
+
     def get(self, path: str, **params):
         q = urllib.parse.urlencode(params)
         req = urllib.request.Request(f"{self._base}{path}" + (f"?{q}" if q else ""),
