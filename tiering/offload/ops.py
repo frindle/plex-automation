@@ -1369,6 +1369,15 @@ def _same_regular(a, b) -> bool:
     return stat_mod.S_ISREG(sa.st_mode) and _same_inode(sa, sb)
 
 
+def _span_done(done, idx, n_chunks, chunk_size) -> bool:
+    """The chunk at idx and the rest of the WANT_SPAN after it are all on disk. A want
+    there comes from a reader that is not waiting (a new handle's ask for the start of
+    the middle, which Plex makes on every seek), so it must not pull the fill away from
+    a viewer who is; a reader that runs out of data wants the missing chunk itself."""
+    k = max(1, WANT_SPAN // chunk_size)
+    return all(i in done for i in range(idx, min(idx + k, n_chunks)))
+
+
 def _read_fill(path, start, chunk_size, n) -> set[int]:
     """Chunk indexes the fill file lists. Lines that are not a chunk start of
     this middle (a `failed` line, a torn last line) are ignored."""
@@ -1541,7 +1550,9 @@ def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry
             if w is not None and w != last_want:
                 last_want = w
                 widx = (w - start) // chunk_size
-                if 0 <= widx < n_chunks and (first or not 0 <= w - (start + cursor * chunk_size) < WANT_SPAN):
+                if 0 <= widx < n_chunks and (first or (
+                        not 0 <= w - (start + cursor * chunk_size) < WANT_SPAN
+                        and not _span_done(done, widx, n_chunks, chunk_size))):
                     cursor = widx
                 first = False
             hot = bool(urgent and urgent())
