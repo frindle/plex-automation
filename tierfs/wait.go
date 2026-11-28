@@ -13,6 +13,12 @@ import (
 // writes another one.
 const wantSpan = 64 << 20
 
+// wantResend is how often a read that is still waiting writes its want again,
+// span or not. The promote follows the latest want of any handle, so another
+// viewer of the same file can take it elsewhere; without the resend this read
+// would wait until the fill wrapped round to it.
+var wantResend = 2 * time.Second
+
 var (
 	errFillFailed  = errors.New("promote failed")
 	errWaitTimeout = errors.New("no progress from the promote")
@@ -55,9 +61,13 @@ func (h *handle) fillFileExists() bool {
 
 // noteWant writes a want event for the chunk at off, unless it falls in the
 // 64 MiB after this handle's last want.
-func (h *handle) noteWant(off int64) {
+func (h *handle) noteWant(off int64) { h.sendWant(off, false) }
+
+// sendWant writes a want event for the chunk at off; with force it does so
+// even inside the span.
+func (h *handle) sendWant(off int64, force bool) {
 	h.wantMu.Lock()
-	send := !h.hasWant || off < h.lastW || off >= h.lastW+wantSpan
+	send := force || !h.hasWant || off < h.lastW || off >= h.lastW+wantSpan
 	if send {
 		h.hasWant, h.lastW = true, off
 	}
@@ -136,7 +146,7 @@ func (h *handle) waitChunks(ctx context.Context, first, last, off, n int64) erro
 		return nil
 	}
 	srv := h.srv
-	start := now
+	start, sent := now, now
 	srv.m.WaitReads.Add(1)
 	srv.m.WaitingReads.Add(1)
 	defer srv.m.WaitingReads.Add(-1)
@@ -160,6 +170,10 @@ func (h *handle) waitChunks(ctx context.Context, first, last, off, n int64) erro
 			}
 		}
 		h.noteWant(miss)
+		if time.Since(sent) >= wantResend {
+			h.sendWant(miss, true)
+			sent = time.Now()
+		}
 		since := start
 		if lp := h.fill.lastProgress(); lp.After(since) {
 			since = lp

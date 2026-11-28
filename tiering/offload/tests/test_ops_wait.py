@@ -92,6 +92,39 @@ def test_want_inside_the_next_64mib_keeps_the_cursor(big):
     assert offs[:4] == [HEAD + i * CS for i in (10, 11, 12, 13)]  # sequential, never skipped ahead
 
 
+def _by_count(spy, steps):
+    """want() that answers by how many chunks the spy has fetched: steps is
+    [(fetched_below, want), ...] and the last want holds after that."""
+    def want():
+        n = len(spy.calls)
+        for lim, w in steps:
+            if n < lim:
+                return w
+        return steps[-1][1]
+    return want
+
+
+def test_want_for_chunks_already_on_disk_keeps_the_cursor(big):
+    # the viewer seeks to chunk 40; then Plex opens the file again and asks for the
+    # start of the middle, which is on disk: the fill stays with the viewer
+    env = big
+    spy = Spy(env)
+    env.promote(spy, want=_by_count(spy, [(20, HEAD), (25, HEAD + 40 * CS), (N, HEAD)]))
+    offs = [o for o, _ in spy.calls]
+    assert offs == [HEAD + i * CS for i in list(range(20)) + list(range(40, N)) + list(range(20, 40))]
+
+
+def test_want_with_a_hole_inside_the_span_still_moves_the_cursor(big):
+    # chunk 10 is on disk but 20 is not, and 20 is inside the 64 MiB after it: a
+    # reader there is about to wait, so the fill goes back for it
+    env = big
+    spy = Spy(env)
+    env.promote(spy, want=_by_count(spy, [(20, HEAD), (25, HEAD + 40 * CS), (N, HEAD + 10 * CS)]))
+    offs = [o for o, _ in spy.calls]
+    assert offs == [HEAD + i * CS for i in
+                    list(range(20)) + list(range(40, 45)) + list(range(20, 40)) + list(range(45, N))]
+
+
 def test_resume_trusts_the_fill_file(big):
     env = big
 

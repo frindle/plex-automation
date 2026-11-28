@@ -460,3 +460,28 @@ func TestConfigWaitEnv(t *testing.T) {
 		t.Error("TIERFS_WAIT_S=0 accepted")
 	}
 }
+
+// Another viewer's want can take the promote elsewhere. A read still waiting
+// writes its want again every wantResend, even inside its 64 MiB span, so the
+// promote comes back to it.
+func TestWaitResendsWantWhileWaiting(t *testing.T) {
+	old := wantResend
+	wantResend = 60 * time.Millisecond
+	t.Cleanup(func() { wantResend = old })
+	w := wSetup(t)
+	w.s.cfg.WaitTimeout = 400 * time.Millisecond
+	h := w.open(t)
+	a := w.m.HeadLen + 2*w.m.ChunkSize
+	if _, errno := w.readAs(ctxPid(playerPid), h, a, 4096); errno != syscall.EIO {
+		t.Fatalf("errno = %v", errno)
+	}
+	got := w.wants(t)
+	if len(got) < 3 {
+		t.Fatalf("wants = %v, want the first and at least two resends", got)
+	}
+	for _, o := range got {
+		if o != a {
+			t.Fatalf("wants = %v, all at %d", got, a)
+		}
+	}
+}
