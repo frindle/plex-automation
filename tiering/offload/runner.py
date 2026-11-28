@@ -1690,6 +1690,11 @@ class Runner:
             if not q.ok and any(str(r).endswith("_unsure") for r in q.reasons):
                 # a partial search or a spent budget: not tonight, and nothing is recorded
                 log.info("demote %s not tonight: %s", id, ",".join(q.reasons))
+                hs = (getattr(q, "steps", None) or {}).get("hash")
+                if isinstance(hs, dict) and hs.get("kind") == "read_fault":
+                    # the upload is L but AltMount served other bytes: playback would too
+                    self._alert("remote_read_fault", id, first_bad=hs.get("first_bad"),
+                                read_faults=hs.get("read_faults", 0))
                 return
             if not q.ok:
                 log.info("demote %s skipped: qualify failed: %s", id, ",".join(q.reasons))
