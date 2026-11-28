@@ -19,7 +19,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
+import shutil
 import stat as stat_mod
 import tempfile
 import threading
@@ -1619,3 +1621,378 @@ def _fill_middle(reader, row, stub, lib, chunk_size, digests, fpath, want, retry
         for x in (fd, ffd):
             if x is not None:
                 os.close(x)
+
+
+# --------------------------------------------------------------------------
+# restore path: bring a file back as a different release
+
+RESTORED_NOTE = "restored from the restore path"
+RESTORE_TMP_SUFFIX = ".restore-tmp"
+RESTORE_IMPORTED, RESTORE_COPIED, RESTORE_VERIFIED, RESTORE_SWAPPED = 101, 102, 103, 104
+RESTORE_SYNC_EVERY = 128 * MIB  # the copy is fsynced and its offset noted this often
+RESTORE_ZERO_RUN = 512 * 1024  # a run of zeros this long is a zero-filled hole
+RESTORE_SPACE_MARGIN = 1024 * MIB
+RESTORE_READ_TRIES = 3
+_RESTORE_STATES = ("offloaded", "failed")
+
+
+class _RestoreStop(Exception):
+    """A restore step stopped. `hard` ends the attempt (the temp file is dropped, the row
+    keeps its old step); otherwise the same call resumes later."""
+
+    def __init__(self, reason, hard=True, **detail):
+        super().__init__(reason)
+        self.reason, self.hard, self.detail = reason, hard, detail
+
+
+def _restore_key(id) -> str:
+    return f"restore:{id}"
+
+
+def _restore_name(remote, lib, keep_name) -> str:
+    """File name for the restored file. keep_name: L's base name with the restore file's
+    extension, so the arr's naming (the episode numbers in it) and Plex's path for the item
+    stay as they were. Otherwise the restore release's own file name."""
+    own = os.path.basename(str(remote).replace("\\", "/"))
+    ext = os.path.splitext(own)[1]
+    if keep_name:
+        return os.path.splitext(os.path.basename(lib))[0] + ext
+    return own
+
+
+def _restore_name_ok(name, lib) -> str:
+    if not name or name in (".", "..") or "/" in name or "\x00" in name or name.startswith("."):
+        return f"unusable file name {name!r}"
+    if len(name.encode()) > 240:
+        return "file name too long"
+    if name.endswith(RESTORE_TMP_SUFFIX) or name.endswith(TMP_SUFFIX):
+        return "file name clashes with a temp suffix"
+    if not os.path.splitext(name)[1]:
+        return "restore file has no extension"
+    return ""
+
+
+def restore_from_path(db, id, importer, reader, *, apply: bool = False, path_map=None,
+                      keep_name: bool = True, notify=None, after_step=None,
+                      chunk: int = CHUNK) -> Result:
+    """Replace an offloaded file by its restore path: the different release in `nzb_path2`.
+
+    1. import `nzb_path2` through AltMount (`importer.import_nzb`), find its media file;
+    2. copy it through the WebDAV `reader` into `<L>.restore-tmp` (same directory, so the
+       same file system), fsynced, its offset noted every 128 MiB so a crash resumes;
+    3. verify: the local file is the remote size, holds no long run of zeros (a segment
+       AltMount could not fetch is zero-filled and still answered 206), and its SHA-256
+       equals that of a second, independent full read of the remote;
+    4. put it in place under `_restore_name` and drop the symlink L. Same name: one atomic
+       RENAME_EXCHANGE, the symlink that comes out is checked before it is dropped (an arr
+       file that appeared meanwhile is put back). New name: hard link, then drop the symlink;
+    5. the row becomes `failed` with restore_note RESTORED_NOTE. The stub, manifest, chunk
+       list and fill file stay: a player that opened L through tierfs keeps reading the old
+       release until it stops, and the orphan cleanup removes them after its grace days.
+    6. `notify(row, new_share_path)` (best effort, never fails the restore) tells the arr and
+       Plex.
+
+    Nothing is deleted or replaced before the verified file is in hand. Any failure up to the
+    swap leaves L, the stub and the row as they were (the temp file goes, except after a
+    transient read error, which keeps it for the same call to resume). Events:
+    restore_start, restore_done, restore_failed.
+
+    The whole attempt holds the id's lock, the one promote, demote and relink take: a promote
+    that a player starts meanwhile is busy (the player reads through tierfs until the restore is
+    done), so the two never write the row's step at the same time."""
+    with _id_lock(db, id) as mine:
+        if not mine:
+            return Result(False, None, 0, _BUSY)
+        return _restore(db, id, importer, reader, apply, path_map, keep_name, notify,
+                        after_step, chunk)
+
+
+def _restore_fail(db, id, row, reason, hard=True, **detail):
+    log.error("%s: restore: %s", id, reason)
+    st.log_event(db, id, "restore_failed", {"reason": reason, "resumable": not hard, **detail})
+    return Result(False, row["state"], int(row.get("step") or 0), reason)
+
+
+def _restore(db, id, importer, reader, apply, path_map, keep_name, notify, after_step, chunk):
+    row = st.get(db, id)
+    if row is None:
+        return Result(False, None, 0, "unknown id")
+    state, step = row["state"], int(row.get("step") or 0)
+    marker = st.kv_get(db, _restore_key(id)) or None
+    if state not in _RESTORE_STATES:
+        return Result(False, state, step, f"state {state!r} cannot be restored")
+    if apply and os.environ.get("TIERING_APPLY") != "1":
+        return Result(False, state, step, "TIERING_APPLY=1 is not set; refusing to apply")
+    share, stub = row.get("lib_path"), row.get("stub_path")
+    nzb2 = row.get("nzb_path2")
+    if not (share and stub and row.get("size")):
+        return Result(False, state, step, "row is missing facts needed to restore")
+    lib, reason = _resolve_lib(share, path_map)
+    if reason:
+        return Result(False, state, step, reason)
+    ext = os.path.splitext(lib)[1]
+    tmp = lib + RESTORE_TMP_SUFFIX
+
+    def ours():
+        return os.path.islink(lib) and os.path.basename(os.readlink(lib)) == f"{id}{ext}"
+
+    # from verified on, L may already have been swapped; the swap checks for itself
+    done_swap = bool(marker) and step >= RESTORE_VERIFIED
+    if not done_swap:
+        if not ours():
+            return Result(False, state, step, "L is not the tierfs symlink for this id")
+        if not os.path.isfile(stub) or os.path.islink(stub):
+            return Result(False, state, step, "stub is missing")
+        if not nzb2 or not os.path.isfile(nzb2):
+            return Result(False, state, step, "no restore path: nzb_path2 is empty or not on disk")
+    if not apply:
+        log.info("dry run: would restore %s from %s", id, "the restore path")
+        return Result(True, state, step, "dry run", dry_run=True)
+
+    if not marker:
+        marker = {"orig_step": step, "keep_name": bool(keep_name)}
+        step = 0  # a step left over from an earlier attempt has no marker to go with it
+        st.log_event(db, id, "restore_start", {"from": state, "keep_name": bool(keep_name)})
+    else:
+        st.log_event(db, id, "restore_start", {"from": state, "resume_step": step})
+
+    def note(**kw):
+        marker.update(kw)
+        st.kv_set(db, _restore_key(id), marker)
+
+    def mark(n):
+        cur = (st.get(db, id) or {}).get("state")
+        if cur in _RESTORE_STATES:
+            st.update_if(db, id, cur, step=n)
+        if after_step:
+            after_step(n)
+
+    try:
+        if step < RESTORE_SWAPPED:
+            # ---- import (a crash before the path is noted imports once more: harmless)
+            if step < RESTORE_IMPORTED or not marker.get("remote"):
+                try:
+                    with open(nzb2, "rb") as f:
+                        raw = f.read()
+                    name = (row.get("release_name") or row.get("title") or "restore") + " restore"
+                    remote = importer.import_nzb(raw, name)
+                except Exception as e:
+                    raise _RestoreStop(f"import failed: {type(e).__name__}") from None
+                size = reader.size(remote) if remote else 0
+                new_name = _restore_name(remote, lib, marker["keep_name"])
+                bad = _restore_name_ok(new_name, lib)
+                if bad or size <= 0:
+                    raise _RestoreStop(bad or "restore file is empty")
+                target = os.path.join(os.path.dirname(lib), new_name)
+                if target != lib and os.path.lexists(target):
+                    raise _RestoreStop(f"{new_name} already exists beside L; not overwriting")
+                note(remote=remote, name=new_name, size=size, copied=0)
+                mark(RESTORE_IMPORTED)
+                step = RESTORE_IMPORTED
+                _point("restore.imported")
+            # ---- copy
+            if step < RESTORE_COPIED:
+                _restore_copy(reader, marker, tmp, stub, note, chunk)
+                mark(RESTORE_COPIED)
+                step = RESTORE_COPIED
+                _point("restore.copied")
+            # ---- verify
+            if step < RESTORE_VERIFIED:
+                ino = _restore_verify(reader, marker, tmp)
+                note(ino=ino)
+                mark(RESTORE_VERIFIED)
+                step = RESTORE_VERIFIED
+                _point("restore.verified")
+            # ---- swap
+            _restore_swap(db, id, lib, tmp, ext, marker)
+            _point("restore.swapped")
+            mark(RESTORE_SWAPPED)
+            step = RESTORE_SWAPPED
+    except (_RestoreStop, OSError, OpsError) as e:
+        if not isinstance(e, _RestoreStop):
+            e = _RestoreStop(f"{type(e).__name__}: {e}"[:300])
+        if e.hard:
+            with contextlib.suppress(OSError):
+                if os.path.lexists(tmp) and not os.path.islink(tmp):
+                    os.unlink(tmp)
+            st.kv_set(db, _restore_key(id), None)
+            cur = st.get(db, id)
+            if cur and cur.get("state") in _RESTORE_STATES \
+                    and int(cur.get("step") or 0) >= RESTORE_IMPORTED:
+                st.update_if(db, id, cur["state"], step=marker.get("orig_step", 0))
+        return _restore_fail(db, id, st.get(db, id) or row, e.reason, hard=e.hard, **e.detail)
+
+    # ---- final: the row, then the arr and Plex
+    final = marker
+    new_share = os.path.join(os.path.dirname(share), final["name"])
+    for cur_state in _RESTORE_STATES:
+        if st.update_if(db, id, cur_state, state="failed", restore_note=RESTORED_NOTE, step=0):
+            break
+    st.kv_set(db, _restore_key(id), None)
+    st.log_event(db, id, "restore_done", {"name": final["name"], "size": final["size"],
+                                          "same_name": new_share == share})
+    log.warning("%s: restored from the restore path as %s", id, final["name"])
+    if notify is not None:
+        try:
+            res = notify(st.get(db, id) or row, new_share)
+        except Exception as e:
+            res = {"error": type(e).__name__}
+        st.log_event(db, id, "restore_notify", dict(res or {}))
+    if after_step:
+        after_step(105)
+    return Result(True, "failed", RESTORE_SWAPPED, RESTORED_NOTE)
+
+
+def _restore_copy(reader, marker, tmp, stub, note, chunk):
+    remote, size = marker["remote"], int(marker["size"])
+    off = int(marker.get("copied") or 0)
+    d = os.path.dirname(tmp) or "."
+    if off == 0 or not os.path.isfile(tmp):
+        off = 0
+        if shutil.disk_usage(d).free < size + RESTORE_SPACE_MARGIN:
+            raise _RestoreStop("not enough free space beside L for the restore file")
+    elif os.path.getsize(tmp) < off:
+        off = 0
+    _require_real_fs(d)
+    sst = os.stat(stub)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        os.ftruncate(fd, off)
+        with contextlib.suppress(OSError):
+            os.fchown(fd, sst.st_uid, sst.st_gid)
+        with contextlib.suppress(OSError):
+            os.fchmod(fd, stat_mod.S_IMODE(sst.st_mode) | 0o444)
+        since = 0
+        while off < size:
+            n = min(chunk, size - off)
+            data = b""
+            for attempt in range(RESTORE_READ_TRIES):
+                try:
+                    data = reader.read_range(remote, off, n)
+                except Exception:
+                    data = b""
+                if len(data) == n:
+                    break
+                _sleep(min(RETRY_MAX_DELAY, 2.0 ** attempt))
+            if len(data) != n:
+                raise _RestoreStop(f"restore copy stopped at offset {off}: remote read failed",
+                                   hard=False, offset=off)
+            os.pwrite(fd, data, off)
+            off += n
+            since += n
+            if since >= RESTORE_SYNC_EVERY:
+                os.fsync(fd)
+                note(copied=off)
+                since = 0
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    note(copied=size)
+    _fsync_dir(d)
+
+
+def _restore_verify(reader, marker, tmp) -> int:
+    """Size, no zero-filled hole, and the SHA-256 of a second full read of the remote."""
+    remote, size = marker["remote"], int(marker["size"])
+    try:
+        ls = os.lstat(tmp)
+    except OSError:
+        raise _RestoreStop("restore temp file is gone") from None
+    if not stat_mod.S_ISREG(ls.st_mode) or ls.st_size != size:
+        raise _RestoreStop(f"restore file is {ls.st_size} bytes, expected {size}")
+    h, carry, worst, got = hashlib.sha256(), 0, 0, 0
+    with open(tmp, "rb") as f:
+        while True:
+            b = f.read(CHUNK)
+            if not b:
+                break
+            h.update(b)
+            got += len(b)
+            best, carry = _scan_zeros(b, carry)
+            worst = max(worst, best)
+    if got != size:
+        raise _RestoreStop("restore file changed while it was read back")
+    if worst >= RESTORE_ZERO_RUN:
+        raise _RestoreStop(f"restore file holds a run of {worst} zero bytes (a hole); not used")
+    try:
+        again = reader.sha256_full(remote)
+        size2 = reader.size(remote)
+    except Exception as e:
+        raise _RestoreStop(f"second read of the remote failed: {type(e).__name__}",
+                           hard=False) from None
+    if size2 != size:
+        raise _RestoreStop(f"remote size changed from {size} to {size2}")
+    if again != h.hexdigest():
+        raise _RestoreStop("the copy differs from a second read of the remote; not used")
+    return ls.st_ino
+
+
+_ZERO_RUN = re.compile(b"\x00{4096,}")
+
+
+def _scan_zeros(b: bytes, carry: int):
+    """(longest run of zero bytes seen in this block, counting the `carry` zeros the last
+    block ended with; zeros this block ends with). Runs under 4 KiB are not counted."""
+    lead = len(b) - len(b.lstrip(b"\x00"))
+    if lead == len(b):
+        return carry + lead, carry + lead
+    best = carry + lead if carry + lead >= 4096 else 0
+    for m in _ZERO_RUN.finditer(b, lead):
+        best = max(best, m.end() - m.start())
+    return best, len(b) - len(b.rstrip(b"\x00"))
+
+
+def _restore_swap(db, id, lib, tmp, ext, marker) -> None:
+    """Put the verified temp file in place and drop the symlink L. Idempotent: a resume
+    after a crash at any point in here finishes the job or finds it done."""
+    target = os.path.join(os.path.dirname(lib), marker["name"])
+    ino = marker.get("ino")
+
+    def ours(p):
+        return os.path.islink(p) and os.path.basename(os.readlink(p)) == f"{id}{ext}"
+
+    def is_new(p):
+        try:
+            s = os.lstat(p)
+        except OSError:
+            return False
+        return stat_mod.S_ISREG(s.st_mode) and s.st_ino == ino
+
+    if True:  # the caller holds the id's lock (restore_from_path)
+        cur = st.get(db, id) or {}
+        if cur.get("state") not in _RESTORE_STATES:
+            raise _RestoreStop(f"row is now {cur.get('state')!r}; not swapping")
+        same = target == lib
+        if same:
+            if ours(tmp):  # crashed after the exchange: the symlink came out, drop it
+                os.unlink(tmp)
+            if is_new(lib):
+                return
+            if not ours(lib):
+                raise _RestoreStop("L is no longer the tierfs symlink; not swapping")
+            if not is_new(tmp):
+                raise _RestoreStop("restore temp file is gone or changed")
+            if not exchange_available():
+                raise _RestoreStop("renameat2 is unavailable; refusing to swap")
+            _try_exchange(tmp, lib)
+            _point("restore.exchanged")
+            if not ours(tmp):  # what came out is not our symlink (an arr file): put it back
+                _exchange(tmp, lib)
+                raise _RestoreStop("a file appeared at L meanwhile; swapped back, nothing changed")
+            os.unlink(tmp)
+        else:
+            if os.path.lexists(tmp) and is_new(tmp):
+                if os.path.lexists(target) and not is_new(target):
+                    raise _RestoreStop(f"{marker['name']} appeared beside L; not overwriting")
+                if not is_new(target):
+                    os.link(tmp, target)
+                    _point("restore.linked")
+                os.unlink(tmp)
+            if not is_new(target):
+                raise _RestoreStop("restore file is gone or changed")
+            if ours(lib):
+                os.unlink(lib)
+            elif os.path.lexists(lib):
+                raise _RestoreStop("L is no longer the tierfs symlink; restored file left "
+                                   "beside it, nothing removed")
+        _fsync_dir(os.path.dirname(lib) or ".")
