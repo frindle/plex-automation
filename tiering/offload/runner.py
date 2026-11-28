@@ -6,6 +6,7 @@ what is idle, only inside the night window.
 
   python -m offload.runner --once     one pass, then exit (cron, testing)
   python -m offload.runner            loop, one pass every 60 s
+  python -m offload.runner restub     rebuild lost stubs from the remote (see restub.py)
 
 Dry run unless TIERING_APPLY=1: every planned action is logged and nothing
 that changes a file is called.
@@ -1825,6 +1826,9 @@ def start_health_server(runner: Runner, spec: str):
 
 
 def main(argv=None, env=None, deps=None) -> int:
+    if (sys.argv[1:] if argv is None else argv)[:1] == ["restub"]:
+        from . import restub  # one-shot repair command, no runner lock or loop
+        return restub.main(argv, env)
     once = "--once" in (sys.argv[1:] if argv is None else argv)
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
