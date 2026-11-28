@@ -166,7 +166,7 @@ def test_sources():
 def twin_world(tmp_path, content=None, live=True, same_ids=False):
     w = World(tmp_path)
     ids = [f"s{i}@t" for i in range(40)] if same_ids else [f"tw{i}@t" for i in range(8)]
-    nzb = make_nzb(ids, name="twin")
+    nzb = make_nzb(ids, name="twin", seg_bytes=len(w.content) * 21 // 20 // len(ids) + 1)
     w.nz.releases["twin"] = {"title": REL, "nzb": nzb}
     w.am.storage_by_nzb[nzb] = f"/mnt/am/movies/{REL}-twin"
     w.dav.files[f"/movies/{REL}-twin/{REL}.mkv"] = w.content if content is None else content

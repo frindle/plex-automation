@@ -203,6 +203,7 @@ class Config:
     head_min_s: float = HEAD_MIN_S
     min_play_s: float = MIN_PLAY_S
     only_paths: frozenset = frozenset()  # empty: no allowlist; else only these may be demoted
+    only_spec: str = ""  # "@file" form of TIERING_ONLY_PATHS: re-read at the start of each pass
     orphan_grace_days: float = 7.0  # 0 turns the orphan stub cleanup off
     auto_restore: bool = False  # TIERING_AUTO_RESTORE: restore from the restore path when the exact copy is bad
 
@@ -266,6 +267,8 @@ class Config:
             head_min_s=max(0.0, float(e.get("TIERING_HEAD_MIN_S") or HEAD_MIN_S)),
             min_play_s=max(0.0, float(e.get("TIERING_MIN_PLAY_S") or MIN_PLAY_S)),
             only_paths=parse_only_paths(e.get("TIERING_ONLY_PATHS")),
+            only_spec=(e.get("TIERING_ONLY_PATHS") or "").strip()
+            if (e.get("TIERING_ONLY_PATHS") or "").strip().startswith("@") else "",
             orphan_grace_days=max(0.0, float(
                 7.0 if e.get("TIERING_ORPHAN_GRACE_DAYS") in (None, "")
                 else e["TIERING_ORPHAN_GRACE_DAYS"])),
@@ -527,14 +530,35 @@ class Runner:
         self.passes = 0
         self.errors = 0
         self.counts: dict = {}
+        self.only_blocked = False
         self.heartbeat_path = cfg.db + ".heartbeat"
 
     # ---- small helpers
 
     def _may_demote(self, row) -> bool:
         """The TIERING_ONLY_PATHS allowlist; only ever asked about demotes."""
+        if self.only_blocked:  # the allowlist file could not be read this pass: no demotes
+            return False
         only = self.cfg.only_paths
         return not only or _norm_only(str(row.get("lib_path") or "")) in only
+
+    def refresh_only_paths(self):
+        """Start of each pass: an `@file` allowlist is read again. A file that cannot be read,
+        or that holds no paths, blocks every demote this pass (never opens them up). The log
+        holds the count only, never a path."""
+        self.only_blocked = False
+        if not self.cfg.only_spec:
+            return
+        try:
+            new = parse_only_paths(self.cfg.only_spec)
+        except ValueError as e:
+            self.only_blocked = True
+            log.warning("TIERING_ONLY_PATHS: %s; demotes are stopped this pass", e)
+            return
+        if new != self.cfg.only_paths:
+            log.info("TIERING_ONLY_PATHS: now %d path(s) (was %d)", len(new),
+                     len(self.cfg.only_paths))
+        self.cfg.only_paths = new
 
     def announce_only_paths(self):
         """Once at start: the allowlist's size, and how many of its paths match no row."""
@@ -1372,6 +1396,7 @@ class Runner:
     def _pass(self, now, wait):
         db = self.db()
         cfg, st = self.cfg, self.state
+        self.refresh_only_paths()
         self._load_persisted(db)
         self.skipped_paths = set()
         self._register(db, now)
@@ -1491,7 +1516,7 @@ class Runner:
         for r in rows:  # an offload a crash left half done is resumed, not restarted
             if r["state"] == "offloading":
                 dcands.insert(0, r)
-        if cfg.only_paths:  # before disk, qualify or anything remote: others never offload
+        if cfg.only_paths or self.only_blocked:  # before disk, qualify or anything remote: others never offload
             kept = [r for r in dcands if self._may_demote(r)]
             if not cfg.apply:
                 for r in dcands:

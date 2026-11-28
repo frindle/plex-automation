@@ -39,6 +39,7 @@ remote_path, sha256, restore_score, restore_note, last_check_ts and last_stat_ok
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import re
 import tempfile
@@ -47,6 +48,7 @@ import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import ParseError
 
 from .altmount import AltMountError
@@ -71,6 +73,12 @@ HASH_WORKERS = 4  # range reads in flight during the compare
 # head repeated for over 10 minutes, to every reader, then right again.
 HASH_FAULT_PAUSES = (30.0, 120.0, 300.0, 600.0)
 HASH_FAULT_MAX = 2  # chunks one compare waits out like that; more is a read fault at once
+# A listing (or NZB file) is only "the same file" when its size is near the local file's.
+# NZB sizes count par2 and yEnc overhead, so they run a little above the file: allow from
+# SIZE_RATIO_MIN to SIZE_RATIO_MAX times the local size. A same-titled release of another
+# edition (a much larger or smaller encode) falls outside and is skipped.
+SIZE_RATIO_MIN = 0.98
+SIZE_RATIO_MAX = 1.25
 _ZEROS = b"\0" * (64 << 10)  # a run this long in the remote chunk, not in L: zero-filled
 
 
@@ -347,7 +355,7 @@ def find_twin(found, name: str, own_ids: frozenset, lib_path: str, *, indexers, 
     except OSError:
         return None
     seen: list[frozenset] = []
-    for rel in _find_exact(found, name):
+    for rel in _find_exact(found, name, size):
         if own_link and rel.link == own_link:
             continue
         if grabs <= 0:
@@ -362,6 +370,9 @@ def find_twin(found, name: str, own_ids: frozenset, lib_path: str, *, indexers, 
         if not ids or ids & own_ids or any(ids & s for s in seen):
             continue  # our own upload, or one already tried
         seen.append(ids)
+        if nzb_problem(raw, size):
+            _strike(indexers, rel)
+            continue
         try:
             v = verify(raw)
             if v is None:
@@ -388,11 +399,57 @@ def _same_samples(reader, remote_path: str, lib_path: str, size: int) -> bool:
     return True
 
 
-def _find_exact(found, name: str):
+def _strike(indexers, rel) -> None:
+    """A bad NZB is a strike against its release (it counts only once it repeats on a later
+    night), when the client keeps such marks."""
+    fn = getattr(indexers, "strike", None)
+    if fn:
+        fn(rel)
+
+
+def size_in_ratio(size: int, local_size: int | None) -> bool:
+    """Is ``size`` within SIZE_RATIO_MIN..SIZE_RATIO_MAX of the local file's size? An
+    unknown size on either side (<= 0 or None) is not held against the candidate."""
+    if not local_size or local_size <= 0 or not size or size <= 0:
+        return True
+    return SIZE_RATIO_MIN <= size / local_size <= SIZE_RATIO_MAX
+
+
+def _find_exact(found, name: str, local_size: int | None = None):
+    """Listings with the exact cleaned title and, when the local size is known, a listing
+    size within the sane ratio of it (same title, other edition: skipped)."""
     want = _clean(name)
     for rel in found:
-        if _clean(rel.title) == want:
+        if _clean(rel.title) == want and size_in_ratio(getattr(rel, "size", 0), local_size):
             yield rel
+
+
+def nzb_problem(raw: bytes, local_size: int | None) -> str | None:
+    """Why this NZB must not be imported, or None. It needs segment byte counts (an NZB
+    without them makes the importer fail with "total size is zero"), and its largest
+    non-par2 file, or for a release split into RAR volumes the sum of its non-par2 files,
+    must be within the sane size ratio of the local file."""
+    total, best, data = 0, 0, 0
+    for _, el in ET.iterparse(io.BytesIO(raw), events=("end",)):
+        if el.tag.rsplit("}", 1)[-1] != "file":
+            continue
+        n = 0
+        for seg in el.iter():
+            if seg.tag.rsplit("}", 1)[-1] == "segment":
+                try:
+                    n += max(0, int(seg.get("bytes") or 0))
+                except ValueError:
+                    pass
+        total += n
+        if ".par2" not in (el.get("subject") or "").lower():
+            best = max(best, n)
+            data += n
+        el.clear()
+    if total <= 0:
+        return "zero_size"
+    if best <= 0 or not (size_in_ratio(best, local_size) or size_in_ratio(data, local_size)):
+        return "size_out_of_ratio"
+    return None
 
 
 def sha256_file(path: str) -> str:
@@ -612,6 +669,22 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
         steps[step] = {"ok": False, **info}
         return QualifyResult(False, [reason], fields, steps)
 
+    try:
+        local_size = os.path.getsize(str(row.get("lib_path") or ""))
+    except OSError:
+        local_size = None  # the hash step reports it
+
+    def bad_nzb(raw, rel=None):
+        try:
+            why = nzb_problem(raw, local_size)
+        except ParseError:
+            why = "unparsable"
+        if why is None:
+            return None
+        if rel is not None:
+            _strike(indexers, rel)
+        return fail("nzb", "nzb_bad", why=why)
+
     # 1. exact NZB
     nzb_path = row.get("nzb_path")
     nzb_bytes = None
@@ -621,8 +694,11 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
             nzb_bytes = read_archived(nzb_path)
             note_attempt("reset")  # it has an NZB: nothing of the row's is failing here
             steps["nzb"] = {"ok": True, "reused": True}
+            if (res := bad_nzb(nzb_bytes)) is not None:
+                return res
         else:
             fails = 0
+            grabbed = None
             items = 0  # candidates that failed as items: no NZB behind the listing
             try:
                 found = searched()
@@ -631,10 +707,11 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
                 return fail("nzb", "nzb_unsure", why="indexers unavailable")
             unsure = bool(getattr(found, "partial", False))  # an indexer was not asked
             others = unsure  # trouble that is not the row's
-            for rel in _find_exact(found, name):
+            for rel in _find_exact(found, name, local_size):
                 try:
                     nzb_bytes = indexers.fetch_nzb(rel)
                     own_link = rel.link
+                    grabbed = rel
                     break
                 except GrabBudgetSpent:
                     unsure = others = True
@@ -678,6 +755,8 @@ def _qualify(row: dict, noted: list, *, reader, importer, indexers, stat_primary
                 # "not on any indexer" only after a complete search; else try again later
                 return fail("nzb", "nzb_unsure" if unsure else "no_exact_nzb")
             note_attempt("reset")
+            if (res := bad_nzb(nzb_bytes, grabbed)) is not None:
+                return res
             nzb_path = archive_nzb(nzb_bytes, archive_dir, name)
             steps["nzb"] = {"ok": True, "reused": False}
     except _ERRORS as e:

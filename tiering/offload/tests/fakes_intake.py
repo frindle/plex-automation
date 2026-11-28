@@ -17,8 +17,9 @@ from xml.sax.saxutils import escape
 APIKEY = "k" * 32
 
 
-def make_nzb(ids, name="x") -> bytes:
-    segs = "".join(f'<segment bytes="100" number="{i + 1}">{m}</segment>' for i, m in enumerate(ids))
+def make_nzb(ids, name="x", seg_bytes=100) -> bytes:
+    segs = "".join(f'<segment bytes="{seg_bytes}" number="{i + 1}">{m}</segment>'
+                   for i, m in enumerate(ids))
     return (f'<?xml version="1.0" encoding="UTF-8"?>'
             f'<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file subject="{name}">'
             f"<segments>{segs}</segments></file></nzb>").encode()
@@ -264,7 +265,7 @@ class _NzHandler(_Quiet):
             items.append(
                 f"<item><title>{escape(rel['title'])}</title><guid>{gid}</guid>"
                 f'<enclosure url="{o.url}/get/{gid}?apikey={o.key}" length="{len(rel["nzb"])}"/>'
-                f'<newznab:attr name="size" value="{rel.get("size", 1000)}"/></item>')
+                f'<newznab:attr name="size" value="{rel.get("size", 0)}"/></item>')
         body = ('<?xml version="1.0"?><rss xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">'
                 f"<channel>{o.extra_items}{''.join(items)}</channel></rss>").encode()
         self.send_response(200)

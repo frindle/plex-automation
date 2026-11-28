@@ -482,6 +482,18 @@ class NewznabClient:
                 self._bad.popitem(last=False)
             self._save_state()
 
+    def strike(self, rel: Release) -> None:
+        """The release's NZB came back but is unusable (no byte counts, the wrong size). The
+        same bytes come back every time, so unlike a missing NZB (maybe a maintenance page)
+        there is nothing to confirm: it counts as bad at once, until BAD_TTL_S passes."""
+        with self._sync():
+            key, now = self._bad_key(rel), self._wall()
+            self._bad.pop(key, None)
+            self._bad[key] = [now - BAD_CONFIRM_S, now]
+            while len(self._bad) > _BAD_MAX:
+                self._bad.popitem(last=False)
+            self._save_state()
+
     def _clear_bad(self, rel: Release) -> None:
         """A valid NZB came back: forget any strikes against the release."""
         self._refresh()
