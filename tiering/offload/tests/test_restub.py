@@ -7,7 +7,7 @@ import pytest
 
 from tiering.offload import ops, restub
 from tiering.offload import state as st
-from tiering.offload.tests.test_ops import ID, MIB, FakeReader, assert_offloaded, tree
+from tiering.offload.tests.test_ops import ID, FakeReader, assert_offloaded, tree
 from tiering.offload.tests.test_ops import env as env  # noqa: F401 (fixture)
 
 
@@ -56,9 +56,10 @@ def alerts(env):  # noqa: F811
 def only_edges(reader, row):
     """Every read the reader saw is inside the head or the tail, never the middle."""
     hl, tl, size = row["head_len"], row["tail_len"], row["size"]
-    for off, n in reader.calls:
+    calls = [c for c in reader.calls if c != (0, 1)]  # (0, 1) is the one-byte liveness probe
+    for off, n in calls:
         assert off + n <= hl or off >= size - tl, (off, n)
-    assert sum(n for _o, n in reader.calls) == hl + tl
+    assert sum(n for _o, n in calls) == hl + tl
 
 
 def test_missing_stub_rebuilt_from_head_and_tail_only(env):  # noqa: F811
