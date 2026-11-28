@@ -1948,6 +1948,51 @@ def restore_main(args, env=None, deps=None) -> int:
     return 0 if res.ok else 1
 
 
+def switch_main(args, env=None, deps=None, plex=None, **kw) -> int:
+    """`--switch-live ID [--check]`: move the players watching row ID onto the restore-path
+    release (see switch_live.py). `--check` only lists the sessions and whether each player
+    accepts remote control. Otherwise a dry run unless TIERING_APPLY=1. Like --restore it does
+    not take the runner lock."""
+    from . import switch_live
+    try:
+        cfg = Config.from_env(env)
+        deps = deps or load_deps(cfg)
+    except Exception as e:
+        log.error("settings: %s: %s", type(e).__name__, e)
+        return 2
+    i = args.index("--switch-live")
+    if i + 1 >= len(args) or args[i + 1].startswith("-"):
+        log.error("--switch-live needs a row id")
+        return 2
+    id = args[i + 1]
+    db = deps.state.open_db(cfg.db)
+    row = deps.state.get(db, id)
+    if row is None:
+        log.error("switch: no row with id %s", id)
+        return 1
+    try:
+        plex = plex or switch_live.Plex()
+        if "--check" in args:
+            switch_live.check(row, plex, out=print)
+            return 0
+        if deps.restore is None:
+            log.error("switch: restore is not available")
+            return 2
+        e = os.environ if env is None else env
+        res = switch_live.switch_live(
+            db, row, plex, apply=cfg.apply, restore=deps.restore, path_map=cfg.path_map,
+            tierfs_mount=cfg.tierfs_mount, server_url=e.get("TIERING_PLEX_PLAYER_URL") or None,
+            **kw)
+    except switch_live.PlexRCError as e:
+        log.error("switch %s: %s", id, e)
+        return 1
+    log.info("switch %s: switched=%d left=%d %s", id, len(res["switched"]), len(res["left"]),
+             res["note"])
+    for m, why in res["left"].items():
+        log.warning("switch %s: player %s left on the old file: %s", id, m, why)
+    return 0 if res["switched"] or not res["left"] else 1
+
+
 def main(argv=None, env=None, deps=None) -> int:
     args = sys.argv[1:] if argv is None else argv
     once = "--once" in args
@@ -1960,6 +2005,8 @@ def main(argv=None, env=None, deps=None) -> int:
     root.setLevel(logging.INFO)
     if "--restore" in args:
         return restore_main(args, env, deps)
+    if "--switch-live" in args:
+        return switch_main(args, env, deps)
     try:
         cfg = Config.from_env(env)
     except ValueError as e:

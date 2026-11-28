@@ -13,10 +13,14 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/tierfs ./cmd/tierf
 FROM python:3.15-slim
 # fuse3 brings fusermount3, which tierfs mounts and unmounts with.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends fuse3 ca-certificates \
+ && apt-get install -y --no-install-recommends fuse3 ca-certificates ffmpeg \
  && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir blake3
+RUN pip install --no-cache-dir blake3 numpy
 WORKDIR /app
 COPY --from=tierfs /out/tierfs /usr/local/bin/tierfs
 COPY tiering/offload ./offload
+# --switch-live maps a play position onto another release with watch_hold.map_offset; ffmpeg runs
+# as watch-align, a name tierfs reads as a background reader (TIERFS_BACKGROUND_COMMS).
+COPY watch_hold.py ./watch_hold.py
+RUN ln -s "$(command -v ffmpeg)" /usr/local/bin/watch-align
 CMD ["python", "-u", "-m", "offload.supervise"]
