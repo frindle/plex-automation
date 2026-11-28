@@ -122,6 +122,11 @@ def test_nzb_problem_ignores_par2_and_takes_the_largest_file():
     assert q.nzb_problem(nzb(("a.mkv", [500, 520])), 3000) == "size_out_of_ratio"
     assert q.nzb_problem(nzb(("a.mkv", [0])), 1000) == "zero_size"
     assert q.nzb_problem(nzb(("a.par2", [1000])), 1000) == "size_out_of_ratio"
+    # a release split into RAR volumes: no one file is near the local size, their sum is
+    rar = nzb(*[(f"a.part{i:02d}.rar yEnc", [250]) for i in range(1, 5)],
+              ("a.sfv yEnc", [10]), ("a.vol0+3.par2 yEnc", [300]))
+    assert q.nzb_problem(rar, 1000) is None
+    assert q.nzb_problem(rar, 3000) == "size_out_of_ratio"  # the sum is too small as well
 
 
 # ---- fix 3: the @file allowlist is read again each pass

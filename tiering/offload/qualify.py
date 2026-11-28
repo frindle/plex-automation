@@ -427,8 +427,9 @@ def _find_exact(found, name: str, local_size: int | None = None):
 def nzb_problem(raw: bytes, local_size: int | None) -> str | None:
     """Why this NZB must not be imported, or None. It needs segment byte counts (an NZB
     without them makes the importer fail with "total size is zero"), and its largest
-    non-par2 file must be within the sane size ratio of the local file."""
-    total, best = 0, 0
+    non-par2 file, or for a release split into RAR volumes the sum of its non-par2 files,
+    must be within the sane size ratio of the local file."""
+    total, best, data = 0, 0, 0
     for _, el in ET.iterparse(io.BytesIO(raw), events=("end",)):
         if el.tag.rsplit("}", 1)[-1] != "file":
             continue
@@ -442,10 +443,11 @@ def nzb_problem(raw: bytes, local_size: int | None) -> str | None:
         total += n
         if ".par2" not in (el.get("subject") or "").lower():
             best = max(best, n)
+            data += n
         el.clear()
     if total <= 0:
         return "zero_size"
-    if best <= 0 or not size_in_ratio(best, local_size):
+    if best <= 0 or not (size_in_ratio(best, local_size) or size_in_ratio(data, local_size)):
         return "size_out_of_ratio"
     return None
 
