@@ -1695,8 +1695,12 @@ def restore_from_path(db, id, importer, reader, *, apply: bool = False, path_map
     Nothing is deleted or replaced before the verified file is in hand. Any failure up to the
     swap leaves L, the stub and the row as they were (the temp file goes, except after a
     transient read error, which keeps it for the same call to resume). Events:
-    restore_start, restore_done, restore_failed."""
-    with _id_lock(db, f"{id}.restore") as mine:
+    restore_start, restore_done, restore_failed.
+
+    The whole attempt holds the id's lock, the one promote, demote and relink take: a promote
+    that a player starts meanwhile is busy (the player reads through tierfs until the restore is
+    done), so the two never write the row's step at the same time."""
+    with _id_lock(db, id) as mine:
         if not mine:
             return Result(False, None, 0, _BUSY)
         return _restore(db, id, importer, reader, apply, path_map, keep_name, notify,
@@ -1757,7 +1761,9 @@ def _restore(db, id, importer, reader, apply, path_map, keep_name, notify, after
         st.kv_set(db, _restore_key(id), marker)
 
     def mark(n):
-        st.update_if(db, id, st.get(db, id)["state"], step=n)
+        cur = (st.get(db, id) or {}).get("state")
+        if cur in _RESTORE_STATES:
+            st.update_if(db, id, cur, step=n)
         if after_step:
             after_step(n)
 
@@ -1811,7 +1817,8 @@ def _restore(db, id, importer, reader, apply, path_map, keep_name, notify, after
                     os.unlink(tmp)
             st.kv_set(db, _restore_key(id), None)
             cur = st.get(db, id)
-            if cur and int(cur.get("step") or 0) >= RESTORE_IMPORTED:
+            if cur and cur.get("state") in _RESTORE_STATES \
+                    and int(cur.get("step") or 0) >= RESTORE_IMPORTED:
                 st.update_if(db, id, cur["state"], step=marker.get("orig_step", 0))
         return _restore_fail(db, id, st.get(db, id) or row, e.reason, hard=e.hard, **e.detail)
 
@@ -1951,9 +1958,7 @@ def _restore_swap(db, id, lib, tmp, ext, marker) -> None:
             return False
         return stat_mod.S_ISREG(s.st_mode) and s.st_ino == ino
 
-    with _id_lock(db, id) as held:
-        if not held:
-            raise _RestoreStop(_BUSY, hard=False)
+    if True:  # the caller holds the id's lock (restore_from_path)
         cur = st.get(db, id) or {}
         if cur.get("state") not in _RESTORE_STATES:
             raise _RestoreStop(f"row is now {cur.get('state')!r}; not swapping")
