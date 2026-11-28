@@ -361,14 +361,17 @@ class Stack:
             os.makedirs(os.path.join(self.remote, release), exist_ok=True)
             shutil.copyfile(disk_path, os.path.join(self.remote, f["remote"]))
         f["ids"] = [f"{release}.p{i}@standin" for i in range(6)]
+        # Segment byte counts that add up to the file, as a real NZB's do: qualify refuses an NZB whose size is
+        # out of ratio with the local file (nzb_problem).
+        seg = max(1, -(-size // 6))
         f["alt_ids"] = [f"{release}.alt{i}@standin" for i in range(6)]
         self.indexer.releases[f"{key}-exact"] = {"title": release,
-                                                 "nzb": fk.make_nzb(f["ids"], release)}
+                                                 "nzb": fk.make_nzb(f["ids"], release, seg)}
         for n in (self.nntp1, self.nntp2):
             n.ids |= set(f["ids"])
         if twin:
             tw_ids = [f"{release}.tw{i}@standin" for i in range(6)]
-            nzb = fk.make_nzb(tw_ids, release)
+            nzb = fk.make_nzb(tw_ids, release, seg)
             self.indexer.releases[f"{key}-twin"] = {"title": release, "nzb": nzb}
             for n in (self.nntp1, self.nntp2):
                 n.ids |= set(tw_ids)
@@ -379,7 +382,7 @@ class Stack:
         if alt:
             title = release.rsplit("-", 1)[0] + "-OTHER"
             self.indexer.releases[f"{key}-alt"] = {"title": title,
-                                                   "nzb": fk.make_nzb(f["alt_ids"], title)}
+                                                   "nzb": fk.make_nzb(f["alt_ids"], title, seg)}
             for n in (self.nntp1, self.nntp2):
                 n.ids |= set(f["alt_ids"])
         if (section, "movie" if kind == "movie" else "show") not in self.plex.sections:
