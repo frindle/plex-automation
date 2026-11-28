@@ -10,7 +10,8 @@ with a bindfs stand-in.
   files, deterministic sha256s in `SHA256SUMS`.
 - `fake_webdav.py` serves a copy of the library bytes as the remote, with Basic
   auth. A fake NNTP answers STAT for every message id.
-- tierfs mounted on the host at `${TIERFS_MOUNT}` after Plex starts (`:rslave`).
+- tierfs mounted on the host at `${TIERFS_MOUNT}` after Plex starts (`:rslave`). In the deployed
+  container that is the `fs/` subfolder of the mapped directory (see `test_tiering_compose.sh`).
 - Plex is scanned and every part id, rating key and size is recorded.
 - Runner env: `TIERING_APPLY=1 TIERING_NEW_DAYS=0 TIERING_DEMOTE_WINDOW=00:00-24:00
   TIERING_PASS_SECONDS=2`. Scenario 9 leaves `TIERING_APPLY` unset.

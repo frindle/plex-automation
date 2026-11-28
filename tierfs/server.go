@@ -147,6 +147,11 @@ func (s *Server) Start() error {
 		},
 	}
 	clearStaleMount(s.cfg.Mount)
+	// The mount point is the fs/ subfolder of the directory the containers map, and
+	// nothing else may have made it yet.
+	if err := os.MkdirAll(s.cfg.Mount, 0o755); err != nil {
+		return fmt.Errorf("mount point: %w", err)
+	}
 	srv, err := fs.Mount(s.cfg.Mount, s.root, opts)
 	if err != nil {
 		return fmt.Errorf("mount: %w", err)

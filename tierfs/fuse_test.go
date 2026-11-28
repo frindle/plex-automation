@@ -178,6 +178,20 @@ func TestFuseStatMatchesManifest(t *testing.T) {
 	}
 }
 
+// The mount point is a subfolder that does not exist yet (fs/ of the shared directory);
+// Start creates it.
+func TestFuseStartCreatesTheMountPoint(t *testing.T) {
+	var mnt string
+	e := startFuse(t, func(c *Config) { mnt = filepath.Join(c.Mount, "fs"); c.Mount = mnt })
+	fi, err := os.Stat(filepath.Join(mnt, e.m.Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != e.m.Size {
+		t.Errorf("size %d, manifest %d", fi.Size(), e.m.Size)
+	}
+}
+
 func TestFuseFullReadMatchesSHA256(t *testing.T) {
 	e := startFuse(t, nil)
 	want := sha256.Sum256(e.data)

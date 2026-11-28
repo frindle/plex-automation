@@ -11,8 +11,14 @@
 # alone again (stop it first: docker-compose stop tiering).
 #
 # Every site value comes from .env (see .env.example); nothing here is a secret.
-# ${TIERFS_MOUNT} must be the SAME absolute path on the host, in this container,
-# in Plex and in the arrs: library symlinks point at it.
+# ${TIERFS_MOUNT} is the shared directory every container maps, at the SAME
+# absolute path on the host, in this container, in Plex and in the arrs. tierfs
+# mounts its fs/ subfolder, and library symlinks point at
+# ${TIERFS_MOUNT}/fs/<id><ext>. The FUSE mount never sits at the mapped path
+# itself: a container created while it did captured that one mount, and after a
+# tierfs restart it kept the dead copy ("Transport endpoint is not connected")
+# until it was restarted too. Mapping the directory above the mount, every
+# mount and unmount under it reaches the container.
 
 services:
   tiering:
@@ -66,8 +72,9 @@ services:
       # The torrent gate served by arr-webhook.
       TIERING_API: "${TIERING_API:?set TIERING_API in .env}"
       TIERING_NZB_DIR: "/state/nzb"
-      # tierfs and the runner share these.
-      TIERFS_MOUNT: "${TIERFS_MOUNT:?set TIERFS_MOUNT in .env}"
+      # tierfs and the runner share these. Inside the container TIERFS_MOUNT is the
+      # FUSE mount point: the fs/ subfolder of the shared directory (see the top).
+      TIERFS_MOUNT: "${TIERFS_MOUNT:?set TIERFS_MOUNT in .env}/fs"
       TIERFS_MANIFESTS: "/state/manifests"
       TIERFS_EVENTS: "/state/events/events.jsonl"
       TIERFS_STUB_ROOTS: "${TIERFS_STUB_ROOTS:?set TIERFS_STUB_ROOTS in .env}"
@@ -121,9 +128,10 @@ services:
       # paths, never through the share; tierfs reads the stubs there at the paths
       # in the manifests) and the tierfs mount as it comes and goes.
       - "/mnt:/mnt:rslave"
-      # The FUSE mount itself, shared back to the host so Plex and the arrs get it.
-      # The host directory must already be a shared mount point
-      # (tiering/tierfs-host-mount.sh does that at array start).
+      # The shared directory; tierfs mounts its fs/ subfolder, and the mount is
+      # shared back to the host so Plex and the arrs get it. The host directory
+      # must already be a shared mount point (tiering/tierfs-host-mount.sh does
+      # that at array start).
       - "${TIERFS_MOUNT:?set TIERFS_MOUNT in .env}:${TIERFS_MOUNT:?set TIERFS_MOUNT in .env}:rshared"
       # The share at the path Plex reports for it, read-only.
       - "${TIERING_SHARE_HOST:?set TIERING_SHARE_HOST in .env}:${TIERING_SHARE_PLEX:?set TIERING_SHARE_PLEX in .env}:ro,rslave"

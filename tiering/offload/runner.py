@@ -312,6 +312,9 @@ class Deps:
     # open_holders(path) -> list of pids holding the file open (tierfs included); a -1 entry
     # means "not clear". None: the orphan cleanup cannot tell, so it keeps every stub.
     open_holders: Callable | None = None
+    # relink(db, row, mount_wait) -> "ok" | "relinked" | "skip: why": points an offloaded L at
+    # TIERFS_MOUNT when its symlink names the entry in another directory (ops.relink_to_mount).
+    relink: Callable | None = None
 
 
 def _http_gate(cfg: Config):
@@ -390,7 +393,12 @@ def load_deps(cfg: Config) -> Deps:
         # ignore_comm=(): a tierfs reader holding the stub counts as a holder too
         return ops.scan_open_holders(path, ignore_comm=())
 
-    return Deps(st, promote, demote, qualify, _http_gate(cfg), register, weekly, open_holders)
+    def relink(db, row, mount_wait):
+        return ops.relink_to_mount(db, row, cfg.tierfs_mount, path_map=cfg.path_map,
+                                   mount_wait=mount_wait)
+
+    return Deps(st, promote, demote, qualify, _http_gate(cfg), register, weekly, open_holders,
+                relink)
 
 
 # --------------------------------------------------------------------------
@@ -526,6 +534,36 @@ class Runner:
         missing = len(only - known)
         if missing:
             log.warning("TIERING_ONLY_PATHS: %d path(s) match no row", missing)
+
+    def relink_moved_mount(self) -> dict:
+        """Once at start, APPLY only: offloaded files whose L still points at the old mount
+        directory (before TIERFS_MOUNT moved to the fs/ subfolder) are pointed at the
+        mount. Returns the count per outcome; a skip leaves the file as it was."""
+        out: dict = {}
+        relink = self.deps.relink
+        if not self.cfg.apply or not self.cfg.tierfs_mount or relink is None:
+            return out
+        try:
+            rows = self.state.list_files(self.db(), "offloaded")
+        except Exception as e:
+            log.warning("relink at start: rows not readable (%s)", type(e).__name__)
+            return out
+        wait = 60.0  # tierfs is up before the runner starts; the first entry may still be loading
+        for row in rows:
+            try:
+                r = relink(self.db(), row, wait)
+            except Exception as e:  # never stops the start
+                r = f"skip: {type(e).__name__}"
+            wait = 2.0
+            key = str(r).split(":", 1)[0]
+            out[key] = out.get(key, 0) + 1
+            if key == "skip":
+                log.warning("%s: relink %s", row["id"], r)
+            elif key == "relinked":
+                log.info("%s: L now points at the mount", row["id"])
+        if out.get("relinked") or out.get("skip"):
+            log.info("relink at start: %s", out)
+        return out
 
     def _open(self):
         return self.state.open_db(self.cfg.db)
@@ -1856,6 +1894,7 @@ def main(argv=None, env=None, deps=None) -> int:
         runner.announce_only_paths()
         if once:
             try:
+                runner.relink_moved_mount()
                 runner.run_pass(wait=True)
             except Exception as e:
                 log.error("pass failed: %s: %s", type(e).__name__, e)
@@ -1866,6 +1905,7 @@ def main(argv=None, env=None, deps=None) -> int:
             signal.signal(sig, lambda *_: runner.stop.set())
         runner.sleep = lambda s: runner.stop.wait(s)
         try:
+            runner.relink_moved_mount()
             runner.run_forever()
         finally:
             srv.shutdown()
