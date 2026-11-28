@@ -142,9 +142,9 @@ for f in $DOCKERFILE $COMPOSE_FILE $LOCKFILE; do
   check "$f changed: builds" "$(builds)" 1
 done
 
-# 5b. the offload tier's images: its compose file, tierfs/ and tiering/offload/ build;
+# 5b. the offload tier's images: its compose file, tierfs/, tiering/offload/ and altmount/ build;
 # the rest of tiering/ does not
-for f in docker-compose.tiering.yml tierfs/config.go tiering/Dockerfile tiering/offload/state.py; do
+for f in docker-compose.tiering.yml tierfs/config.go tiering/Dockerfile tiering/offload/state.py altmount/Dockerfile; do
   upstream "$f" append
   run_update
   check "$f changed: builds" "$(builds)" 1

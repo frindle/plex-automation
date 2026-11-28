@@ -144,7 +144,12 @@ services:
   # Deliberately left out vs upstream: docker.sock/auto-update, the /mnt mount, /dev/fuse
   # and SYS_ADMIN (only for its own rclone mount, off by default; we use WebDAV + API).
   altmount:
-    image: ghcr.io/kipsilabs/altmount:v0.4.0   # upstream moved from ghcr.io/javi11 at v0.4.0
+    # Upstream v0.4.0 (ghcr.io/kipsilabs/altmount:v0.4.0) with only the binary rebuilt against the nntppool
+    # commit that fixes spliced article bodies: see altmount/Dockerfile. Back to the upstream image (drop build:)
+    # once an AltMount release includes that fix.
+    image: altmount-nntppool-fix:v0.4.0
+    build:
+      context: ./altmount
     container_name: altmount
     restart: unless-stopped
     network_mode: "service:tiering"
