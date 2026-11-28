@@ -35,7 +35,7 @@ The hot-set code implements these rules.
 
 These names apply to each library file system.
 
-- `L` is the library path Plex sees. When the file is offloaded, `L` is a symlink to `${TIERFS_MOUNT}/<id><ext>`.
+- `L` is the library path Plex sees. When the file is offloaded, `L` is a symlink to `${TIERFS_MOUNT}/<id><ext>`. In the container `TIERFS_MOUNT` is the FUSE mount point, the `fs/` subfolder of the directory Plex and the arrs map (`.env`'s `TIERFS_MOUNT`), so a container created while tierfs is up never holds the FUSE mount itself and follows every remount. A link made before the move (to `<id><ext>` one level up) is pointed at the mount when the runner starts (`ops.relink_to_mount`: under the id lock, only once tierfs serves the entry at the recorded size, and swapped back if anything but that link is found at `L`).
 - The stub is `${stub_root}/<id><ext>`. It must be on the same file system as `L`, so that rename and link are atomic and never copy.
   - The stub keeps the original bytes in `[0, head_len)` and `[size - tail_len, size)`.
   - Everything else in the stub is a hole, made with `fallocate(PUNCH_HOLE | KEEP_SIZE)`.

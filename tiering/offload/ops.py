@@ -610,6 +610,70 @@ def demote(db, row: dict, **kw) -> Result:
     return offload(db, row, _demote=True, **kw)
 
 
+def relink_to_mount(db, row: dict, tierfs_mount, path_map=None, mount_wait: float = 30.0) -> str:
+    """Point an offloaded L at <tierfs_mount>/<id><ext> when its symlink names this id's
+    entry in another directory. TIERFS_MOUNT moved to the fs/ subfolder of the directory
+    the containers map, so a container created while tierfs is up never holds the FUSE
+    mount itself (it kept the dead one after a tierfs restart); links made before point
+    one level up. The new link is swapped in with RENAME_EXCHANGE under the id lock, only
+    once tierfs serves the entry at the recorded size, and anything but our old symlink
+    found at L in that instant is swapped back. Returns "ok" (already there), "relinked"
+    or "skip: <why>"; a skip changes nothing."""
+    id = row["id"]
+    share = row.get("lib_path")
+    if not share or not tierfs_mount:
+        return "skip: no lib_path or no mount"
+    lib, reason = _resolve_lib(share, path_map)
+    if reason:
+        return "skip: the library path does not map to one disk path"
+    name = f"{id}{os.path.splitext(lib)[1]}"
+    target = os.path.join(_norm_mount(tierfs_mount), name)
+    with _id_lock(db, id) as held:
+        if not held:
+            return f"skip: {_BUSY}"
+        cur = st.get(db, id) or {}
+        if cur.get("state") != "offloaded":
+            return "skip: not offloaded"
+        try:
+            got = os.readlink(lib)
+        except OSError:
+            return "skip: L is not a symlink"
+        if os.path.basename(got) != name:
+            return "skip: L is not this id's tierfs symlink"
+        if os.path.isabs(got) and os.path.normpath(got) == target:
+            return "ok"
+        if not _wait_for(lambda: _mount_serves(target, cur.get("size")), mount_wait):
+            return "skip: tierfs does not serve the entry at the mount yet"
+        tmp = lib + TMP_SUFFIX
+        if os.path.lexists(tmp):
+            if not (os.path.islink(tmp) and os.path.basename(os.readlink(tmp)) == name):
+                return f"skip: L{TMP_SUFFIX} exists and is not our symlink"
+            os.unlink(tmp)
+        os.symlink(target, tmp)
+        try:
+            _exchange(tmp, lib)
+        except OSError as e:
+            _rm_our_symlink(tmp, id, lib)
+            return f"skip: exchange failed ({e.strerror or type(e).__name__})"
+        try:
+            old = os.readlink(tmp)
+        except OSError:
+            old = None
+        if old is None or os.path.basename(old) != name:
+            try:
+                _exchange(tmp, lib)
+            except OSError:
+                log.error("%s: relink found something new at L and could not swap it back; "
+                          "it is at L%s", id, TMP_SUFFIX)
+                return f"skip: L changed during the relink; what was there is at L{TMP_SUFFIX}"
+            _rm_our_symlink(tmp, id, lib)
+            return "skip: L changed during the relink; left as it was"
+        os.unlink(tmp)
+        st.log_event(db, id, "relinked", {"reason": "tierfs mount moved",
+                                          "from": os.path.dirname(got), "to": os.path.dirname(target)})
+        return "relinked"
+
+
 def _abort_offload(db, id, reason, lib, stub, manifest_dir, step, to_whole=False):
     """Back out before the swap: drop the stub link only if it is another name
     for a regular L, and remove the manifest and chunk list. While L is a

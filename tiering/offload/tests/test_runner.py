@@ -1200,3 +1200,33 @@ def test_only_paths_dry_run_logs_skips(tmp_path, monkeypatch, caplog):
     assert "demotes skipped by TIERING_ONLY_PATHS: 1" in caplog.text
     assert "plan: demote " + b + " id=b skipped" in caplog.text
     assert "plan: demote " + a + " id=a (idle" in caplog.text and w.calls == []
+
+
+# ---------------------------------------------------------------- relink at start
+
+
+def test_relink_at_start_only_offloaded_rows_and_never_stops_the_start(w):
+    for id, state in (("a", "offloaded"), ("b", "offloaded"), ("c", "whole")):
+        w.row(id, None, w.movie(id), state)
+    calls = []
+
+    def relink(db, row, mount_wait):
+        calls.append((row["id"], mount_wait))
+        if row["id"] == "b":
+            raise OSError("boom")
+        return "relinked"
+
+    w.runner.deps.relink = relink
+    assert w.runner.relink_moved_mount() == {"relinked": 1, "skip": 1}
+    assert calls == [("a", 60.0), ("b", 2.0)]  # the first waits for tierfs, the rest barely
+
+
+def test_relink_at_start_not_in_a_dry_run_or_without_the_dep(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, apply=False)
+    w.row("a", None, w.movie("a"), "offloaded")
+    calls = []
+    w.runner.deps.relink = lambda db, row, mount_wait: calls.append(row["id"]) or "relinked"
+    assert w.runner.relink_moved_mount() == {} and calls == []
+    w.runner.cfg.apply = True
+    w.runner.deps.relink = None
+    assert w.runner.relink_moved_mount() == {}

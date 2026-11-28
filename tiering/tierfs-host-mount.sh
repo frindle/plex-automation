@@ -1,7 +1,9 @@
 #!/bin/bash
-# Makes the tierfs mount directory a shared mount point on the host, so the FUSE
-# mount the tiering container makes inside it shows up on the host and, from there,
-# in Plex and the arrs (which map the same path with slave propagation).
+# Makes the tierfs directory a shared mount point on the host, so the FUSE mount the
+# tiering container makes in its fs/ subfolder shows up on the host and, from there,
+# in Plex and the arrs (which map the directory, not fs/, with slave propagation).
+# The mount sits one level down so a container mapped while tierfs is up still maps
+# this shared directory, never the FUSE mount itself, and follows every remount.
 #
 # Run on the host at array start, before the containers (User Scripts plugin,
 # "At Startup of Array"). Safe to run again.
@@ -19,4 +21,7 @@ if ! mountpoint -q "$M"; then
   mount --make-private "$M"
 fi
 mount --make-rshared "$M"
+# tierfs creates it too; made here so the layout is in place before any container maps it.
+[ -d "$M/fs" ] || mkdir "$M/fs" \
+  || echo "warning: could not create $M/fs (is an old-layout tierfs still mounted at $M?)" >&2
 findmnt -o TARGET,PROPAGATION "$M"
