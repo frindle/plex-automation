@@ -17,7 +17,7 @@ ALT = "Movie.2020.1080p.WEB-DL-ALT"
 class World:
     def __init__(self, tmp_path, alt_title=ALT, content=None, alt_live=True):
         self.content = content or os.urandom(50_000)
-        self.nzb = make_nzb(IDS)
+        self.nzb = make_nzb(IDS, seg_bytes=len(self.content) * 21 // 20 // len(IDS) + 1)
         self.dav = FakeDav({f"/movies/{REL}/{REL}.mkv": self.content})
         self.am = FakeAltMount(f"/mnt/am/movies/{REL}", pending_polls=1)
         rels = {"exact": {"title": REL, "nzb": self.nzb}}
