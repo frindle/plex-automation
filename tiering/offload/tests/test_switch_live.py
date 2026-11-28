@@ -294,3 +294,45 @@ def test_cli_check_and_dry_run(env, tmp_path, capsys):
     assert env.restored == [] and fp.sent("/player/playback/playMedia") == []
     assert runner.switch_main(["--switch-live", "nope"], e, deps, plex=fp.plex) == 1
     assert runner.switch_main(["--switch-live"], e, deps, plex=fp.plex) == 2
+
+
+def _mark_env(tmp_path, state="offloaded", note=None, name="m"):
+    db = st.open_db(str(tmp_path / f"{name}.db"))
+    st.upsert(db, {"id": "abc", "lib_path": LIB, "state": state, "size": OLD_SIZE,
+                   "restore_note": note})
+    deps = type("D", (), {})()
+    deps.state = st
+    return db, deps, {"TIERING_DB": str(tmp_path / f"{name}.db")}
+
+
+def test_mark_failed_dry_run_changes_nothing(tmp_path):
+    db, deps, e = _mark_env(tmp_path)
+    assert runner.main(["--mark-failed", "abc"], env=e, deps=deps) == 0
+    assert st.get(db, "abc")["state"] == "offloaded"
+    assert runner.main(["--mark-failed"], env=e, deps=deps) == 2
+    assert runner.main(["--mark-failed", "nope"], env=e, deps=deps) == 1
+
+
+def test_mark_failed_and_undo(tmp_path):
+    db, deps, e = _mark_env(tmp_path)
+    e["TIERING_APPLY"] = "1"
+    assert runner.main(["--mark-failed", "abc"], env=e, deps=deps) == 0
+    r = st.get(db, "abc")
+    assert (r["state"], r["restore_note"]) == ("failed", runner.HAND_FAILED_NOTE)
+    assert runner.main(["--mark-failed", "abc"], env=e, deps=deps) == 1  # not offloaded now
+    assert runner.main(["--mark-failed", "abc", "--undo"], env=e, deps=deps) == 0
+    r = st.get(db, "abc")
+    assert (r["state"], r["restore_note"]) == ("offloaded", None)
+    kinds = [x["kind"] for x in st.events(db, "abc")]
+    assert kinds[-2:] == ["marked_failed", "unmarked_failed"]
+
+
+def test_mark_failed_leaves_rows_in_other_states(tmp_path):
+    for n, (state, note) in enumerate((("promoting", None), ("failed", "bad_chunk at offset 1"),
+                                       ("failed", runner.RESTORED_NOTE))):
+        db, deps, e = _mark_env(tmp_path, state, note, name=f"m{n}")
+        e["TIERING_APPLY"] = "1"
+        assert runner.main(["--mark-failed", "abc"], env=e, deps=deps) == 1
+        if state == "failed":  # undo only reverses a hand mark, never a real failure
+            assert runner.main(["--mark-failed", "abc", "--undo"], env=e, deps=deps) == 1
+        assert (st.get(db, "abc")["state"], st.get(db, "abc")["restore_note"]) == (state, note)
