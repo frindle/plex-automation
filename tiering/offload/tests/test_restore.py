@@ -266,7 +266,7 @@ def test_refusals(e, monkeypatch):
 
 
 def test_a_second_restore_of_the_same_id_is_busy(e):
-    with ops._id_lock(e.db, f"{ID}.restore") as held_:
+    with ops._id_lock(e.db, ID) as held_:  # a promote, demote or relink of this id
         assert held_
         res = restore(e)
     assert not res.ok and res.reason == ops._BUSY
@@ -285,3 +285,18 @@ def test_events_carry_no_secret_shaped_text(e):
     restore(e)
     blob = json.dumps(st.events(e.db, ID))
     assert "apikey" not in blob.lower() and "http" not in blob.lower()
+
+
+def test_a_promote_during_a_restore_is_busy_and_leaves_the_step_alone(e):
+    """A player that starts a promote while the restore copies gets busy: the two never
+    write the row's step at the same time, and the restore still finishes."""
+    seen = []
+
+    def during(n):
+        if n == ops.RESTORE_IMPORTED:
+            r = e.promote()
+            seen.append((r.ok, r.reason, st.get(e.db, ID)["state"]))
+
+    res = restore(e, after_step=during)
+    assert seen == [(False, ops._BUSY, "offloaded")]
+    assert res.ok and st.get(e.db, ID)["state"] == "failed"
