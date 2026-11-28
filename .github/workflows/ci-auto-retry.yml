@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 5
     steps:
       # workflow_run checks out the default branch, never the PR's code.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Decide and re-run
         env:
           GH_TOKEN: ${{ github.token }}
