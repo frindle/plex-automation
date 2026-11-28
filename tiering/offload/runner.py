@@ -1948,6 +1948,104 @@ def restore_main(args, env=None, deps=None) -> int:
     return 0 if res.ok else 1
 
 
+HAND_FAILED_NOTE = "marked failed by hand"
+
+
+def mark_failed_main(args, env=None, deps=None) -> int:
+    """`--mark-failed ID [--undo]`: mark one offloaded row failed, the state a bad chunk
+    leaves, so no promote runs for it (a want never promotes a failed row). tierfs keeps
+    serving its stub, so it still plays, and --restore or --switch-live can run while it does.
+    `--undo` puts a row marked this way back to offloaded. A dry run unless TIERING_APPLY=1.
+    The state change is a compare-and-set, so a row a promote or demote holds is left alone.
+    Only TIERING_DB and TIERING_APPLY are read: it touches the state DB and nothing else."""
+    e = os.environ if env is None else env
+    dbpath, apply = e.get("TIERING_DB", ""), e.get("TIERING_APPLY") == "1"
+    if not dbpath:
+        log.error("settings: TIERING_DB must be set")
+        return 2
+    if deps is None:
+        from . import state as st_mod
+        state = st_mod
+    else:
+        state = deps.state
+    i = args.index("--mark-failed")
+    if i + 1 >= len(args) or args[i + 1].startswith("-"):
+        log.error("--mark-failed needs a row id")
+        return 2
+    id, undo = args[i + 1], "--undo" in args
+    db = state.open_db(dbpath)
+    row = state.get(db, id)
+    if row is None:
+        log.error("mark-failed: no row with id %s", id)
+        return 1
+    if undo:
+        if row["state"] != "failed" or row.get("restore_note") != HAND_FAILED_NOTE:
+            log.error("mark-failed --undo: %s is %s (%s), not marked by hand", id, row["state"],
+                      row.get("restore_note") or "no note")
+            return 1
+        frm, to = "failed", {"state": "offloaded", "restore_note": None}
+    else:
+        if row["state"] != "offloaded":
+            log.error("mark-failed: %s is %s, only an offloaded row can be marked", id,
+                      row["state"])
+            return 1
+        frm, to = "offloaded", {"state": "failed", "restore_note": HAND_FAILED_NOTE}
+    if not apply:
+        log.info("dry run: would set %s %s -> %s", id, frm, to["state"])
+        return 0
+    if not state.update_if(db, id, frm, **to):
+        log.error("mark-failed: %s moved on from %s, nothing changed", id, frm)
+        return 1
+    state.log_event(db, id, "unmarked_failed" if undo else "marked_failed", {})
+    log.info("%s: %s -> %s", id, frm, to["state"])
+    return 0
+
+
+def switch_main(args, env=None, deps=None, plex=None, **kw) -> int:
+    """`--switch-live ID [--check]`: move the players watching row ID onto the restore-path
+    release (see switch_live.py). `--check` only lists the sessions and whether each player
+    accepts remote control. Otherwise a dry run unless TIERING_APPLY=1. Like --restore it does
+    not take the runner lock."""
+    from . import switch_live
+    try:
+        cfg = Config.from_env(env)
+        deps = deps or load_deps(cfg)
+    except Exception as e:
+        log.error("settings: %s: %s", type(e).__name__, e)
+        return 2
+    i = args.index("--switch-live")
+    if i + 1 >= len(args) or args[i + 1].startswith("-"):
+        log.error("--switch-live needs a row id")
+        return 2
+    id = args[i + 1]
+    db = deps.state.open_db(cfg.db)
+    row = deps.state.get(db, id)
+    if row is None:
+        log.error("switch: no row with id %s", id)
+        return 1
+    try:
+        plex = plex or switch_live.Plex()
+        if "--check" in args:
+            switch_live.check(row, plex, out=print)
+            return 0
+        if deps.restore is None:
+            log.error("switch: restore is not available")
+            return 2
+        e = os.environ if env is None else env
+        res = switch_live.switch_live(
+            db, row, plex, apply=cfg.apply, restore=deps.restore, path_map=cfg.path_map,
+            tierfs_mount=cfg.tierfs_mount, server_url=e.get("TIERING_PLEX_PLAYER_URL") or None,
+            **kw)
+    except switch_live.PlexRCError as e:
+        log.error("switch %s: %s", id, e)
+        return 1
+    log.info("switch %s: switched=%d left=%d %s", id, len(res["switched"]), len(res["left"]),
+             res["note"])
+    for m, why in res["left"].items():
+        log.warning("switch %s: player %s left on the old file: %s", id, m, why)
+    return 0 if res["switched"] or not res["left"] else 1
+
+
 def main(argv=None, env=None, deps=None) -> int:
     args = sys.argv[1:] if argv is None else argv
     once = "--once" in args
@@ -1960,6 +2058,10 @@ def main(argv=None, env=None, deps=None) -> int:
     root.setLevel(logging.INFO)
     if "--restore" in args:
         return restore_main(args, env, deps)
+    if "--switch-live" in args:
+        return switch_main(args, env, deps)
+    if "--mark-failed" in args:
+        return mark_failed_main(args, env, deps)
     try:
         cfg = Config.from_env(env)
     except ValueError as e:

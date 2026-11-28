@@ -394,3 +394,18 @@ Swaps are automatic. One long-running process applies the hot set.
 - No code path deletes media. The only unlinks are the stub's extra link, made in step 2 of an offload, a temp symlink, and (after `TIERING_ORPHAN_GRACE_DAYS`) the stub and manifest of a row whose `L` an arr replaced, see "Orphan cleanup" (rows noted "L replaced" or "restored from the restore path"). That one deletes only `<stub root>/<id><ext>` and never `L`. The restore path creates and removes only its own temp file and the symlink `L`, see "Restore path".
 - The tests run in GitHub Actions or the sandbox, never against the live library.
 - No unverified remote byte is ever served or written: tierfs and promote both check every chunk against the chunk list.
+
+### Live release switch (`switch_live.py`, `--switch-live <id> [--check]`)
+
+Carries a player that is watching the offloaded file onto the restore-path release, at the same scene. Order, chosen so that nothing is ever fetched at switch time and a failure leaves the player where it was:
+
+1. `/status/sessions`: sessions whose part file is the row's library file; per session the player's `machineIdentifier`, `viewOffset` and the item's `ratingKey`.
+2. Remote-control probe per player: listed by the server's `/clients` with the `playback` capability, else a proxied `/player/timeline/poll` that the player answers. A player that fails both stays on the old file. If no player passes, nothing is restored.
+3. `ops.restore_from_path` (skipped when the row is already restored). It returns only after the new file is local, size-checked, hole-free and hashed twice, so the new release is pre-buffered by construction. The old stub stays, so the player's open file keeps working.
+4. Poll `/library/metadata/<ratingKey>` (2 minutes) until a part with the new file's size shows (the partial scan from notify.py ran). Timeout: no switch.
+5. Per player: re-read `viewOffset`, `watch_hold.map_offset` (old file read through tierfs as the `watch-align` background reader, new file from disk) gives the position in the new release; no confident match (or any error) means no switch, never a fall back to the old offset.
+6. `playMedia` through the server's player proxy, following python-plexapi (`PlexClient.playMedia`, `sendCommand` with `proxyThroughServer`): `GET /player/playback/playMedia` with header `X-Plex-Target-Client-Identifier` and query `key`, `offset` (ms), `machineIdentifier`, `protocol`/`address`/`port` (the server as the player should reach it), `type=video`, `providerIdentifier`, `containerKey` (a play queue from `POST /playQueues`), `token` (a short-lived delegation token from `/security/token`) and an increasing `commandID`. Afterwards the session is watched for up to 25 s to see the new part; if it does not show, the run warns.
+
+A paused session is switched at once, like a playing one. `TIERING_APPLY` unset or 0: every read-only step runs and the log says what would be sent; nothing is restored or sent. The Plex token is only in the `X-Plex-Token` header; no URL or token is logged.
+
+Honest limits: the player reopens the file (a few seconds of rebuffer, and its audio and subtitle choice may reset); which apps honour a proxied `playMedia` is unverified, as is the exact offset unit and `containerKey` behaviour per app; the offset mapping can fail on quiet or very different cuts, and then the player is left alone; the address the player is told must be reachable from the player (`TIERING_PLEX_PLAYER_URL`). Only the fakes in `tests/test_switch_live.py` have exercised the Plex side.
