@@ -4,15 +4,19 @@
 # the whole body after it. The CRC passes, so AltMount serves (and caches) the article as its first chunk followed
 # by the full body again (kipsilabs/altmount#1089). With one provider this happens on the escalated retry pass.
 #
-# Everything except /app/altmount is the upstream image. The binary is built the way upstream's docker/Dockerfile
-# builds it (non-CLI build: the web UI is served from /app/frontend/dist, which the upstream image already has).
+# Everything except /app/altmount is the upstream image. The binary is built the way upstream's release image is
+# (docker/Dockerfile.ci, used by release.yml): Debian bookworm toolchain, static glibc link. The alpine builder in
+# docker/Dockerfile cannot link it: gopar-turbo's prebuilt libgf16 needs glibc's __memcpy_chk. Non-CLI build: the
+# web UI is served from /app/frontend/dist, which the upstream image already has.
 #
 # Remove this directory and the build: in docker-compose.tiering.yml once an AltMount release requires a nntppool
 # that includes the fix (javi11/nntppool#107 asks for the tag).
 ARG ALTMOUNT_IMAGE=ghcr.io/kipsilabs/altmount:v0.4.0
 
-FROM golang:1.27-alpine AS build
-RUN apk add --no-cache git gcc g++ musl-dev sqlite-dev
+FROM golang:1.27-bookworm AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git gcc g++ libc6-dev libsqlite3-dev \
+ && rm -rf /var/lib/apt/lists/*
 # AltMount v0.4.0's commit, and the nntppool commit that merged #104.
 ARG ALTMOUNT_COMMIT=276157560ecd510de127c69b5368aaa0e0ce4277
 ARG NNTPPOOL_COMMIT=292745291188a4a1afd497837356b97e24dfe54b
