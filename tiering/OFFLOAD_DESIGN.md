@@ -299,6 +299,30 @@ The inputs are plain dicts shaped like Plex's JSON: `ratingKey`, `grandparentRat
 4. Link the stub to `L.tierfs-tmp`, then `rename` it over `L`.
 5. Unlink the stub path, remove the manifest, the chunk list and the fill file, and set `state=whole`.
 
+### Restore path (`ops.restore_from_path`)
+
+For a row in `offloaded`, or `failed` with its stub still there, that has `nzb_path2` (the different release found by qualify). It brings the file back as that release, not the offloaded one. The runner has no new state (the CHECK constraint stays); progress is `step` 101 to 104 plus a kv marker `restore:<id>` (import result, offset copied, name, inode of the temp file). Promote ignores `step` outside `promoting`, so the two do not interfere. A per-id lock `<id>.restore` stops two restores of one row; the swap takes the normal id lock.
+
+1. **Import** (step 101): `nzb_path2` goes through AltMount (`ImportClient.import_nzb`), the media file is found. The target name is chosen now (see below); a name that already exists beside `L` stops the restore before any copy.
+2. **Copy** (102): the WebDAV reader copies it into `<L>.restore-tmp`, in `L`'s directory (same file system, so the final rename is atomic). Free space is checked first. The temp file is fsynced and its offset noted every 128 MiB. A transient read error keeps the temp file and the call resumes from the noted offset next time.
+3. **Verify** (103): size equals the remote's; no run of 512 KiB or more of zero bytes (AltMount answers 206 with zeros for a segment it could not fetch); the SHA-256 of the local copy equals the SHA-256 of a second, independent full read of the remote, and the remote size has not changed.
+4. **Swap** (104): same name: one `RENAME_EXCHANGE` of the temp file and `L`; the symlink that comes out is checked to be ours before it is unlinked (if an arr file appeared meanwhile it is exchanged back and nothing is lost). New name: hard link to the new name, unlink the temp name, unlink the symlink `L` (only if it is still our symlink). Every sub-step is idempotent, so a resume after a crash finishes or finds it done.
+5. **Final row**: `state=failed`, `restore_note="restored from the restore path"`, `step=0`, event `restore_done`. The stub, manifest, chunk list and fill file stay.
+
+Name: by default the restored file keeps `L`'s base name with the restore file's extension, so the arr's naming and Plex's path for the item stay as they were. `keep_name=False` (`--release-name`) uses the restore release's own file name.
+
+Any failure before the swap leaves `L`, the stub and the row as they were: the temp file is dropped (except after a transient read error), the kv marker is cleared and `step` goes back to its old value; event `restore_failed`. Nothing is overwritten or deleted that the restore did not create. Events: `restore_start`, `restore_done`, `restore_failed`, `restore_notify`.
+
+**Triggers.** `python -m offload.runner --restore <id>` for one row (a dry run unless `TIERING_APPLY=1`). The runner calls it by itself after a `bad_chunk` or a `promote_short_remote` only when `TIERING_AUTO_RESTORE=1` (default off), once per id and process.
+
+**After the swap** `notify.py` asks Radarr (`RescanMovie`) or Sonarr (`RescanSeries`) to rescan, using the arr item that owns the folder (else a unique imdb/tvdb id match), through `register.ArrClient.post`; then a Plex partial scan of the folder (`plex_watch.scan_path`) if `PLEX_URL` and `PLEX_TOKEN` are set, else it is skipped and the `restore_notify` event says so. Keys and tokens go in headers, never in a URL. A notify failure never fails the restore.
+
+**What a player sees.** A player that has the old file open reads it through tierfs (`L` was a symlink to the mount). The restore does not unmount, delete, truncate or invalidate the stub, manifest, chunk list or fill file, and unlinking the symlink does not affect an open handle: the current play carries on with the old release until it stops. The orphan cleanup removes the stub and manifest only after `TIERING_ORPHAN_GRACE_DAYS` and only when nothing holds the stub open. The next play opens the path again and gets the new file. With the default name the path is unchanged, so Plex sees the same item whose file changed (new size, new mtime) and re-analyzes it on the rescan; with a new name Plex sees the old path vanish and a new one appear. Open question the test is meant to answer: whether Plex keeps watch state and the item identity across the swap, and whether the arr rescan notices a same-path file change.
+
+**Cleanup.** The orphan cleanup also takes `failed` rows with this note. After removing the stub it sets the note to "orphan cleaned" and clears `lib_path`, so register (which skips a path that belongs to a non-`whole` row) can add the new file as a `whole` row.
+
+Known limits: a hard failure after the new-name hard link was made can leave the new file beside `L` (never overwritten on retry); a crash during the copy resumes only from the last noted offset (the bytes after it are rewritten).
+
 ## Runner (`runner.py`)
 
 Swaps are automatic. One long-running process applies the hot set.
@@ -367,6 +391,6 @@ Swaps are automatic. One long-running process applies the hot set.
 ## Safety
 
 - Dry run is the default everywhere. Nothing changes a file unless `TIERING_APPLY=1` is set.
-- No code path deletes media. The only unlinks are the stub's extra link, made in step 2 of an offload, a temp symlink, and (after `TIERING_ORPHAN_GRACE_DAYS`) the stub and manifest of a row whose `L` an arr replaced, see "Orphan cleanup". That one deletes only `<stub root>/<id><ext>` and never `L`.
+- No code path deletes media. The only unlinks are the stub's extra link, made in step 2 of an offload, a temp symlink, and (after `TIERING_ORPHAN_GRACE_DAYS`) the stub and manifest of a row whose `L` an arr replaced, see "Orphan cleanup" (rows noted "L replaced" or "restored from the restore path"). That one deletes only `<stub root>/<id><ext>` and never `L`. The restore path creates and removes only its own temp file and the symlink `L`, see "Restore path".
 - The tests run in GitHub Actions or the sandbox, never against the live library.
 - No unverified remote byte is ever served or written: tierfs and promote both check every chunk against the chunk list.

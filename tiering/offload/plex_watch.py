@@ -1,4 +1,4 @@
-"""Read-only Plex client (GET only) and the tierfs event reader.
+"""Plex client (GET only; the one write-like call is scan_path, a GET) and the tierfs event reader.
 
 Env: PLEX_URL, PLEX_TOKEN. The token is sent only in the X-Plex-Token
 header and is never printed or logged.
@@ -153,6 +153,40 @@ def in_progress():
                             "viewedAt": r.get("lastViewedAt"),
                             "viewOffset": r["viewOffset"]})
     return out
+
+
+def scan_path(folder):
+    """Ask Plex for a partial scan of `folder` (a path as Plex sees it): the section whose
+    location holds it, `GET /library/sections/<key>/refresh?path=<folder>`. Returns the
+    section's title, or None when no section holds the folder. The token is sent in the
+    header only; the answer has no body to parse."""
+    base = os.environ.get("PLEX_URL", "").rstrip("/")
+    token = os.environ.get("PLEX_TOKEN", "")
+    if not base or not token:
+        raise PlexError("PLEX_URL and PLEX_TOKEN must be set")
+    folder = os.path.normpath(str(folder))
+    best = None
+    for sec in _sections():
+        for loc in sec.get("Location") or []:
+            root = os.path.normpath(str(loc.get("path") or ""))
+            if root and (folder == root or folder.startswith(root.rstrip("/") + "/")) \
+                    and (best is None or len(root) > best[0]):
+                best = (len(root), sec)
+    if best is None:
+        return None
+    sec = best[1]
+    url = f"{base}/library/sections/{quote(str(sec['key']), safe='')}/refresh?" + \
+        urlencode({"path": folder})
+    req = urllib.request.Request(url, headers={"Accept": "application/json",
+                                               "X-Plex-Token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            r.read(1024)
+    except urllib.error.HTTPError as e:
+        raise PlexError(f"scan failed: HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise PlexError(f"scan failed: {type(e).__name__}") from None
+    return sec.get("title")
 
 
 def read_tierfs_events(path, since_ts, id_to_rk):
